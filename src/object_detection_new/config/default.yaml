@@ -1,17 +1,24 @@
 /**:
   ros__parameters:
-    # Camera settings
-    camera_type: 'realsense'  # 'realsense' or 'kinect'
-    image_topic: '/camera/camera/color/image_raw'
-    depth_topic: '/camera/camera/aligned_depth_to_color/image_raw'
-    camera_info_topic: '/camera/camera/aligned_depth_to_color/camera_info'
+    # Camera types to subscribe to
+    camera_types: ['realsense', 'orbbec']
+    
+    # Realsense camera topics
+    realsense_image_topic: '/camera/xarm_camera/color/image_raw'
+    realsense_depth_topic: '/camera/xarm_camera/aligned_depth_to_color/image_raw'
+    realsense_camera_info_topic: '/camera/xarm_camera/aligned_depth_to_color/camera_info'
+    
+    # Orbbec camera topics
+    orbbec_image_topic: '/camera/color/image_raw'
+    orbbec_depth_topic: '/camera/depth_registered/points'
+    orbbec_camera_info_topic: '/camera/color/camera_info'
     
     # Model settings
     model_path: 'yolo11m-seg.pt'  # Can be absolute path or filename in models/
     confidence_threshold: 0.5
     
     # Publishing settings
-    publish_rate: 5.0  # Hz, set to 0 to disable continuous publishing
+    publish_rate: 0  # Hz, set to 0 to disable continuous publishing
     
     # Depth processing
     max_depth: 10.0  # meters
@@ -19,3 +26,4 @@
     
     # Visualization
     visualization: false
+

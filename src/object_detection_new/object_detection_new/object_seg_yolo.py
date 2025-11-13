@@ -1,9 +1,12 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 import numpy as np
 import cv2
 from pathlib import Path
+import threading
+import copy
 
 # ROS2 messages
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
@@ -17,7 +20,7 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 # Computer vision
 from ultralytics import YOLO
-from cv_bridge import CvBridge, CvBridgeError
+from cv_bridge import CvBridge
 
 
 class YOLOSegmentationNode(Node):
@@ -45,29 +48,47 @@ class YOLOSegmentationNode(Node):
 
         # State variables
         self.bridge = CvBridge()
-        self.camera_intrinsic = None
-        self.recent_rgb_msg = None
-        self.recent_depth_msg = None
-        self.recent_rgb_img = None
-        self.recent_depth_img = None
-        self.recent_points = None
-        self.recent_valid_mask = None
-        self.last_publish_time = None
+
+        # Thread locks for data protection
+        self.lock_msg = threading.Lock()
+        self.lock_info = threading.Lock()
+
+        # Camera data storage (per camera type)
+        self.camera_intrinsic = {
+            'realsense': None,
+            'orbbec': None
+        }
+        self.recent_sync_msg = {
+            'realsense': None,
+            'orbbec': None
+        }
+        self.recent_publish_time = {
+            'realsense': None,
+            'orbbec': None
+        }
 
         self.get_logger().info('YOLO Segmentation Node initialized successfully')
 
     def _declare_parameters(self):
         """Declare all ROS2 parameters with defaults."""
-        self.declare_parameter('camera_type', 'realsense')  # 'realsense' or 'kinect'
+        self.declare_parameter('camera_types', ['realsense', 'orbbec'])
         self.declare_parameter('model_path', 'yolov11m-seg.pt')
+        # Realsense topics
         self.declare_parameter(
-            'image_topic', '/camera/camera/color/image_raw')
+            'realsense_image_topic', '/camera/xarm_camera/color/image_raw')
         self.declare_parameter(
-            'depth_topic',
-            '/camera/camera/aligned_depth_to_color/image_raw')
+            'realsense_depth_topic',
+            '/camera/xarm_camera/aligned_depth_to_color/image_raw')
         self.declare_parameter(
-            'camera_info_topic',
-            '/camera/camera/aligned_depth_to_color/camera_info')
+            'realsense_camera_info_topic',
+            '/camera/xarm_camera/aligned_depth_to_color/camera_info')
+        # Orbbec topics
+        self.declare_parameter(
+            'orbbec_image_topic', '/camera/color/image_raw')
+        self.declare_parameter(
+            'orbbec_depth_topic', '/camera/depth_registered/points')
+        self.declare_parameter(
+            'orbbec_camera_info_topic', '/camera/color/camera_info')
         # Hz, 0 = no continuous publishing
         self.declare_parameter('publish_rate', 5.0)
         self.declare_parameter('confidence_threshold', 0.5)
@@ -77,18 +98,15 @@ class YOLOSegmentationNode(Node):
 
     def _load_parameters(self):
         """Load all parameters."""
-        self.camera_type = self.get_parameter('camera_type').value
+        self.camera_types = self.get_parameter('camera_types').value
         self.model_path = self.get_parameter('model_path').value
-        self.image_topic = self.get_parameter('image_topic').value
-        self.depth_topic = self.get_parameter('depth_topic').value
-        self.camera_info_topic = self.get_parameter('camera_info_topic').value
         self.publish_rate = self.get_parameter('publish_rate').value
         self.conf_threshold = self.get_parameter('confidence_threshold').value
         self.visualization = self.get_parameter('visualization').value
         self.max_depth = self.get_parameter('max_depth').value
         self.min_depth = self.get_parameter('min_depth').value
 
-        self.get_logger().info(f'Camera type: {self.camera_type}')
+        self.get_logger().info(f'Camera types: {self.camera_types}')
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Confidence threshold: {self.conf_threshold}')
 
@@ -97,7 +115,7 @@ class YOLOSegmentationNode(Node):
         try:
             model_file = Path(self.model_path)
             found = False
-            
+
             # If not absolute path, search for it
             if not model_file.is_absolute():
                 # Try to find in installed share directory first
@@ -109,10 +127,10 @@ class YOLOSegmentationNode(Node):
                     if share_model.exists():
                         model_file = share_model
                         found = True
-                        self.get_logger().info(f'Found model in share directory')
+                        self.get_logger().info('Found model in share directory')
                 except Exception as e:
                     self.get_logger().warn(f'Could not check share directory: {e}')
-                
+
                 # Try to find in package source directory
                 if not found:
                     pkg_dir = Path(__file__).parent.parent
@@ -121,7 +139,7 @@ class YOLOSegmentationNode(Node):
                     if src_model.exists():
                         model_file = src_model
                         found = True
-                        self.get_logger().info(f'Found model in source directory')
+                        self.get_logger().info('Found model in source directory')
 
             # Check if file exists (for absolute paths)
             if model_file.is_absolute() and model_file.exists():
@@ -147,36 +165,66 @@ class YOLOSegmentationNode(Node):
             depth=10
         )
 
-        # Synchronized subscribers
-        self.image_sub = Subscriber(
-            self, Image, self.image_topic, qos_profile=qos_profile
-        )
+        # Subscribe to both realsense and orbbec cameras
+        if 'realsense' in self.camera_types:
+            cb_realsense = MutuallyExclusiveCallbackGroup()
 
-        if self.camera_type == 'realsense':
-            self.depth_sub = Subscriber(
-                self, Image, self.depth_topic, qos_profile=qos_profile
+            realsense_image_topic = self.get_parameter('realsense_image_topic').value
+            realsense_depth_topic = self.get_parameter('realsense_depth_topic').value
+            realsense_camera_info_topic = self.get_parameter('realsense_camera_info_topic').value
+
+            image_sub_realsense = Subscriber(
+                self, Image, realsense_image_topic, qos_profile=qos_profile
             )
-        else:  # kinect
-            self.depth_sub = Subscriber(
-                self, PointCloud2, self.depth_topic, qos_profile=qos_profile
+            depth_sub_realsense = Subscriber(
+                self, Image, realsense_depth_topic, qos_profile=qos_profile
             )
 
-        # Synchronizer
-        self.sync = ApproximateTimeSynchronizer(
-            [self.image_sub, self.depth_sub],
-            queue_size=10,
-            slop=0.1
-        )
-        self.sync.registerCallback(self._sync_callback)
+            sync_realsense = ApproximateTimeSynchronizer(
+                [image_sub_realsense, depth_sub_realsense],
+                queue_size=10,
+                slop=0.1
+            )
+            sync_realsense.registerCallback(self._realsense_callback)
 
-        # Camera info subscriber (for realsense)
-        if self.camera_type == 'realsense':
-            self.camera_info_sub = self.create_subscription(
+            self.camera_info_sub_realsense = self.create_subscription(
                 CameraInfo,
-                self.camera_info_topic,
-                self._camera_info_callback,
-                qos_profile=10
+                realsense_camera_info_topic,
+                self._camera_info_realsense_callback,
+                qos_profile=10,
+                callback_group=cb_realsense
             )
+            self.get_logger().info('Subscribed to realsense camera')
+
+        if 'orbbec' in self.camera_types:
+            cb_orbbec = MutuallyExclusiveCallbackGroup()
+
+            orbbec_image_topic = self.get_parameter('orbbec_image_topic').value
+            orbbec_depth_topic = self.get_parameter('orbbec_depth_topic').value
+            orbbec_camera_info_topic = self.get_parameter('orbbec_camera_info_topic').value
+
+            image_sub_orbbec = Subscriber(
+                self, Image, orbbec_image_topic, qos_profile=qos_profile
+            )
+            depth_sub_orbbec = Subscriber(
+                self, PointCloud2, orbbec_depth_topic, qos_profile=qos_profile
+            )
+
+            sync_orbbec = ApproximateTimeSynchronizer(
+                [image_sub_orbbec, depth_sub_orbbec],
+                queue_size=10,
+                slop=0.1
+            )
+            sync_orbbec.registerCallback(self._orbbec_callback)
+
+            self.camera_info_sub_orbbec = self.create_subscription(
+                CameraInfo,
+                orbbec_camera_info_topic,
+                self._camera_info_orbbec_callback,
+                qos_profile=10,
+                callback_group=cb_orbbec
+            )
+            self.get_logger().info('Subscribed to orbbec camera')
 
     def _init_publishers(self):
         """Initialize publishers."""
@@ -196,49 +244,44 @@ class YOLOSegmentationNode(Node):
         self.detection_srv = self.create_service(
             ObjectDetection,
             service_name,
-            self._detection_service_callback
+            self._detection_service_callback,
+            callback_group=MutuallyExclusiveCallbackGroup()
         )
         self.get_logger().info(f'Detection service created: {service_name}')
 
-    def _camera_info_callback(self, msg: CameraInfo):
-        """Store camera intrinsic parameters."""
-        self.camera_intrinsic = msg
+    def _camera_info_realsense_callback(self, msg: CameraInfo):
+        """Store realsense camera intrinsic parameters."""
+        self.lock_info.acquire()
+        self.camera_intrinsic['realsense'] = msg
+        self.lock_info.release()
 
-    def _sync_callback(self, rgb_msg: Image, depth_msg):
-        """Process synchronized RGB and depth messages."""
-        try:
-            # Convert RGB image
-            rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+    def _camera_info_orbbec_callback(self, msg: CameraInfo):
+        """Store orbbec camera intrinsic parameters."""
+        self.lock_info.acquire()
+        self.camera_intrinsic['orbbec'] = msg
+        self.lock_info.release()
 
-            # Convert depth based on camera type
-            if self.camera_type == 'realsense':
-                if self.camera_intrinsic is None:
-                    return
-                depth_img = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
-                depth_img = depth_img.astype(float) / 1000.0  # mm to meters
-                points, valid_mask = self._depth_to_points(depth_img)
-            else:  # kinect
-                points, valid_mask = self._pointcloud_to_array(depth_msg)
+    def _realsense_callback(self, rgb_msg: Image, depth_msg: Image):
+        """Process synchronized realsense RGB and depth messages."""
+        self.lock_msg.acquire()
+        self.recent_sync_msg['realsense'] = (rgb_msg, depth_msg)
+        self.recent_publish_time['realsense'] = self.get_clock().now()
+        self.lock_msg.release()
 
-            # Store latest data
-            self.recent_rgb_msg = rgb_msg
-            self.recent_depth_msg = depth_msg
-            self.recent_rgb_img = rgb_img
-            self.recent_points = points
-            self.recent_valid_mask = valid_mask
+    def _orbbec_callback(self, rgb_msg: Image, depth_msg: PointCloud2):
+        """Process synchronized orbbec RGB and depth messages."""
+        self.lock_msg.acquire()
+        self.recent_sync_msg['orbbec'] = (rgb_msg, depth_msg)
+        self.recent_publish_time['orbbec'] = self.get_clock().now()
+        self.lock_msg.release()
 
-        except CvBridgeError as e:
-            self.get_logger().error(f'CV Bridge error: {e}')
-        except Exception as e:
-            self.get_logger().error(f'Sync callback error: {e}')
-
-    def _depth_to_points(self, depth_img: np.ndarray) -> tuple:
+    def _depth_to_points(self, depth_img: np.ndarray, intrinsic: CameraInfo) -> tuple:
         """Convert depth image to 3D points using camera intrinsics."""
         H, W = depth_img.shape
-        fx = self.camera_intrinsic.k[0]
-        fy = self.camera_intrinsic.k[4]
-        cx = self.camera_intrinsic.k[2]
-        cy = self.camera_intrinsic.k[5]
+        fx = intrinsic.k[0]
+        fy = intrinsic.k[4]
+        cx = intrinsic.k[2]
+        cy = intrinsic.k[5]
 
         # Create coordinate grids
         x_coords = np.arange(W)
@@ -261,29 +304,78 @@ class YOLOSegmentationNode(Node):
 
         return points, valid_mask
 
-    def _pointcloud_to_array(self, pc_msg: PointCloud2) -> tuple:
-        """Convert PointCloud2 to point array."""
-        # Assuming Kinect format: 1536x2048
-        h, w = 1536, 2048
+    def _pointcloud_to_array(self, pc_msg: PointCloud2, intrinsic: CameraInfo) -> tuple:
+        """
+        Convert PointCloud2 to point array (Orbbec format).
+
+        Orbbec outputs unordered point cloud, need to reproject to image grid.
+        """
+        h, w = 720, 1280
+        K = np.array(intrinsic.k).reshape((3, 3))
+
+        # Parse point cloud
         arr = np.frombuffer(pc_msg.data, dtype='<f4')
-        arr = arr.reshape((h, w, 8))[:, :, :3]
+        N = len(arr) // 5  # x, y, z, rgb (padding to 5 floats)
+        points = arr.reshape((N, 5))[:, [0, 1, 2]]
+
+        # Project to image coordinates
+        points_homo = points / np.repeat(points[:, 2:3], 3, axis=1)
+        coor_homo = (K @ points_homo.T).T
+        coor = np.rint(coor_homo[:, :2]).astype(int)
+
+        # Create depth image
+        depth_img = np.zeros((h, w, 3))
+        valid_coords = (coor[:, 0] >= 0) & (coor[:, 0] < w) & \
+                       (coor[:, 1] >= 0) & (coor[:, 1] < h)
+        depth_img[coor[valid_coords, 1], coor[valid_coords, 0], :] = points[valid_coords]
 
         # Valid mask
-        valid_mask = ~np.any(np.isnan(arr), axis=2)
-        valid_mask &= (arr[:, :, 2] < self.max_depth)
-        valid_mask &= (arr[:, :, 2] > self.min_depth)
+        valid_mask = (depth_img[:, :, 2] > self.min_depth) & \
+                     (depth_img[:, :, 2] < self.max_depth)
 
-        # Remove NaNs
-        arr = np.nan_to_num(arr, nan=0.0)
+        return depth_img, valid_mask
 
-        return arr, valid_mask
+    def _process_realsense_data(self, rgb_msg: Image, depth_msg: Image,
+                                intrinsic: CameraInfo) -> tuple:
+        """Process realsense RGB-D data into usable format."""
+        rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        depth_img = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
+        depth_img = depth_img.astype(float) / 1000.0  # mm to meters
+
+        points, valid_mask = self._depth_to_points(depth_img, intrinsic)
+
+        return rgb_img, points, valid_mask, depth_msg.header
+
+    def _process_orbbec_data(self, rgb_msg: Image, depth_msg: PointCloud2,
+                             intrinsic: CameraInfo) -> tuple:
+        """Process orbbec RGB-D data into usable format."""
+        rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        points, valid_mask = self._pointcloud_to_array(depth_msg, intrinsic)
+
+        return rgb_img, points, valid_mask, depth_msg.header
 
     def _detect_objects(
             self, rgb_img: np.ndarray, points: np.ndarray,
             valid_mask: np.ndarray, header: Header,
+            camera: str = 'realsense',
             request_segments: bool = False) -> tuple:
         """
         Run object detection and return results.
+
+        Parameters
+        ----------
+        rgb_img : np.ndarray
+            RGB image
+        points : np.ndarray
+            3D point cloud array
+        valid_mask : np.ndarray
+            Valid depth mask
+        header : Header
+            ROS message header
+        camera : str
+            'realsense' or 'orbbec' - determines coordinate transformation
+        request_segments : bool
+            Whether to return segmentation masks
 
         Returns
         -------
@@ -351,7 +443,7 @@ class YOLOSegmentationNode(Node):
 
                 # Calculate 3D centroid
                 centroid = self._calculate_centroid(
-                    points, mask, valid_mask, (y1, x1, y2, x2)
+                    points, mask, valid_mask, (y1, x1, y2, x2), camera
                 )
 
                 if centroid is None:
@@ -389,7 +481,7 @@ class YOLOSegmentationNode(Node):
     def _calculate_centroid(
             self, points: np.ndarray, mask: np.ndarray,
             valid_mask: np.ndarray,
-            bbox: tuple) -> geometry_msgs.msg.Point:
+            bbox: tuple, camera: str) -> geometry_msgs.msg.Point:
         """Calculate 3D centroid from segmentation mask and point cloud."""
         y1, x1, y2, x2 = bbox
 
@@ -404,17 +496,26 @@ class YOLOSegmentationNode(Node):
         if combined_mask.sum() < 10:
             return None
 
-        # Calculate weighted average
-        masked_points = roi_points * combined_mask[:, :, np.newaxis]
-        centroid_3d = masked_points.sum(axis=(0, 1)) / combined_mask.sum()
+        # Calculate median for depth, mean for x/y
+        obj_pts = roi_points[combined_mask]
 
         # Create Point message (coordinate system depends on camera type)
         point = geometry_msgs.msg.Point()
-        if self.camera_type == 'realsense':
+        if camera == 'realsense':
+            # Realsense: transform from camera to robot frame
+            # Camera: x-right, y-down, z-forward
+            # Robot: x-forward, y-left, z-up
+            centroid_3d = np.mean(obj_pts, axis=0)
+            centroid_3d[2] = np.median(obj_pts[:, 2])  # Use median for depth
+
             point.x = float(centroid_3d[2])   # z -> x (forward)
             point.y = float(-centroid_3d[0])  # x -> -y (left)
             point.z = float(-centroid_3d[1])  # y -> -z (up)
-        else:  # kinect
+        else:  # orbbec
+            # Orbbec already in correct frame
+            centroid_3d = np.mean(obj_pts, axis=0)
+            centroid_3d[2] = np.median(obj_pts[:, 2])  # Use median for depth
+
             point.x = float(centroid_3d[0])
             point.y = float(centroid_3d[1])
             point.z = float(centroid_3d[2])
@@ -446,29 +547,6 @@ class YOLOSegmentationNode(Node):
         )
         cv2.drawContours(img, contours, -1, (0, 0, 255), 2)
 
-    def _publish_detections(self):
-        """Publish detections at configured rate."""
-        if self.recent_rgb_img is None or self.recent_points is None:
-            return
-
-        try:
-            objects_msg, _ = self._detect_objects(
-                self.recent_rgb_img,
-                self.recent_points,
-                self.recent_valid_mask,
-                self.recent_rgb_msg.header,
-                request_segments=False
-            )
-
-            self.detection_pub.publish(objects_msg)
-
-            if self.visualization and self.recent_rgb_img is not None:
-                cv2.imshow('Detections', self.recent_rgb_img)
-                cv2.waitKey(1)
-
-        except Exception as e:
-            self.get_logger().error(f'Error publishing detections: {e}')
-
     def _detection_service_callback(
             self, request: ObjectDetection.Request,
             response: ObjectDetection.Response
@@ -476,13 +554,57 @@ class YOLOSegmentationNode(Node):
         """Handle detection service requests."""
         self.get_logger().info('Detection service request received')
 
-        # Check if data is available
-        if self.recent_rgb_img is None or self.recent_points is None:
+        # Determine which camera to use
+        camera = 'orbbec'  # default
+        if 'realsense' in request.camera:
+            camera = 'realsense'
+        elif 'orbbec' in request.camera:
+            camera = 'orbbec'
+        else:
+            self.get_logger().warn(f'Unknown camera: {request.camera}, using orbbec')
+
+        # Get camera data with thread safety
+        self.lock_msg.acquire()
+        rec_msg = copy.deepcopy(self.recent_sync_msg.get(camera))
+        self.lock_msg.release()
+
+        if rec_msg is None:
             response.header = Header(stamp=self.get_clock().now().to_msg())
             response.status = 1
             response.objects = []
             response.person_id = 0
-            self.get_logger().warn('No image data available')
+            self.get_logger().warn(f'No {camera} camera data available')
+            return response
+
+        # Get camera intrinsics
+        self.lock_info.acquire()
+        intrinsic = copy.deepcopy(self.camera_intrinsic.get(camera))
+        self.lock_info.release()
+
+        if intrinsic is None:
+            response.header = Header(stamp=self.get_clock().now().to_msg())
+            response.status = 1
+            response.objects = []
+            response.person_id = 0
+            self.get_logger().warn(f'No {camera} camera intrinsic data')
+            return response
+
+        # Process camera data
+        try:
+            if camera == 'realsense':
+                rgb_img, points, valid_mask, header = self._process_realsense_data(
+                    rec_msg[0], rec_msg[1], intrinsic
+                )
+            else:  # orbbec
+                rgb_img, points, valid_mask, header = self._process_orbbec_data(
+                    rec_msg[0], rec_msg[1], intrinsic
+                )
+        except Exception as e:
+            self.get_logger().error(f'Error processing {camera} data: {e}')
+            response.header = Header(stamp=self.get_clock().now().to_msg())
+            response.status = 1
+            response.objects = []
+            response.person_id = 0
             return response
 
         # Parse request flags
@@ -492,10 +614,11 @@ class YOLOSegmentationNode(Node):
         # Run detection
         try:
             objects_msg, segments = self._detect_objects(
-                self.recent_rgb_img,
-                self.recent_points,
-                self.recent_valid_mask,
-                self.recent_depth_msg.header,
+                rgb_img,
+                points,
+                valid_mask,
+                header,
+                camera=camera,
                 request_segments=request_segments
             )
 
@@ -508,9 +631,9 @@ class YOLOSegmentationNode(Node):
             # Add RGB image if requested
             if request_image:
                 response.rgb_image = self.bridge.cv2_to_imgmsg(
-                    self.recent_rgb_img, "bgr8"
+                    rgb_img, "bgr8"
                 )
-                depth_img = self.recent_points[:, :, 2].astype(np.float32)
+                depth_img = points[:, :, 2].astype(np.float32)
                 response.depth_image = self.bridge.cv2_to_imgmsg(
                     depth_img, "32FC1"
                 )
@@ -532,7 +655,7 @@ class YOLOSegmentationNode(Node):
                 response.segments = []
 
             self.get_logger().info(
-                f'Detected {len(response.objects)} objects'
+                f'Detected {len(response.objects)} objects using {camera}'
             )
 
         except Exception as e:
@@ -549,8 +672,12 @@ def main(args=None):
     rclpy.init(args=args)
     node = YOLOSegmentationNode()
 
+    # Use MultiThreadedExecutor for concurrent callback processing
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

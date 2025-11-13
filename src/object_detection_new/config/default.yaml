@@ -1,0 +1,21 @@
+/**:
+  ros__parameters:
+    # Camera settings
+    camera_type: 'realsense'  # 'realsense' or 'kinect'
+    image_topic: '/camera/camera/color/image_raw'
+    depth_topic: '/camera/camera/aligned_depth_to_color/image_raw'
+    camera_info_topic: '/camera/camera/aligned_depth_to_color/camera_info'
+    
+    # Model settings
+    model_path: 'yolo11m-seg.pt'  # Can be absolute path or filename in models/
+    confidence_threshold: 0.5
+    
+    # Publishing settings
+    publish_rate: 5.0  # Hz, set to 0 to disable continuous publishing
+    
+    # Depth processing
+    max_depth: 10.0  # meters
+    min_depth: 0.1   # meters
+    
+    # Visualization
+    visualization: false

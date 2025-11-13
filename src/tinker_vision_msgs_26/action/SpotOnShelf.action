@@ -1,7 +1,7 @@
 # Goal: Request to spot objects on shelf
-geometry_msgs/PoseStamped shelf_left
-geometry_msgs/PoseStamped shelf_right
-float32[] shelf_heights
+geometry_msgs/PoseStamped shelf_left # in map frame
+geometry_msgs/PoseStamped shelf_right # in map frame
+float32[] shelf_heights # in meters
 string[] item_ids
 
 ---

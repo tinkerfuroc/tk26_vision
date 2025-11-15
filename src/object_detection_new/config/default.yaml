@@ -26,4 +26,9 @@
     
     # Visualization
     visualization: false
-
+    
+    # Sorting mode: 'none', 'closest', 'highest'
+    # - 'none': No sorting (original detection order)
+    # - 'closest': Sort by distance (closest objects first)
+    # - 'highest': Sort by height (highest objects first)
+    sort_mode: 'closest'

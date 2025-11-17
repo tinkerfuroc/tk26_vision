@@ -18,6 +18,10 @@ import geometry_msgs.msg
 from tinker_vision_msgs.msg import Object, Objects
 from tinker_vision_msgs.srv import ObjectDetection
 
+# TF2 for coordinate transformations
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+from tf2_geometry_msgs import do_transform_point
+
 # Message filters for synchronization
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
@@ -51,6 +55,10 @@ class YOLOSegmentationNode(Node):
 
         # State variables
         self.bridge = CvBridge()
+
+        # TF2 buffer and listener for coordinate transformations
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Thread locks for data protection
         self.lock_msg = threading.Lock()
@@ -396,7 +404,8 @@ class YOLOSegmentationNode(Node):
         return rgb_img, points, valid_mask, depth_msg.header
 
     def _sort_objects_and_segments(self, objects: list, segments: list, 
-                                     sort_mode: str) -> tuple:
+                                     sort_mode: str, source_frame: str = 'camera_link',
+                                     header: Header = None) -> tuple:
         """
         Sort detected objects and their corresponding segments based on centroid position.
         
@@ -410,28 +419,101 @@ class YOLOSegmentationNode(Node):
             Sorting mode: 'none', 'closest', 'highest'
             - 'none': No sorting (original detection order)
             - 'closest': Sort by distance (closest first, based on centroid.x)
-            - 'highest': Sort by height (highest first, based on centroid.z)
+            - 'highest': Sort by height (highest first, based on centroid.z in map frame)
+        source_frame : str, optional
+            Source frame for transformations (e.g., 'camera_link')
+        header : Header, optional
+            ROS message header for timestamp
         
         Returns
         -------
         tuple
             (sorted objects list, sorted segments list)
         """
+        self.get_logger().info(f"Sorting objects with mode: {sort_mode}")
         if sort_mode == 'none' or not objects:
+            self.get_logger().info("No sorting applied")
             return objects, segments
         
         # Create list of (index, object) tuples for sorting
         indexed_objects = list(enumerate(objects))
         
         if sort_mode == 'closest':
-            # Sort by distance (centroid.x in robot frame = forward distance)
-            indexed_objects.sort(key=lambda x: math.sqrt(x[1].centroid.x**2 + x[1].centroid.y**2 + x[1].centroid.z**2))
+            # Sort by distance (centroid.z in camera frame = forward distance)
+            indexed_objects.sort(key=lambda x: x[1].centroid.z)
+            if indexed_objects:
+                self.get_logger().info(f"Sorted by closest: nearest at z={indexed_objects[0][1].centroid.z:.2f}m")
         
         elif sort_mode == 'highest':
-            # Sort by height (centroid.z in robot frame = vertical position)
-            # Negative to get highest first (larger z values first)
-            indexed_objects.sort(key=lambda x: x[1].centroid.y)
-        
+            # Try to transform to map frame for proper height sorting
+            use_map_frame = False
+            transform = None
+            
+            if source_frame and header:
+                try:
+                    # Check if map frame exists
+                    transform = self.tf_buffer.lookup_transform(
+                        'map',
+                        source_frame,
+                        header.stamp,
+                        timeout=rclpy.duration.Duration(seconds=0.1)
+                    )
+                    use_map_frame = True
+                    self.get_logger().info("Using map frame for height sorting")
+                    
+                except (LookupException, ConnectivityException, ExtrapolationException) as e:
+                    self.get_logger().warn(
+                        f"Failed to get transform from {source_frame} to map frame: {e}. "
+                        f"Falling back to 'closest' sorting mode."
+                    )
+                    sort_mode = 'closest'
+            else:
+                self.get_logger().warn(
+                    "No source_frame or header provided for 'highest' mode. "
+                    "Falling back to 'closest' sorting mode."
+                )
+                sort_mode = 'closest'
+            
+            if use_map_frame:
+                # Transform centroids to map frame and sort by z (height)
+                transformed_heights = []
+                
+                for idx, obj in indexed_objects:
+                    try:
+                        # Create PointStamped message
+                        point_stamped = geometry_msgs.msg.PointStamped()
+                        point_stamped.header = header
+                        point_stamped.header.frame_id = source_frame
+                        point_stamped.point = obj.centroid
+                        
+                        # Transform point
+                        transformed_point = do_transform_point(point_stamped, transform)
+                        height = transformed_point.point.z
+                        transformed_heights.append((idx, obj))
+                        
+                    except Exception as e:
+                        self.get_logger().warn(
+                            f"Failed to transform object {idx}: {e}. Using original position."
+                        )
+                        # Fallback: use camera frame y as approximate height
+                        transformed_heights.append((idx, obj))
+                
+                # Sort by height (negative for highest first)
+                transformed_heights.sort(key=lambda x: -x[1].centroid.z)
+                indexed_objects = transformed_heights
+
+                if transformed_heights:
+                    self.get_logger().info(
+                        f"Sorted by height in map frame: highest at z={transformed_heights[0][1].centroid.z:.2f}m" + \
+                        f"All points: {[f'z={obj[1].centroid.z:.2f}m' for obj in transformed_heights]}"
+                    )
+            else:
+                # Fallback to closest sorting
+                indexed_objects.sort(key=lambda x: x[1].centroid.z)
+                if indexed_objects:
+                    self.get_logger().info(
+                        f"Fallback: sorted by closest at z={indexed_objects[0][1].centroid.z:.2f}m"
+                    )
         else:
             self.get_logger().warn(f'Unknown sort_mode: {sort_mode}, using none')
             return objects, segments
@@ -594,28 +676,29 @@ class YOLOSegmentationNode(Node):
 
                 if request_segments:
                     segments.append(mask.astype(np.uint8) * 255)
-                
-                
-                
         
         self.get_logger().info(f'Detected {len(objects_msg.objects)} objects of class "{target_cls}"')
         
         # Sort objects and segments together if requested
+        # Pass the source frame from header for TF transformations
+        source_frame = header.frame_id
         objects_msg.objects, segments = self._sort_objects_and_segments(
-            objects_msg.objects, segments, sort_mode
+            objects_msg.objects, segments, sort_mode,
+            source_frame=source_frame,
+            header=header
         )
         
-        # Also sort detection_info to match
-        if sort_mode != 'none' and detection_info:
-            # Create indexed list
-            indexed_info = list(enumerate(detection_info))
+        # # Also sort detection_info to match
+        # if sort_mode != 'none' and detection_info:
+        #     # Create indexed list
+        #     indexed_info = list(enumerate(detection_info))
             
-            if sort_mode == 'closest':
-                indexed_info.sort(key=lambda x: x[1]['centroid'].x)
-            elif sort_mode == 'highest':
-                indexed_info.sort(key=lambda x: -x[1]['centroid'].z)
+        #     if sort_mode == 'closest':
+        #         indexed_info.sort(key=lambda x: x[1]['centroid'].x)
+        #     elif sort_mode == 'highest':
+        #         indexed_info.sort(key=lambda x: -x[1]['centroid'].z)
             
-            detection_info = [info for _, info in indexed_info]
+        #     detection_info = [info for _, info in indexed_info]
         
         # Visualize all detections in one image
         if self.visualization and detection_info:
@@ -704,7 +787,7 @@ class YOLOSegmentationNode(Node):
             cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
             
             # Draw label with index (shows sorting order)
-            label = f'#{idx+1} {cls_name} {conf:.2f} d={math.sqrt(centroid.x**2 + centroid.y**2 + centroid.z**2):.2f}m h={centroid.y:.2f}m'
+            label = f'#{idx+1} {cls_name} {conf:.2f} x={centroid.x:.2f}m y={centroid.y:.2f}m z={centroid.z:.2f}m'
 
             # Add background for text readability
             (label_w, label_h), _ = cv2.getTextSize(

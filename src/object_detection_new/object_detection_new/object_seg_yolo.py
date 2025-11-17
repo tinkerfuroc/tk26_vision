@@ -508,7 +508,8 @@ class YOLOSegmentationNode(Node):
 
         segments = []
         detection_info = []  # Store info for visualization: (bbox, mask, cls_name, conf, centroid)
-
+        detection_info_all = []
+        
         # Process detections
         for result in results:
             
@@ -525,12 +526,11 @@ class YOLOSegmentationNode(Node):
 
                 # Filter by confidence
                 if conf < self.conf_threshold:
+                    self.get_logger().debug(f'Skipping detection {i}: low confidence {conf:.2f}')
                     continue
 
                 cls_id = int(boxes.cls[i])
                 cls_name = self.model.names[cls_id]
-                if cls_name != target_cls:
-                    continue
 
                 # Get bounding box
                 x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
@@ -559,6 +559,27 @@ class YOLOSegmentationNode(Node):
                     )
                     continue
 
+                
+                detection_info_all.append({
+                    'bbox': (x1, y1, x2, y2),
+                    'mask': mask,
+                    'cls_name': cls_name,
+                    'conf': conf,
+                    'centroid': centroid
+                })
+                
+                if cls_name != target_cls:
+                    continue
+                
+                # Store detection info for visualization
+                detection_info.append({
+                    'bbox': (x1, y1, x2, y2),
+                    'mask': mask,
+                    'cls_name': cls_name,
+                    'conf': conf,
+                    'centroid': centroid
+                })
+                
                 # Create Object message
                 obj = Object()
                 obj.conf = conf
@@ -574,14 +595,8 @@ class YOLOSegmentationNode(Node):
                 if request_segments:
                     segments.append(mask.astype(np.uint8) * 255)
                 
-                # Store detection info for visualization
-                detection_info.append({
-                    'bbox': (x1, y1, x2, y2),
-                    'mask': mask,
-                    'cls_name': cls_name,
-                    'conf': conf,
-                    'centroid': centroid
-                })
+                
+                
         
         self.get_logger().info(f'Detected {len(objects_msg.objects)} objects of class "{target_cls}"')
         
@@ -605,6 +620,7 @@ class YOLOSegmentationNode(Node):
         # Visualize all detections in one image
         if self.visualization and detection_info:
             self._visualize_all_detections(rgb_img, detection_info, header)
+            self._visualize_all_detections(rgb_img, detection_info_all, Header(stamp=rclpy.time.Time().to_msg(), frame_id='camera_link'))
 
         objects_msg.status = 0 if len(objects_msg.objects) > 0 else 1
 
@@ -785,8 +801,10 @@ class YOLOSegmentationNode(Node):
             return response
 
         # Parse request flags
-        request_segments = 'request_segments' in request.flags
-        request_image = 'request_image' in request.flags
+        request_segments = True
+        # request_segments = 'request_segments' in request.flags
+        request_image = True
+        # request_image = 'request_image' in request.flags
         
         # Parse sorting mode from flags or use default
         sort_mode = self.sort_mode  # default from parameters

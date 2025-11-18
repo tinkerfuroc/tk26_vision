@@ -10,6 +10,7 @@ import threading
 import copy
 import os
 import torch
+import time
 
 # ROS2 messages
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
@@ -108,7 +109,7 @@ class YOLOSegmentationNode(Node):
         self.declare_parameter('min_depth', 0.1)   # meters
 
         # vision log folder
-        self.declare_parameter('vision_log_folder', 'tmp/vision_log')
+        self.declare_parameter('vision_log_folder', f'tmp/vision_log{time.strftime("%Y%m%d_%H%M%S", time.localtime())}')
         
         # Sorting mode: 'none', 'closest', 'highest'
         self.declare_parameter('sort_mode', 'none')
@@ -601,7 +602,7 @@ class YOLOSegmentationNode(Node):
             boxes = result.boxes
             masks = result.masks
 
-            self.get_logger().info(f'Found {len(boxes.cls)} total detections')
+            self.get_logger().info(f'Found {len(boxes.cls)} total detections via camera {camera}')
 
             for i in range(len(boxes.cls)):
                 conf = float(boxes.conf[i])
@@ -701,9 +702,9 @@ class YOLOSegmentationNode(Node):
         #     detection_info = [info for _, info in indexed_info]
         
         # Visualize all detections in one image
-        if self.visualization and detection_info:
-            self._visualize_all_detections(rgb_img, detection_info, header)
-            self._visualize_all_detections(rgb_img, detection_info_all, Header(stamp=rclpy.time.Time().to_msg(), frame_id='camera_link'))
+        if self.visualization:
+            self._visualize_all_detections(rgb_img, detection_info)
+            self._visualize_all_detections(rgb_img, detection_info_all, displaying_all=True)
 
         objects_msg.status = 0 if len(objects_msg.objects) > 0 else 1
 
@@ -751,7 +752,7 @@ class YOLOSegmentationNode(Node):
         return point
 
     def _visualize_all_detections(
-            self, img: np.ndarray, detection_info: list, header: Header):
+            self, img: np.ndarray, detection_info: list, displaying_all=False):
         """
         Visualize all detections in a single image.
         
@@ -771,7 +772,7 @@ class YOLOSegmentationNode(Node):
         np.random.seed(42)  # For consistent colors
         colors = [tuple(map(int, np.random.randint(0, 255, 3))) for _ in detection_info]
         
-        self.get_logger().info(f'Visualizing {len(detection_info)} detections')
+        # self.get_logger().info(f'Visualizing {len(detection_info)} detections')
         
         # Draw all detections
         for idx, (info, color) in enumerate(zip(detection_info, colors)):
@@ -818,7 +819,9 @@ class YOLOSegmentationNode(Node):
             vis_img = cv2.addWeighted(vis_img, 0.7, mask_overlay, 0.3, 0)
         
         # Save with timestamp
-        timestamp = header.stamp.sec * 1000000000 + header.stamp.nanosec
+        timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+        if displaying_all:
+            timestamp += '_all'
         filename = f'{self.vision_log_folder}/detection_{timestamp}.png'
         cv2.imwrite(filename, vis_img)
         self.get_logger().info(f'Saved visualization to {filename}')
@@ -942,10 +945,6 @@ class YOLOSegmentationNode(Node):
                 ]
             else:
                 response.segments = []
-
-            self.get_logger().info(
-                f'Detected {len(response.objects)} objects using {camera}'
-            )
 
         except Exception as e:
             self.get_logger().error(f'Detection failed: {e}')

@@ -643,7 +643,7 @@ class YOLOSegmentationNode(Node):
 
                 # Calculate 3D centroid
                 centroid = self._calculate_centroid(
-                    points, mask, valid_mask, (y1, x1, y2, x2), camera
+                    points, mask, valid_mask, (x1, y1, x2, y2), camera
                 )
 
                 if centroid is None:
@@ -715,16 +715,20 @@ class YOLOSegmentationNode(Node):
             self, points: np.ndarray, mask: np.ndarray,
             valid_mask: np.ndarray,
             bbox: tuple, camera: str) -> geometry_msgs.msg.Point:
-        """Calculate 3D centroid from segmentation mask and point cloud."""
-        y1, x1, y2, x2 = bbox
+        """Calculate 3D centroid from segmentation mask and point cloud.
+        
+        Args:
+            bbox: (x1, y1, x2, y2) where x is column (horizontal), y is row (vertical)
+        """
+        x1, y1, x2, y2 = bbox
 
-        # Extract region of interest
-        roi_mask = mask[x1:x2, y1:y2]
-        roi_valid = valid_mask[x1:x2, y1:y2]
+        # Extract region of interest (numpy arrays are [row, col] = [y, x])
+        roi_mask = mask[y1:y2, x1:x2]
+        roi_valid = valid_mask[y1:y2, x1:x2]
         if np.sum(roi_mask) == 0:
             self.get_logger().warn('No valid mask pixels in ROI for centroid calculation!')
             roi_mask = np.ones_like(roi_mask)
-        roi_points = points[x1:x2, y1:y2]
+        roi_points = points[y1:y2, x1:x2]
 
         # Combine masks
         combined_mask = roi_mask & roi_valid

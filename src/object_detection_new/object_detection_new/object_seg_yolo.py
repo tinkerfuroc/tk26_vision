@@ -100,13 +100,15 @@ class YOLOSegmentationNode(Node):
         self.declare_parameter(
             'orbbec_depth_topic', '/camera/depth_registered/points')
         self.declare_parameter(
-            'orbbec_camera_info_topic', '/camera/color/camera_info')
+            'orbbec_camera_info_topic', '/camera/color/camera_info')        
         # Hz, 0 = no continuous publishing
         self.declare_parameter('publish_rate', 5.0)
         self.declare_parameter('confidence_threshold', 0.0)
         self.declare_parameter('visualization', False)
         self.declare_parameter('max_depth', 10.0)  # meters
         self.declare_parameter('min_depth', 0.0)   # meters
+        self.declare_parameter('sync_wait_time_limit', 5) # how many 0.1 seconds to wait
+        self.declare_parameter('img_sync_thres', 0.00)
 
         # vision log folder
         self.declare_parameter('vision_log_folder', f'tmp/vision_log{time.strftime("%Y%m%d_%H%M%S", time.localtime())}')
@@ -144,6 +146,12 @@ class YOLOSegmentationNode(Node):
 
         self.sort_mode = self.get_parameter('sort_mode').value
         self.get_logger().info(f'Default sort mode: {self.sort_mode}')
+
+        self.sync_wait_time_limit = self.get_parameter('sync_wait_time_limit').value
+        self.get_logger().info(f'Sync wait time limit: {self.sync_wait_time_limit} x 0.1 times')
+
+        self.img_sync_thres = self.get_parameter('img_sync_thres').value
+        self.get_logger().info(f'Image sync threshold: {self.img_sync_thres} seconds')
 
         if not os.path.exists(self.vision_log_folder):
             os.makedirs(self.vision_log_folder)
@@ -326,25 +334,33 @@ class YOLOSegmentationNode(Node):
         self.lock_msg.release()
 
     def _depth_to_points(self, depth_img: np.ndarray, intrinsic: CameraInfo) -> tuple:
-        """Convert depth image to 3D points using camera intrinsics."""
+        """Convert depth image to 3D points using camera intrinsics.
+        
+        Returns points in camera frame where:
+        - points[:, :, 0] = x_camera (left/right in camera frame, derived from pixel rows)
+        - points[:, :, 1] = y_camera (up/down in camera frame, derived from pixel columns)
+        - points[:, :, 2] = z_camera (forward/depth)
+        
+        This matches the convention used in seg_langsam.py
+        """
         H, W = depth_img.shape
         fx = intrinsic.k[0]
         fy = intrinsic.k[4]
         cx = intrinsic.k[2]
         cy = intrinsic.k[5]
 
-        # Create coordinate grids
-        x_coords = np.arange(W)
-        y_coords = np.arange(H)
-        x_grid, y_grid = np.meshgrid(x_coords, y_coords)
+        # Create coordinate grids matching seg_langsam convention
+        # points_x corresponds to rows (H dimension) - lateral position in camera frame
+        # points_y corresponds to columns (W dimension) - vertical position in camera frame
+        points_x = np.repeat(np.expand_dims(np.arange(0, H), axis=1), W, axis=1)
+        points_y = np.repeat(np.expand_dims(np.arange(0, W), axis=0), H, axis=0)
+        
+        # Back-project to 3D using pinhole camera model
+        points_x = (points_x - cy) * depth_img / fy
+        points_y = (points_y - cx) * depth_img / fx
 
-        # Back-project to 3D
-        z = depth_img
-        x = (x_grid - cx) * z / fx
-        y = (y_grid - cy) * z / fy
-
-        # Stack to get points [H, W, 3]
-        points = np.stack([x, y, z], axis=-1)
+        # Stack to get points [H, W, 3] where axis 2 = [x, y, z] in camera frame
+        points = np.stack([points_x, points_y, depth_img], axis=-1)
 
         # Valid mask
         valid_mask = np.ones_like(depth_img, dtype=bool)
@@ -563,6 +579,7 @@ class YOLOSegmentationNode(Node):
             (Objects, list of segment masks)
 
         """
+
         # Pad image to multiple of 32
         h, w = rgb_img.shape[:2]
         h_pad = ((h + 31) // 32) * 32
@@ -745,9 +762,18 @@ class YOLOSegmentationNode(Node):
             centroid_3d = np.mean(obj_pts, axis=0)
             centroid_3d[2] = np.median(obj_pts[:, 2])  # Use median for depth
 
-            point.x = float(centroid_3d[2])
-            point.y = float(-centroid_3d[0])
-            point.z = float(-centroid_3d[1])
+            # RealSense camera frame to ROS convention
+            # obj_pts contains [x_camera, y_camera, z_camera] where:
+            #   x_camera = lateral (from pixel rows)
+            #   y_camera = vertical (from pixel columns)  
+            #   z_camera = depth (forward)
+            # Convert to ROS standard frame:
+            #   x = forward (depth)
+            #   y = left (negative of vertical pixel position)
+            #   z = up (negative of lateral pixel position)
+            point.x = float(centroid_3d[2])  # depth -> forward
+            point.y = float(-centroid_3d[1])  # -y_camera -> left
+            point.z = float(-centroid_3d[0])  # -x_camera -> up
         else:  # orbbec
             # Orbbec already in correct frame
             centroid_3d = np.mean(obj_pts, axis=0)
@@ -850,10 +876,24 @@ class YOLOSegmentationNode(Node):
         else:
             self.get_logger().warn(f'Unknown camera: {request.camera}, using orbbec')
 
-        # Get camera data with thread safety
-        self.lock_msg.acquire()
-        rec_msg = copy.deepcopy(self.recent_sync_msg.get(camera))
-        self.lock_msg.release()
+        rec_msg = None
+        call_time = self.get_clock().now()
+        for i in range(self.sync_wait_time_limit):
+            self.lock_msg.acquire()
+            recent_time = self.recent_publish_time[camera]
+            self.lock_msg.release()
+            if self.recent_publish_time[camera] is None \
+                or (call_time - recent_time).nanoseconds / 1e9 > self.img_sync_thres:
+                self.get_logger().warn(
+                    f'Skipping detection: no recent {camera} data within sync threshold (called at {call_time}, most recent {recent_time})'
+                )
+                time.sleep(0.1)
+            else:
+                self.lock_msg.acquire()
+                rec_msg = copy.deepcopy(self.recent_sync_msg.get(camera))
+                self.lock_msg.release()
+                break
+        
 
         if rec_msg is None:
             response.header = Header(stamp=self.get_clock().now().to_msg())

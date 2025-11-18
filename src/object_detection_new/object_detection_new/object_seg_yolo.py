@@ -103,10 +103,10 @@ class YOLOSegmentationNode(Node):
             'orbbec_camera_info_topic', '/camera/color/camera_info')
         # Hz, 0 = no continuous publishing
         self.declare_parameter('publish_rate', 5.0)
-        self.declare_parameter('confidence_threshold', 0.5)
+        self.declare_parameter('confidence_threshold', 0.0)
         self.declare_parameter('visualization', False)
         self.declare_parameter('max_depth', 10.0)  # meters
-        self.declare_parameter('min_depth', 0.1)   # meters
+        self.declare_parameter('min_depth', 0.0)   # meters
 
         # vision log folder
         self.declare_parameter('vision_log_folder', f'tmp/vision_log{time.strftime("%Y%m%d_%H%M%S", time.localtime())}')
@@ -606,14 +606,16 @@ class YOLOSegmentationNode(Node):
 
             for i in range(len(boxes.cls)):
                 conf = float(boxes.conf[i])
+                cls_id = int(boxes.cls[i])
+                cls_name = self.model.names[cls_id]
+
+                self.get_logger().info(f'Detection {i}: class={cls_name}, conf={conf:.2f}')
+
 
                 # Filter by confidence
                 if conf < self.conf_threshold:
-                    self.get_logger().debug(f'Skipping detection {i}: low confidence {conf:.2f}')
+                    self.get_logger().info(f'Skipping detection {i}: low confidence {conf:.2f}')
                     continue
-
-                cls_id = int(boxes.cls[i])
-                cls_name = self.model.names[cls_id]
 
                 # Get bounding box
                 x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
@@ -631,25 +633,24 @@ class YOLOSegmentationNode(Node):
                 mask = mask[:h, :w]  # Crop to original size
                 mask = (mask > 0.5).astype(bool)
 
+                detection_info_all.append({
+                    'bbox': (x1, y1, x2, y2),
+                    'mask': mask,
+                    'cls_name': cls_name,
+                    'conf': conf,
+                    'centroid': None
+                })
+
                 # Calculate 3D centroid
                 centroid = self._calculate_centroid(
                     points, mask, valid_mask, (y1, x1, y2, x2), camera
                 )
 
                 if centroid is None:
-                    self.get_logger().debug(
+                    self.get_logger().info(
                         f'Skipping {cls_name}: invalid depth'
                     )
                     continue
-
-                
-                detection_info_all.append({
-                    'bbox': (x1, y1, x2, y2),
-                    'mask': mask,
-                    'cls_name': cls_name,
-                    'conf': conf,
-                    'centroid': centroid
-                })
                 
                 if cls_name != target_cls:
                     continue
@@ -720,6 +721,9 @@ class YOLOSegmentationNode(Node):
         # Extract region of interest
         roi_mask = mask[x1:x2, y1:y2]
         roi_valid = valid_mask[x1:x2, y1:y2]
+        if np.sum(roi_mask) == 0:
+            self.get_logger().warn('No valid mask pixels in ROI for centroid calculation!')
+            roi_mask = np.ones_like(roi_mask)
         roi_points = points[x1:x2, y1:y2]
 
         # Combine masks

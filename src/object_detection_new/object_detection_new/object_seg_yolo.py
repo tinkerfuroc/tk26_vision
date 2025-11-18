@@ -404,13 +404,32 @@ class YOLOSegmentationNode(Node):
     def _process_realsense_data(self, rgb_msg: Image, depth_msg: Image,
                                 intrinsic: CameraInfo) -> tuple:
         """Process realsense RGB-D data into usable format."""
+        
         rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
         depth_img = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
         depth_img = depth_img.astype(float) / 1000.0  # mm to meters
 
-        points, valid_mask = self._depth_to_points(depth_img, intrinsic)
+        H, W = depth_img.shape
+        fx, fy, cx, cy = tuple(intrinsic.k[[0, 4, 2, 5]])
+        points_x = np.repeat(np.expand_dims(np.arange(0, H), axis=1), W, axis=1)
+        points_y = np.repeat(np.expand_dims(np.arange(0, W), axis=0), H, axis=0)
+        points_x = (points_x - cx) * depth_img / fx
+        points_y = (points_y - cy) * depth_img / fy
+        
+        validmask_points = np.ones_like(depth_img)
+        validmask_points[depth_img > 10] = 0
+        validmask_points[depth_img < 1e-6] = 0
+        # depth_img *= validmask_points
+        depth_img[depth_img > 10] = 10
+        depth_img[depth_img < 1e-6] = 0
 
-        return rgb_img, points, valid_mask, depth_msg.header
+        points = np.stack([points_x, points_y, depth_img], axis=2)
+
+        return rgb_img, points, validmask_points, depth_msg.header
+
+        # points, valid_mask = self._depth_to_points(depth_img, intrinsic)
+
+        # return rgb_img, points, valid_mask, depth_msg.header
 
     def _process_orbbec_data(self, rgb_msg: Image, depth_msg: PointCloud2,
                              intrinsic: CameraInfo) -> tuple:
@@ -421,7 +440,8 @@ class YOLOSegmentationNode(Node):
         return rgb_img, points, valid_mask, depth_msg.header
 
     def _sort_objects_and_segments(self, objects: list, segments: list, 
-                                     sort_mode: str, source_frame: str = 'camera_link',
+                                     sort_mode: str, camera: str = 'orbbec',
+                                     source_frame: str = 'camera_link',
                                      header: Header = None) -> tuple:
         """
         Sort detected objects and their corresponding segments based on centroid position.
@@ -435,8 +455,12 @@ class YOLOSegmentationNode(Node):
         sort_mode : str
             Sorting mode: 'none', 'closest', 'highest'
             - 'none': No sorting (original detection order)
-            - 'closest': Sort by distance (closest first, based on centroid.x)
+            - 'closest': Sort by distance (closest first)
+                - For realsense: uses centroid.x (forward distance in ROS frame)
+                - For orbbec: uses centroid.z (forward distance in ROS frame)
             - 'highest': Sort by height (highest first, based on centroid.z in map frame)
+        camera : str, optional
+            Camera type ('realsense' or 'orbbec') - determines which axis to use for distance
         source_frame : str, optional
             Source frame for transformations (e.g., 'camera_link')
         header : Header, optional
@@ -447,7 +471,7 @@ class YOLOSegmentationNode(Node):
         tuple
             (sorted objects list, sorted segments list)
         """
-        self.get_logger().info(f"Sorting objects with mode: {sort_mode}")
+        self.get_logger().info(f"Sorting objects with mode: {sort_mode}, camera: {camera}")
         if sort_mode == 'none' or not objects:
             self.get_logger().info("No sorting applied")
             return objects, segments
@@ -456,10 +480,21 @@ class YOLOSegmentationNode(Node):
         indexed_objects = list(enumerate(objects))
         
         if sort_mode == 'closest':
-            # Sort by distance (centroid.z in camera frame = forward distance)
-            indexed_objects.sort(key=lambda x: x[1].centroid.z)
-            if indexed_objects:
-                self.get_logger().info(f"Sorted by closest: nearest at z={indexed_objects[0][1].centroid.z:.2f}m")
+            # Sort by distance - axis depends on camera type
+            # RealSense: forward is X axis (after our coordinate transform)
+            # Orbbec: forward is Z axis (standard ROS convention)
+            if camera == 'realsense':
+                indexed_objects.sort(key=lambda x: x[1].centroid.x)
+                if indexed_objects:
+                    self.get_logger().info(
+                        f"Sorted by closest (realsense): nearest at x={indexed_objects[0][1].centroid.x:.2f}m"
+                    )
+            else:  # orbbec or default
+                indexed_objects.sort(key=lambda x: x[1].centroid.z)
+                if indexed_objects:
+                    self.get_logger().info(
+                        f"Sorted by closest (orbbec): nearest at z={indexed_objects[0][1].centroid.z:.2f}m"
+                    )
         
         elif sort_mode == 'highest':
             # Try to transform to map frame for proper height sorting
@@ -505,24 +540,28 @@ class YOLOSegmentationNode(Node):
                         
                         # Transform point
                         transformed_point = do_transform_point(point_stamped, transform)
+                        self.get_logger().info(
+                            f"Object {idx} original point at {obj.centroid} ({point_stamped.point}), transformed to {transformed_point.point}")
                         height = transformed_point.point.z
-                        transformed_heights.append((idx, obj))
+                        # Store idx, obj, and transformed height for sorting
+                        transformed_heights.append((idx, obj, height))
                         
                     except Exception as e:
                         self.get_logger().warn(
-                            f"Failed to transform object {idx}: {e}. Using original position."
+                            f"Failed to transform object {idx}: {e}. Using camera frame z as fallback."
                         )
-                        # Fallback: use camera frame y as approximate height
-                        transformed_heights.append((idx, obj))
+                        # Fallback: use camera frame z
+                        transformed_heights.append((idx, obj, obj.centroid.z))
                 
-                # Sort by height (negative for highest first)
-                transformed_heights.sort(key=lambda x: -x[1].centroid.z)
-                indexed_objects = transformed_heights
+                # Sort by transformed height (negative for highest first)
+                transformed_heights.sort(key=lambda x: -x[2])
+                # Extract idx and obj, discarding the height value
+                indexed_objects = [(idx, obj) for idx, obj, _ in transformed_heights]
 
                 if transformed_heights:
                     self.get_logger().info(
-                        f"Sorted by height in map frame: highest at z={transformed_heights[0][1].centroid.z:.2f}m" + \
-                        f"All points: {[f'z={obj[1].centroid.z:.2f}m' for obj in transformed_heights]}"
+                        f"Sorted by height in map frame: highest at z={transformed_heights[0][2]:.2f}m" + \
+                        f"All points: {[f'z={item[2]:.2f}m' for item in transformed_heights]}"
                     )
             else:
                 # Fallback to closest sorting
@@ -699,10 +738,11 @@ class YOLOSegmentationNode(Node):
         self.get_logger().info(f'Detected {len(objects_msg.objects)} objects of class "{target_cls}"')
         
         # Sort objects and segments together if requested
-        # Pass the source frame from header for TF transformations
+        # Pass the camera type and source frame from header for TF transformations
         source_frame = header.frame_id
         objects_msg.objects, segments = self._sort_objects_and_segments(
             objects_msg.objects, segments, sort_mode,
+            camera=camera,
             source_frame=source_frame,
             header=header
         )
@@ -747,14 +787,18 @@ class YOLOSegmentationNode(Node):
             roi_mask = np.ones_like(roi_mask)
         roi_points = points[y1:y2, x1:x2]
 
-        # Combine masks
-        combined_mask = roi_mask & roi_valid
+        # Combine masks using multiplication (works for both bool and float masks)
+        # This matches seg_langsam's approach: mask_obj[x1: x2, y1: y2] * validmask_pt[x1: x2, y1: y2]
+        combined_mask = roi_mask.astype(float) * roi_valid.astype(float)
 
         if combined_mask.sum() < 10:
             return None
 
         # Calculate median for depth, mean for x/y
-        obj_pts = roi_points[combined_mask]
+        # Use np.nonzero to get indices of non-zero elements (matching seg_langsam)
+        obj_pts = roi_points[np.nonzero(combined_mask)]
+        if len(obj_pts.shape) != 2 or obj_pts.shape[0] == 0:
+            return None
 
         # Create Point message (coordinate system depends on camera type)
         point = geometry_msgs.msg.Point()

@@ -470,8 +470,6 @@ class PersonReIDModel:
             combined = torch.nn.functional.normalize(combined, p=2, dim=1)
         
         return combined.cpu().numpy().flatten()
-        
-        return combined.cpu().numpy().flatten()
 
 
 class AppearanceExtractor:
@@ -1256,6 +1254,36 @@ class YOLOTracker:
         self.last_known_bbox: Optional[Tuple[int, int, int, int]] = None
         self.last_known_center: Optional[Tuple[float, float]] = None
         
+        # Camera motion detection - disable spatial bonus during camera shake
+        self.scene_center_history: List[Tuple[float, float]] = []  # Recent scene centroids
+        self.camera_motion_detected: bool = False
+        self.last_camera_motion_time: float = 0.0
+        self.CAMERA_MOTION_THRESHOLD: float = 50.0  # Pixels of scene movement to trigger detection
+        self.CAMERA_MOTION_COOLDOWN: float = 0.5  # Seconds before re-enabling spatial bonus
+        
+        # Optical flow-based camera motion detection (more robust)
+        self.prev_gray_frame: Optional[np.ndarray] = None
+        self.optical_flow_points: Optional[np.ndarray] = None
+        self.camera_motion_vector: Tuple[float, float] = (0.0, 0.0)  # Estimated camera movement
+        
+        # Velocity-based position prediction for target
+        self.target_velocity: Tuple[float, float] = (0.0, 0.0)  # pixels per second
+        self.target_velocity_history: List[Tuple[float, float]] = []  # for smoothing
+        self.last_position_time: float = 0.0
+        
+        # Relative position tracking - track positions relative to other people
+        self.relative_positions: Dict[int, Tuple[float, float]] = {}  # track_id -> (dx, dy) from target
+        
+        # Appearance consistency tracking - prevent sudden switches
+        self.candidate_consistency: Dict[int, List[float]] = {}  # track_id -> list of recent similarities
+        self.CONSISTENCY_WINDOW: int = 5  # Number of frames to track consistency
+        self.CONSISTENCY_THRESHOLD: float = 0.15  # Max variance in similarity for consistent match
+        
+        # Performance optimization - skip feature extraction for some non-targets
+        self.frame_count: int = 0
+        self.reid_extraction_interval: int = 3  # Extract features for non-targets every N frames
+        self.fast_tracking_mode: bool = False  # Use lighter processing when stably tracking
+        
         # Occlusion detection
         self.occlusion_iou_threshold: float = 0.3  # IoU threshold to consider occlusion
         self.is_occluded: bool = False
@@ -1737,6 +1765,304 @@ class YOLOTracker:
             return best_match
         return None
     
+    def _update_scene_motion(self, results: List[TrackingResult], frame: Optional[np.ndarray] = None):
+        """
+        Detect camera motion using multiple methods:
+        1. Scene centroid tracking (fast, works with multiple people)
+        2. Optical flow (robust, works even with single person)
+        
+        When the camera shakes, all person positions shift together. By tracking
+        the average position (scene centroid) and optical flow, we can detect sudden 
+        camera motion and temporarily disable spatial continuity in ReID (which would 
+        otherwise cause the tracker to lock onto the wrong person).
+        
+        Args:
+            results: All detection results from current frame
+            frame: Current frame (optional, needed for optical flow)
+        """
+        current_time = time.time()
+        
+        # Get all person detections
+        person_results = [r for r in results if r.class_id == 0 and r.track_id >= 0]
+        
+        motion_detected = False
+        motion_magnitude = 0.0
+        
+        # Method 1: Scene centroid tracking (when multiple people visible)
+        if len(person_results) >= 2:
+            # Compute scene centroid (average center of all persons)
+            centers = []
+            for r in person_results:
+                x1, y1, x2, y2 = r.bbox
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                centers.append((cx, cy))
+            
+            scene_cx = sum(c[0] for c in centers) / len(centers)
+            scene_cy = sum(c[1] for c in centers) / len(centers)
+            
+            # Compare with previous scene centroid
+            if self.scene_center_history:
+                prev_cx, prev_cy = self.scene_center_history[-1]
+                centroid_motion = ((scene_cx - prev_cx) ** 2 + (scene_cy - prev_cy) ** 2) ** 0.5
+                
+                if centroid_motion > self.CAMERA_MOTION_THRESHOLD:
+                    motion_detected = True
+                    motion_magnitude = max(motion_magnitude, centroid_motion)
+                    # Estimate camera motion vector from centroid shift
+                    self.camera_motion_vector = (scene_cx - prev_cx, scene_cy - prev_cy)
+            
+            # Keep only last few scene centers
+            self.scene_center_history.append((scene_cx, scene_cy))
+            if len(self.scene_center_history) > 5:
+                self.scene_center_history.pop(0)
+        
+        # Method 2: Optical flow (works even with single person, more robust)
+        if frame is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if len(frame.shape) == 3 else frame
+            
+            if self.prev_gray_frame is not None:
+                # Use sparse optical flow on a grid of points
+                if self.optical_flow_points is None or self.frame_count % 10 == 0:
+                    # Create grid of points to track (every 50 pixels)
+                    h, w = gray.shape[:2]
+                    pts_x = np.arange(50, w - 50, 50)
+                    pts_y = np.arange(50, h - 50, 50)
+                    xx, yy = np.meshgrid(pts_x, pts_y)
+                    self.optical_flow_points = np.float32(
+                        np.column_stack((xx.ravel(), yy.ravel()))
+                    ).reshape(-1, 1, 2)
+                
+                if self.optical_flow_points is not None and len(self.optical_flow_points) > 0:
+                    # Calculate optical flow
+                    new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                        self.prev_gray_frame, gray, self.optical_flow_points, None,
+                        winSize=(21, 21), maxLevel=2,
+                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+                    )
+                    
+                    if new_pts is not None and status is not None:
+                        # Get valid points
+                        good_old = self.optical_flow_points[status.flatten() == 1]
+                        good_new = new_pts[status.flatten() == 1]
+                        
+                        if len(good_old) > 10:  # Need enough points
+                            # Compute median flow (robust to outliers from moving objects)
+                            flow = good_new - good_old
+                            median_flow_x = np.median(flow[:, 0, 0])
+                            median_flow_y = np.median(flow[:, 0, 1])
+                            
+                            flow_magnitude = (median_flow_x ** 2 + median_flow_y ** 2) ** 0.5
+                            
+                            # Use lower threshold for optical flow (more precise)
+                            FLOW_MOTION_THRESHOLD = 15.0  # pixels per frame
+                            if flow_magnitude > FLOW_MOTION_THRESHOLD:
+                                motion_detected = True
+                                motion_magnitude = max(motion_magnitude, flow_magnitude)
+                                self.camera_motion_vector = (median_flow_x, median_flow_y)
+            
+            self.prev_gray_frame = gray.copy()
+        
+        # Update camera motion state
+        if motion_detected:
+            self.camera_motion_detected = True
+            self.last_camera_motion_time = current_time
+            logger.info(f"Camera motion detected! Magnitude: {motion_magnitude:.1f}px, "
+                       f"Vector: ({self.camera_motion_vector[0]:.1f}, {self.camera_motion_vector[1]:.1f})")
+        elif self.camera_motion_detected:
+            # Check if cooldown has passed
+            if current_time - self.last_camera_motion_time > self.CAMERA_MOTION_COOLDOWN:
+                self.camera_motion_detected = False
+                self.camera_motion_vector = (0.0, 0.0)
+                logger.info("Camera stabilized, re-enabling spatial continuity")
+    
+    def _update_relative_positions(self, target_result: TrackingResult, results: List[TrackingResult]):
+        """
+        Track positions of other people relative to the target.
+        
+        These relative positions are invariant to camera motion, so they can help
+        identify if the target moved or if the camera just panned.
+        
+        Args:
+            target_result: The target person's detection
+            results: All detection results
+        """
+        target_cx = (target_result.bbox[0] + target_result.bbox[2]) / 2.0
+        target_cy = (target_result.bbox[1] + target_result.bbox[3]) / 2.0
+        
+        for r in results:
+            if r.track_id == target_result.track_id or r.class_id != 0:
+                continue
+            
+            cx = (r.bbox[0] + r.bbox[2]) / 2.0
+            cy = (r.bbox[1] + r.bbox[3]) / 2.0
+            
+            # Store relative position (dx, dy) from target
+            self.relative_positions[r.track_id] = (cx - target_cx, cy - target_cy)
+    
+    def _check_relative_position_consistency(
+        self, 
+        candidate: TrackingResult, 
+        results: List[TrackingResult]
+    ) -> Tuple[bool, float]:
+        """
+        Check if relative positions to other people are consistent.
+        
+        If the candidate is at the same relative position to other people as
+        the target was before, it's more likely to be the correct target.
+        
+        Args:
+            candidate: Candidate detection to check
+            results: All detections
+            
+        Returns:
+            Tuple of (is_consistent, consistency_score)
+        """
+        if not self.relative_positions:
+            return True, 1.0  # No prior data, can't check
+        
+        cand_cx = (candidate.bbox[0] + candidate.bbox[2]) / 2.0
+        cand_cy = (candidate.bbox[1] + candidate.bbox[3]) / 2.0
+        
+        position_errors = []
+        
+        for r in results:
+            if r.track_id == candidate.track_id or r.class_id != 0:
+                continue
+            
+            if r.track_id in self.relative_positions:
+                expected_dx, expected_dy = self.relative_positions[r.track_id]
+                
+                # Current relative position
+                cx = (r.bbox[0] + r.bbox[2]) / 2.0
+                cy = (r.bbox[1] + r.bbox[3]) / 2.0
+                actual_dx = cx - cand_cx
+                actual_dy = cy - cand_cy
+                
+                # Error in relative position
+                error = ((actual_dx - expected_dx) ** 2 + (actual_dy - expected_dy) ** 2) ** 0.5
+                position_errors.append(error)
+        
+        if not position_errors:
+            return True, 1.0  # No common references
+        
+        # Average error - should be small if this is the right person
+        avg_error = sum(position_errors) / len(position_errors)
+        
+        # Consider consistent if average error < 100 pixels
+        RELATIVE_POSITION_THRESHOLD = 100.0
+        is_consistent = avg_error < RELATIVE_POSITION_THRESHOLD
+        
+        # Convert to score (1.0 = perfect, 0.0 = 200px error)
+        consistency_score = max(0.0, 1.0 - avg_error / 200.0)
+        
+        if not is_consistent:
+            logger.info(f"Relative position check: candidate ID {candidate.track_id} "
+                       f"has avg error {avg_error:.1f}px (threshold={RELATIVE_POSITION_THRESHOLD})")
+        
+        return is_consistent, consistency_score
+    
+    def _update_candidate_consistency(self, track_id: int, similarity: float):
+        """
+        Track appearance similarity consistency for a candidate over time.
+        
+        Legitimate targets should have consistent similarity scores.
+        Wrong candidates often show erratic scores.
+        
+        Args:
+            track_id: Track ID of the candidate
+            similarity: Current similarity score
+        """
+        if track_id not in self.candidate_consistency:
+            self.candidate_consistency[track_id] = []
+        
+        self.candidate_consistency[track_id].append(similarity)
+        
+        # Keep only recent history
+        if len(self.candidate_consistency[track_id]) > self.CONSISTENCY_WINDOW:
+            self.candidate_consistency[track_id].pop(0)
+    
+    def _get_candidate_consistency_score(self, track_id: int) -> float:
+        """
+        Get consistency score for a candidate based on historical similarity variance.
+        
+        Args:
+            track_id: Track ID to check
+            
+        Returns:
+            Consistency score (1.0 = perfectly consistent, 0.0 = very inconsistent)
+        """
+        if track_id not in self.candidate_consistency:
+            return 0.5  # No history, neutral score
+        
+        history = self.candidate_consistency[track_id]
+        if len(history) < 2:
+            return 0.5  # Not enough history
+        
+        # Compute variance
+        variance = np.var(history)
+        
+        # Convert variance to score (lower variance = higher score)
+        # variance of 0.01 = score ~0.9, variance of 0.04 = score ~0.6
+        score = max(0.0, 1.0 - variance / self.CONSISTENCY_THRESHOLD)
+        
+        return score
+    
+    def _predict_target_position(self, dt: float = 0.033) -> Optional[Tuple[float, float]]:
+        """
+        Predict target position based on velocity and camera motion compensation.
+        
+        Args:
+            dt: Time delta since last frame (default ~30fps)
+            
+        Returns:
+            Predicted (cx, cy) or None if can't predict
+        """
+        if self.last_known_center is None:
+            return None
+        
+        # Start with last known position
+        pred_x, pred_y = self.last_known_center
+        
+        # Add velocity-based prediction
+        vx, vy = self.target_velocity
+        pred_x += vx * dt
+        pred_y += vy * dt
+        
+        # Compensate for camera motion (camera moved, so target appears to move opposite)
+        # This is critical during camera shake
+        cam_dx, cam_dy = self.camera_motion_vector
+        pred_x += cam_dx  # Add camera motion to expected position
+        pred_y += cam_dy
+        
+        return (pred_x, pred_y)
+    
+    def _update_target_velocity(self, current_center: Tuple[float, float]):
+        """
+        Update target velocity estimate with smoothing.
+        
+        Args:
+            current_center: Current target center (cx, cy)
+        """
+        current_time = time.time()
+        
+        if self.last_known_center is not None and self.last_position_time > 0:
+            dt = current_time - self.last_position_time
+            if dt > 0.001:  # Avoid division by zero
+                # Raw velocity
+                vx = (current_center[0] - self.last_known_center[0]) / dt
+                vy = (current_center[1] - self.last_known_center[1]) / dt
+                
+                # Smooth with exponential moving average
+                alpha = 0.3
+                old_vx, old_vy = self.target_velocity
+                self.target_velocity = (
+                    alpha * vx + (1 - alpha) * old_vx,
+                    alpha * vy + (1 - alpha) * old_vy
+                )
+        
+        self.last_position_time = current_time
+    
     def _register_other_persons(self, frame: np.ndarray, results: List[TrackingResult]):
         """
         Register other persons seen in the frame to help with distinctiveness checking.
@@ -1744,11 +2070,18 @@ class YOLOTracker:
         This helps prevent wrong ID assignment by knowing what other people look like.
         Only registers new persons that haven't been seen before, limited to max 3 per frame.
         
+        Performance optimization: Skip registration on some frames when stably tracking.
+        
         Args:
             frame: Current frame
             results: All detection results
         """
         if self.appearance_extractor is None:
+            return
+        
+        # Performance optimization: Skip registration periodically when stably tracking
+        # This significantly improves FPS as ResNet feature extraction is expensive
+        if self.fast_tracking_mode and self.frame_count % self.reid_extraction_interval != 0:
             return
         
         registered_count = 0
@@ -1921,9 +2254,15 @@ class YOLOTracker:
                        f"(best candidate: ID {best_match.track_id})")
             return None
         
+        # Track consistency for candidates (helps detect stable matches vs erratic ones)
+        self._update_candidate_consistency(best_match.track_id, best_similarity)
+        
         # If multiple candidates, check margin between best and second-best
+        second_best_match = None
+        second_best_similarity = 0.0
         if len(candidate_scores) > 1:
             second_best_match, second_best_similarity, _ = candidate_scores[1]
+            self._update_candidate_consistency(second_best_match.track_id, second_best_similarity)
             margin = best_similarity - second_best_similarity
             
             # Log the comparison
@@ -1931,10 +2270,83 @@ class YOLOTracker:
                         f"Second ID {second_best_match.track_id} ({second_best_similarity:.3f}), "
                         f"Margin: {margin:.3f} (required: {ReIDMatcher.REID_MARGIN})")
             
-            # If margin is too small, use spatial continuity as tiebreaker
+            # Get consistency scores for both candidates
+            best_consistency = self._get_candidate_consistency_score(best_match.track_id)
+            second_consistency = self._get_candidate_consistency_score(second_best_match.track_id)
+            logger.debug(f"Consistency scores: Best ID {best_match.track_id}={best_consistency:.2f}, "
+                        f"Second ID {second_best_match.track_id}={second_consistency:.2f}")
+            
+            # If margin is too small, use additional checks
             if margin < ReIDMatcher.REID_MARGIN:
-                # Try spatial continuity - prefer the candidate closer to last known position
-                if self.last_known_center is not None:
+                # Check if camera is shaking - use advanced disambiguation
+                if self.camera_motion_detected:
+                    logger.info(f"Camera motion detected - using advanced disambiguation")
+                    
+                    # Method 1: Use velocity-based position prediction
+                    predicted_pos = self._predict_target_position()
+                    if predicted_pos is not None:
+                        pred_x, pred_y = predicted_pos
+                        
+                        def get_distance_to_predicted(result: TrackingResult) -> float:
+                            x1, y1, x2, y2 = result.bbox
+                            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                            return ((cx - pred_x) ** 2 + (cy - pred_y) ** 2) ** 0.5
+                        
+                        dist_best = get_distance_to_predicted(best_match)
+                        dist_second = get_distance_to_predicted(second_best_match)
+                        
+                        logger.info(f"Velocity prediction: predicted ({pred_x:.0f}, {pred_y:.0f}), "
+                                   f"Best ID {best_match.track_id} dist={dist_best:.0f}px, "
+                                   f"Second ID {second_best_match.track_id} dist={dist_second:.0f}px")
+                        
+                        # If prediction clearly favors one candidate
+                        PREDICTION_THRESHOLD = 80.0  # pixels
+                        if dist_second < dist_best - PREDICTION_THRESHOLD:
+                            logger.info(f"Velocity prediction prefers Second ID {second_best_match.track_id}")
+                            # But only switch if second also has reasonable appearance
+                            if second_best_similarity > self.reid_threshold:
+                                best_match = second_best_match
+                                best_similarity = second_best_similarity
+                                best_features = candidate_scores[1][2]
+                        elif dist_best > dist_second + PREDICTION_THRESHOLD:
+                            logger.info(f"Velocity prediction confirms Best ID {best_match.track_id}")
+                    
+                    # Method 2: Check relative position consistency
+                    best_rel_consistent, best_rel_score = self._check_relative_position_consistency(
+                        best_match, results
+                    )
+                    second_rel_consistent, second_rel_score = self._check_relative_position_consistency(
+                        second_best_match, results
+                    )
+                    
+                    logger.info(f"Relative position consistency: Best ID {best_match.track_id}={best_rel_score:.2f}, "
+                               f"Second ID {second_best_match.track_id}={second_rel_score:.2f}")
+                    
+                    # If relative positions clearly favor one candidate
+                    if second_rel_score > best_rel_score + 0.3 and second_best_similarity > self.reid_threshold:
+                        logger.info(f"Relative position prefers Second ID {second_best_match.track_id}")
+                        best_match = second_best_match
+                        best_similarity = second_best_similarity
+                        best_features = candidate_scores[1][2]
+                    
+                    # Method 3: Check appearance consistency (erratic = bad)
+                    if best_consistency < 0.3 and second_consistency > 0.6:
+                        logger.info(f"Consistency check: Best ID {best_match.track_id} is erratic ({best_consistency:.2f}), "
+                                   f"Second ID {second_best_match.track_id} is stable ({second_consistency:.2f})")
+                        if second_best_similarity > self.reid_threshold:
+                            best_match = second_best_match
+                            best_similarity = second_best_similarity
+                            best_features = candidate_scores[1][2]
+                    
+                    # Final decision: accept if appearance is strong enough
+                    if best_similarity > self.reid_threshold + 0.05:
+                        logger.info(f"Accepting ID {best_match.track_id} after advanced disambiguation")
+                    else:
+                        logger.info(f"ReID FAILED during camera motion: insufficient confidence after all checks")
+                        return None
+                        
+                # Camera stable - use spatial continuity as tiebreaker
+                elif self.last_known_center is not None:
                     def get_distance_to_last(result: TrackingResult) -> float:
                         x1, y1, x2, y2 = result.bbox
                         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
@@ -2180,11 +2592,18 @@ class YOLOTracker:
             # Reset appearance model since we're tracking a new target
             self.target_appearance = None
         
+        # Increment frame counter for optimization
+        self.frame_count += 1
+        
         # Perform tracking
         results = self.track(frame, persist=True)
         
         # Store results for debug visualization
         self.last_results = results if results else []
+        
+        # Update camera motion detection (for spatial continuity during ReID)
+        if results:
+            self._update_scene_motion(results, frame)
         
         # Log detection summary for debugging
         if results:
@@ -2333,6 +2752,12 @@ class YOLOTracker:
                         self.pending_reid_match = None
                         self.consecutive_reid_frames = 0
                         
+                        # Enable fast tracking mode after stable tracking for a while
+                        # (reduces feature extraction frequency for better FPS)
+                        if not self.fast_tracking_mode and self.frame_count > 30:
+                            self.fast_tracking_mode = True
+                            logger.info("Enabling fast tracking mode (stable tracking detected)")
+                        
                         # Reset occlusion state if we're cleanly tracking
                         if not is_occluded and self.is_occluded:
                             logger.info("Occlusion cleared - resuming normal tracking")
@@ -2355,6 +2780,12 @@ class YOLOTracker:
                             logger.debug(f"Track ID {result.track_id} verified but appearance NOT updated "
                                         f"(similarity={similarity:.3f} < {APPEARANCE_UPDATE_THRESHOLD})")
                         
+                        # Update velocity and relative positions for camera shake handling
+                        center = ((result.bbox[0] + result.bbox[2]) / 2.0,
+                                  (result.bbox[1] + result.bbox[3]) / 2.0)
+                        self._update_target_velocity(center)
+                        self._update_relative_positions(result, results)
+                        
                         return self._with_original_id(result)
                 
                 # Non-person or no ReID - just accept track ID match
@@ -2373,6 +2804,12 @@ class YOLOTracker:
                 # Update appearance model for non-persons
                 if self.enable_reid and result.class_id != 0:
                     self._update_appearance(frame, result)
+                
+                # Update velocity and relative positions
+                center = ((result.bbox[0] + result.bbox[2]) / 2.0,
+                          (result.bbox[1] + result.bbox[3]) / 2.0)
+                self._update_target_velocity(center)
+                self._update_relative_positions(result, results)
                 
                 # Return result with consistent original track ID
                 return self._with_original_id(result)
@@ -2494,6 +2931,11 @@ class YOLOTracker:
                 # temporarily undetected for one frame
                 self.frames_lost += 1
                 
+                # Disable fast tracking mode when we're lost (need full ReID)
+                if self.fast_tracking_mode:
+                    self.fast_tracking_mode = False
+                    logger.info("Disabling fast tracking mode (target lost, need full ReID)")
+                
                 # Only reset pending match after several consecutive failures
                 # This prevents losing progress due to momentary detection failures
                 if self.frames_lost > 3:
@@ -2504,6 +2946,10 @@ class YOLOTracker:
         else:
             # ReID disabled or exceeded max frames
             self.frames_lost += 1
+            
+            # Disable fast tracking mode when lost
+            if self.fast_tracking_mode:
+                self.fast_tracking_mode = False
         
         # Target not found
         if self.frames_lost > self.max_frames_lost:
@@ -2575,6 +3021,26 @@ class YOLOTracker:
         self.pending_reid_match = None
         # Clear the person registry
         self.person_registry.clear()
+        # Reset camera motion detection
+        self.scene_center_history.clear()
+        self.camera_motion_detected = False
+        self.last_camera_motion_time = 0.0
+        self.camera_motion_vector = (0.0, 0.0)
+        self.prev_gray_frame = None
+        self.optical_flow_points = None
+        # Reset spatial tracking
+        self.last_known_bbox = None
+        self.last_known_center = None
+        # Reset velocity and relative position tracking
+        self.target_velocity = (0.0, 0.0)
+        self.target_velocity_history.clear() if hasattr(self, 'target_velocity_history') and self.target_velocity_history else None
+        self.last_position_time = 0.0
+        self.relative_positions.clear()
+        # Reset candidate consistency tracking
+        self.candidate_consistency.clear()
+        # Reset frame counter
+        self.frame_count = 0
+        self.fast_tracking_mode = False
         logger.info("Tracker reset")
     
     def get_class_names(self) -> Dict[int, str]:

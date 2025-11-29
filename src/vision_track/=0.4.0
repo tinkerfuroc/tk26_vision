@@ -1,0 +1,7 @@
+Collecting lap
+  Downloading lap-0.5.12-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.2 kB)
+Requirement already satisfied: numpy>=1.21.6 in /home/cindy/.local/lib/python3.10/site-packages (from lap) (1.26.4)
+Downloading lap-0.5.12-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl (1.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.7/1.7 MB 9.1 MB/s eta 0:00:00
+Installing collected packages: lap
+Successfully installed lap-0.5.12

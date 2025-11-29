@@ -1,0 +1,20 @@
+# YOLO Object Tracking with Segmentation - Requirements
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.21.0
+opencv-python>=4.5.0
+scipy>=1.7.0
+
+# PyTorch - For GPU support, visit https://pytorch.org/get-started/locally/
+# for installation instructions specific to your CUDA version.
+# The command below installs CPU version. For GPU, use:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Ultralytics YOLO - For object detection and segmentation
+ultralytics>=8.0.0
+
+# For ByteTrack
+lap>=0.4.0

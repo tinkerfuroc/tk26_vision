@@ -1,0 +1,15 @@
+# uses orbbec camera to track person
+bool return_rgb_img
+bool return_depth_img
+bool return_segment
+bool debug  # When true, draws all detected person bounding boxes on the RGB image
+---
+int32 status
+string message
+---
+bool target_lost
+int32 target_track_id
+geometry_msgs/PointStamped target_position
+sensor_msgs/Image rgb_img
+sensor_msgs/Image depth_img
+sensor_msgs/Image segment_img

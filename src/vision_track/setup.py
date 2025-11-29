@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+import os
+from glob import glob
 
 package_name = 'vision_track'
 
@@ -10,16 +12,20 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # Include model files
+        ('share/' + package_name + '/models', glob('*.pt')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='cindy',
     maintainer_email='cindy.w0135@gmail.com',
-    description='TODO: Package description',
+    description='Person tracking package using YOLO with re-identification',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'person_track_server = vision_track.person_track_node:main',
+            'person_track_test_client = vision_track.person_track_test_client:main',
         ],
     },
 )

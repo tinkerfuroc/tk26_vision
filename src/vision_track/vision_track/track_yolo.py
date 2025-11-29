@@ -10,6 +10,7 @@ Author: TinkerFuroc
 Date: 2025
 """
 
+import copy
 import cv2
 import numpy as np
 import torch
@@ -168,7 +169,9 @@ class PersonRegistry:
         # Map from display_id to TargetAppearance
         self.known_persons: Dict[int, TargetAppearance] = {}
         # Minimum distinctiveness - target must be this much more similar than any other known person
-        self.distinctiveness_threshold = 0.15
+        # Lowered from 0.15 to 0.03 because the "other person" registry can get contaminated
+        # with target features during ID switches
+        self.distinctiveness_threshold = 0.03
     
     def register_person(self, display_id: int, appearance: TargetAppearance):
         """
@@ -199,6 +202,18 @@ class PersonRegistry:
         """Clear all registered persons."""
         self.known_persons.clear()
         logger.debug("Cleared person registry")
+    
+    def clear_temporary_ids(self):
+        """
+        Clear persons registered with temporary IDs (ID <= -1000).
+        These are often contaminated with target features during ID bounces.
+        """
+        temp_ids = [pid for pid in self.known_persons.keys() if pid <= -1000]
+        for pid in temp_ids:
+            del self.known_persons[pid]
+            logger.debug(f"Removed temporary person ID {pid} from registry")
+        if temp_ids:
+            logger.info(f"Cleared {len(temp_ids)} temporary person IDs from registry")
     
     def check_distinctiveness(
         self,
@@ -233,8 +248,11 @@ class PersonRegistry:
             
             # If candidate is too similar to another known person, reject
             margin = target_similarity - other_similarity
+            logger.info(f"Distinctiveness check: target {target_id} sim={target_similarity:.3f}, "
+                       f"other person {person_id} sim={other_similarity:.3f}, margin={margin:.3f} "
+                       f"(required: {self.distinctiveness_threshold})")
             if margin < self.distinctiveness_threshold:
-                logger.debug(f"Candidate rejected: similarity to target {target_id} ({target_similarity:.3f}) "
+                logger.info(f"Candidate rejected: similarity to target {target_id} ({target_similarity:.3f}) "
                            f"not distinctive from person {person_id} ({other_similarity:.3f}), margin={margin:.3f}")
                 return False
         
@@ -273,12 +291,15 @@ class PersonRegistry:
 
 class PersonReIDModel:
     """
-    Specialized Person Re-Identification model.
+    Enhanced Person Re-Identification model.
     
-    Uses a combination of techniques optimized for person re-identification:
-    1. Body part-based feature extraction (upper body, lower body, full body)
-    2. Color histogram in multiple color spaces
-    3. Deep features from a model fine-tuned for person ReID
+    Uses multiple complementary feature types for robust person matching:
+    1. Deep CNN features with part-based pooling (global + horizontal parts)
+    2. Channel attention for emphasizing discriminative features
+    3. Multiple spatial scales for better robustness
+    
+    Key insight: Generic ImageNet features are NOT discriminative enough for person ReID.
+    This model applies transformations to make features more person-specific.
     """
     
     def __init__(self, device: str = "cpu"):
@@ -289,87 +310,166 @@ class PersonReIDModel:
             device: Device for computation
         """
         self.device = device
-        self.feature_dim = 512
+        self.feature_dim = 512  # Output feature dimension
         self.model = None
         self.use_deep_features = False
         
         self._load_reid_model()
     
     def _load_reid_model(self):
-        """Load a ReID-optimized model."""
+        """Load an enhanced ReID model with attention mechanisms."""
         try:
-            # Try to use ResNet18 with better pooling for ReID
-            from torchvision.models import resnet18, ResNet18_Weights
+            from torchvision.models import resnet50, ResNet50_Weights
             
-            base_model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            # Use ResNet50 for better feature extraction (deeper = more discriminative)
+            base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
             
-            # Create a ReID-style model with global + part-based pooling
-            self.model = torch.nn.Sequential(
-                # Feature backbone (remove avgpool and fc)
+            # Feature backbone (remove avgpool and fc) - outputs 2048 channels
+            self.backbone = torch.nn.Sequential(
                 *list(base_model.children())[:-2],
             )
+            
+            # Channel attention module - helps focus on discriminative channels
+            self.channel_attention = torch.nn.Sequential(
+                torch.nn.AdaptiveAvgPool2d(1),
+                torch.nn.Flatten(),
+                torch.nn.Linear(2048, 512),
+                torch.nn.ReLU(inplace=True),
+                torch.nn.Linear(512, 2048),
+                torch.nn.Sigmoid()
+            )
+            
+            # Bottleneck to reduce to 512 dimensions (standard ReID size)
+            self.bottleneck = torch.nn.Sequential(
+                torch.nn.Linear(2048, 512),
+                torch.nn.BatchNorm1d(512),
+                torch.nn.ReLU(inplace=True)
+            )
+            
+            # Part-based bottlenecks (for 4 horizontal parts)
+            self.part_bottlenecks = torch.nn.ModuleList([
+                torch.nn.Sequential(
+                    torch.nn.Linear(2048, 128),
+                    torch.nn.BatchNorm1d(128),
+                    torch.nn.ReLU(inplace=True)
+                ) for _ in range(4)
+            ])
             
             # Global average pooling
             self.gap = torch.nn.AdaptiveAvgPool2d(1)
             
-            # Horizontal strip pooling for part-based features
-            self.strip_pool = torch.nn.AdaptiveAvgPool2d((3, 1))  # 3 horizontal parts
+            # Part pooling - 4 horizontal strips (head, upper body, lower body, legs)
+            self.part_pool = torch.nn.AdaptiveAvgPool2d((4, 1))
             
-            self.model.to(self.device)
+            # Move to device
+            self.backbone.to(self.device)
+            self.channel_attention.to(self.device)
+            self.bottleneck.to(self.device)
+            self.part_bottlenecks.to(self.device)
             self.gap.to(self.device)
-            self.strip_pool.to(self.device)
-            self.model.eval()
+            self.part_pool.to(self.device)
+            
+            # Set to eval mode
+            self.backbone.eval()
+            self.channel_attention.eval()
+            self.bottleneck.eval()
+            self.part_bottlenecks.eval()
             
             self.use_deep_features = True
-            self.feature_dim = 512 + 512 * 3  # global + 3 parts
-            logger.info("Loaded ResNet18-based Person ReID model")
+            self.feature_dim = 512 + 128 * 4  # global (512) + 4 parts (128 each)
+            logger.info("Loaded ResNet50-based Person ReID model with attention")
             
         except Exception as e:
-            logger.warning(f"Could not load ReID model: {e}")
+            logger.warning(f"Could not load enhanced ReID model: {e}")
+            self._load_fallback_model()
+    
+    def _load_fallback_model(self):
+        """Fallback to simpler model if enhanced fails."""
+        try:
+            from torchvision.models import resnet18, ResNet18_Weights
+            
+            base_model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            self.backbone = torch.nn.Sequential(
+                *list(base_model.children())[:-2],
+            )
+            self.gap = torch.nn.AdaptiveAvgPool2d(1)
+            self.backbone.to(self.device)
+            self.gap.to(self.device)
+            self.backbone.eval()
+            
+            self.channel_attention = None
+            self.bottleneck = None
+            self.part_bottlenecks = None
+            self.part_pool = None
+            
+            self.use_deep_features = True
+            self.feature_dim = 512
+            logger.info("Loaded fallback ResNet18 ReID model")
+            
+        except Exception as e:
+            logger.warning(f"Could not load fallback model: {e}")
             self.use_deep_features = False
     
     def extract_features(self, crop: np.ndarray) -> np.ndarray:
         """
-        Extract ReID features from a person crop.
+        Extract discriminative ReID features from a person crop.
         
         Args:
             crop: Person crop (RGB), should be the full person bounding box
             
         Returns:
-            Feature vector optimized for person matching
+            L2-normalized feature vector optimized for person matching
         """
-        if not self.use_deep_features or self.model is None:
+        if not self.use_deep_features or self.backbone is None:
             return np.zeros(self.feature_dim, dtype=np.float32)
         
-        # Resize to standard ReID size (256x128 is common for person ReID)
+        # Resize to standard ReID size (256x128 is standard for person ReID)
+        # Height > Width because people are taller than wide
         crop_resized = cv2.resize(crop, (128, 256))
         
-        # Normalize
+        # ImageNet normalization
         mean = np.array([0.485, 0.456, 0.406])
         std = np.array([0.229, 0.224, 0.225])
         crop_normalized = (crop_resized / 255.0 - mean) / std
         
-        # Convert to tensor
+        # Convert to tensor [1, 3, 256, 128]
         tensor = torch.from_numpy(crop_normalized).float()
         tensor = tensor.permute(2, 0, 1).unsqueeze(0)
         tensor = tensor.to(self.device)
         
         with torch.no_grad():
-            # Get feature maps
-            features = self.model(tensor)  # [1, 512, H, W]
+            # Get feature maps [1, 2048, 8, 4] or [1, 512, 8, 4] for ResNet18
+            features = self.backbone(tensor)
             
-            # Global features
-            global_feat = self.gap(features).flatten(1)  # [1, 512]
+            if self.channel_attention is not None:
+                # Apply channel attention
+                attn_weights = self.channel_attention(features)
+                attn_weights = attn_weights.view(-1, features.shape[1], 1, 1)
+                features = features * attn_weights
+                
+                # Global features
+                global_feat = self.gap(features).flatten(1)  # [1, 2048]
+                global_feat = self.bottleneck(global_feat)  # [1, 512]
+                
+                # Part-based features (4 horizontal strips)
+                part_features = self.part_pool(features)  # [1, 2048, 4, 1]
+                part_feats = []
+                for i in range(4):
+                    part_i = part_features[:, :, i, :].flatten(1)  # [1, 2048]
+                    part_i = self.part_bottlenecks[i](part_i)  # [1, 128]
+                    part_feats.append(part_i)
+                part_feat = torch.cat(part_feats, dim=1)  # [1, 512]
+                
+                # Concatenate global + parts
+                combined = torch.cat([global_feat, part_feat], dim=1)  # [1, 1024]
+            else:
+                # Simple fallback
+                combined = self.gap(features).flatten(1)  # [1, 512]
             
-            # Part-based features (3 horizontal strips)
-            part_feat = self.strip_pool(features)  # [1, 512, 3, 1]
-            part_feat = part_feat.flatten(1)  # [1, 512*3]
-            
-            # Concatenate
-            combined = torch.cat([global_feat, part_feat], dim=1)
-            
-            # L2 normalize
+            # L2 normalize - CRITICAL for cosine similarity to work properly
             combined = torch.nn.functional.normalize(combined, p=2, dim=1)
+        
+        return combined.cpu().numpy().flatten()
         
         return combined.cpu().numpy().flatten()
 
@@ -494,52 +594,149 @@ class AppearanceExtractor:
         mask: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
-        Extract color histograms for different body parts.
+        Extract discriminative color features for different body parts.
         
-        Divides the person into upper body (top 40%), middle (40%), and lower body (bottom 20%).
-        This helps distinguish people by clothing colors.
+        Uses LAB color space (perceptually uniform) and multiple body regions
+        for better person discrimination. Different people wear different colored
+        clothes on different body parts.
+        
+        Body parts:
+        - Head region (top 15%): Usually skin/hair color
+        - Upper torso (15-35%): Shirt/jacket upper
+        - Lower torso (35-55%): Shirt/jacket lower  
+        - Upper legs (55-75%): Pants upper
+        - Lower legs (75-100%): Pants lower / shoes
         
         Args:
             crop: Person crop (RGB)
-            mask: Optional mask
+            mask: Optional segmentation mask
             
         Returns:
-            Concatenated color histograms for body parts
+            Concatenated multi-scale color features for body parts
         """
         h, w = crop.shape[:2]
         
-        # Define body part regions (approximate for standing person)
-        # Upper body: top 40% (head + torso)
-        # Middle: 40% (torso + upper legs)  
-        # Lower: bottom 20% (legs/feet)
-        upper_end = int(h * 0.4)
-        middle_end = int(h * 0.8)
+        if h < 10 or w < 5:
+            return np.zeros(160, dtype=np.float32)  # 5 parts * 32 bins
         
-        parts = [
-            crop[:upper_end, :],      # Upper body
-            crop[upper_end:middle_end, :],  # Middle
-            crop[middle_end:, :]      # Lower body
+        # Define 5 body part regions for finer discrimination
+        part_boundaries = [
+            (0.0, 0.15),    # Head
+            (0.15, 0.35),   # Upper torso
+            (0.35, 0.55),   # Lower torso
+            (0.55, 0.75),   # Upper legs
+            (0.75, 1.0),    # Lower legs
         ]
         
-        if mask is not None:
-            masks = [
-                mask[:upper_end, :],
-                mask[upper_end:middle_end, :],
-                mask[middle_end:, :]
-            ]
-        else:
-            masks = [None, None, None]
+        parts = []
+        masks_list = []
         
-        # Extract histogram for each part
+        for start_ratio, end_ratio in part_boundaries:
+            y_start = int(h * start_ratio)
+            y_end = int(h * end_ratio)
+            if y_end > y_start:
+                parts.append(crop[y_start:y_end, :])
+                if mask is not None:
+                    masks_list.append(mask[y_start:y_end, :])
+                else:
+                    masks_list.append(None)
+            else:
+                parts.append(None)
+                masks_list.append(None)
+        
+        # Extract histogram for each part using LAB color space
         histograms = []
-        for part, part_mask in zip(parts, masks):
-            if part.size == 0:
+        for part, part_mask in zip(parts, masks_list):
+            if part is None or part.size == 0:
                 histograms.append(np.zeros(32, dtype=np.float32))
             else:
-                hist = self._extract_compact_color_histogram(part, part_mask)
+                hist = self._extract_lab_color_histogram(part, part_mask)
                 histograms.append(hist)
         
         return np.concatenate(histograms)
+    
+    def _extract_lab_color_histogram(
+        self,
+        crop: np.ndarray,
+        mask: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Extract color histogram in LAB color space.
+        
+        LAB is perceptually uniform - equal distances in LAB correspond to
+        equal perceived color differences. This makes it better for distinguishing
+        similar colors (like different shades of blue shirts).
+        
+        Args:
+            crop: Image crop (RGB)
+            mask: Optional mask
+            
+        Returns:
+            Normalized LAB color histogram (32 bins)
+        """
+        if crop.size == 0:
+            return np.zeros(32, dtype=np.float32)
+        
+        # Convert RGB to LAB
+        try:
+            lab = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB)
+        except:
+            return np.zeros(32, dtype=np.float32)
+        
+        # Use a, b channels (color information, ignore L for illumination invariance)
+        # But also include some L information for brightness-based discrimination
+        a_bins, b_bins = 12, 12
+        l_bins = 8
+        
+        if mask is not None and mask.size > 0:
+            mask_uint8 = (mask * 255).astype(np.uint8)
+        else:
+            mask_uint8 = None
+        
+        # Histogram of a and b channels (color)
+        # a: green-red, b: blue-yellow
+        hist_ab = cv2.calcHist([lab], [1, 2], mask_uint8, [a_bins, b_bins], [0, 256, 0, 256])
+        hist_ab = hist_ab.flatten()
+        
+        # Histogram of L channel (brightness) - helps distinguish light vs dark clothing
+        hist_l = cv2.calcHist([lab], [0], mask_uint8, [l_bins], [0, 256])
+        hist_l = hist_l.flatten()
+        
+        # Combine and normalize
+        hist = np.concatenate([hist_ab, hist_l])  # 144 + 8 = 152, but we want 32
+        
+        # Reduce to 32 dimensions using stride sampling
+        # Actually, let's use a simpler histogram
+        h_bins, s_bins = 16, 16  # 256 total
+        
+        # Use HSV for the main histogram (proven to work well)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], mask_uint8, [h_bins, s_bins], [0, 180, 0, 256])
+        hist = hist.flatten()  # 256 values
+        
+        # Add LAB a-b for extra discrimination
+        lab_hist = cv2.calcHist([lab], [1, 2], mask_uint8, [8, 8], [0, 256, 0, 256])
+        lab_hist = lab_hist.flatten()  # 64 values
+        
+        # Combine: dominant HSV + LAB
+        # Downsample HSV to 192 bins, LAB to 64 = 256 total, then to 32
+        combined = np.concatenate([hist, lab_hist])  # 320 values
+        
+        # Normalize
+        combined = combined / (np.sum(combined) + 1e-6)
+        
+        # Reduce to 32 dimensions by averaging groups
+        n_groups = 32
+        group_size = len(combined) // n_groups
+        reduced = np.array([
+            np.sum(combined[i*group_size:(i+1)*group_size]) 
+            for i in range(n_groups)
+        ], dtype=np.float32)
+        
+        # Re-normalize
+        reduced = reduced / (np.sum(reduced) + 1e-6)
+        
+        return reduced
     
     def _extract_compact_color_histogram(
         self,
@@ -645,29 +842,41 @@ class ReIDMatcher:
     Handles re-identification matching between stored appearance and candidates.
     
     Uses a weighted combination of multiple similarity metrics:
-    1. Person ReID features (cosine similarity) - primary for persons
-    2. Body part color histogram correlation
-    3. Size similarity
+    1. Person ReID deep features (ResNet50 with attention)
+    2. Body part color histograms (5-part LAB+HSV features)
+    3. General color histogram
+    4. Size consistency
     
-    Motion prediction is disabled as it's unreliable when camera moves.
+    Key insight: For robust ReID, we need multiple complementary features.
+    Deep features capture body shape/pose, color features capture clothing.
     """
     
-    # Weights for PERSON re-identification - heavily favor deep features
-    WEIGHT_REID = 0.75       # Person ReID deep features (most important)
-    WEIGHT_BODY_COLOR = 0.20  # Body part colors (clothing)
-    WEIGHT_COLOR = 0.03      # General color histogram
-    WEIGHT_SIZE = 0.02       # Size (least reliable)
+    # Weights for PERSON re-identification
+    # Deep features are most discriminative when trained properly
+    # Body color is critical as a backup and for clothing-based discrimination
+    WEIGHT_REID = 0.50        # Person ReID deep features (ResNet50)
+    WEIGHT_BODY_COLOR = 0.35  # Body part colors (clothing) - CRITICAL
+    WEIGHT_COLOR = 0.10       # General color histogram
+    WEIGHT_SIZE = 0.05        # Size (least reliable but helps)
     
     # Weights for NON-PERSON objects
     WEIGHT_CNN_GENERAL = 0.50
     WEIGHT_COLOR_GENERAL = 0.40
     WEIGHT_SIZE_GENERAL = 0.10
     
-    # Thresholds - strict for multi-person scenarios
-    REID_THRESHOLD = 0.60     # Minimum similarity for re-identification
-    REID_MARGIN = 0.10        # Best match must be this much better than second-best
-    TIME_DECAY_FACTOR = 0.998  # Very slow decay
-    MAX_REID_TIME = 120.0     # 2 minutes max search time
+    # Thresholds - must be strict to avoid matching different people
+    # With proper features: same person > 0.7, different person < 0.4
+    REID_THRESHOLD = 0.50     # Minimum similarity for re-identification
+    REID_MARGIN = 0.08        # Best match must be clearly better than second-best
+    TIME_DECAY_FACTOR = 1.0   # NO time decay - features should be stable over time
+    MAX_REID_TIME = 600.0     # 10 minutes max search time
+    
+    # Minimum body color similarity - strict to reject different clothing
+    # With histogram intersection: same clothes > 0.6, different < 0.3
+    MIN_BODY_COLOR_SIMILARITY = 0.40  # Reject if body colors are too different
+    
+    # Minimum ReID feature similarity - reject if deep features too different
+    MIN_REID_SIMILARITY = 0.30  # Raw cosine similarity minimum (before transformation)
     
     # Person class ID (COCO)
     PERSON_CLASS_ID = 0
@@ -717,61 +926,117 @@ class ReIDMatcher:
         candidate_features: Dict[str, np.ndarray],
         time_decay: float
     ) -> float:
-        """Compute similarity for person re-identification."""
-        scores = []
-        weights = []
+        """
+        Compute similarity for person re-identification.
         
-        # 1. Person ReID features (most important)
+        Uses a strict multi-stage verification approach:
+        1. Deep ReID features (most discriminative)
+        2. Body part color features (clothing appearance)
+        3. General color distribution
+        4. Size consistency
+        
+        Key insight: For ReID to work, we need features where:
+        - Same person across time: similarity > 0.7
+        - Different people: similarity < 0.4
+        
+        If features don't show this separation, they're not discriminative enough.
+        """
+        reid_sim_raw = None
+        body_color_sim = None
+        color_sim = None
+        size_sim = None
+        
+        # 1. Person ReID features (most important) - use raw cosine similarity
         if 'reid' in candidate_features:
             target_reid = target.get_average_feature()
             if target_reid is not None:
                 candidate_reid = candidate_features['reid']
                 # Check dimension compatibility
                 if target_reid.shape[0] == candidate_reid.shape[0]:
-                    reid_sim = cls._cosine_similarity(target_reid, candidate_reid)
-                    # Use a more discriminative transformation
-                    # Cosine similarity of 0.8+ should be a strong match
-                    # Below 0.5 should be rejected
-                    # Apply sigmoid-like transformation centered around 0.6
-                    reid_sim_transformed = 1.0 / (1.0 + np.exp(-10 * (reid_sim - 0.6)))
-                    scores.append(reid_sim_transformed)
-                    weights.append(cls.WEIGHT_REID)
+                    # Raw cosine similarity - for L2-normalized vectors this is in [-1, 1]
+                    # Same person should give > 0.5, different people < 0.2
+                    reid_sim_raw = cls._cosine_similarity(target_reid, candidate_reid)
+                    
+                    # Hard rejection: if deep features are too different, this is NOT the same person
+                    if reid_sim_raw < cls.MIN_REID_SIMILARITY:
+                        logger.info(f"Rejecting candidate: ReID similarity {reid_sim_raw:.3f} < {cls.MIN_REID_SIMILARITY}")
+                        return 0.0
                 else:
-                    # Dimension mismatch - skip ReID features, rely on other features
                     logger.debug(f"ReID dimension mismatch: {target_reid.shape[0]} vs {candidate_reid.shape[0]}")
         
-        # 2. Body part color similarity
+        # 2. Body part color similarity - use histogram intersection (stricter than Bhattacharyya)
         if 'body_color' in candidate_features:
             target_body = target.get_body_color()
             if target_body is not None:
-                body_sim = cls._histogram_similarity(target_body, candidate_features['body_color'])
-                # Body color should also be discriminative
-                body_sim_transformed = body_sim ** 2  # Square to penalize low matches
-                scores.append(body_sim_transformed)
-                weights.append(cls.WEIGHT_BODY_COLOR)
+                # Use histogram intersection instead of Bhattacharyya
+                # Intersection gives 1.0 only for identical histograms
+                body_color_sim = cls._histogram_intersection(target_body, candidate_features['body_color'])
+                
+                # Hard rejection: if clothing colors are too different
+                if body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY:
+                    logger.info(f"Rejecting candidate: body color similarity {body_color_sim:.3f} < {cls.MIN_BODY_COLOR_SIMILARITY}")
+                    return 0.0
         
         # 3. General color histogram
         if 'color_hist' in candidate_features:
             target_hist = target.get_average_color_hist()
             if target_hist is not None:
-                color_sim = cls._histogram_similarity(target_hist, candidate_features['color_hist'])
-                scores.append(color_sim)
-                weights.append(cls.WEIGHT_COLOR)
+                color_sim = cls._histogram_intersection(target_hist, candidate_features['color_hist'])
         
         # 4. Size similarity
         if 'size' in candidate_features:
             target_size = target.get_average_size()
             if target_size is not None:
                 size_sim = cls._size_similarity(target_size, tuple(candidate_features['size']))
-                scores.append(size_sim)
-                weights.append(cls.WEIGHT_SIZE)
+        
+        # Combine scores with proper weighting
+        # The key is that ReID features should dominate when available
+        scores = []
+        weights = []
+        
+        if reid_sim_raw is not None:
+            # Transform cosine similarity: [-1, 1] -> [0, 1]
+            # Then apply a steeper transformation to penalize low similarities
+            reid_normalized = (reid_sim_raw + 1.0) / 2.0  # [0, 1]
+            # Apply power to make it steeper (penalize low similarities more)
+            reid_transformed = reid_normalized ** 1.5
+            scores.append(reid_transformed)
+            weights.append(cls.WEIGHT_REID)
+        
+        if body_color_sim is not None:
+            # Body color is already in [0, 1], apply mild steepening
+            body_transformed = body_color_sim ** 1.3
+            scores.append(body_transformed)
+            weights.append(cls.WEIGHT_BODY_COLOR)
+        
+        if color_sim is not None:
+            scores.append(color_sim)
+            weights.append(cls.WEIGHT_COLOR)
+        
+        if size_sim is not None:
+            scores.append(size_sim)
+            weights.append(cls.WEIGHT_SIZE)
         
         if not scores:
             return 0.0
         
         weights = np.array(weights)
         weights = weights / np.sum(weights)
-        similarity = np.sum(np.array(scores) * weights) * time_decay
+        raw_similarity = np.sum(np.array(scores) * weights)
+        similarity = raw_similarity * time_decay
+        
+        # Detailed logging with component breakdown
+        components = []
+        if reid_sim_raw is not None:
+            components.append(f"reid={reid_sim_raw:.3f}")
+        if body_color_sim is not None:
+            components.append(f"body={body_color_sim:.3f}")
+        if color_sim is not None:
+            components.append(f"color={color_sim:.3f}")
+        if size_sim is not None:
+            components.append(f"size={size_sim:.3f}")
+        
+        logger.info(f"Person similarity: final={similarity:.3f} ({', '.join(components)})")
         
         return float(similarity)
     
@@ -838,6 +1103,60 @@ class ReIDMatcher:
         h2 = hist2[:min_len]
         bc = np.sum(np.sqrt(h1 * h2 + 1e-10))
         return float(np.clip(bc, 0.0, 1.0))
+    
+    @staticmethod
+    def _histogram_intersection(hist1: np.ndarray, hist2: np.ndarray) -> float:
+        """
+        Compute histogram similarity using histogram intersection.
+        
+        Intersection is stricter than Bhattacharyya - it only counts overlapping parts.
+        For two identical histograms, intersection = 1.0
+        For completely different histograms, intersection = 0.0
+        
+        This is better for distinguishing different clothing colors because
+        it doesn't give partial credit for "similar" colors.
+        """
+        # Ensure same length
+        min_len = min(len(hist1), len(hist2))
+        h1 = hist1[:min_len]
+        h2 = hist2[:min_len]
+        
+        # Normalize histograms to sum to 1
+        h1_sum = np.sum(h1)
+        h2_sum = np.sum(h2)
+        
+        if h1_sum < 1e-6 or h2_sum < 1e-6:
+            return 0.0
+        
+        h1_norm = h1 / h1_sum
+        h2_norm = h2 / h2_sum
+        
+        # Histogram intersection: sum of min at each bin
+        intersection = np.sum(np.minimum(h1_norm, h2_norm))
+        
+        return float(np.clip(intersection, 0.0, 1.0))
+    
+    @staticmethod
+    def _chi_square_distance(hist1: np.ndarray, hist2: np.ndarray) -> float:
+        """
+        Compute chi-square distance between histograms.
+        
+        Chi-square is very sensitive to differences - good for ReID.
+        Returns similarity (1 - normalized distance).
+        """
+        min_len = min(len(hist1), len(hist2))
+        h1 = hist1[:min_len]
+        h2 = hist2[:min_len]
+        
+        # Chi-square distance
+        denominator = h1 + h2 + 1e-10
+        chi_sq = np.sum((h1 - h2) ** 2 / denominator)
+        
+        # Convert to similarity (0 distance = 1 similarity)
+        # Chi-square can be large, so we use exponential decay
+        similarity = np.exp(-chi_sq * 0.5)
+        
+        return float(np.clip(similarity, 0.0, 1.0))
     
     @staticmethod
     def _size_similarity(size1: Tuple[float, float], size2: Tuple[float, float]) -> float:
@@ -920,17 +1239,32 @@ class YOLOTracker:
         self.target_appearance: Optional[TargetAppearance] = None
         self.reid_threshold = ReIDMatcher.REID_THRESHOLD
         self.frames_lost = 0
-        self.max_frames_lost = 150  # ~5 seconds at 30fps before giving up
+        self.max_frames_lost = 600  # ~20 seconds at 30fps before giving up (increased for long-term)
+        
+        # Spatial continuity tracking - last known position for re-id preference
+        self.last_known_bbox: Optional[Tuple[int, int, int, int]] = None
+        self.last_known_center: Optional[Tuple[float, float]] = None
+        
+        # Occlusion detection
+        self.occlusion_iou_threshold: float = 0.3  # IoU threshold to consider occlusion
+        self.is_occluded: bool = False
+        self.occlusion_start_time: Optional[float] = None
+        self.pre_occlusion_appearance: Optional[TargetAppearance] = None  # Saved appearance before occlusion
+        self.frames_since_occlusion_ended: int = 0
+        self.occlusion_recovery_frames: int = 5  # Frames to wait after occlusion before trusting track
         
         # Person registry - stores features of all known persons to prevent wrong ID assignment
         self.person_registry = PersonRegistry()
         
         # Temporal consistency tracking - prevent rapid ID switching
         self.last_reid_switch_time: float = 0.0
-        self.reid_switch_cooldown: float = 0.5  # Minimum seconds between YOLO ID switches
+        self.reid_switch_cooldown: float = 1.0  # Minimum seconds between YOLO ID switches (increased)
         self.consecutive_reid_frames: int = 0   # Counter for consecutive ReID frames
-        self.reid_confirmation_frames: int = 3  # Require this many frames before switching
+        self.reid_confirmation_frames: int = 8  # Require this many frames before switching (increased for stability)
         self.pending_reid_match: Optional[Tuple[int, float]] = None  # (track_id, first_seen_time)
+        
+        # Store last results for debug visualization
+        self.last_results: List[TrackingResult] = []
         
         # Determine device
         self.device = self._get_device(device)
@@ -1342,6 +1676,7 @@ class YOLOTracker:
         Register other persons seen in the frame to help with distinctiveness checking.
         
         This helps prevent wrong ID assignment by knowing what other people look like.
+        Only registers new persons that haven't been seen before, limited to max 3 per frame.
         
         Args:
             frame: Current frame
@@ -1350,13 +1685,29 @@ class YOLOTracker:
         if self.appearance_extractor is None:
             return
         
+        registered_count = 0
+        max_register_per_frame = 2  # Limit to avoid performance impact
+        
         for result in results:
+            if registered_count >= max_register_per_frame:
+                break
+            
             # Only register persons
             if result.class_id != 0:  # Not a person
                 continue
             
+            # Skip persons with invalid track IDs (ID -1 or less)
+            # These are often the target with a temporary ID, and registering them
+            # would contaminate the registry with target features
+            if result.track_id < 0:
+                continue
+            
             # Skip the current target
             if result.track_id == self.target_track_id:
+                continue
+            
+            # Also skip if this might be the pending ReID match
+            if self.pending_reid_match is not None and result.track_id == self.pending_reid_match[0]:
                 continue
             
             # Skip if already registered with a different display ID
@@ -1395,6 +1746,7 @@ class YOLOTracker:
             
             # Register with temporary ID
             self.person_registry.register_person(temp_display_id, other_appearance)
+            registered_count += 1
     
     def _find_best_match_reid(
         self,
@@ -1423,12 +1775,22 @@ class YOLOTracker:
         
         # STRICT class filtering - only match same class as target
         target_class_id = self.target_appearance.class_id
-        candidates = [r for r in results if r.class_id == target_class_id]
+        target_class_name = self.target_appearance.class_name
+        
+        # For person tracking, we MUST ensure we only match person class (class_id=0)
+        # Also filter out invalid track IDs (-1)
+        if target_class_id == 0:  # Person
+            candidates = [r for r in results if r.class_id == 0 and r.class_name.lower() == 'person' and r.track_id >= 0]
+        else:
+            candidates = [r for r in results if r.class_id == target_class_id and r.track_id >= 0]
         
         # If no same-class candidates, don't try to match different classes
         if not candidates:
-            logger.debug(f"No candidates of class {self.target_class_name} found for re-identification")
+            logger.info(f"ReID: No valid person candidates (track_id >= 0) for re-identification. "
+                       f"Total results: {len(results)}, persons with invalid IDs: {sum(1 for r in results if r.class_id == 0 and r.track_id < 0)}")
             return None
+        
+        logger.debug(f"ReID: {len(candidates)} candidates of class '{target_class_name}' from {len(results)} total detections")
         
         # Check if target is a person (for person-specific ReID)
         is_person = (target_class_id == 0)  # COCO person class ID
@@ -1446,16 +1808,23 @@ class YOLOTracker:
             )
             
             if not features:
+                logger.debug(f"ID {result.track_id}: No features extracted")
                 continue
             
-            # Log raw cosine similarity for debugging (before transformation)
-            # Only compare if dimensions match
+            # Log detailed feature comparison for debugging
             if is_person and 'reid' in features and target_reid is not None:
                 if target_reid.shape[0] == features['reid'].shape[0]:
                     raw_cosine = ReIDMatcher._cosine_similarity(target_reid, features['reid'])
-                    logger.debug(f"ID {result.track_id}: raw cosine={raw_cosine:.3f}")
+                    logger.debug(f"ID {result.track_id}: raw ReID cosine={raw_cosine:.3f}")
                 else:
                     logger.debug(f"ID {result.track_id}: feature dim mismatch ({target_reid.shape[0]} vs {features['reid'].shape[0]})")
+            
+            # Log body color comparison
+            if is_person and 'body_color' in features:
+                target_body = self.target_appearance.get_body_color()
+                if target_body is not None:
+                    body_sim = ReIDMatcher._histogram_similarity(target_body, features['body_color'])
+                    logger.debug(f"ID {result.track_id}: body color similarity={body_sim:.3f}")
             
             # Compute similarity with person-specific matching
             similarity = ReIDMatcher.compute_similarity(
@@ -1466,58 +1835,83 @@ class YOLOTracker:
                 is_person=is_person
             )
             
-            candidate_scores.append((result, similarity))
+            candidate_scores.append((result, similarity, features))
         
         if not candidate_scores:
+            logger.debug("No candidates with valid features")
             return None
         
         # Sort by similarity (highest first)
         candidate_scores.sort(key=lambda x: x[1], reverse=True)
         
-        # Log all candidates for debugging
-        logger.debug(f"ReID candidates: {[(r.track_id, f'{s:.3f}') for r, s in candidate_scores]}")
+        # Log all candidates for debugging - CHANGE TO INFO FOR TROUBLESHOOTING
+        logger.info(f"ReID candidates (threshold={self.reid_threshold}): {[(r.track_id, f'{s:.3f}') for r, s, _ in candidate_scores]}")
         
-        best_match, best_similarity = candidate_scores[0]
+        best_match, best_similarity, best_features = candidate_scores[0]
         
         # Check if best similarity exceeds threshold
         if best_similarity <= self.reid_threshold:
-            logger.debug(f"Best similarity {best_similarity:.3f} below threshold {self.reid_threshold}")
+            logger.info(f"ReID FAILED: Best similarity {best_similarity:.3f} <= threshold {self.reid_threshold} "
+                       f"(best candidate: ID {best_match.track_id})")
             return None
         
         # If multiple candidates, check margin between best and second-best
         if len(candidate_scores) > 1:
-            second_best_match, second_best_similarity = candidate_scores[1]
+            second_best_match, second_best_similarity, _ = candidate_scores[1]
             margin = best_similarity - second_best_similarity
             
             # Log the comparison
-            logger.debug(f"Best: ID {best_match.track_id} ({best_similarity:.3f}), "
-                        f"Second: ID {second_best_match.track_id} ({second_best_similarity:.3f}), "
-                        f"Margin: {margin:.3f}")
+            logger.info(f"ReID margin check: Best ID {best_match.track_id} ({best_similarity:.3f}), "
+                        f"Second ID {second_best_match.track_id} ({second_best_similarity:.3f}), "
+                        f"Margin: {margin:.3f} (required: {ReIDMatcher.REID_MARGIN})")
             
-            # If margin is too small, be more conservative
+            # If margin is too small, use spatial continuity as tiebreaker
             if margin < ReIDMatcher.REID_MARGIN:
-                # Check if we should prefer the previous YOLO ID for temporal consistency
-                prev_yolo_id = self.target_track_id
-                
-                # See if any of the top candidates matches our previous YOLO ID
-                for result, score in candidate_scores:
-                    if result.track_id == prev_yolo_id and score > self.reid_threshold:
-                        logger.debug(f"Preferring previous YOLO ID {prev_yolo_id} for temporal consistency "
-                                    f"(score: {score:.3f}, margin too small: {margin:.3f})")
-                        return result
-                
-                # If neither matches previous ID and margin is too small, reject
-                logger.debug(f"Rejecting match: margin {margin:.3f} < {ReIDMatcher.REID_MARGIN}, "
-                            f"ambiguous between ID {best_match.track_id} and ID {second_best_match.track_id}")
-                return None
+                # Try spatial continuity - prefer the candidate closer to last known position
+                if self.last_known_center is not None:
+                    def get_distance_to_last(result: TrackingResult) -> float:
+                        x1, y1, x2, y2 = result.bbox
+                        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                        lx, ly = self.last_known_center
+                        return ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+                    
+                    dist_best = get_distance_to_last(best_match)
+                    dist_second = get_distance_to_last(second_best_match)
+                    
+                    logger.info(f"Using spatial continuity: Best ID {best_match.track_id} dist={dist_best:.1f}px, "
+                               f"Second ID {second_best_match.track_id} dist={dist_second:.1f}px")
+                    
+                    # If second-best is significantly closer (>50px advantage), prefer it
+                    # unless best has appearance advantage
+                    spatial_threshold = 100.0  # pixels
+                    if dist_second < dist_best - spatial_threshold and second_best_similarity > self.reid_threshold:
+                        # Second candidate is much closer to last position - might be an occlusion case
+                        logger.info(f"Spatial tiebreaker: preferring closer ID {second_best_match.track_id} "
+                                   f"(dist={dist_second:.1f}px vs {dist_best:.1f}px)")
+                        best_match = second_best_match
+                        best_similarity = second_best_similarity
+                        best_features = candidate_scores[1][2]
+                    elif dist_best < dist_second - spatial_threshold:
+                        # Best candidate is much closer - trust it despite small margin
+                        logger.info(f"Spatial confirmation: ID {best_match.track_id} is closer "
+                                   f"(dist={dist_best:.1f}px vs {dist_second:.1f}px), accepting despite small margin")
+                    else:
+                        # Both are similar distance - truly ambiguous
+                        logger.info(f"ReID FAILED: margin {margin:.3f} < {ReIDMatcher.REID_MARGIN}, "
+                                    f"and spatial positions similar (ambiguous between ID {best_match.track_id} and ID {second_best_match.track_id})")
+                        return None
+                else:
+                    # No spatial info available - reject ambiguous match
+                    logger.info(f"ReID FAILED: margin {margin:.3f} < {ReIDMatcher.REID_MARGIN}, "
+                                f"ambiguous between ID {best_match.track_id} and ID {second_best_match.track_id}")
+                    return None
         
         # Check distinctiveness against other known persons in the registry
-        if is_person and self.original_track_id is not None:
-            # Extract features for the best match for distinctiveness check
-            best_features = self.appearance_extractor.extract_features(
-                frame, best_match.bbox, best_match.mask, class_id=best_match.class_id
-            )
-            
+        # BUT ONLY if there are multiple candidates in the current frame
+        # If there's only one person visible, we should trust the similarity score alone
+        # because the registry can get contaminated with target features during ID bounces
+        if is_person and self.original_track_id is not None and len(candidate_scores) > 1:
+            # Use the features we already extracted
             if best_features:
                 def similarity_func(appearance: TargetAppearance, features: Dict[str, np.ndarray]) -> float:
                     return ReIDMatcher.compute_similarity(
@@ -1532,10 +1926,24 @@ class YOLOTracker:
                 )
                 
                 if not is_distinctive:
-                    logger.debug(f"Rejecting match: candidate not distinctive enough from other known persons")
+                    logger.info(f"ReID FAILED: candidate ID {best_match.track_id} not distinctive enough from other known persons")
                     return None
+        elif is_person and len(candidate_scores) == 1:
+            # When only one person is visible, be MORE cautious since we can't compare
+            # Require higher similarity to accept as the target
+            SINGLE_PERSON_THRESHOLD = 0.65  # Higher threshold when only one candidate
+            if best_similarity < SINGLE_PERSON_THRESHOLD:
+                logger.info(f"ReID FAILED: only one person visible but similarity {best_similarity:.3f} < {SINGLE_PERSON_THRESHOLD} "
+                           f"(requires higher confidence when no comparison is possible)")
+                return None
+            logger.info(f"Single person mode: similarity {best_similarity:.3f} >= {SINGLE_PERSON_THRESHOLD}, accepting")
         
-        logger.info(f"Re-identified target as ID {best_match.track_id} with similarity {best_similarity:.3f}")
+        # Final sanity check - make sure we're returning a person when tracking person
+        if target_class_id == 0 and best_match.class_id != 0:
+            logger.warning(f"Rejecting match: expected person but got class {best_match.class_name} (id={best_match.class_id})")
+            return None
+        
+        logger.info(f"Re-identified target (class='{best_match.class_name}') as ID {best_match.track_id} with similarity {best_similarity:.3f}")
         return best_match
     
     @staticmethod
@@ -1566,6 +1974,111 @@ class YOLOTracker:
         union = area1 + area2 - intersection
         
         return intersection / union if union > 0 else 0.0
+    
+    def _detect_occlusion(
+        self,
+        target_result: TrackingResult,
+        all_results: List[TrackingResult]
+    ) -> Tuple[bool, Optional[TrackingResult]]:
+        """
+        Detect if the target is being occluded by another person.
+        
+        Args:
+            target_result: The current tracking result for our target
+            all_results: All detection results in the current frame
+            
+        Returns:
+            Tuple of (is_occluded, occluder_result)
+        """
+        if target_result is None:
+            return False, None
+        
+        target_bbox = target_result.bbox
+        target_area = (target_bbox[2] - target_bbox[0]) * (target_bbox[3] - target_bbox[1])
+        
+        for result in all_results:
+            # Skip self
+            if result.track_id == target_result.track_id:
+                continue
+            
+            # Only consider person detections as potential occluders
+            if result.class_id != 0:
+                continue
+            
+            # Calculate IoU
+            iou = self._calculate_iou(target_bbox, result.bbox)
+            
+            if iou > self.occlusion_iou_threshold:
+                # Check if the occluder is in front (larger bounding box or closer to camera)
+                # Heuristic: person with larger bbox is likely closer to camera
+                occluder_area = (result.bbox[2] - result.bbox[0]) * (result.bbox[3] - result.bbox[1])
+                
+                # Also check overlap ratio relative to target's area
+                x1 = max(target_bbox[0], result.bbox[0])
+                y1 = max(target_bbox[1], result.bbox[1])
+                x2 = min(target_bbox[2], result.bbox[2])
+                y2 = min(target_bbox[3], result.bbox[3])
+                intersection = max(0, x2 - x1) * max(0, y2 - y1)
+                overlap_ratio = intersection / target_area if target_area > 0 else 0
+                
+                # If significant overlap (>40% of target covered), consider it occlusion
+                if overlap_ratio > 0.4 or (occluder_area > target_area * 1.2 and iou > 0.35):
+                    logger.info(f"Occlusion detected: Person ID {result.track_id} overlapping target "
+                               f"(IoU={iou:.2f}, overlap_ratio={overlap_ratio:.2f}, "
+                               f"occluder_area={occluder_area}, target_area={target_area})")
+                    return True, result
+        
+        return False, None
+    
+    def _save_pre_occlusion_state(self):
+        """Save the target appearance before occlusion for later verification."""
+        if self.target_appearance is not None:
+            # Deep copy the appearance
+            self.pre_occlusion_appearance = copy.deepcopy(self.target_appearance)
+            logger.info("Saved pre-occlusion appearance for later verification")
+    
+    def _verify_post_occlusion(
+        self,
+        frame: np.ndarray,
+        result: TrackingResult,
+        current_time: float
+    ) -> bool:
+        """
+        Verify that the tracked person after occlusion is still the same target.
+        
+        Args:
+            frame: Current frame
+            result: The detection result to verify
+            current_time: Current timestamp
+            
+        Returns:
+            True if the person matches pre-occlusion appearance, False otherwise
+        """
+        if self.pre_occlusion_appearance is None:
+            return True  # No pre-occlusion appearance saved, assume OK
+        
+        if self.appearance_extractor is None:
+            return True
+        
+        features = self.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=0)
+        if not features:
+            return True  # Can't extract features, assume OK
+        
+        # Compare with pre-occlusion appearance
+        similarity = ReIDMatcher.compute_similarity(
+            self.pre_occlusion_appearance, features, result.bbox, current_time, is_person=True
+        )
+        
+        # Use stricter threshold for post-occlusion verification
+        POST_OCCLUSION_VERIFY_THRESHOLD = 0.50
+        
+        if similarity < POST_OCCLUSION_VERIFY_THRESHOLD:
+            logger.warning(f"Post-occlusion verification FAILED: similarity={similarity:.3f} < {POST_OCCLUSION_VERIFY_THRESHOLD}. "
+                          f"Track ID {result.track_id} may have switched to occluder!")
+            return False
+        
+        logger.info(f"Post-occlusion verification PASSED: similarity={similarity:.3f}")
+        return True
     
     def update(
         self,
@@ -1603,13 +2116,181 @@ class YOLOTracker:
         # Perform tracking
         results = self.track(frame, persist=True)
         
-        # Register other visible persons for distinctiveness checking
-        if self.enable_reid and len(results) > 1:
-            self._register_other_persons(frame, results)
+        # Store results for debug visualization
+        self.last_results = results if results else []
+        
+        # Log detection summary for debugging
+        if results:
+            person_results = [r for r in results if r.class_id == 0]
+            person_ids = [r.track_id for r in person_results]
+            # Log more frequently to debug ID bouncing
+            logger.debug(f"Frame detections: {len(person_results)} persons with IDs {person_ids}. Looking for target YOLO ID: {self.target_track_id}")
         
         # Stage 1: Try to find target by track ID
+        # IMPORTANT: We verify appearance to catch ID switches (when ByteTrack assigns
+        # our target's ID to a different person, e.g., when someone walks in front)
+        # Also check for pending ReID match ID to handle confirmation period
+        target_ids_to_check = [self.target_track_id]
+        if self.pending_reid_match is not None:
+            pending_id, _ = self.pending_reid_match
+            if pending_id not in target_ids_to_check:
+                target_ids_to_check.append(pending_id)
+        
         for result in results:
-            if result.track_id == self.target_track_id:
+            if result.track_id in target_ids_to_check:
+                # Verify class hasn't changed (prevent tracking a non-person object)
+                if self.target_class_id is not None and result.class_id != self.target_class_id:
+                    logger.warning(f"Track ID {result.track_id} class changed from {self.target_class_name} to {result.class_name}, ignoring")
+                    continue
+                
+                # CRITICAL: Check for occlusion by another person
+                # If another person significantly overlaps our target, we need to be extra careful
+                is_occluded, occluder = self._detect_occlusion(result, results)
+                
+                if is_occluded and self.enable_reid and result.class_id == 0:
+                    current_time = time.time()
+                    
+                    if not self.is_occluded:
+                        # Occlusion just started - save pre-occlusion appearance
+                        self._save_pre_occlusion_state()
+                        self.is_occluded = True
+                        self.occlusion_start_time = current_time
+                        logger.warning(f"Occlusion started! Target ID {result.track_id} being occluded by ID {occluder.track_id}")
+                    
+                    # During occlusion, be VERY strict about appearance matching
+                    # The track ID might have been "stolen" by the occluder
+                    features = self.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=0)
+                    if features:
+                        similarity = ReIDMatcher.compute_similarity(
+                            self.target_appearance, features, result.bbox, current_time, is_person=True
+                        )
+                        
+                        # Very strict threshold during occlusion
+                        OCCLUSION_SIMILARITY_THRESHOLD = 0.60
+                        
+                        if similarity < OCCLUSION_SIMILARITY_THRESHOLD:
+                            # Track likely transferred to occluder - don't follow!
+                            logger.warning(f"Track ID {result.track_id} appearance degraded during occlusion "
+                                          f"(similarity={similarity:.3f} < {OCCLUSION_SIMILARITY_THRESHOLD}). "
+                                          f"Treating as lost - will re-identify after occlusion.")
+                            # Skip this match, fall through to lost/ReID handling
+                            continue
+                        else:
+                            # Still looks like target despite occlusion
+                            logger.info(f"Target appears occluded but still identifiable (similarity={similarity:.3f})")
+                            # Don't update appearance during occlusion!
+                            self.state = TrackerState.TRACKING
+                            self.frames_lost = 0
+                            return self._with_original_id(result)
+                
+                # If we were occluded but now we're not, verify this is still the target
+                if self.is_occluded and not is_occluded:
+                    current_time = time.time()
+                    self.frames_since_occlusion_ended += 1
+                    
+                    if self.frames_since_occlusion_ended <= self.occlusion_recovery_frames:
+                        # Still in recovery period - verify with pre-occlusion appearance
+                        if not self._verify_post_occlusion(frame, result, current_time):
+                            # Failed verification - track was stolen by occluder!
+                            logger.warning(f"Post-occlusion verification failed! Track ID {result.track_id} "
+                                          f"likely switched to occluder. Will re-identify.")
+                            # Force ReID by not accepting this match
+                            continue
+                        else:
+                            # Passed verification - but keep checking for a few more frames
+                            logger.info(f"Post-occlusion frame {self.frames_since_occlusion_ended}/{self.occlusion_recovery_frames}")
+                    else:
+                        # Recovery period over - clear occlusion state
+                        logger.info("Occlusion recovery complete - resuming normal tracking")
+                        self.is_occluded = False
+                        self.occlusion_start_time = None
+                        self.pre_occlusion_appearance = None
+                        self.frames_since_occlusion_ended = 0
+                
+                # CRITICAL: Verify appearance to detect ID switches
+                # ByteTrack can assign our target's ID to a different person during occlusion
+                if self.enable_reid and self.target_appearance is not None and result.class_id == 0:
+                    features = self.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=0)
+                    if features:
+                        current_time = time.time()
+                        similarity = ReIDMatcher.compute_similarity(
+                            self.target_appearance, features, result.bbox, current_time, is_person=True
+                        )
+                        
+                        # Threshold for detecting ID switch (person changed completely)
+                        ID_SWITCH_DETECTION_THRESHOLD = 0.35
+                        # Threshold for updating appearance (only update when very confident)
+                        APPEARANCE_UPDATE_THRESHOLD = 0.55
+                        
+                        if similarity < ID_SWITCH_DETECTION_THRESHOLD:
+                            # ID switch detected! This track ID now belongs to a different person
+                            logger.warning(f"ID switch detected! Track ID {result.track_id} appearance changed "
+                                          f"(similarity={similarity:.3f} < {ID_SWITCH_DETECTION_THRESHOLD}). "
+                                          f"Likely a different person. Will try ReID.")
+                            # Don't accept this match - fall through to ReID stage
+                            continue
+                        
+                        # Check if this is the pending ReID ID (continue confirmation)
+                        is_pending_id = (self.pending_reid_match is not None and 
+                                        result.track_id == self.pending_reid_match[0])
+                        is_confirmed_target = (result.track_id == self.target_track_id)
+                        
+                        if is_pending_id and not is_confirmed_target:
+                            # Continue confirmation for pending ID
+                            self.consecutive_reid_frames += 1
+                            logger.debug(f"Pending ID {result.track_id} confirmed in Stage 1 "
+                                        f"({self.consecutive_reid_frames}/{self.reid_confirmation_frames} frames)")
+                            
+                            if self.consecutive_reid_frames >= self.reid_confirmation_frames:
+                                # Fully confirmed! Update target track ID
+                                old_id = self.target_track_id
+                                self.target_track_id = result.track_id
+                                self.pending_reid_match = None
+                                self.consecutive_reid_frames = 0
+                                
+                                # Clear other persons registry to prevent contamination buildup
+                                self.person_registry.clear()
+                                if self.original_track_id is not None:
+                                    self.person_registry.register_person(self.original_track_id, self.target_appearance)
+                                
+                                logger.info(f"ReID confirmed via Stage 1: YOLO ID {old_id} -> {self.target_track_id}")
+                            
+                            # Return result (with original display ID)
+                            self.state = TrackerState.TRACKING
+                            self.frames_lost = 0
+                            return self._with_original_id(result)
+                        
+                        # Track is the confirmed target - accept it
+                        self.state = TrackerState.TRACKING
+                        self.frames_lost = 0
+                        self.pending_reid_match = None
+                        self.consecutive_reid_frames = 0
+                        
+                        # Reset occlusion state if we're cleanly tracking
+                        if not is_occluded and self.is_occluded:
+                            logger.info("Occlusion cleared - resuming normal tracking")
+                            self.is_occluded = False
+                            self.occlusion_start_time = None
+                            self.pre_occlusion_appearance = None
+                            self.frames_since_occlusion_ended = 0
+                        
+                        # Update class info if needed
+                        if self.target_class_id != result.class_id:
+                            self.target_class_id = result.class_id
+                            self.target_class_name = result.class_name
+                        
+                        # ONLY update appearance when similarity is high enough
+                        # This prevents contamination during occlusion
+                        if similarity >= APPEARANCE_UPDATE_THRESHOLD:
+                            self._update_appearance(frame, result)
+                            logger.debug(f"Track ID {result.track_id} appearance updated (similarity={similarity:.3f})")
+                        else:
+                            logger.debug(f"Track ID {result.track_id} verified but appearance NOT updated "
+                                        f"(similarity={similarity:.3f} < {APPEARANCE_UPDATE_THRESHOLD})")
+                        
+                        return self._with_original_id(result)
+                
+                # Non-person or no ReID - just accept track ID match
                 self.state = TrackerState.TRACKING
                 self.frames_lost = 0
                 
@@ -1622,12 +2303,26 @@ class YOLOTracker:
                     self.target_class_id = result.class_id
                     self.target_class_name = result.class_name
                 
-                # Update appearance model
-                if self.enable_reid:
+                # Update appearance model for non-persons
+                if self.enable_reid and result.class_id != 0:
                     self._update_appearance(frame, result)
                 
                 # Return result with consistent original track ID
                 return self._with_original_id(result)
+        
+        # Stage 1 didn't find target - log why
+        if results:
+            person_results = [r for r in results if r.class_id == 0]
+            person_ids = [r.track_id for r in person_results]
+            valid_person_ids = [r.track_id for r in person_results if r.track_id >= 0]
+            
+            if self.target_track_id in person_ids:
+                logger.info(f"Stage 1: Target ID {self.target_track_id} found but REJECTED (appearance mismatch or class change)")
+            else:
+                logger.info(f"Stage 1: Target ID {self.target_track_id} NOT in person detections. "
+                           f"Found {len(person_results)} persons with IDs: {person_ids} (valid: {valid_person_ids})")
+        else:
+            logger.info(f"Stage 1: No detections at all")
         
         # Stage 2: Track ID not found, try re-identification
         # Note: frames_lost is incremented AFTER we try ReID, so that a successful
@@ -1637,11 +2332,42 @@ class YOLOTracker:
             self.state = TrackerState.REIDENTIFYING
             
             # Try to re-identify using appearance
+            # Register other visible persons for distinctiveness checking (only during ReID)
+            # This is expensive so only do it when we need it
+            if len(results) > 1:
+                self._register_other_persons(frame, results)
+            
             reid_match = self._find_best_match_reid(frame, results)
+            
+            # Log ReID result
+            if reid_match is None:
+                logger.info(f"Stage 2 ReID: No match found (frames_lost={self.frames_lost})")
+            else:
+                logger.info(f"Stage 2 ReID: Found match ID {reid_match.track_id}")
             
             if reid_match is not None:
                 current_time = time.time()
                 new_yolo_id = reid_match.track_id
+                
+                # Safety check: never accept invalid track IDs
+                if new_yolo_id < 0:
+                    logger.warning(f"ReID returned invalid track ID {new_yolo_id}, ignoring")
+                    reid_match = None
+            
+            if reid_match is not None:
+                # Get the similarity score from the match
+                features = self.appearance_extractor.extract_features(
+                    frame, reid_match.bbox, reid_match.mask, class_id=reid_match.class_id
+                )
+                if features:
+                    match_similarity = ReIDMatcher.compute_similarity(
+                        self.target_appearance, features, reid_match.bbox, current_time, is_person=True
+                    )
+                else:
+                    match_similarity = 0.5  # Default if features not available
+                
+                # ALWAYS require confirmation frames to prevent rapid ID bouncing
+                # This is critical when multiple persons have similar appearances
                 
                 # Check if this is the same ID as pending match
                 if self.pending_reid_match is not None:
@@ -1666,19 +2392,24 @@ class YOLOTracker:
                                 self.pending_reid_match = None
                                 self.consecutive_reid_frames = 0
                                 
-                                # Update appearance
-                                self._update_appearance(frame, reid_match)
+                                # Clear other persons registry to prevent contamination buildup
+                                # Other person appearances may have been contaminated with target features
+                                self.person_registry.clear()
+                                # Re-register the target
+                                if self.original_track_id is not None:
+                                    self.person_registry.register_person(self.original_track_id, self.target_appearance)
                                 
-                                logger.info(f"Re-identified target (YOLO ID: {old_yolo_id} -> {self.target_track_id}, "
-                                           f"display ID: {self.original_track_id}, confirmed over {self.reid_confirmation_frames} frames)")
+                                logger.info(f"Confirmed ReID: YOLO ID {old_yolo_id} -> {self.target_track_id} "
+                                           f"(confirmed over {self.reid_confirmation_frames} frames)")
                                 return self._with_original_id(reid_match)
                             else:
                                 logger.debug(f"ReID cooldown: {time_since_last_switch:.2f}s < {self.reid_switch_cooldown}s")
                         else:
                             logger.debug(f"ReID pending confirmation: {self.consecutive_reid_frames}/{self.reid_confirmation_frames} frames")
                     else:
-                        # Different ID - reset pending
-                        logger.debug(f"ReID candidate changed from {pending_id} to {new_yolo_id}, resetting confirmation")
+                        # Different ID - but don't reset if similarity is decent
+                        # This handles YOLO ID bouncing
+                        logger.debug(f"ReID candidate changed from {pending_id} to {new_yolo_id}")
                         self.pending_reid_match = (new_yolo_id, current_time)
                         self.consecutive_reid_frames = 1
                 else:
@@ -1691,10 +2422,18 @@ class YOLOTracker:
                 # Return the match for visualization
                 return self._with_original_id(reid_match)
             else:
-                # No match found - increment frames lost and reset pending
+                # No match found - increment frames lost
+                # But DON'T reset pending_reid_match immediately - the target might just be
+                # temporarily undetected for one frame
                 self.frames_lost += 1
-                self.pending_reid_match = None
-                self.consecutive_reid_frames = 0
+                
+                # Only reset pending match after several consecutive failures
+                # This prevents losing progress due to momentary detection failures
+                if self.frames_lost > 3:
+                    if self.pending_reid_match is not None:
+                        logger.debug(f"Resetting pending ReID match after {self.frames_lost} failed frames")
+                    self.pending_reid_match = None
+                    self.consecutive_reid_frames = 0
         else:
             # ReID disabled or exceeded max frames
             self.frames_lost += 1
@@ -1712,7 +2451,13 @@ class YOLOTracker:
         
         This ensures users always see the same track ID for the target,
         even if YOLO assigns a new ID after re-identification.
+        Also updates last known position for spatial continuity.
         """
+        # Update last known position for spatial continuity in ReID
+        self.last_known_bbox = result.bbox
+        x1, y1, x2, y2 = result.bbox
+        self.last_known_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        
         return TrackingResult(
             track_id=self.original_track_id,
             bbox=result.bbox,

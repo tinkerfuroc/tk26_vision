@@ -106,7 +106,7 @@ class YOLOSegmentationNode(Node):
         self.declare_parameter('confidence_threshold', 0.0)
         self.declare_parameter('visualization', False)
         self.declare_parameter('max_depth', 10.0)  # meters
-        self.declare_parameter('min_depth', 0.0)   # meters
+        self.declare_parameter('min_depth', -10.0)   # meters
         self.declare_parameter('sync_wait_time_limit', 5) # how many 0.1 seconds to wait
         self.declare_parameter('img_sync_thres', 0.00)
 
@@ -858,7 +858,6 @@ class YOLOSegmentationNode(Node):
             mask = info['mask']
             cls_name = info['cls_name']
             conf = info['conf']
-            centroid = info['centroid']
             
             x1, y1, x2, y2 = bbox
             
@@ -866,7 +865,12 @@ class YOLOSegmentationNode(Node):
             cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
             
             # Draw label with index (shows sorting order)
-            label = f'#{idx+1} {cls_name} {conf:.2f} x={centroid.x:.2f}m y={centroid.y:.2f}m z={centroid.z:.2f}m'
+            label = ''
+            if displaying_all:
+                label = f'#{idx+1} {cls_name} {conf:.2f}'
+            else:
+                centroid = info['centroid']
+                label = f'#{idx+1} {cls_name} {conf:.2f} x={centroid.x:.2f}m y={centroid.y:.2f}m z={centroid.z:.2f}m'
 
             # Add background for text readability
             (label_w, label_h), _ = cv2.getTextSize(

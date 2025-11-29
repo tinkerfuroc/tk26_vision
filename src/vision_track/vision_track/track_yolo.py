@@ -864,19 +864,29 @@ class ReIDMatcher:
     WEIGHT_COLOR_GENERAL = 0.40
     WEIGHT_SIZE_GENERAL = 0.10
     
-    # Thresholds - must be strict to avoid matching different people
-    # With proper features: same person > 0.7, different person < 0.4
-    REID_THRESHOLD = 0.50     # Minimum similarity for re-identification
+    # Thresholds - balanced for accuracy vs pose variation tolerance
+    # Analysis from logs shows:
+    #   - Same person continuous tracking: reid ~0.85-0.98, body ~0.80-0.97
+    #   - Same person with pose change: reid ~0.70-0.80, body ~0.70-0.85
+    #   - Different person (WRONG match): reid ~0.55-0.70, body ~0.60-0.75
+    # Setting thresholds to accept pose variation but reject different people
+    REID_THRESHOLD = 0.60     # Minimum COMBINED similarity for re-identification
     REID_MARGIN = 0.08        # Best match must be clearly better than second-best
     TIME_DECAY_FACTOR = 1.0   # NO time decay - features should be stable over time
     MAX_REID_TIME = 600.0     # 10 minutes max search time
     
-    # Minimum body color similarity - strict to reject different clothing
-    # With histogram intersection: same clothes > 0.6, different < 0.3
-    MIN_BODY_COLOR_SIMILARITY = 0.40  # Reject if body colors are too different
+    # CRITICAL: Minimum RAW reid similarity
+    # Same person with pose change: ~0.70-0.80
+    # Different person: ~0.55-0.70
+    # Set floor at 0.55 to allow pose variation while rejecting most wrong matches
+    MIN_REID_SIMILARITY_RAW = 0.55  # Raw cosine similarity floor
     
-    # Minimum ReID feature similarity - reject if deep features too different
-    MIN_REID_SIMILARITY = 0.30  # Raw cosine similarity minimum (before transformation)
+    # Minimum body color similarity - more tolerant for lighting variation
+    # Same person: ~0.70-0.95, Different person: ~0.60-0.75  
+    MIN_BODY_COLOR_SIMILARITY = 0.50  # Reject if body colors are too different
+    
+    # Legacy threshold for backward compatibility
+    MIN_REID_SIMILARITY = 0.40  # Transformed similarity minimum
     
     # Person class ID (COCO)
     PERSON_CLASS_ID = 0
@@ -953,13 +963,14 @@ class ReIDMatcher:
                 candidate_reid = candidate_features['reid']
                 # Check dimension compatibility
                 if target_reid.shape[0] == candidate_reid.shape[0]:
-                    # Raw cosine similarity - for L2-normalized vectors this is in [-1, 1]
-                    # Same person should give > 0.5, different people < 0.2
+                    # Raw cosine similarity for L2-normalized vectors is in [-1, 1]
+                    # From logs: Same person ~0.70-0.98 (pose dependent), Different person ~0.55-0.70
                     reid_sim_raw = cls._cosine_similarity(target_reid, candidate_reid)
                     
-                    # Hard rejection: if deep features are too different, this is NOT the same person
-                    if reid_sim_raw < cls.MIN_REID_SIMILARITY:
-                        logger.info(f"Rejecting candidate: ReID similarity {reid_sim_raw:.3f} < {cls.MIN_REID_SIMILARITY}")
+                    # Hard rejection: RAW reid similarity must be above floor
+                    # Set conservatively to allow pose variation
+                    if reid_sim_raw < cls.MIN_REID_SIMILARITY_RAW:
+                        logger.info(f"HARD REJECT: ReID raw similarity {reid_sim_raw:.3f} < {cls.MIN_REID_SIMILARITY_RAW}")
                         return 0.0
                 else:
                     logger.debug(f"ReID dimension mismatch: {target_reid.shape[0]} vs {candidate_reid.shape[0]}")
@@ -1251,7 +1262,7 @@ class YOLOTracker:
         self.occlusion_start_time: Optional[float] = None
         self.pre_occlusion_appearance: Optional[TargetAppearance] = None  # Saved appearance before occlusion
         self.frames_since_occlusion_ended: int = 0
-        self.occlusion_recovery_frames: int = 5  # Frames to wait after occlusion before trusting track
+        self.occlusion_recovery_frames: int = 20  # Frames to wait after occlusion before trusting track
         
         # Person registry - stores features of all known persons to prevent wrong ID assignment
         self.person_registry = PersonRegistry()
@@ -1431,29 +1442,84 @@ class YOLOTracker:
         masks = result.masks
         names = result.names
         
-        for i, box in enumerate(boxes):
+        # Access the underlying data arrays directly
+        # In newer ultralytics versions, these could be numpy arrays
+        xyxy_data = boxes.xyxy
+        cls_data = boxes.cls
+        conf_data = boxes.conf
+        id_data = boxes.id  # Could be None
+        
+        # Convert to numpy if tensor
+        if hasattr(xyxy_data, 'cpu'):
+            xyxy_np = xyxy_data.cpu().numpy()
+        else:
+            xyxy_np = np.asarray(xyxy_data)
+        
+        if hasattr(cls_data, 'cpu'):
+            cls_np = cls_data.cpu().numpy()
+        else:
+            cls_np = np.asarray(cls_data)
+        
+        if hasattr(conf_data, 'cpu'):
+            conf_np = conf_data.cpu().numpy()
+        else:
+            conf_np = np.asarray(conf_data)
+        
+        id_np = None
+        if id_data is not None:
+            if hasattr(id_data, 'cpu'):
+                id_np = id_data.cpu().numpy()
+            else:
+                id_np = np.asarray(id_data)
+        
+        for i in range(len(boxes)):
             # Get bounding box coordinates
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+            x1, y1, x2, y2 = xyxy_np[i].astype(int)
             
             # Get track ID (if available)
-            track_id = int(box.id[0]) if box.id is not None else -1
+            track_id = -1
+            if id_np is not None:
+                track_id = int(id_np[i])
             
             # Get confidence and class
-            confidence = float(box.conf[0])
-            class_id = int(box.cls[0])
+            confidence = float(conf_np[i])
+            class_id = int(cls_np[i])
             class_name = names[class_id]
             
-            # Get segmentation mask (if available)
+            # Get segmentation mask (if available) - handle both tensor and numpy
             mask = None
             if masks is not None and i < len(masks):
-                mask = masks[i].data[0].cpu().numpy()
-                # Resize mask to original image size
-                mask = cv2.resize(
-                    mask.astype(np.float32),
-                    (result.orig_shape[1], result.orig_shape[0]),
-                    interpolation=cv2.INTER_LINEAR
-                )
-                mask = (mask > 0.5).astype(np.uint8)
+                # Handle different ways masks can be stored in ultralytics
+                try:
+                    mask_obj = masks[i]
+                    if hasattr(mask_obj, 'data'):
+                        mask_data = mask_obj.data
+                        # data could be tensor or already accessed
+                        if hasattr(mask_data, '__getitem__'):
+                            mask_data = mask_data[0]
+                        if hasattr(mask_data, 'cpu'):
+                            mask = mask_data.cpu().numpy()
+                        elif isinstance(mask_data, np.ndarray):
+                            mask = mask_data
+                        else:
+                            mask = np.asarray(mask_data)
+                    elif hasattr(mask_obj, 'xy'):
+                        # Polygon format - skip for now
+                        mask = None
+                    else:
+                        mask = None
+                except Exception as e:
+                    logger.debug(f"Failed to extract mask: {e}")
+                    mask = None
+                
+                if mask is not None:
+                    # Resize mask to original image size
+                    mask = cv2.resize(
+                        mask.astype(np.float32),
+                        (result.orig_shape[1], result.orig_shape[0]),
+                        interpolation=cv2.INTER_LINEAR
+                    )
+                    mask = (mask > 0.5).astype(np.uint8)
             
             tracking_results.append(TrackingResult(
                 track_id=track_id,
@@ -1929,12 +1995,13 @@ class YOLOTracker:
                     logger.info(f"ReID FAILED: candidate ID {best_match.track_id} not distinctive enough from other known persons")
                     return None
         elif is_person and len(candidate_scores) == 1:
-            # When only one person is visible, be MORE cautious since we can't compare
-            # Require higher similarity to accept as the target
-            SINGLE_PERSON_THRESHOLD = 0.65  # Higher threshold when only one candidate
+            # When only one person is visible, be cautious but allow pose variation
+            # From logs: Same person with pose change ~0.75-0.82, different person ~0.65-0.77
+            # Setting threshold at 0.72 to allow pose variation while filtering most wrong matches
+            SINGLE_PERSON_THRESHOLD = 0.72  # Allow pose variation
             if best_similarity < SINGLE_PERSON_THRESHOLD:
                 logger.info(f"ReID FAILED: only one person visible but similarity {best_similarity:.3f} < {SINGLE_PERSON_THRESHOLD} "
-                           f"(requires higher confidence when no comparison is possible)")
+                           f"(requires high confidence when no comparison is possible)")
                 return None
             logger.info(f"Single person mode: similarity {best_similarity:.3f} >= {SINGLE_PERSON_THRESHOLD}, accepting")
         

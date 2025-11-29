@@ -99,6 +99,9 @@ class PersonTrackNode(Node):
         self.declare_parameter('enable_reid', True)
         self.declare_parameter('max_frames_lost', 600)  # ~20 seconds at 30fps
         
+        # ReID mode: 'custom' uses our ResNet50-based ReID, 'native' uses YOLO's BoT-SORT ReID
+        self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
+        
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/depth_registered/points')
@@ -106,7 +109,7 @@ class PersonTrackNode(Node):
         
         # Tracking parameters
         self.declare_parameter('tracking_rate', 15.0)  # Hz
-        self.declare_parameter('lost_timeout', 60.0)  # seconds before declaring failure
+        self.declare_parameter('lost_timeout', 300.0)  # seconds before declaring failure
         
         self.get_logger().info('Parameters declared')
 
@@ -116,6 +119,7 @@ class PersonTrackNode(Node):
         self.confidence_threshold = self.get_parameter('confidence_threshold').value
         self.enable_reid = self.get_parameter('enable_reid').value
         self.max_frames_lost = self.get_parameter('max_frames_lost').value
+        self.reid_mode = self.get_parameter('reid_mode').value
         
         self.image_topic = self.get_parameter('image_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
@@ -126,26 +130,38 @@ class PersonTrackNode(Node):
         
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Enable ReID: {self.enable_reid}')
+        self.get_logger().info(f'ReID mode: {self.reid_mode}')
         self.get_logger().info(f'Tracking rate: {self.tracking_rate} Hz')
 
     def _init_tracker(self):
-        """Initialize the YOLO tracker."""
+        """Initialize the YOLO tracker based on reid_mode parameter."""
         self.get_logger().info('Initializing YOLO Tracker...')
         
         try:
             # Find model path
             model_file = self._find_model_path(self.model_path)
             
-            self.tracker = YOLOTracker(
-                model_path=str(model_file),
-                confidence_threshold=self.confidence_threshold,
-                enable_reid=self.enable_reid
-            )
-            
-            # Set max_frames_lost after initialization
-            self.tracker.max_frames_lost = self.max_frames_lost
-            
-            self.get_logger().info(f'YOLO Tracker initialized with model: {model_file}')
+            if self.reid_mode == 'native':
+                # Use native BoT-SORT ReID from YOLO
+                from vision_track.track_yolo_native import YOLOTrackerNative
+                self.tracker = YOLOTrackerNative(
+                    model_path=str(model_file),
+                    confidence_threshold=self.confidence_threshold,
+                    appearance_thresh=0.25,  # Lower = stricter ReID matching
+                    proximity_thresh=0.5,
+                    track_buffer=60,  # 2 seconds at 30fps
+                )
+                self.tracker.max_frames_lost = self.max_frames_lost
+                self.get_logger().info(f'YOLO Tracker (NATIVE ReID) initialized with model: {model_file}')
+            else:
+                # Use custom ResNet50-based ReID (default)
+                self.tracker = YOLOTracker(
+                    model_path=str(model_file),
+                    confidence_threshold=self.confidence_threshold,
+                    enable_reid=self.enable_reid
+                )
+                self.tracker.max_frames_lost = self.max_frames_lost
+                self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
             
         except Exception as e:
             self.get_logger().error(f'Failed to initialize tracker: {e}')
@@ -259,6 +275,9 @@ class PersonTrackNode(Node):
     def _camera_info_callback(self, msg: CameraInfo):
         """Store camera intrinsic parameters."""
         with self.lock_info:
+            # Log resolution on first camera info received
+            if self.camera_intrinsic is None:
+                self.get_logger().info(f'Camera info received: resolution {msg.width}x{msg.height}')
             self.camera_intrinsic = msg
 
     def _camera_callback(self, rgb_msg: Image, depth_msg: PointCloud2):
@@ -276,13 +295,19 @@ class PersonTrackNode(Node):
             points: np.ndarray of shape (H, W, 3) containing 3D points
             valid_mask: np.ndarray of shape (H, W) with valid depth mask
         """
-        h, w = 720, 1280
+        # Get resolution from camera intrinsics (dynamic, not hardcoded)
+        h = intrinsic.height
+        w = intrinsic.width
         K = np.array(intrinsic.k).reshape((3, 3))
+        
+        # Parse point cloud - detect the point step size
+        point_step = pc_msg.point_step
+        floats_per_point = point_step // 4  # Assuming float32 (4 bytes)
         
         # Parse point cloud
         arr = np.frombuffer(pc_msg.data, dtype='<f4')
-        N = len(arr) // 5  # x, y, z, rgb (padding to 5 floats)
-        points_raw = arr.reshape((N, 5))[:, [0, 1, 2]]
+        N = len(arr) // floats_per_point
+        points_raw = arr.reshape((N, floats_per_point))[:, [0, 1, 2]]  # x, y, z
         
         # Filter invalid points
         valid = ~np.isnan(points_raw[:, 2]) & (points_raw[:, 2] > 0)

@@ -101,6 +101,7 @@ class PersonTrackNode(Node):
         self.declare_parameter('max_frames_lost', 600)  # ~20 seconds at 30fps
         self.declare_parameter('inference_size', 1280)  # imgsz for YOLO; lower for speed
         self.declare_parameter('reid_verification_interval', 5)  # periodic on-track ReID sanity check
+        self.declare_parameter('allow_indefinite_recovery', True)  # if True, never abort for long-term loss
         
         # ReID mode: 'custom' uses our ResNet50-based ReID, 'native' uses YOLO's BoT-SORT ReID
         self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
@@ -124,6 +125,7 @@ class PersonTrackNode(Node):
         self.max_frames_lost = self.get_parameter('max_frames_lost').value
         self.inference_size = self.get_parameter('inference_size').value
         self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
+        self.allow_indefinite_recovery = self.get_parameter('allow_indefinite_recovery').value
         self.reid_mode = self.get_parameter('reid_mode').value
         
         self.image_topic = self.get_parameter('image_topic').value
@@ -138,6 +140,7 @@ class PersonTrackNode(Node):
         self.get_logger().info(f'ReID mode: {self.reid_mode}')
         self.get_logger().info(f'Inference size (imgsz): {self.inference_size}')
         self.get_logger().info(f'ReID verification interval: {self.reid_verification_interval}')
+        self.get_logger().info(f'Allow indefinite recovery: {self.allow_indefinite_recovery}')
         self.get_logger().info(f'Tracking rate: {self.tracking_rate} Hz')
 
     def _init_tracker(self):
@@ -147,6 +150,14 @@ class PersonTrackNode(Node):
         try:
             # Find model path
             model_file = self._find_model_path(self.model_path)
+            # Allow loss duration to be governed by time, not fixed frames.
+            # Use whichever is larger: explicit max_frames_lost or rate * lost_timeout.
+            max_frames_allowed = (
+                int(self.tracking_rate * self.lost_timeout)
+                if not self.allow_indefinite_recovery
+                else int(1e12)  # effectively infinite
+            )
+            max_frames_allowed = max(max_frames_allowed, int(self.max_frames_lost))
             
             if self.reid_mode == 'native':
                 # Use native BoT-SORT ReID from YOLO
@@ -158,7 +169,7 @@ class PersonTrackNode(Node):
                     proximity_thresh=0.5,
                     track_buffer=60,  # 2 seconds at 30fps
                 )
-                self.tracker.max_frames_lost = self.max_frames_lost
+                self.tracker.max_frames_lost = max_frames_allowed
                 self.get_logger().info(f'YOLO Tracker (NATIVE ReID) initialized with model: {model_file}')
             else:
                 # Use custom ResNet50-based ReID (default)
@@ -169,8 +180,14 @@ class PersonTrackNode(Node):
                     inference_size=self.inference_size,
                     reid_verification_interval=int(self.reid_verification_interval)
                 )
-                self.tracker.max_frames_lost = self.max_frames_lost
+                self.tracker.max_frames_lost = max_frames_allowed
                 self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
+            
+            self.get_logger().info(
+                f"Max frames lost set to {self.tracker.max_frames_lost} "
+                f"(tracking_rate={self.tracking_rate} Hz, lost_timeout={self.lost_timeout}s, "
+                f"param_max_frames_lost={self.max_frames_lost})"
+            )
             
         except Exception as e:
             self.get_logger().error(f'Failed to initialize tracker: {e}')

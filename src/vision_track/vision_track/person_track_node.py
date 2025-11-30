@@ -800,8 +800,11 @@ class PersonTrackNode(Node):
         finally:
             self._cleanup_tracking()
         
-        # Should not reach here normally
-        result.status = 0  # Success (though tracking normally runs indefinitely)
+        # Only report success if the goal is still active and not canceled/aborted
+        if goal_handle.is_cancel_requested or not goal_handle.is_active:
+            return result
+        
+        result.status = 0  # Success (tracking ended cleanly)
         result.message = 'Tracking completed'
         goal_handle.succeed()
         return result

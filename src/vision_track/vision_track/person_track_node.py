@@ -16,6 +16,7 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.duration import Duration
 
 import numpy as np
 import cv2
@@ -28,6 +29,8 @@ import os
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from geometry_msgs.msg import PointStamped, Point
 from std_msgs.msg import Header
+from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_point
 
 # Action definition
 from tinker_vision_msgs_26.action import TrackPerson
@@ -64,6 +67,8 @@ class PersonTrackNode(Node):
         self.tracker: YOLOTracker = None
         self.tracking_active = False
         self.goal_handle = None
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # Thread locks
         self.lock_msg = threading.Lock()
@@ -597,6 +602,7 @@ class PersonTrackNode(Node):
         return_depth_img = goal_handle.request.return_depth_img
         return_segment = goal_handle.request.return_segment
         debug_mode = goal_handle.request.debug  # Debug mode draws all detected persons
+        target_frame = goal_handle.request.target_frame.strip() if goal_handle.request.target_frame else ''
         
         result = TrackPerson.Result()
         feedback = TrackPerson.Feedback()
@@ -707,12 +713,33 @@ class PersonTrackNode(Node):
                     feedback.target_lost = False
                     feedback.target_track_id = track_result.track_id
                     
+                    feedback.target_position = PointStamped()
+                    feedback.is_transformation_successful = False
+                    
                     if position is not None:
-                        feedback.target_position = PointStamped()
+                        # Default to camera frame
                         feedback.target_position.header = rgb_msg.header
                         feedback.target_position.point = position
+                        
+                        # Transform if requested and possible
+                        if target_frame and target_frame.lower() != 'none' and target_frame != rgb_msg.header.frame_id:
+                            try:
+                                transform = self.tf_buffer.lookup_transform(
+                                    target_frame,
+                                    rgb_msg.header.frame_id,
+                                    rclpy.time.Time(),
+                                    timeout=Duration(seconds=0.2)
+                                )
+                                transformed = do_transform_point(feedback.target_position, transform)
+                                feedback.target_position = transformed
+                                feedback.is_transformation_successful = True
+                            except Exception as ex:
+                                self.get_logger().warn(
+                                    f"TF transform to '{target_frame}' failed ({ex}); keeping camera frame"
+                                )
+                        else:
+                            feedback.is_transformation_successful = True
                     else:
-                        feedback.target_position = PointStamped()
                         feedback.target_position.header = rgb_msg.header
                     
                     # Add images if requested
@@ -754,6 +781,7 @@ class PersonTrackNode(Node):
                     # Set empty position when lost
                     feedback.target_position = PointStamped()
                     feedback.target_position.header = rgb_msg.header
+                    feedback.is_transformation_successful = False
                     
                     # Still send RGB image when target is lost (for visualization)
                     if return_rgb_img or debug_mode:

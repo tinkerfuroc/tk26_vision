@@ -1,4 +1,5 @@
 # uses orbbec camera to track person
+string target_frame # set to none to use camera frame
 bool return_rgb_img
 bool return_depth_img
 bool return_segment
@@ -9,6 +10,7 @@ string message
 ---
 bool target_lost
 int32 target_track_id
+bool is_transformation_successful
 geometry_msgs/PointStamped target_position
 sensor_msgs/Image rgb_img
 sensor_msgs/Image depth_img

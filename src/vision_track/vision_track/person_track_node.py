@@ -94,10 +94,13 @@ class PersonTrackNode(Node):
 
     def _declare_parameters(self):
         """Declare all ROS2 parameters."""
-        self.declare_parameter('model_path', 'yolo11n-seg.pt')
+        # Prefer a stronger default model. If unavailable we will fall back at runtime.
+        self.declare_parameter('model_path', 'yolo11s-seg.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('enable_reid', True)
         self.declare_parameter('max_frames_lost', 600)  # ~20 seconds at 30fps
+        self.declare_parameter('inference_size', 1280)  # imgsz for YOLO; lower for speed
+        self.declare_parameter('reid_verification_interval', 5)  # periodic on-track ReID sanity check
         
         # ReID mode: 'custom' uses our ResNet50-based ReID, 'native' uses YOLO's BoT-SORT ReID
         self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
@@ -119,6 +122,8 @@ class PersonTrackNode(Node):
         self.confidence_threshold = self.get_parameter('confidence_threshold').value
         self.enable_reid = self.get_parameter('enable_reid').value
         self.max_frames_lost = self.get_parameter('max_frames_lost').value
+        self.inference_size = self.get_parameter('inference_size').value
+        self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
         self.reid_mode = self.get_parameter('reid_mode').value
         
         self.image_topic = self.get_parameter('image_topic').value
@@ -131,6 +136,8 @@ class PersonTrackNode(Node):
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Enable ReID: {self.enable_reid}')
         self.get_logger().info(f'ReID mode: {self.reid_mode}')
+        self.get_logger().info(f'Inference size (imgsz): {self.inference_size}')
+        self.get_logger().info(f'ReID verification interval: {self.reid_verification_interval}')
         self.get_logger().info(f'Tracking rate: {self.tracking_rate} Hz')
 
     def _init_tracker(self):
@@ -158,7 +165,9 @@ class PersonTrackNode(Node):
                 self.tracker = YOLOTracker(
                     model_path=str(model_file),
                     confidence_threshold=self.confidence_threshold,
-                    enable_reid=self.enable_reid
+                    enable_reid=self.enable_reid,
+                    inference_size=self.inference_size,
+                    reid_verification_interval=int(self.reid_verification_interval)
                 )
                 self.tracker.max_frames_lost = self.max_frames_lost
                 self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
@@ -170,6 +179,13 @@ class PersonTrackNode(Node):
     def _find_model_path(self, model_path: str) -> Path:
         """Find the model file path."""
         model_file = Path(model_path)
+        preferred_order = [
+            'yolo11x-seg.pt',
+            'yolo11l-seg.pt',
+            'yolo11m-seg.pt',
+            'yolo11s-seg.pt',
+            'yolo11n-seg.pt',
+        ]
         
         if model_file.is_absolute() and model_file.exists():
             return model_file
@@ -178,15 +194,24 @@ class PersonTrackNode(Node):
         try:
             from ament_index_python.packages import get_package_share_directory
             share_dir = Path(get_package_share_directory('vision_track'))
-            share_model = share_dir / 'models' / model_path
-            if share_model.exists():
-                self.get_logger().info(f'Found model in share/models: {share_model}')
-                return share_model
-            # Also try share root
-            share_model = share_dir / model_path
-            if share_model.exists():
-                self.get_logger().info(f'Found model in share: {share_model}')
-                return share_model
+            model_dirs = [share_dir / 'models', share_dir]
+            for d in model_dirs:
+                share_model = d / model_path
+                if share_model.exists():
+                    self.get_logger().info(f'Found model in share: {share_model}')
+                    return share_model
+            
+            # If requested model missing, pick the best available in share/models
+            for d in model_dirs:
+                if not d.exists():
+                    continue
+                for candidate in preferred_order:
+                    candidate_path = d / candidate
+                    if candidate_path.exists():
+                        self.get_logger().warn(
+                            f"Requested model '{model_path}' not found; using available model '{candidate_path.name}'"
+                        )
+                        return candidate_path
         except Exception as e:
             self.get_logger().warn(f'Could not check share directory: {e}')
         
@@ -220,9 +245,46 @@ class PersonTrackNode(Node):
         except Exception:
             pass
         
+        # Try HuggingFace download as a final fallback
+        downloaded = self._download_model_from_hf(model_path)
+        if downloaded is not None and downloaded.exists():
+            return downloaded
+        
         # Return as-is (YOLO will try to download if needed)
-        self.get_logger().warn(f'Model not found locally, will try to download: {model_path}')
+        self.get_logger().warn(f'Model not found locally and download failed, will try YOLO auto-download: {model_path}')
         return Path(model_path)
+
+    def _download_model_from_hf(self, model_name: str) -> Path:
+        """
+        Attempt to download the requested model from HuggingFace.
+        
+        Returns:
+            Path to the downloaded file, or None if download not possible.
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+        except Exception as exc:
+            self.get_logger().warn(f'HuggingFace download unavailable ({exc}); skipping download attempt.')
+            return None
+        
+        # Map common model names to the ultralytics repo filenames
+        repo_id = "ultralytics/YOLO11"
+        filename = model_name
+        # Ensure output directory exists
+        cache_dir = Path.home() / ".cache" / "vision_track" / "models"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            downloaded_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                cache_dir=cache_dir
+            )
+            self.get_logger().info(f"Downloaded model from HuggingFace: {downloaded_path}")
+            return Path(downloaded_path)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to download model '{model_name}' from HuggingFace: {exc}")
+            return None
 
     def _init_subscribers(self):
         """Initialize camera subscribers with synchronization."""

@@ -869,7 +869,7 @@ class ReIDMatcher:
     #   - Different person (WRONG match): reid ~0.55-0.70, body ~0.60-0.75
     # Setting thresholds to accept pose variation but reject different people
     REID_THRESHOLD = 0.60     # Minimum COMBINED similarity for re-identification
-    REID_MARGIN = 0.08        # Best match must be clearly better than second-best
+    REID_MARGIN = 0.12        # Best match must be clearly better than second-best
     TIME_DECAY_FACTOR = 1.0   # NO time decay - features should be stable over time
     MAX_REID_TIME = 600.0     # 10 minutes max search time
     
@@ -1198,7 +1198,7 @@ class YOLOTracker:
     """
     
     # Default YOLO model for segmentation
-    DEFAULT_MODEL = "yolo11n-seg.pt"
+    DEFAULT_MODEL = "yolo11s-seg.pt"
     
     # Supported YOLO segmentation models
     SUPPORTED_MODELS = [
@@ -1221,7 +1221,9 @@ class YOLOTracker:
         iou_threshold: float = 0.5,
         device: Optional[str] = None,
         warmup: bool = True,
-        enable_reid: bool = True
+        enable_reid: bool = True,
+        inference_size: Optional[int] = None,
+        reid_verification_interval: int = 5
     ):
         """
         Initialize the YOLO tracker.
@@ -1233,6 +1235,8 @@ class YOLOTracker:
             device: Device to use ('cuda', 'cpu', or None for auto)
             warmup: Whether to warm up the model on initialization
             enable_reid: Whether to enable re-identification features
+            inference_size: Optional inference size (imgsz). Lower for speed, higher for accuracy.
+            reid_verification_interval: Run a full-frame ReID sanity check every N frames while tracking
         """
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
@@ -1260,11 +1264,10 @@ class YOLOTracker:
         self.last_camera_motion_time: float = 0.0
         self.CAMERA_MOTION_THRESHOLD: float = 50.0  # Pixels of scene movement to trigger detection
         self.CAMERA_MOTION_COOLDOWN: float = 0.5  # Seconds before re-enabling spatial bonus
-        
-        # Optical flow-based camera motion detection (more robust)
-        self.prev_gray_frame: Optional[np.ndarray] = None
-        self.optical_flow_points: Optional[np.ndarray] = None
         self.camera_motion_vector: Tuple[float, float] = (0.0, 0.0)  # Estimated camera movement
+        self.camera_motion_recent_window: float = 1.0  # Seconds to keep spatial gate strict after shake
+        self.spatial_gate_base: float = 160.0  # Minimum distance gate for spatial plausibility
+        self.camera_motion_gate_scale: float = 0.8  # Make gate stricter during/after camera motion
         
         # Velocity-based position prediction for target
         self.target_velocity: Tuple[float, float] = (0.0, 0.0)  # pixels per second
@@ -1283,6 +1286,7 @@ class YOLOTracker:
         self.frame_count: int = 0
         self.reid_extraction_interval: int = 3  # Extract features for non-targets every N frames
         self.fast_tracking_mode: bool = False  # Use lighter processing when stably tracking
+        self.reid_verification_interval: int = max(0, reid_verification_interval)
         
         # Occlusion detection
         self.occlusion_iou_threshold: float = 0.3  # IoU threshold to consider occlusion
@@ -1290,7 +1294,7 @@ class YOLOTracker:
         self.occlusion_start_time: Optional[float] = None
         self.pre_occlusion_appearance: Optional[TargetAppearance] = None  # Saved appearance before occlusion
         self.frames_since_occlusion_ended: int = 0
-        self.occlusion_recovery_frames: int = 20  # Frames to wait after occlusion before trusting track
+        self.occlusion_recovery_frames: int = 45  # Frames to wait after occlusion before trusting track
         
         # Person registry - stores features of all known persons to prevent wrong ID assignment
         self.person_registry = PersonRegistry()
@@ -1301,6 +1305,9 @@ class YOLOTracker:
         self.consecutive_reid_frames: int = 0   # Counter for consecutive ReID frames
         self.reid_confirmation_frames: int = 8  # Require this many frames before switching (increased for stability)
         self.pending_reid_match: Optional[Tuple[int, float]] = None  # (track_id, first_seen_time)
+
+        # Inference resolution
+        self.inference_size = inference_size
         
         # Store last results for debug visualization
         self.last_results: List[TrackingResult] = []
@@ -1411,12 +1418,18 @@ class YOLOTracker:
         Returns:
             List of TrackingResult objects
         """
-        results = self.model(
-            frame,
+        infer_kwargs = dict(
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             classes=classes,
-            verbose=False
+            verbose=False,
+        )
+        if self.inference_size is not None:
+            infer_kwargs["imgsz"] = self.inference_size
+        
+        results = self.model(
+            frame,
+            **infer_kwargs
         )
         
         return self._parse_results(results[0])
@@ -1438,14 +1451,20 @@ class YOLOTracker:
         Returns:
             List of TrackingResult objects with track IDs
         """
-        results = self.model.track(
-            frame,
+        track_kwargs = dict(
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             classes=classes,
             persist=persist,
             tracker="bytetrack.yaml",
-            verbose=False
+            verbose=False,
+        )
+        if self.inference_size is not None:
+            track_kwargs["imgsz"] = self.inference_size
+        
+        results = self.model.track(
+            frame,
+            **track_kwargs
         )
         
         self.tracked_results = self._parse_results(results[0])
@@ -1767,20 +1786,23 @@ class YOLOTracker:
     
     def _update_scene_motion(self, results: List[TrackingResult], frame: Optional[np.ndarray] = None):
         """
-        Detect camera motion using multiple methods:
-        1. Scene centroid tracking (fast, works with multiple people)
-        2. Optical flow (robust, works even with single person)
+        Detect camera motion using lightweight scene centroid tracking.
         
         When the camera shakes, all person positions shift together. By tracking
-        the average position (scene centroid) and optical flow, we can detect sudden 
-        camera motion and temporarily disable spatial continuity in ReID (which would 
-        otherwise cause the tracker to lock onto the wrong person).
+        the average position (scene centroid), we can detect sudden camera motion
+        and temporarily disable spatial continuity in ReID.
+        
+        This is a fast implementation that skips optical flow for performance.
         
         Args:
             results: All detection results from current frame
-            frame: Current frame (optional, needed for optical flow)
+            frame: Current frame (optional, not used in fast mode)
         """
         current_time = time.time()
+        
+        # Skip processing every other frame for performance
+        if self.frame_count % 2 != 0:
+            return
         
         # Get all person detections
         person_results = [r for r in results if r.class_id == 0 and r.track_id >= 0]
@@ -1788,87 +1810,48 @@ class YOLOTracker:
         motion_detected = False
         motion_magnitude = 0.0
         
-        # Method 1: Scene centroid tracking (when multiple people visible)
+        # Scene centroid tracking (fast, works with multiple people)
         if len(person_results) >= 2:
-            # Compute scene centroid (average center of all persons)
-            centers = []
+            # Compute scene centroid (average center of all persons) - simple arithmetic
+            sum_cx, sum_cy = 0.0, 0.0
             for r in person_results:
-                x1, y1, x2, y2 = r.bbox
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
-                centers.append((cx, cy))
+                sum_cx += (r.bbox[0] + r.bbox[2]) * 0.5
+                sum_cy += (r.bbox[1] + r.bbox[3]) * 0.5
             
-            scene_cx = sum(c[0] for c in centers) / len(centers)
-            scene_cy = sum(c[1] for c in centers) / len(centers)
+            scene_cx = sum_cx / len(person_results)
+            scene_cy = sum_cy / len(person_results)
             
             # Compare with previous scene centroid
             if self.scene_center_history:
                 prev_cx, prev_cy = self.scene_center_history[-1]
-                centroid_motion = ((scene_cx - prev_cx) ** 2 + (scene_cy - prev_cy) ** 2) ** 0.5
+                # Use Manhattan distance for speed (avoid sqrt)
+                centroid_motion_manhattan = abs(scene_cx - prev_cx) + abs(scene_cy - prev_cy)
                 
-                if centroid_motion > self.CAMERA_MOTION_THRESHOLD:
+                # Convert threshold to Manhattan (~1.41x Euclidean for diagonal movement)
+                if centroid_motion_manhattan > self.CAMERA_MOTION_THRESHOLD * 1.2:
                     motion_detected = True
-                    motion_magnitude = max(motion_magnitude, centroid_motion)
-                    # Estimate camera motion vector from centroid shift
+                    motion_magnitude = centroid_motion_manhattan
                     self.camera_motion_vector = (scene_cx - prev_cx, scene_cy - prev_cy)
             
-            # Keep only last few scene centers
+            # Keep only last 3 scene centers (reduced from 5)
             self.scene_center_history.append((scene_cx, scene_cy))
-            if len(self.scene_center_history) > 5:
+            if len(self.scene_center_history) > 3:
                 self.scene_center_history.pop(0)
-        
-        # Method 2: Optical flow (works even with single person, more robust)
-        if frame is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if len(frame.shape) == 3 else frame
-            
-            if self.prev_gray_frame is not None:
-                # Use sparse optical flow on a grid of points
-                if self.optical_flow_points is None or self.frame_count % 10 == 0:
-                    # Create grid of points to track (every 50 pixels)
-                    h, w = gray.shape[:2]
-                    pts_x = np.arange(50, w - 50, 50)
-                    pts_y = np.arange(50, h - 50, 50)
-                    xx, yy = np.meshgrid(pts_x, pts_y)
-                    self.optical_flow_points = np.float32(
-                        np.column_stack((xx.ravel(), yy.ravel()))
-                    ).reshape(-1, 1, 2)
-                
-                if self.optical_flow_points is not None and len(self.optical_flow_points) > 0:
-                    # Calculate optical flow
-                    new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                        self.prev_gray_frame, gray, self.optical_flow_points, None,
-                        winSize=(21, 21), maxLevel=2,
-                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-                    )
-                    
-                    if new_pts is not None and status is not None:
-                        # Get valid points
-                        good_old = self.optical_flow_points[status.flatten() == 1]
-                        good_new = new_pts[status.flatten() == 1]
-                        
-                        if len(good_old) > 10:  # Need enough points
-                            # Compute median flow (robust to outliers from moving objects)
-                            flow = good_new - good_old
-                            median_flow_x = np.median(flow[:, 0, 0])
-                            median_flow_y = np.median(flow[:, 0, 1])
-                            
-                            flow_magnitude = (median_flow_x ** 2 + median_flow_y ** 2) ** 0.5
-                            
-                            # Use lower threshold for optical flow (more precise)
-                            FLOW_MOTION_THRESHOLD = 15.0  # pixels per frame
-                            if flow_magnitude > FLOW_MOTION_THRESHOLD:
-                                motion_detected = True
-                                motion_magnitude = max(motion_magnitude, flow_magnitude)
-                                self.camera_motion_vector = (median_flow_x, median_flow_y)
-            
-            self.prev_gray_frame = gray.copy()
         
         # Update camera motion state
         if motion_detected:
+            was_stable = not self.camera_motion_detected
             self.camera_motion_detected = True
             self.last_camera_motion_time = current_time
-            logger.info(f"Camera motion detected! Magnitude: {motion_magnitude:.1f}px, "
-                       f"Vector: ({self.camera_motion_vector[0]:.1f}, {self.camera_motion_vector[1]:.1f})")
+            logger.info(f"Camera motion detected! Magnitude: {motion_magnitude:.1f}px")
+            
+            # IMPORTANT: Reset pending ReID match when camera shakes
+            # Any confirmation progress might be for the wrong person
+            if was_stable and self.pending_reid_match is not None:
+                logger.info(f"Camera shake - resetting pending ReID (was confirming ID {self.pending_reid_match[0]})")
+                self.pending_reid_match = None
+                self.consecutive_reid_frames = 0
+                
         elif self.camera_motion_detected:
             # Check if cooldown has passed
             if current_time - self.last_camera_motion_time > self.CAMERA_MOTION_COOLDOWN:
@@ -1961,6 +1944,43 @@ class YOLOTracker:
                        f"has avg error {avg_error:.1f}px (threshold={RELATIVE_POSITION_THRESHOLD})")
         
         return is_consistent, consistency_score
+
+    def _passes_spatial_gate(
+        self,
+        candidate_bbox: Tuple[int, int, int, int],
+        use_camera_gate: bool = False
+    ) -> Tuple[bool, float, float]:
+        """
+        Check whether a candidate is spatially plausible relative to last known target position.
+        
+        During or shortly after camera motion we tighten the gate to avoid snapping
+        to nearby people that move in lockstep with the camera pan.
+        """
+        if self.last_known_center is None:
+            return True, 0.0, float("inf")
+        
+        # Prefer velocity + camera motion compensated prediction when available
+        predicted = self._predict_target_position()
+        if predicted is None:
+            predicted = self.last_known_center
+        
+        cand_cx = (candidate_bbox[0] + candidate_bbox[2]) * 0.5
+        cand_cy = (candidate_bbox[1] + candidate_bbox[3]) * 0.5
+        
+        dx = cand_cx - predicted[0]
+        dy = cand_cy - predicted[1]
+        dist = (dx * dx + dy * dy) ** 0.5
+        
+        gate = self.spatial_gate_base
+        if self.last_known_bbox is not None:
+            w = self.last_known_bbox[2] - self.last_known_bbox[0]
+            h = self.last_known_bbox[3] - self.last_known_bbox[1]
+            gate = max(gate, max(w, h) * 1.5)
+        
+        if use_camera_gate:
+            gate = max(80.0, gate * self.camera_motion_gate_scale)
+        
+        return dist <= gate, dist, gate
     
     def _update_candidate_consistency(self, track_id: int, similarity: float):
         """
@@ -2007,6 +2027,61 @@ class YOLOTracker:
         score = max(0.0, 1.0 - variance / self.CONSISTENCY_THRESHOLD)
         
         return score
+
+    def _periodic_reid_validation(
+        self,
+        frame: np.ndarray,
+        results: List[TrackingResult],
+        current_result: TrackingResult,
+        current_similarity: Optional[float] = None
+    ) -> Tuple[bool, Optional[TrackingResult]]:
+        """
+        Run a scheduled ReID sanity check while already tracking.
+        
+        Returns:
+            (keep_current, better_match) where better_match is a TrackingResult if found.
+        """
+        if (self.reid_verification_interval <= 0 or
+            self.frame_count % self.reid_verification_interval != 0 or
+            not self.enable_reid or
+            self.target_appearance is None or
+            self.appearance_extractor is None or
+            current_result.class_id != 0):
+            return True, None
+        
+        # Compute current similarity if needed
+        if current_similarity is None:
+            features_cur = self.appearance_extractor.extract_features(
+                frame, current_result.bbox, current_result.mask, class_id=current_result.class_id
+            )
+            if features_cur:
+                current_similarity = ReIDMatcher.compute_similarity(
+                    self.target_appearance, features_cur, current_result.bbox, time.time(), is_person=True
+                )
+            else:
+                current_similarity = 0.0
+        
+        match = self._find_best_match_reid(frame, results)
+        if match is None:
+            return True, None
+        
+        best_match, best_similarity = match
+        
+        # No action if best is current target
+        if best_match.track_id == current_result.track_id:
+            return True, None
+        
+        # Require clear superiority to switch/trigger pending confirmation
+        margin = best_similarity - (current_similarity or 0.0)
+        MARGIN_REQUIRED = max(ReIDMatcher.REID_MARGIN, 0.08)
+        if best_similarity > self.reid_threshold and margin > MARGIN_REQUIRED:
+            logger.info(
+                f"Periodic ReID prefers ID {best_match.track_id} (sim={best_similarity:.3f}) "
+                f"over current {current_result.track_id} (sim={current_similarity:.3f}, margin={margin:.3f})"
+            )
+            return False, best_match
+        
+        return True, None
     
     def _predict_target_position(self, dt: float = 0.033) -> Optional[Tuple[float, float]]:
         """
@@ -2151,7 +2226,7 @@ class YOLOTracker:
         self,
         frame: np.ndarray,
         results: List[TrackingResult]
-    ) -> Optional[TrackingResult]:
+    ) -> Optional[Tuple[TrackingResult, float]]:
         """
         Find the detection that best matches the stored appearance using re-identification.
         
@@ -2163,9 +2238,9 @@ class YOLOTracker:
         Args:
             frame: Current frame
             results: List of tracking results
-            
+        
         Returns:
-            Best matching TrackingResult or None
+            Best matching (TrackingResult, similarity) or None
         """
         if self.target_appearance is None or self.appearance_extractor is None:
             return None
@@ -2423,7 +2498,7 @@ class YOLOTracker:
             return None
         
         logger.info(f"Re-identified target (class='{best_match.class_name}') as ID {best_match.track_id} with similarity {best_similarity:.3f}")
-        return best_match
+        return (best_match, best_similarity)
     
     @staticmethod
     def _calculate_iou(
@@ -2549,7 +2624,7 @@ class YOLOTracker:
         )
         
         # Use stricter threshold for post-occlusion verification
-        POST_OCCLUSION_VERIFY_THRESHOLD = 0.50
+        POST_OCCLUSION_VERIFY_THRESHOLD = 0.65
         
         if similarity < POST_OCCLUSION_VERIFY_THRESHOLD:
             logger.warning(f"Post-occlusion verification FAILED: similarity={similarity:.3f} < {POST_OCCLUSION_VERIFY_THRESHOLD}. "
@@ -2597,6 +2672,7 @@ class YOLOTracker:
         
         # Perform tracking
         results = self.track(frame, persist=True)
+        current_time = time.time()
         
         # Store results for debug visualization
         self.last_results = results if results else []
@@ -2628,6 +2704,24 @@ class YOLOTracker:
                 if self.target_class_id is not None and result.class_id != self.target_class_id:
                     logger.warning(f"Track ID {result.track_id} class changed from {self.target_class_name} to {result.class_name}, ignoring")
                     continue
+
+                # Spatial plausibility gate - especially strict during/after camera motion.
+                # Skip gate when we've been lost for a long time to allow far re-acquisition.
+                if self.frames_lost < 20:
+                    use_motion_gate = (
+                        self.camera_motion_detected or
+                        (current_time - self.last_camera_motion_time) < self.camera_motion_recent_window
+                    )
+                    passes_gate, move_dist, gate_threshold = self._passes_spatial_gate(
+                        result.bbox,
+                        use_camera_gate=use_motion_gate
+                    )
+                    if not passes_gate:
+                        logger.info(
+                            f"Spatial gate reject: Track ID {result.track_id} moved {move_dist:.1f}px "
+                            f"(gate {gate_threshold:.1f}px){' during camera motion' if use_motion_gate else ''}"
+                        )
+                        continue
                 
                 # CRITICAL: Check for occlusion by another person
                 # If another person significantly overlaps our target, we need to be extra careful
@@ -2652,7 +2746,7 @@ class YOLOTracker:
                         )
                         
                         # Very strict threshold during occlusion
-                        OCCLUSION_SIMILARITY_THRESHOLD = 0.60
+                        OCCLUSION_SIMILARITY_THRESHOLD = 0.70
                         
                         if similarity < OCCLUSION_SIMILARITY_THRESHOLD:
                             # Track likely transferred to occluder - don't follow!
@@ -2704,9 +2798,9 @@ class YOLOTracker:
                         )
                         
                         # Threshold for detecting ID switch (person changed completely)
-                        ID_SWITCH_DETECTION_THRESHOLD = 0.35
+                        ID_SWITCH_DETECTION_THRESHOLD = 0.50
                         # Threshold for updating appearance (only update when very confident)
-                        APPEARANCE_UPDATE_THRESHOLD = 0.55
+                        APPEARANCE_UPDATE_THRESHOLD = 0.65
                         
                         if similarity < ID_SWITCH_DETECTION_THRESHOLD:
                             # ID switch detected! This track ID now belongs to a different person
@@ -2714,6 +2808,17 @@ class YOLOTracker:
                                           f"(similarity={similarity:.3f} < {ID_SWITCH_DETECTION_THRESHOLD}). "
                                           f"Likely a different person. Will try ReID.")
                             # Don't accept this match - fall through to ReID stage
+                            continue
+                        
+                        # Periodic full ReID sanity check even while tracking
+                        keep_current, better_match = self._periodic_reid_validation(
+                            frame, results, result, current_similarity=similarity
+                        )
+                        if not keep_current and better_match is not None:
+                            logger.info(f"Periodic ReID suggests switching to ID {better_match.track_id}; starting confirmation")
+                            self.pending_reid_match = (better_match.track_id, current_time)
+                            self.consecutive_reid_frames = 1
+                            # Skip accepting this frame; Stage 2 will confirm
                             continue
                         
                         # Check if this is the pending ReID ID (continue confirmation)
@@ -2847,9 +2952,10 @@ class YOLOTracker:
             if reid_match is None:
                 logger.info(f"Stage 2 ReID: No match found (frames_lost={self.frames_lost})")
             else:
-                logger.info(f"Stage 2 ReID: Found match ID {reid_match.track_id}")
+                logger.info(f"Stage 2 ReID: Found match ID {reid_match[0].track_id}")
             
             if reid_match is not None:
+                reid_match, best_similarity = reid_match
                 current_time = time.time()
                 new_yolo_id = reid_match.track_id
                 
@@ -2859,7 +2965,9 @@ class YOLOTracker:
                     reid_match = None
             
             if reid_match is not None:
-                # Get the similarity score from the match
+                match_similarity = best_similarity
+                
+                # Get the similarity score from the match (reuse if already computed)
                 features = self.appearance_extractor.extract_features(
                     frame, reid_match.bbox, reid_match.mask, class_id=reid_match.class_id
                 )
@@ -2867,11 +2975,37 @@ class YOLOTracker:
                     match_similarity = ReIDMatcher.compute_similarity(
                         self.target_appearance, features, reid_match.bbox, current_time, is_person=True
                     )
+                    
+                    # Extra guard: if we are recovering from an occlusion, also compare
+                    # against the pre-occlusion appearance and reject weak matches
+                    if self.is_occluded and self.pre_occlusion_appearance is not None:
+                        pre_sim = ReIDMatcher.compute_similarity(
+                            self.pre_occlusion_appearance, features, reid_match.bbox, current_time, is_person=True
+                        )
+                        PRE_OCCLUSION_REID_THRESHOLD = 0.65
+                        if pre_sim < PRE_OCCLUSION_REID_THRESHOLD:
+                            logger.info(
+                                f"ReID candidate ID {reid_match.track_id} rejected: "
+                                f"pre-occlusion similarity {pre_sim:.3f} < {PRE_OCCLUSION_REID_THRESHOLD}"
+                            )
+                            reid_match = None
+                            match_similarity = 0.0
                 else:
                     match_similarity = 0.5  # Default if features not available
                 
                 # ALWAYS require confirmation frames to prevent rapid ID bouncing
                 # This is critical when multiple persons have similar appearances
+                
+                # Dynamically adjust confirmation frames based on recent camera motion
+                # After camera shake, we need MORE frames to be sure we're tracking the right person
+                POST_SHAKE_EXTRA_FRAMES = 5  # Extra frames required after camera motion
+                POST_SHAKE_WINDOW = 2.0  # Seconds after motion to require extra confirmation
+                
+                time_since_motion = current_time - self.last_camera_motion_time
+                if time_since_motion < POST_SHAKE_WINDOW:
+                    required_confirmation_frames = self.reid_confirmation_frames + POST_SHAKE_EXTRA_FRAMES
+                else:
+                    required_confirmation_frames = self.reid_confirmation_frames
                 
                 # Check if this is the same ID as pending match
                 if self.pending_reid_match is not None:
@@ -2882,7 +3016,7 @@ class YOLOTracker:
                         self.consecutive_reid_frames += 1
                         
                         # Check if we've confirmed for enough frames
-                        if self.consecutive_reid_frames >= self.reid_confirmation_frames:
+                        if self.consecutive_reid_frames >= required_confirmation_frames:
                             # Also check cooldown from last switch
                             time_since_last_switch = current_time - self.last_reid_switch_time
                             
@@ -2909,7 +3043,7 @@ class YOLOTracker:
                             else:
                                 logger.debug(f"ReID cooldown: {time_since_last_switch:.2f}s < {self.reid_switch_cooldown}s")
                         else:
-                            logger.debug(f"ReID pending confirmation: {self.consecutive_reid_frames}/{self.reid_confirmation_frames} frames")
+                            logger.debug(f"ReID pending confirmation: {self.consecutive_reid_frames}/{required_confirmation_frames} frames")
                     else:
                         # Different ID - but don't reset if similarity is decent
                         # This handles YOLO ID bouncing
@@ -2920,7 +3054,7 @@ class YOLOTracker:
                     # Start new pending match
                     self.pending_reid_match = (new_yolo_id, current_time)
                     self.consecutive_reid_frames = 1
-                    logger.debug(f"ReID pending: ID {new_yolo_id}, need {self.reid_confirmation_frames} frames to confirm")
+                    logger.debug(f"ReID pending: ID {new_yolo_id}, need {required_confirmation_frames} frames to confirm")
                 
                 # While confirming, we have a valid match - don't increment frames_lost
                 # Return the match for visualization
@@ -3026,8 +3160,6 @@ class YOLOTracker:
         self.camera_motion_detected = False
         self.last_camera_motion_time = 0.0
         self.camera_motion_vector = (0.0, 0.0)
-        self.prev_gray_frame = None
-        self.optical_flow_points = None
         # Reset spatial tracking
         self.last_known_bbox = None
         self.last_known_center = None

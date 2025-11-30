@@ -71,12 +71,21 @@ class TargetAppearance:
     
     # Color histogram history (HSV color distribution)
     color_hist_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
+    upper_color_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
+    lower_color_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
     
     # Body part color history (for person ReID - upper/middle/lower body colors)
     body_color_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
     
     # Size and aspect ratio history
     size_history: Deque[Tuple[int, int]] = field(default_factory=lambda: deque(maxlen=30))
+    anchor_feature: Optional[np.ndarray] = None
+    anchor_body_color: Optional[np.ndarray] = None
+    anchor_color_hist: Optional[np.ndarray] = None
+    anchor_upper_color: Optional[np.ndarray] = None
+    anchor_lower_color: Optional[np.ndarray] = None
+    best_similarity: float = 0.0
+    last_refresh_time: float = 0.0
     
     # Last known position and velocity for motion prediction
     position_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=30))
@@ -573,6 +582,15 @@ class AppearanceExtractor:
             
             # Body part color histograms
             features['body_color'] = self._extract_body_part_colors(crop, mask_crop)
+            
+            # Upper/lower color signatures (coarse but stable for clothing)
+            h_mid = y1 + (y2 - y1) // 2
+            upper_crop = frame[y1:h_mid, x1:x2]
+            lower_crop = frame[h_mid:y2, x1:x2]
+            upper_mask = mask[y1:h_mid, x1:x2] if mask is not None else None
+            lower_mask = mask[h_mid:y2, x1:x2] if mask is not None else None
+            features['upper_color'] = self._extract_color_histogram(upper_crop, upper_mask) if upper_crop.size > 0 else np.zeros(32, dtype=np.float32)
+            features['lower_color'] = self._extract_color_histogram(lower_crop, lower_mask) if lower_crop.size > 0 else np.zeros(32, dtype=np.float32)
         else:
             # General CNN features for non-person objects
             if self.use_general_cnn and self.general_model is not None:
@@ -583,6 +601,12 @@ class AppearanceExtractor:
         
         # Size features
         features['size'] = np.array([x2 - x1, y2 - y1], dtype=np.float32)
+        # Shape cues: aspect ratio and mask coverage help separate similar-stature people
+        aspect_ratio = (x2 - x1) / max((y2 - y1), 1e-6)
+        features['aspect_ratio'] = np.array([aspect_ratio], dtype=np.float32)
+        if mask_crop is not None and mask_crop.size > 0:
+            area_ratio = float(np.sum(mask_crop) / max(mask_crop.size, 1))
+            features['mask_coverage'] = np.array([area_ratio], dtype=np.float32)
         
         return features
     
@@ -852,10 +876,12 @@ class ReIDMatcher:
     # Weights for PERSON re-identification
     # Deep features are most discriminative when trained properly
     # Body color is critical as a backup and for clothing-based discrimination
-    WEIGHT_REID = 0.50        # Person ReID deep features (ResNet50)
-    WEIGHT_BODY_COLOR = 0.35  # Body part colors (clothing) - CRITICAL
-    WEIGHT_COLOR = 0.10       # General color histogram
-    WEIGHT_SIZE = 0.05        # Size (least reliable but helps)
+    WEIGHT_REID = 0.55        # Person ReID deep features (ResNet50)
+    WEIGHT_BODY_COLOR = 0.28  # Body part colors (clothing)
+    WEIGHT_COLOR = 0.08       # General color histogram
+    WEIGHT_UPPER = 0.05       # Upper-body color signature
+    WEIGHT_LOWER = 0.04       # Lower-body color signature
+    WEIGHT_SIZE = 0.0         # De-emphasize size/shape (unreliable across people)
     
     # Weights for NON-PERSON objects
     WEIGHT_CNN_GENERAL = 0.50
@@ -868,8 +894,8 @@ class ReIDMatcher:
     #   - Same person with pose change: reid ~0.70-0.80, body ~0.70-0.85
     #   - Different person (WRONG match): reid ~0.55-0.70, body ~0.60-0.75
     # Setting thresholds to accept pose variation but reject different people
-    REID_THRESHOLD = 0.60     # Minimum COMBINED similarity for re-identification
-    REID_MARGIN = 0.12        # Best match must be clearly better than second-best
+    REID_THRESHOLD = 0.68     # Minimum COMBINED similarity for re-identification
+    REID_MARGIN = 0.15        # Best match must be clearly better than second-best
     TIME_DECAY_FACTOR = 1.0   # NO time decay - features should be stable over time
     MAX_REID_TIME = 600.0     # 10 minutes max search time
     
@@ -877,11 +903,13 @@ class ReIDMatcher:
     # Same person with pose change: ~0.70-0.80
     # Different person: ~0.55-0.70
     # Set floor at 0.55 to allow pose variation while rejecting most wrong matches
-    MIN_REID_SIMILARITY_RAW = 0.55  # Raw cosine similarity floor
+    MIN_REID_SIMILARITY_RAW = 0.60  # Raw cosine similarity floor
     
     # Minimum body color similarity - more tolerant for lighting variation
     # Same person: ~0.70-0.95, Different person: ~0.60-0.75  
-    MIN_BODY_COLOR_SIMILARITY = 0.50  # Reject if body colors are too different
+    MIN_BODY_COLOR_SIMILARITY = 0.60  # Reject if body colors are too different
+    MIN_UPPER_SIMILARITY = 0.55
+    MIN_LOWER_SIMILARITY = 0.55
     
     # Legacy threshold for backward compatibility
     MIN_REID_SIMILARITY = 0.40  # Transformed similarity minimum
@@ -950,8 +978,13 @@ class ReIDMatcher:
         If features don't show this separation, they're not discriminative enough.
         """
         reid_sim_raw = None
+        reid_anchor_sim = None
         body_color_sim = None
+        body_color_anchor_sim = None
         color_sim = None
+        color_anchor_sim = None
+        upper_sim = None
+        lower_sim = None
         size_sim = None
         
         # 1. Person ReID features (most important) - use raw cosine similarity
@@ -964,6 +997,11 @@ class ReIDMatcher:
                     # Raw cosine similarity for L2-normalized vectors is in [-1, 1]
                     # From logs: Same person ~0.70-0.98 (pose dependent), Different person ~0.55-0.70
                     reid_sim_raw = cls._cosine_similarity(target_reid, candidate_reid)
+                    
+                    # Anchor feature comparison (helps with drift against similar stature people)
+                    if target.anchor_feature is not None and target.anchor_feature.shape[0] == candidate_reid.shape[0]:
+                        reid_anchor_sim = cls._cosine_similarity(target.anchor_feature, candidate_reid)
+                        reid_sim_raw = max(reid_sim_raw, reid_anchor_sim)
                     
                     # Hard rejection: RAW reid similarity must be above floor
                     # Set conservatively to allow pose variation
@@ -980,10 +1018,38 @@ class ReIDMatcher:
                 # Use histogram intersection instead of Bhattacharyya
                 # Intersection gives 1.0 only for identical histograms
                 body_color_sim = cls._histogram_intersection(target_body, candidate_features['body_color'])
+                if target.anchor_body_color is not None:
+                    body_color_anchor_sim = cls._histogram_intersection(target.anchor_body_color, candidate_features['body_color'])
+                    body_color_sim = max(body_color_sim, body_color_anchor_sim)
                 
                 # Hard rejection: if clothing colors are too different
                 if body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY:
                     logger.info(f"Rejecting candidate: body color similarity {body_color_sim:.3f} < {cls.MIN_BODY_COLOR_SIMILARITY}")
+                    return 0.0
+        
+        # Upper/lower specific clothing color to combat outfit ambiguity
+        if 'upper_color' in candidate_features:
+            target_upper = None
+            if target.anchor_upper_color is not None:
+                target_upper = target.anchor_upper_color
+            elif target.upper_color_history:
+                target_upper = target.upper_color_history[-1]
+            if target_upper is not None:
+                upper_sim = cls._histogram_intersection(target_upper, candidate_features['upper_color'])
+                if upper_sim < cls.MIN_UPPER_SIMILARITY:
+                    logger.info(f"Rejecting candidate: upper color similarity {upper_sim:.3f} < {cls.MIN_UPPER_SIMILARITY}")
+                    return 0.0
+        
+        if 'lower_color' in candidate_features:
+            target_lower = None
+            if target.anchor_lower_color is not None:
+                target_lower = target.anchor_lower_color
+            elif target.lower_color_history:
+                target_lower = target.lower_color_history[-1]
+            if target_lower is not None:
+                lower_sim = cls._histogram_intersection(target_lower, candidate_features['lower_color'])
+                if lower_sim < cls.MIN_LOWER_SIMILARITY:
+                    logger.info(f"Rejecting candidate: lower color similarity {lower_sim:.3f} < {cls.MIN_LOWER_SIMILARITY}")
                     return 0.0
         
         # 3. General color histogram
@@ -991,6 +1057,9 @@ class ReIDMatcher:
             target_hist = target.get_average_color_hist()
             if target_hist is not None:
                 color_sim = cls._histogram_intersection(target_hist, candidate_features['color_hist'])
+                if target.anchor_color_hist is not None:
+                    color_anchor_sim = cls._histogram_intersection(target.anchor_color_hist, candidate_features['color_hist'])
+                    color_sim = max(color_sim, color_anchor_sim)
         
         # 4. Size similarity
         if 'size' in candidate_features:
@@ -1018,11 +1087,19 @@ class ReIDMatcher:
             scores.append(body_transformed)
             weights.append(cls.WEIGHT_BODY_COLOR)
         
+        if upper_sim is not None:
+            scores.append(upper_sim ** 1.1)
+            weights.append(cls.WEIGHT_UPPER)
+        
+        if lower_sim is not None:
+            scores.append(lower_sim ** 1.1)
+            weights.append(cls.WEIGHT_LOWER)
+        
         if color_sim is not None:
             scores.append(color_sim)
             weights.append(cls.WEIGHT_COLOR)
         
-        if size_sim is not None:
+        if size_sim is not None and cls.WEIGHT_SIZE > 0:
             scores.append(size_sim)
             weights.append(cls.WEIGHT_SIZE)
         
@@ -1287,6 +1364,7 @@ class YOLOTracker:
         self.reid_extraction_interval: int = 3  # Extract features for non-targets every N frames
         self.fast_tracking_mode: bool = False  # Use lighter processing when stably tracking
         self.reid_verification_interval: int = max(0, reid_verification_interval)
+        self.feature_refresh_interval: float = 1.5  # seconds between anchor refreshes when stable
         
         # Occlusion detection
         self.occlusion_iou_threshold: float = 0.3  # IoU threshold to consider occlusion
@@ -1303,8 +1381,11 @@ class YOLOTracker:
         self.last_reid_switch_time: float = 0.0
         self.reid_switch_cooldown: float = 1.0  # Minimum seconds between YOLO ID switches (increased)
         self.consecutive_reid_frames: int = 0   # Counter for consecutive ReID frames
-        self.reid_confirmation_frames: int = 8  # Require this many frames before switching (increased for stability)
+        self.reid_confirmation_frames: int = 12  # Require this many frames before switching (higher for stability)
+        self.reid_preconfirm_frames: int = 3     # Require this many consecutive fits before starting confirmation
         self.pending_reid_match: Optional[Tuple[int, float]] = None  # (track_id, first_seen_time)
+        self.reid_fit_streak: int = 0
+        self.reid_fit_id: Optional[int] = None
 
         # Inference resolution
         self.inference_size = inference_size
@@ -1674,13 +1755,19 @@ class YOLOTracker:
         self.state = TrackerState.LOST
         return False
     
-    def _update_appearance(self, frame: np.ndarray, result: TrackingResult):
+    def _update_appearance(
+        self,
+        frame: np.ndarray,
+        result: TrackingResult,
+        similarity: Optional[float] = None
+    ):
         """
         Update the target appearance model.
         
         Args:
             frame: Current frame
             result: Current tracking result
+            similarity: Optional similarity score for this observation (used to refresh anchors)
         """
         if self.appearance_extractor is None:
             return
@@ -1694,6 +1781,12 @@ class YOLOTracker:
             return
         
         current_time = time.time()
+        refresh_allowed = False
+        if similarity is not None:
+            refresh_allowed = (
+                similarity > 0.82 and
+                (self.target_appearance is None or current_time - self.target_appearance.last_refresh_time > self.feature_refresh_interval)
+            )
         
         # Initialize or update appearance
         if self.target_appearance is None:
@@ -1719,13 +1812,46 @@ class YOLOTracker:
                     self.target_appearance.feature_history.clear()
             
             self.target_appearance.feature_history.append(new_feature)
+            
+            # Initialize or refresh anchors to keep prototypes recent and discriminative
+            if self.target_appearance.anchor_feature is None:
+                self.target_appearance.anchor_feature = new_feature
+                self.target_appearance.best_similarity = similarity if similarity is not None else 0.0
+                self.target_appearance.last_refresh_time = current_time
+            elif refresh_allowed and similarity is not None and similarity >= self.target_appearance.best_similarity:
+                self.target_appearance.anchor_feature = new_feature
+                self.target_appearance.best_similarity = similarity
+                self.target_appearance.last_refresh_time = current_time
         
         if 'color_hist' in features:
             self.target_appearance.color_hist_history.append(features['color_hist'])
+            if self.target_appearance.anchor_color_hist is None:
+                self.target_appearance.anchor_color_hist = features['color_hist']
+            elif refresh_allowed and similarity is not None and similarity >= self.target_appearance.best_similarity:
+                self.target_appearance.anchor_color_hist = features['color_hist']
         
         # Update body color for persons
         if 'body_color' in features:
             self.target_appearance.body_color_history.append(features['body_color'])
+            if self.target_appearance.anchor_body_color is None:
+                self.target_appearance.anchor_body_color = features['body_color']
+            elif refresh_allowed and similarity is not None and similarity >= self.target_appearance.best_similarity:
+                self.target_appearance.anchor_body_color = features['body_color']
+        
+        # Upper/lower color anchors
+        if 'upper_color' in features:
+            self.target_appearance.upper_color_history.append(features['upper_color'])
+            if self.target_appearance.anchor_upper_color is None:
+                self.target_appearance.anchor_upper_color = features['upper_color']
+            elif refresh_allowed and similarity is not None and similarity >= self.target_appearance.best_similarity:
+                self.target_appearance.anchor_upper_color = features['upper_color']
+        
+        if 'lower_color' in features:
+            self.target_appearance.lower_color_history.append(features['lower_color'])
+            if self.target_appearance.anchor_lower_color is None:
+                self.target_appearance.anchor_lower_color = features['lower_color']
+            elif refresh_allowed and similarity is not None and similarity >= self.target_appearance.best_similarity:
+                self.target_appearance.anchor_lower_color = features['lower_color']
         
         if 'size' in features:
             self.target_appearance.size_history.append(tuple(features['size']))
@@ -2800,7 +2926,7 @@ class YOLOTracker:
                         # Threshold for detecting ID switch (person changed completely)
                         ID_SWITCH_DETECTION_THRESHOLD = 0.50
                         # Threshold for updating appearance (only update when very confident)
-                        APPEARANCE_UPDATE_THRESHOLD = 0.65
+                        APPEARANCE_UPDATE_THRESHOLD = 0.80
                         
                         if similarity < ID_SWITCH_DETECTION_THRESHOLD:
                             # ID switch detected! This track ID now belongs to a different person
@@ -2879,7 +3005,7 @@ class YOLOTracker:
                         # ONLY update appearance when similarity is high enough
                         # This prevents contamination during occlusion
                         if similarity >= APPEARANCE_UPDATE_THRESHOLD:
-                            self._update_appearance(frame, result)
+                            self._update_appearance(frame, result, similarity=similarity)
                             logger.debug(f"Track ID {result.track_id} appearance updated (similarity={similarity:.3f})")
                         else:
                             logger.debug(f"Track ID {result.track_id} verified but appearance NOT updated "
@@ -3011,8 +3137,8 @@ class YOLOTracker:
                 if self.pending_reid_match is not None:
                     pending_id, pending_start_time = self.pending_reid_match
                     
-                    if pending_id == new_yolo_id:
-                        # Same ID confirmed again
+                    if pending_id == new_yolo_id and match_similarity >= self.reid_threshold:
+                        # Same ID confirmed again with sufficient similarity
                         self.consecutive_reid_frames += 1
                         
                         # Check if we've confirmed for enough frames
@@ -3029,6 +3155,8 @@ class YOLOTracker:
                                 self.last_reid_switch_time = current_time
                                 self.pending_reid_match = None
                                 self.consecutive_reid_frames = 0
+                                self.reid_fit_streak = 0
+                                self.reid_fit_id = None
                                 
                                 # Clear other persons registry to prevent contamination buildup
                                 # Other person appearances may have been contaminated with target features
@@ -3045,16 +3173,28 @@ class YOLOTracker:
                         else:
                             logger.debug(f"ReID pending confirmation: {self.consecutive_reid_frames}/{required_confirmation_frames} frames")
                     else:
-                        # Different ID - but don't reset if similarity is decent
-                        # This handles YOLO ID bouncing
-                        logger.debug(f"ReID candidate changed from {pending_id} to {new_yolo_id}")
-                        self.pending_reid_match = (new_yolo_id, current_time)
-                        self.consecutive_reid_frames = 1
+                        # Different ID or similarity too low - reset confirmation
+                        logger.debug(f"ReID candidate changed or similarity dropped (ID {pending_id} -> {new_yolo_id}, sim={match_similarity:.3f})")
+                        self.pending_reid_match = None
+                        self.consecutive_reid_frames = 0
                 else:
-                    # Start new pending match
-                    self.pending_reid_match = (new_yolo_id, current_time)
-                    self.consecutive_reid_frames = 1
-                    logger.debug(f"ReID pending: ID {new_yolo_id}, need {required_confirmation_frames} frames to confirm")
+                    # Require pre-confirmation streak of consistent similarity before starting confirmation
+                    if match_similarity >= self.reid_threshold:
+                        if self.reid_fit_id == new_yolo_id:
+                            self.reid_fit_streak += 1
+                        else:
+                            self.reid_fit_id = new_yolo_id
+                            self.reid_fit_streak = 1
+                        
+                        if self.reid_fit_streak >= self.reid_preconfirm_frames:
+                            self.pending_reid_match = (new_yolo_id, current_time)
+                            self.consecutive_reid_frames = 1
+                            logger.debug(f"ReID pending: ID {new_yolo_id}, need {required_confirmation_frames} frames to confirm")
+                        else:
+                            logger.debug(f"ReID pre-confirmation streak {self.reid_fit_streak}/{self.reid_preconfirm_frames} for ID {new_yolo_id}")
+                    else:
+                        self.reid_fit_streak = 0
+                        self.reid_fit_id = None
                 
                 # While confirming, we have a valid match - don't increment frames_lost
                 # Return the match for visualization
@@ -3064,6 +3204,8 @@ class YOLOTracker:
                 # But DON'T reset pending_reid_match immediately - the target might just be
                 # temporarily undetected for one frame
                 self.frames_lost += 1
+                self.reid_fit_streak = 0
+                self.reid_fit_id = None
                 
                 # Disable fast tracking mode when we're lost (need full ReID)
                 if self.fast_tracking_mode:
@@ -3153,6 +3295,8 @@ class YOLOTracker:
         self.last_reid_switch_time = 0.0
         self.consecutive_reid_frames = 0
         self.pending_reid_match = None
+        self.reid_fit_streak = 0
+        self.reid_fit_id = None
         # Clear the person registry
         self.person_registry.clear()
         # Reset camera motion detection

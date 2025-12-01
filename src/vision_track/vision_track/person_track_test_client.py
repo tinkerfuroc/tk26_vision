@@ -205,108 +205,59 @@ class PersonTrackTestClient(Node):
             history = list(self.position_history)
         
         if rgb is None:
-            # Show placeholder
-            placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
-            cv2.putText(
-                placeholder, 
-                "Waiting for tracking data...",
-                (400, 360),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (255, 255, 255),
-                2
-            )
-            cv2.imshow(self.window_name, placeholder)
+            self._show_placeholder()
             return
         
-        # Create visualization canvas
-        vis = rgb.copy()
+        vis = self._apply_segment_mask(rgb, segment)
         h, w = vis.shape[:2]
-        
-        # Overlay segmentation mask if available
+
+        self._draw_info_panel(vis, target_lost, track_id, position)
+        self._draw_position_view(vis, position, history, w, h)
+        self._draw_crosshair(vis, w, h)
+
+        cv2.imshow(self.window_name, vis)
+
+    def _show_placeholder(self):
+        placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.putText(
+            placeholder,
+            "Waiting for tracking data...",
+            (400, 360),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (255, 255, 255),
+            2
+        )
+        cv2.imshow(self.window_name, placeholder)
+
+    def _apply_segment_mask(self, rgb, segment):
+        vis = rgb.copy()
         if segment is not None and segment.shape[:2] == rgb.shape[:2]:
-            # Create colored overlay
             mask_overlay = np.zeros_like(vis)
-            mask_overlay[:, :, 1] = segment  # Green channel for mask
+            mask_overlay[:, :, 1] = segment
             vis = cv2.addWeighted(vis, 0.7, mask_overlay, 0.3, 0)
-        
-        # Draw status text
+        return vis
+
+    def _draw_info_panel(self, vis, target_lost, track_id, position):
         status_color = (0, 0, 255) if target_lost else (0, 255, 0)
         status_text = "TARGET LOST" if target_lost else "TRACKING"
-        
-        # Draw info panel background
         cv2.rectangle(vis, (10, 10), (400, 180), (0, 0, 0), -1)
         cv2.rectangle(vis, (10, 10), (400, 180), (255, 255, 255), 2)
-        
-        # Draw status
-        cv2.putText(
-            vis,
-            f"Status: {status_text}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            status_color,
-            2
-        )
-        
-        # Draw track ID
-        cv2.putText(
-            vis,
-            f"Track ID: {track_id}",
-            (20, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-        
-        # Draw FPS
-        cv2.putText(
-            vis,
-            f"FPS: {self.fps:.1f}",
-            (20, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-        
-        # Draw position if available
+        cv2.putText(vis, f"Status: {status_text}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        cv2.putText(vis, f"Track ID: {track_id}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, f"FPS: {self.fps:.1f}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
         if position is not None:
             point = position.point
             pos_text = f"Position: ({point.x:.2f}, {point.y:.2f}, {point.z:.2f})"
-            cv2.putText(
-                vis,
-                pos_text,
-                (20, 130),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 0),
-                2
-            )
-            
-            # Draw distance
+            cv2.putText(vis, pos_text, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             distance = np.sqrt(point.x**2 + point.y**2 + point.z**2)
-            cv2.putText(
-                vis,
-                f"Distance: {distance:.2f}m",
-                (20, 160),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 0),
-                2
-            )
-        
-        # Draw 3D position visualization (bird's eye view)
-        self._draw_position_view(vis, position, history, w, h)
-        
-        # Draw crosshair at image center
+            cv2.putText(vis, f"Distance: {distance:.2f}m", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+    def _draw_crosshair(self, vis, w, h):
         center_x, center_y = w // 2, h // 2
         cv2.line(vis, (center_x - 20, center_y), (center_x + 20, center_y), (0, 255, 255), 1)
         cv2.line(vis, (center_x, center_y - 20), (center_x, center_y + 20), (0, 255, 255), 1)
-        
-        # Show visualization
-        cv2.imshow(self.window_name, vis)
 
     def _draw_position_view(self, vis, position, history, img_w, img_h):
         """Draw a bird's eye view of the target position."""

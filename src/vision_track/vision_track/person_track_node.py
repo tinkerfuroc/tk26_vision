@@ -596,246 +596,237 @@ class PersonTrackNode(Node):
         self.get_logger().info('Executing track_person action')
         self.tracking_active = True
         self.goal_handle = goal_handle
-        
-        # Get goal parameters
-        return_rgb_img = goal_handle.request.return_rgb_img
-        return_depth_img = goal_handle.request.return_depth_img
-        return_segment = goal_handle.request.return_segment
-        debug_mode = goal_handle.request.debug  # Debug mode draws all detected persons
-        target_frame = goal_handle.request.target_frame.strip() if goal_handle.request.target_frame else ''
-        
+
+        params = {
+            "return_rgb_img": goal_handle.request.return_rgb_img,
+            "return_depth_img": goal_handle.request.return_depth_img,
+            "return_segment": goal_handle.request.return_segment,
+            "debug_mode": goal_handle.request.debug,
+            "target_frame": goal_handle.request.target_frame.strip() if goal_handle.request.target_frame else '',
+        }
+
         result = TrackPerson.Result()
         feedback = TrackPerson.Feedback()
-        
-        # Track timing for lost detection and initialization
-        last_seen_time = time.time()
-        init_start_time = time.time()  # Track when initialization started
-        initialized = False
-        
-        # Tracking rate control
-        rate_period = 1.0 / self.tracking_rate
-        
+
         try:
-            while rclpy.ok():
-                loop_start = time.time()
-                
-                # Check for cancellation
-                if goal_handle.is_cancel_requested:
-                    self.get_logger().info('Goal canceled')
-                    goal_handle.canceled()
-                    result.status = 2  # Canceled
-                    result.message = 'Tracking canceled by request'
-                    self._cleanup_tracking()
-                    return result
-                
-                # Get latest camera data
-                with self.lock_msg:
-                    if self.recent_sync_msg is None:
-                        time.sleep(0.01)
-                        continue
-                    # Skip if we already processed this frame
-                    current_seq = self.frame_seq
-                    if current_seq == self.last_processed_seq:
-                        time.sleep(0.005)  # Small sleep to wait for new frame
-                        continue
-                    rgb_msg, depth_msg = self.recent_sync_msg
-                    self.last_processed_seq = current_seq
-                
-                with self.lock_info:
-                    intrinsic = self.camera_intrinsic
-                
-                if intrinsic is None:
-                    time.sleep(0.01)
-                    continue
-                
-                # Process RGB image (fast)
-                try:
-                    rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-                except Exception as e:
-                    self.get_logger().warn(f'Failed to convert RGB image: {e}')
-                    continue
-                
-                # Convert BGR to RGB for tracker
-                rgb_frame = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
-                
-                with self.lock_tracker:
-                    # Initialize tracking if needed
-                    if not initialized:
-                        success = self.tracker.initialize_tracking(
-                            rgb_frame,
-                            target_class='person'
-                        )
-                        
-                        if success:
-                            initialized = True
-                            last_seen_time = time.time()
-                            self.get_logger().info(
-                                f'Tracking initialized on person (ID: {self.tracker.original_track_id})'
-                            )
-                        else:
-                            # Check timeout for initialization
-                            if time.time() - init_start_time > self.lost_timeout:
-                                self.get_logger().error('Failed to find person for initialization')
-                                goal_handle.abort()
-                                result.status = 1  # Failed
-                                result.message = 'No person found for initialization'
-                                self._cleanup_tracking()
-                                return result
-                            # Small sleep to avoid busy-waiting
-                            time.sleep(0.1)
-                            continue
-                    
-                    # Update tracking
-                    track_result = self.tracker.update(rgb_frame)
-                
-                # Process tracking result
-                if track_result is not None:
-                    last_seen_time = time.time()
-                    
-                    # Process pointcloud ONLY when we have a valid track result (deferred for performance)
-                    try:
-                        points, valid_mask = self._pointcloud_to_array(depth_msg, intrinsic)
-                    except Exception as e:
-                        self.get_logger().warn(f'Failed to process pointcloud: {e}')
-                        points, valid_mask = None, None
-                    
-                    # Calculate 3D position (only if pointcloud was processed)
-                    position = None
-                    if points is not None:
-                        position = self._calculate_centroid(
-                            points, 
-                            track_result.mask,
-                            valid_mask,
-                            track_result.bbox
-                        )
-                    
-                    # Prepare feedback
-                    feedback.target_lost = False
-                    feedback.target_track_id = track_result.track_id
-                    
-                    feedback.target_position = PointStamped()
-                    feedback.is_transformation_successful = False
-                    
-                    if position is not None:
-                        # Default to camera frame
-                        feedback.target_position.header = rgb_msg.header
-                        feedback.target_position.point = position
-                        
-                        # Transform if requested and possible
-                        if target_frame and target_frame.lower() != 'none' and target_frame != rgb_msg.header.frame_id:
-                            try:
-                                transform = self.tf_buffer.lookup_transform(
-                                    target_frame,
-                                    rgb_msg.header.frame_id,
-                                    rclpy.time.Time(),
-                                    timeout=Duration(seconds=0.2)
-                                )
-                                transformed = do_transform_point(feedback.target_position, transform)
-                                feedback.target_position = transformed
-                                feedback.is_transformation_successful = True
-                            except Exception as ex:
-                                self.get_logger().warn(
-                                    f"TF transform to '{target_frame}' failed ({ex}); keeping camera frame"
-                                )
-                        else:
-                            feedback.is_transformation_successful = True
-                    else:
-                        feedback.target_position.header = rgb_msg.header
-                    
-                    # Add images if requested
-                    if return_rgb_img or debug_mode:
-                        if debug_mode:
-                            # Draw debug visualization
-                            debug_img = self._draw_debug_info(
-                                rgb_img, 
-                                self.tracker.last_results,
-                                track_result,
-                                self.tracker.target_track_id
-                            )
-                            feedback.rgb_img = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
-                            feedback.rgb_img.header = rgb_msg.header
-                        else:
-                            feedback.rgb_img = rgb_msg
-                    
-                    if return_depth_img and points is not None:
-                        # Convert points to depth image for visualization
-                        depth_vis = (points[:, :, 2] * 1000).astype(np.uint16)  # meters to mm
-                        feedback.depth_img = self.bridge.cv2_to_imgmsg(depth_vis, encoding='16UC1')
-                        feedback.depth_img.header = rgb_msg.header
-                    
-                    if return_segment and track_result.mask is not None:
-                        # Convert mask to image
-                        mask_img = (track_result.mask * 255).astype(np.uint8)
-                        feedback.segment_img = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
-                        feedback.segment_img.header = rgb_msg.header
-                    
-                    # Publish feedback
-                    goal_handle.publish_feedback(feedback)
-                    
-                else:
-                    # Target not found in this frame
-                    time_since_seen = time.time() - last_seen_time
-                    
-                    feedback.target_lost = True
-                    feedback.target_track_id = self.tracker.original_track_id if self.tracker.original_track_id else -1
-                    # Set empty position when lost
-                    feedback.target_position = PointStamped()
-                    feedback.target_position.header = rgb_msg.header
-                    feedback.is_transformation_successful = False
-                    
-                    # Still send RGB image when target is lost (for visualization)
-                    if return_rgb_img or debug_mode:
-                        if debug_mode:
-                            # Draw debug visualization showing all detections
-                            debug_img = self._draw_debug_info(
-                                rgb_img, 
-                                self.tracker.last_results,
-                                None,  # No track result
-                                self.tracker.target_track_id
-                            )
-                            feedback.rgb_img = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
-                            feedback.rgb_img.header = rgb_msg.header
-                        else:
-                            feedback.rgb_img = rgb_msg
-                    
-                    # Publish feedback indicating target is temporarily lost
-                    goal_handle.publish_feedback(feedback)
-                    
-                    # Check if target is lost for too long
-                    if time_since_seen > self.lost_timeout:
-                        self.get_logger().warn(
-                            f'Target lost for {time_since_seen:.1f}s, aborting'
-                        )
-                        goal_handle.abort()
-                        result.status = 1  # Failed
-                        result.message = f'Target lost for {time_since_seen:.1f} seconds'
-                        self._cleanup_tracking()
-                        return result
-                
-                # Rate control
-                elapsed = time.time() - loop_start
-                if elapsed < rate_period:
-                    time.sleep(rate_period - elapsed)
-        
+            return self._run_tracking_loop(goal_handle, feedback, result, params)
         except Exception as e:
             self.get_logger().error(f'Exception during tracking: {e}')
             goal_handle.abort()
-            result.status = 1  # Failed
+            result.status = 1
             result.message = f'Exception: {str(e)}'
-            self._cleanup_tracking()
             return result
-        
         finally:
             self._cleanup_tracking()
-        
-        # Only report success if the goal is still active and not canceled/aborted
-        if goal_handle.is_cancel_requested or not goal_handle.is_active:
-            return result
-        
-        result.status = 0  # Success (tracking ended cleanly)
-        result.message = 'Tracking completed'
-        goal_handle.succeed()
+
+    def _run_tracking_loop(self, goal_handle, feedback, result, params):
+        last_seen_time = time.time()
+        init_start_time = time.time()
+        initialized = False
+        rate_period = 1.0 / self.tracking_rate
+
+        while rclpy.ok():
+            loop_start = time.time()
+
+            if self._handle_cancel(goal_handle, result):
+                return result
+
+            data = self._get_latest_data()
+            if data is None:
+                time.sleep(0.01)
+                continue
+            if data is False:
+                time.sleep(0.005)
+                continue
+
+            rgb_img, rgb_msg, depth_msg, intrinsic = data
+            rgb_frame = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+
+            with self.lock_tracker:
+                if not initialized:
+                    initialized = self._try_initialize(rgb_frame, init_start_time, goal_handle, result)
+                    if not initialized:
+                        time.sleep(0.1)
+                        continue
+                    last_seen_time = time.time()
+                track_result = self.tracker.update(rgb_frame)
+
+            if track_result is not None:
+                last_seen_time = time.time()
+                self._handle_tracked_frame(
+                    track_result, rgb_img, rgb_msg, depth_msg, intrinsic, feedback, goal_handle, params
+                )
+            else:
+                if self._handle_lost_frame(last_seen_time, rgb_img, rgb_msg, feedback, goal_handle, params, result):
+                    return result
+
+            elapsed = time.time() - loop_start
+            if elapsed < rate_period:
+                time.sleep(rate_period - elapsed)
+
+        if goal_handle.is_active and not goal_handle.is_cancel_requested:
+            result.status = 0
+            result.message = 'Tracking completed'
+            goal_handle.succeed()
         return result
+
+    def _handle_cancel(self, goal_handle, result) -> bool:
+        if not goal_handle.is_cancel_requested:
+            return False
+        self.get_logger().info('Goal canceled')
+        goal_handle.canceled()
+        result.status = 2
+        result.message = 'Tracking canceled by request'
+        return True
+
+    def _get_latest_data(self):
+        with self.lock_msg:
+            if self.recent_sync_msg is None:
+                return None
+            current_seq = self.frame_seq
+            if current_seq == self.last_processed_seq:
+                return False
+            rgb_msg, depth_msg = self.recent_sync_msg
+            self.last_processed_seq = current_seq
+
+        with self.lock_info:
+            intrinsic = self.camera_intrinsic
+        if intrinsic is None:
+            return None
+
+        try:
+            rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        except Exception as e:
+            self.get_logger().warn(f'Failed to convert RGB image: {e}')
+            return None
+
+        return rgb_img, rgb_msg, depth_msg, intrinsic
+
+    def _try_initialize(self, rgb_frame, init_start_time, goal_handle, result) -> bool:
+        success = self.tracker.initialize_tracking(rgb_frame, target_class='person')
+        if success:
+            self.get_logger().info(f'Tracking initialized on person (ID: {self.tracker.original_track_id})')
+            return True
+
+        if time.time() - init_start_time > self.lost_timeout:
+            self.get_logger().error('Failed to find person for initialization')
+            goal_handle.abort()
+            result.status = 1
+            result.message = 'No person found for initialization'
+        return False
+
+    def _handle_tracked_frame(
+        self,
+        track_result,
+        rgb_img,
+        rgb_msg,
+        depth_msg,
+        intrinsic,
+        feedback,
+        goal_handle,
+        params,
+    ):
+        try:
+            points, valid_mask = self._pointcloud_to_array(depth_msg, intrinsic)
+        except Exception as e:
+            self.get_logger().warn(f'Failed to process pointcloud: {e}')
+            points, valid_mask = None, None
+
+        position = None
+        if points is not None:
+            position = self._calculate_centroid(points, track_result.mask, valid_mask, track_result.bbox)
+
+        feedback.target_lost = False
+        feedback.target_track_id = track_result.track_id
+        feedback.target_position = PointStamped()
+        feedback.is_transformation_successful = False
+
+        if position is not None:
+            feedback.target_position.header = rgb_msg.header
+            feedback.target_position.point = position
+            target_frame = params["target_frame"]
+            if target_frame and target_frame.lower() != 'none' and target_frame != rgb_msg.header.frame_id:
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        target_frame,
+                        rgb_msg.header.frame_id,
+                        rclpy.time.Time(),
+                        timeout=Duration(seconds=0.2)
+                    )
+                    transformed = do_transform_point(feedback.target_position, transform)
+                    feedback.target_position = transformed
+                    feedback.is_transformation_successful = True
+                except Exception as ex:
+                    self.get_logger().warn(f"TF transform to '{target_frame}' failed ({ex}); keeping camera frame")
+            else:
+                feedback.is_transformation_successful = True
+        else:
+            feedback.target_position.header = rgb_msg.header
+
+        if params["return_rgb_img"] or params["debug_mode"]:
+            if params["debug_mode"]:
+                debug_img = self._draw_debug_info(
+                    rgb_img,
+                    self.tracker.last_results,
+                    track_result,
+                    self.tracker.target_track_id
+                )
+                feedback.rgb_img = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
+                feedback.rgb_img.header = rgb_msg.header
+            else:
+                feedback.rgb_img = rgb_msg
+
+        if params["return_depth_img"] and points is not None:
+            depth_vis = (points[:, :, 2] * 1000).astype(np.uint16)
+            feedback.depth_img = self.bridge.cv2_to_imgmsg(depth_vis, encoding='16UC1')
+            feedback.depth_img.header = rgb_msg.header
+
+        if params["return_segment"] and track_result.mask is not None:
+            mask_img = (track_result.mask * 255).astype(np.uint8)
+            feedback.segment_img = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
+            feedback.segment_img.header = rgb_msg.header
+
+        goal_handle.publish_feedback(feedback)
+
+    def _handle_lost_frame(
+        self,
+        last_seen_time: float,
+        rgb_img,
+        rgb_msg,
+        feedback,
+        goal_handle,
+        params,
+        result,
+    ) -> bool:
+        time_since_seen = time.time() - last_seen_time
+        feedback.target_lost = True
+        feedback.target_track_id = self.tracker.original_track_id if self.tracker.original_track_id else -1
+        feedback.target_position = PointStamped()
+        feedback.target_position.header = rgb_msg.header
+        feedback.is_transformation_successful = False
+
+        if params["return_rgb_img"] or params["debug_mode"]:
+            if params["debug_mode"]:
+                debug_img = self._draw_debug_info(
+                    rgb_img,
+                    self.tracker.last_results,
+                    None,
+                    self.tracker.target_track_id
+                )
+                feedback.rgb_img = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
+                feedback.rgb_img.header = rgb_msg.header
+            else:
+                feedback.rgb_img = rgb_msg
+
+        goal_handle.publish_feedback(feedback)
+
+        if time_since_seen > self.lost_timeout:
+            self.get_logger().warn(f'Target lost for {time_since_seen:.1f}s, aborting')
+            goal_handle.abort()
+            result.status = 1
+            result.message = f'Target lost for {time_since_seen:.1f} seconds'
+            return True
+        return False
 
     def _cleanup_tracking(self):
         """Clean up tracking state."""

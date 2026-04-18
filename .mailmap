@@ -1,0 +1,11 @@
+# Canonicalize author/committer attribution for git log, git blame, and GitHub.
+#
+# Format: Proper Name <proper@email>  Commit Name <commit@email>
+# The right-hand side is matched against the commit metadata; the left-hand
+# side is what gets displayed. See `man 5 gitmailmap` for full syntax.
+#
+# Why: grange <2634070476@qq.com> commits in this repo were actually authored
+# by Ccindy0171 on a shared machine whose default git config pointed at that
+# identity. Raw commit metadata is left intact (no history rewrite); this file
+# just tells mailmap-aware tooling to display the correct author.
+Ccindy0171 <cindy.w0135@gmail.com> <2634070476@qq.com>

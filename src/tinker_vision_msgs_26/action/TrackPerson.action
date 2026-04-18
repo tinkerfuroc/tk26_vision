@@ -1,5 +1,6 @@
 # uses orbbec camera to track person
 string target_frame # set to none to use camera frame
+string target_point_topic # empty → use server param default (/target_points)
 bool return_rgb_img
 bool return_depth_img
 bool return_segment

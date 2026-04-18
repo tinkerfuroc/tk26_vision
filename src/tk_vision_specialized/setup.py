@@ -21,6 +21,9 @@ setup(
     entry_points={
         'console_scripts': [
             'spot_on_shelf_server = tk_vision_specialized.spot_on_shelf_server:main',
+            'waving_person_server = tk_vision_specialized.waving_person_server:main',
+            'waving_client = tk_vision_specialized.waving_client:main',
+            'check_waving_inference = tk_vision_specialized.check_waving_inference:main',
         ],
     },
 )

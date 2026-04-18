@@ -67,6 +67,7 @@ class PersonTrackNode(Node):
         self.tracker: YOLOTracker = None
         self.tracking_active = False
         self.goal_handle = None
+        self.target_point_pub = None
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
@@ -119,7 +120,8 @@ class PersonTrackNode(Node):
         # Tracking parameters
         self.declare_parameter('tracking_rate', 15.0)  # Hz
         self.declare_parameter('lost_timeout', 300.0)  # seconds before declaring failure
-        
+        self.declare_parameter('target_point_topic', '/target_points')  # default PointStamped pub topic
+
         self.get_logger().info('Parameters declared')
 
     def _load_parameters(self):
@@ -139,6 +141,7 @@ class PersonTrackNode(Node):
         
         self.tracking_rate = self.get_parameter('tracking_rate').value
         self.lost_timeout = self.get_parameter('lost_timeout').value
+        self.default_target_point_topic = self.get_parameter('target_point_topic').value
         
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Enable ReID: {self.enable_reid}')
@@ -608,6 +611,10 @@ class PersonTrackNode(Node):
         result = TrackPerson.Result()
         feedback = TrackPerson.Feedback()
 
+        topic = (goal_handle.request.target_point_topic or '').strip() or self.default_target_point_topic
+        self.target_point_pub = self.create_publisher(PointStamped, topic, 10)
+        self.get_logger().info(f'Publishing tracked PointStamped to "{topic}"')
+
         try:
             return self._run_tracking_loop(goal_handle, feedback, result, params)
         except Exception as e:
@@ -760,6 +767,13 @@ class PersonTrackNode(Node):
                     self.get_logger().warn(f"TF transform to '{target_frame}' failed ({ex}); keeping camera frame")
             else:
                 feedback.is_transformation_successful = True
+
+            if (
+                not feedback.target_lost
+                and feedback.is_transformation_successful
+                and self.target_point_pub is not None
+            ):
+                self.target_point_pub.publish(feedback.target_position)
         else:
             feedback.target_position.header = rgb_msg.header
 
@@ -832,11 +846,15 @@ class PersonTrackNode(Node):
         """Clean up tracking state."""
         self.tracking_active = False
         self.goal_handle = None
-        
+
+        if self.target_point_pub is not None:
+            self.destroy_publisher(self.target_point_pub)
+            self.target_point_pub = None
+
         with self.lock_tracker:
             if self.tracker is not None:
                 self.tracker.reset()
-        
+
         self.get_logger().info('Tracking cleaned up')
 
 

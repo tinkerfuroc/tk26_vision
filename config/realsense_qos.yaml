@@ -1,0 +1,27 @@
+# realsense-ros (pinned v4.57.7) defaults every image stream's QoS to
+# IMAGE_QOS = "SYSTEM_DEFAULT" (see thirdparty/realsense-ros/realsense2_camera/
+# include/constants.h:83). FastDDS resolves "SYSTEM_DEFAULT" to
+# RELIABLE + TRANSIENT_LOCAL + KEEP_LAST(1) — a latched-topic profile that
+# chokes high-rate, large-payload streams. Override each *_qos parameter to
+# "DEFAULT" (= RELIABLE + VOLATILE + KEEP_LAST(10)).
+#
+# Usage (via the rs_launch.py `config_file` arg):
+#
+#   ros2 launch realsense2_camera rs_launch.py \
+#       camera_name:=xarm_camera \
+#       align_depth.enable:=true \
+#       config_file:=$(pwd)/src/tk26_vision/config/realsense_qos.yaml
+#
+# IMPORTANT: rs_launch.py loads this yaml with plain yaml.SafeLoader and
+# passes the resulting dict directly to the Node's `parameters=[...]` — the
+# usual ROS2 `/**: ros__parameters: ...` wrapper is NOT parsed, the keys must
+# be at the top level exactly as written below.
+
+color_qos: DEFAULT
+depth_qos: DEFAULT
+infra1_qos: DEFAULT
+infra2_qos: DEFAULT
+color_info_qos: DEFAULT
+depth_info_qos: DEFAULT
+infra1_info_qos: DEFAULT
+infra2_info_qos: DEFAULT

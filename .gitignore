@@ -4,6 +4,11 @@ log/
 .vscode/
 **/*.pt
 
+scripts/tests/logs/
+
+
+thirdparty/
+!thirdparty/README.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -145,6 +150,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv-vision-main
 env/
 venv/
 ENV/

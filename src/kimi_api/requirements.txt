@@ -1,0 +1,8 @@
+# Runtime Python deps for kimi_api nodes.
+# Install into the Python environment that `ros2 run` uses:
+#   python3 -m pip install -r src/tk26_vision/src/kimi_api/requirements.txt
+openai>=1.0
+python-dotenv>=1.0
+opencv-python>=4.5
+numpy>=1.21
+scipy>=1.7

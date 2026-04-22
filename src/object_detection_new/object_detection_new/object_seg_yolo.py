@@ -39,8 +39,8 @@ class YOLOSegmentationNode(Node):
     advanced features.
     """
 
-    def __init__(self):
-        super().__init__('yolo_segmentation_node')
+    def __init__(self, node_name='yolo_segmentation_node', parameter_overrides=None):
+        super().__init__(node_name, parameter_overrides=parameter_overrides or [])
 
         # Declare parameters
         self._declare_parameters()
@@ -85,6 +85,7 @@ class YOLOSegmentationNode(Node):
         self.get_logger().info('Declaring parameters...')
         self.declare_parameter('camera_types', ['realsense', 'orbbec'])
         self.declare_parameter('model_path', 'yolo11m-seg.pt')
+        self.declare_parameter('service_name', 'object_detection_yolo')
         # Realsense topics
         self.declare_parameter(
             'realsense_image_topic', '/camera/xarm_camera/color/image_raw')
@@ -298,7 +299,7 @@ class YOLOSegmentationNode(Node):
 
     def _init_service(self):
         """Initialize detection service."""
-        service_name = 'object_detection_yolo'
+        service_name = self.get_parameter('service_name').value
         self.detection_srv = self.create_service(
             ObjectDetection,
             service_name,

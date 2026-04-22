@@ -1,0 +1,28 @@
+int32 n_layers
+string prompt
+sensor_msgs/Image img_table
+sensor_msgs/Image segment_object
+# the left and right point of the front of the shelf, height does not matter
+geometry_msgs/PointStamped pt_shelf_left
+geometry_msgs/PointStamped pt_shelf_right
+string flags
+string target_frame
+
+---
+
+std_msgs/Header header
+geometry_msgs/PointStamped place_point
+int32 status
+int32 shelf_layer
+string error_msg
+string place_reason
+
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image
+sensor_msgs/Image segment
+sensor_msgs/PointCloud2 env_points
+
+---
+
+int32 status
+string message

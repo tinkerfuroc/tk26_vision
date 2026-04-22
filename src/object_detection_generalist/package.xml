@@ -22,7 +22,6 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>ament_index_python</depend>
-  <depend>tinker_vision_msgs</depend>
   <depend>tinker_vision_msgs_26</depend>
   <exec_depend>object_detection_new</exec_depend>
   <exec_depend>kimi_api</exec_depend>

@@ -20,11 +20,11 @@ t4_servo_motion() {
     start_node ctrl_t4.1 pan_tilt ctrl --ros-args -p "device:=$SERVO_DEVICE"
     sleep 3
     printf '  -> commanding pan=0.3, tilt=0.0. Watch the servo move.\n'
-    ros2 topic pub --once /pan_tilt_ctrl_modify tinker_vision_msgs/msg/PanTiltCtrl '{pan: 0.3, tilt: 0.0}' >/dev/null 2>&1 || true
+    ros2 topic pub --once /pan_tilt_ctrl_modify tinker_vision_msgs_26/msg/PanTiltCtrl '{pan: 0.3, tilt: 0.0}' >/dev/null 2>&1 || true
     sleep 2
     timeout 3 ros2 run tf2_ros tf2_echo base_link camera_link >"$LOG_DIR/T4.1_after.tf" 2>&1 || true
     printf '  -> returning to home (pan=0.0, tilt=0.0)\n'
-    ros2 topic pub --once /pan_tilt_ctrl_modify tinker_vision_msgs/msg/PanTiltCtrl '{pan: 0.0, tilt: 0.0}' >/dev/null 2>&1 || true
+    ros2 topic pub --once /pan_tilt_ctrl_modify tinker_vision_msgs_26/msg/PanTiltCtrl '{pan: 0.0, tilt: 0.0}' >/dev/null 2>&1 || true
     sleep 2
     if grep -qE 'Translation' "$LOG_DIR/T4.1_after.tf"; then
         pass "T4.1 (visual inspection required: did the servo physically move?)"
@@ -42,7 +42,7 @@ t4_servo_tracking() {
     start_node follow_head_t4.2 pan_tilt follow_head
     wait_for_action /follow_head_action 15 || { fail "T4.2" "follow_head_action missing"; stop_all_nodes; return; }
     printf '  -> wave a hand in front of the orbbec camera for ~15 s now.\n'
-    ros2 action send_goal /follow_head_action tinker_vision_msgs/action/FollowHeadAction '{start_following: true}' --feedback >"$LOG_DIR/T4.2.actout" 2>&1 &
+    ros2 action send_goal /follow_head_action tinker_vision_msgs_26/action/FollowHeadAction '{start_following: true}' --feedback >"$LOG_DIR/T4.2.actout" 2>&1 &
     ap=$!
     sleep 15
     kill "$ap" 2>/dev/null || true; wait "$ap" 2>/dev/null || true

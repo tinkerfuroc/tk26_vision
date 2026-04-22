@@ -16,8 +16,8 @@ import time
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from std_msgs.msg import Header
 import geometry_msgs.msg
-from tinker_vision_msgs.msg import Object, Objects
-from tinker_vision_msgs.srv import ObjectDetection
+from tinker_vision_msgs_26.msg import Object, Objects
+from tinker_vision_msgs_26.srv import ObjectDetection
 
 # TF2 for coordinate transformations
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException

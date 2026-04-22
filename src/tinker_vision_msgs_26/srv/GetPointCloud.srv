@@ -1,0 +1,7 @@
+# camera in ['realsense', 'orbbec']
+string camera
+
+---
+int32 status
+string error_msg
+sensor_msgs/PointCloud2 points

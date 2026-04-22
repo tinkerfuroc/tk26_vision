@@ -18,7 +18,7 @@ from cv_bridge import CvBridge
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
-from tinker_vision_msgs.srv import DoorDetection
+from tinker_vision_msgs_26.srv import DoorDetection
 
 
 class DoorDetectionService(Node):

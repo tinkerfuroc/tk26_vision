@@ -16,7 +16,7 @@ if have_api_key; then
     start_node feature_matching_t3 kimi_api feature_matching
     if wait_for_service /feature_matching_service 15; then
         out="$LOG_DIR/T3.1.svcout"
-        timeout 45 ros2 service call /feature_matching_service tinker_vision_msgs/srv/FeatureMatching \
+        timeout 45 ros2 service call /feature_matching_service tinker_vision_msgs_26/srv/FeatureMatching \
             "{camera: 'orbbec', features: ['red bottle'], max_distance: 2.0, target_frame: 'base_link'}" 2>&1 | head -c 4000 >"$out" || true
         if grep -qE 'Traceback' "$out"; then
             fail "T3.1" "traceback in response"
@@ -60,7 +60,7 @@ if have_api_key; then
     start_node feature_matching_t3.4 kimi_api feature_matching
     if wait_for_service /feature_matching_service 15; then
         out="$LOG_DIR/T3.4.svcout"
-        timeout 90 ros2 service call /feature_matching_service tinker_vision_msgs/srv/FeatureMatching \
+        timeout 90 ros2 service call /feature_matching_service tinker_vision_msgs_26/srv/FeatureMatching \
             "{camera: 'realsense', features: ['person'], max_distance: 3.0, target_frame: 'base_link'}" 2>&1 \
             | head -c 4000 >"$out" || true
         if grep -qE 'Traceback' "$out"; then

@@ -1,0 +1,16 @@
+# Goal: Start human following with optional parameters
+bool start_following
+string master_name  # Optional name for the master
+float32 follow_distance  # Optional desired following distance (meters)
+---
+# Result: Final status when action completes
+int32 status
+string message
+geometry_msgs/PoseStamped final_master_pose
+---
+# Feedback: Continuous updates during following
+string current_state  # Current state: "FACE_RECORDING", "SKELETON_RECORDING", "TRACKING", "OCCLUSION_WAIT"
+bool master_detected
+geometry_msgs/PoseStamped current_master_pose
+float32 tracking_confidence
+string status_message 

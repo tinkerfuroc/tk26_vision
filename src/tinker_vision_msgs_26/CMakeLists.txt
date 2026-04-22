@@ -11,14 +11,34 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(tinker_vision_msgs REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/BoundingBox.msg"
+  "msg/Face.msg"
+  "msg/FaceResult.msg"
+  "msg/Object.msg"
+  "msg/Objects.msg"
+  "msg/PanTiltCtrl.msg"
+  "srv/DetectWaving.srv"
+  "srv/DoorDetection.srv"
+  "srv/FaceRegister.srv"
+  "srv/FeatureExtraction.srv"
+  "srv/FeatureMatching.srv"
+  "srv/FollowHead.srv"
+  "srv/GetImage.srv"
+  "srv/GetPointCloud.srv"
+  "srv/ObjectDetection.srv"
+  "srv/ObjectDetectionGeneralist.srv"
+  "srv/ObjectDetectionImage.srv"
+  "srv/PointDirection.srv"
+  "srv/SeatRecommendation.srv"
+  "action/Categorize.action"
+  "action/FollowHeadAction.action"
+  "action/HumanFollowing.action"
   "action/SpotOnShelf.action"
   "action/TrackPerson.action"
-  "srv/ObjectDetection.srv"
-  DEPENDENCIES geometry_msgs std_msgs sensor_msgs tinker_vision_msgs
+  DEPENDENCIES geometry_msgs std_msgs sensor_msgs
 )
 
 if(BUILD_TESTING)

@@ -4,7 +4,7 @@ Subclasses `YOLOSegmentationNode` from `object_detection_new` and overrides
 the service registration + callback so the node:
 
   1. advertises `/object_detection_generalist` under the redesigned
-     `tinker_vision_msgs_26/srv/ObjectDetection` with typed boolean flags;
+     `tinker_vision_msgs_26/srv/ObjectDetectionGeneralist` with typed boolean flags;
   2. runs the pretrained parent YOLO model for classes it already knows;
   3. falls back to Gemini 2.5 Pro (bounding box) + FastSAM (mask) when the
      requested `prompt` is not in the YOLO class list, the caller opts in
@@ -26,8 +26,8 @@ from rclpy.parameter import Parameter
 
 from std_msgs.msg import Header
 
-from tinker_vision_msgs.msg import Object
-from tinker_vision_msgs_26.srv import ObjectDetection as GeneralistObjectDetection
+from tinker_vision_msgs_26.msg import Object
+from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist
 
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
 
@@ -84,7 +84,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         """Advertise the redesigned ObjectDetection service."""
         service_name = self.get_parameter('service_name').value
         self.detection_srv = self.create_service(
-            GeneralistObjectDetection,
+            ObjectDetectionGeneralist,
             service_name,
             self._generalist_service_callback,
             callback_group=MutuallyExclusiveCallbackGroup(),
@@ -97,9 +97,9 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
     def _generalist_service_callback(
         self,
-        request: GeneralistObjectDetection.Request,
-        response: GeneralistObjectDetection.Response,
-    ) -> GeneralistObjectDetection.Response:
+        request: ObjectDetectionGeneralist.Request,
+        response: ObjectDetectionGeneralist.Response,
+    ) -> ObjectDetectionGeneralist.Response:
         response.header = Header(stamp=self.get_clock().now().to_msg())
         response.status = 1
         response.person_id = 0

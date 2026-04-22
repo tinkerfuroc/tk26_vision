@@ -4,9 +4,9 @@ Open-vocabulary object detection for tk26 vision. Runs a clean pretrained YOLO f
 
 ## Interface
 
-Service: `/object_detection_generalist`, type [`tinker_vision_msgs_26/srv/ObjectDetection`](../tinker_vision_msgs_26/srv/ObjectDetection.srv).
+Service: `/object_detection_generalist`, type [`tinker_vision_msgs_26/srv/ObjectDetectionGeneralist`](../tinker_vision_msgs_26/srv/ObjectDetectionGeneralist.srv).
 
-This is a **new srv** with typed boolean flags — not the legacy `tinker_vision_msgs/srv/ObjectDetection` that `/object_detection` and `/object_detection_yolo` still accept. See [`tinker_vision_msgs_26/README.md`](../tinker_vision_msgs_26/README.md#objectdetectionsrv-field-mapping-from-tk23--tk26) for the field mapping.
+This is a **new srv** with typed boolean flags — not the legacy `tinker_vision_msgs_26/srv/ObjectDetection` (same package, different type) that `/object_detection` and `/object_detection_yolo` still accept. See [`tinker_vision_msgs_26/README.md`](../tinker_vision_msgs_26/README.md#objectdetectionsrv-field-mapping-from-tk23--tk26) for the field mapping.
 
 Request fields that matter for path selection:
 
@@ -64,15 +64,15 @@ Common parameter overrides:
 
 ```bash
 # YOLO branch (chair is a COCO class)
-ros2 service call /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetection \
+ros2 service call /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetectionGeneralist \
   "{camera: realsense, prompt: chair}"
 
 # Open-vocabulary via VLM+SAM
-ros2 service call /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetection \
+ros2 service call /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetectionGeneralist \
   "{camera: realsense, prompt: 'monitor screen', use_vlm_sam_fallback: true}"
 
 # Force VLM+SAM even on a COCO class
-ros2 service call /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetection \
+ros2 service call /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetectionGeneralist \
   "{camera: realsense, prompt: bottle, force_vlm_sam: true}"
 ```
 
@@ -96,11 +96,10 @@ VLM dominates and is network-bound. Don't put the generalist on a hot path — i
 
 - `object_detection_new` (base class, service callback internals)
 - `kimi_api` (shared `_env.py` for API key loading)
-- `tinker_vision_msgs_26` (new srv)
-- `tinker_vision_msgs` (legacy `Object.msg` used by reference in the srv response)
+- `tinker_vision_msgs_26` (all interfaces: new `ObjectDetectionGeneralist.srv`, legacy `ObjectDetection.srv`, shared `Object.msg`)
 - Python (venv): `openai`, `python-dotenv`, `ultralytics>=8.4.33`, `numpy`, `opencv-python`
 
 ## Related services
 
 - `/object_detection_yolo` — specialist, custom-trained competition model, `excluded_classes=['person']`. Served by `object_detection_new/yolo_seg_node`.
-- `/object_detection` — pretrained COCO YOLO on the **legacy** tk23 srv. Kept for backward compatibility with tk25_decision BTs that still hard-code this name. Served by `object_detection_new/yolo_seg_default_node`.
+- `/object_detection` — pretrained COCO YOLO on the **legacy** `tinker_vision_msgs_26/srv/ObjectDetection` (string-flag schema inherited from tk23). Kept for backward compatibility with tk25_decision BTs that still hard-code this name. Served by `object_detection_new/yolo_seg_default_node`.

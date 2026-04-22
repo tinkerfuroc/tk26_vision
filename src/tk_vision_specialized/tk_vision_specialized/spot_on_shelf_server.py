@@ -15,7 +15,7 @@ import tf2_ros
 import tf2_geometry_msgs
 
 from tinker_vision_msgs_26.action import SpotOnShelf
-from tinker_vision_msgs.srv import ObjectDetection
+from tinker_vision_msgs_26.srv import ObjectDetection
 
 
 class SpotOnShelfServer(Node):

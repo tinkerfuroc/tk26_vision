@@ -7,7 +7,7 @@ Task-specific vision servers. Each node wraps a narrow detection task and expose
 | Executable | Type | Interface | Description |
 |---|---|---|---|
 | `spot_on_shelf_server` | action | `tinker_vision_msgs_26/action/SpotOnShelf` | Detect objects on a shelf and bucket them into vertical layers + horizontal grids. Delegates detection to `object_detection_yolo`. |
-| `waving_person_server` | service | `tinker_vision_msgs/srv/DetectWaving` | Find all persons raising a hand / waving in the current Orbbec frame. YOLOv8 person boxes + MediaPipe Pose on each ROI. |
+| `waving_person_server` | service | `tinker_vision_msgs_26/srv/DetectWaving` | Find all persons raising a hand / waving in the current Orbbec frame. YOLOv8 person boxes + MediaPipe Pose on each ROI. |
 | `waving_client` | — | — | Example client: calls `/detect_waving_persons` once per second, prints results. Useful for camera-alignment sanity before demos. |
 | `check_waving_inference` | — | — | Offline tester. Subscribes to `/camera/color/image_raw`, runs N YOLO + MediaPipe passes on a timer, dumps `XX_raw.jpg`, `XX_annotated.jpg`, `XX_result.json` into a timestamped folder. Has no ROS service dependency. |
 
@@ -41,7 +41,7 @@ ros2 run tk_vision_specialized waving_person_server
 # separate shell:
 ros2 run tk_vision_specialized waving_client
 # or a single-shot call:
-ros2 service call /detect_waving_persons tinker_vision_msgs/srv/DetectWaving \
+ros2 service call /detect_waving_persons tinker_vision_msgs_26/srv/DetectWaving \
   "{threshold_meters: 3.0, target_frame: 'map'}"
 ```
 
@@ -63,6 +63,6 @@ Flags: `--runs`, `--interval`, `--image-topic`, `--model`, `--output-root`, `--n
 
 ## Dependencies
 
-ROS (via `package.xml`): `rclpy`, `geometry_msgs`, `std_msgs`, `sensor_msgs`, `tinker_vision_msgs`, `tinker_vision_msgs_26`, `tf2_ros`, `tf2_geometry_msgs`, `cv_bridge`, `message_filters`.
+ROS (via `package.xml`): `rclpy`, `geometry_msgs`, `std_msgs`, `sensor_msgs`, `tinker_vision_msgs_26`, `tf2_ros`, `tf2_geometry_msgs`, `cv_bridge`, `message_filters`.
 
 Python (via `requirements.txt`, pip-installed): `ultralytics>=8.0.0`, `mediapipe>=0.10.0`, `opencv-python>=4.5.0`, `numpy>=1.21.0`.

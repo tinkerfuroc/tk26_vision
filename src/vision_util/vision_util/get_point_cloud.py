@@ -17,7 +17,7 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
-from tinker_vision_msgs.srv import GetPointCloud
+from tinker_vision_msgs_26.srv import GetPointCloud
 
 
 class GetPointCloudService(Node):

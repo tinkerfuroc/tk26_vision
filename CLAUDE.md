@@ -69,7 +69,7 @@ ros2 run vision_util get_point_cloud                 # /get_point_cloud_service
 
 ```
 src/tk26_vision/src/
-├── tinker_vision_msgs_26/         # action/TrackPerson, action/SpotOnShelf, srv/ObjectDetection (new generalist)
+├── tinker_vision_msgs_26/         # canonical vision interfaces — all msgs/srvs/actions live here (absorbed tk23's tinker_vision_msgs)
 ├── object_detection_new/          # YOLO-seg: specialist (yolo_seg_node, excludes 'person') + default (yolo_seg_default_node, pretrained COCO)
 ├── object_detection_generalist/   # Pretrained YOLO + Gemini 2.5 Pro bbox + FastSAM mask fallback, tk26 srv
 ├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
@@ -82,12 +82,11 @@ src/tk26_vision/src/
 **Notes:**
 - Three object-detection services now coexist. Canonical targets going forward:
   - `/object_detection_yolo` (specialist, custom-trained model, `excluded_classes=['person']`) — arena/competition items.
-  - `/object_detection_generalist` (new, tk26 srv with boolean flags) — the recommended target for open-vocabulary / non-arena callers (person detection, seat-rec helpers, any class YOLO doesn't recognize).
-  - `/object_detection` (pretrained COCO, tk23 srv, `excluded_classes=[]`) — kept for backward compatibility with tk25_decision BT nodes that still hard-code this name. Prefer the generalist for new code.
+  - `/object_detection_generalist` (new, `tinker_vision_msgs_26/srv/ObjectDetectionGeneralist` with boolean flags) — the recommended target for open-vocabulary / non-arena callers (person detection, seat-rec helpers, any class YOLO doesn't recognize).
+  - `/object_detection` (pretrained COCO, `tinker_vision_msgs_26/srv/ObjectDetection` — the legacy string-flag schema, kept under its original name) — back-compat for tk25_decision BT nodes that still hard-code this name. Prefer the generalist for new code.
 - The specialist (`yolo_seg_node`) now silently drops the `'person'` class regardless of what the (future) custom model emits. To detect people, use the generalist or the default node.
-- `kimi_api` calls `object_detection` (generalist) via the `detection_service` ROS param — retargetable without rebuilding.
-- All migrated nodes import from `tinker_vision_msgs` (tk23's package), not `tinker_vision_msgs_26`. Intentional — `tk25_decision/messages.py` also imports from it. Consolidation deferred.
-- The new `tinker_vision_msgs_26/srv/ObjectDetection` references `tinker_vision_msgs/Object` by rosidl dependency, so there is no duplicate type namespace (same pattern that avoided the `DetectWaving` split).
+- `kimi_api` calls `object_detection_generalist` via the `detection_service` ROS param — retargetable without rebuilding.
+- **All vision interfaces live in `tinker_vision_msgs_26`.** The legacy `tinker_vision_msgs` package (tk23) has been retired and the whole `src/tk23_vision/` tree is `COLCON_IGNORE`d. The two srv names (`ObjectDetection` = legacy string-flag schema, `ObjectDetectionGeneralist` = new boolean-flag schema) coexist in the same package so both specialist and generalist servers can be served without name collisions.
 - Cameras: RealSense = aligned depth-to-color Image + pinhole intrinsics (ROS convention: x=fwd, y=left, z=up); Orbbec = PointCloud2 reprojected to image grid (standard ROS convention from the cloud).
 
 ## Models

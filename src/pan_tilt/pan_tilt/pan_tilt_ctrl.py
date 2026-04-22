@@ -25,7 +25,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from tf2_ros import TransformBroadcaster
 from tf_transformations import quaternion_from_euler
-from tinker_vision_msgs.msg import PanTiltCtrl
+from tinker_vision_msgs_26.msg import PanTiltCtrl
 
 
 class PanTiltCtrlNode(Node):

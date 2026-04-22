@@ -52,6 +52,33 @@ else
 fi
 stop_all_nodes
 
+section "T3.4 — feature_matching ↔ generalist_node"
+if have_api_key; then
+    start_node generalist_t3 object_detection_generalist generalist_node
+    wait_for_service /object_detection_generalist 30 || fail "T3.4" "generalist did not advertise"
+    # feature_matching's default detection_service is 'object_detection_generalist' post-migration.
+    start_node feature_matching_t3.4 kimi_api feature_matching
+    if wait_for_service /feature_matching_service 15; then
+        out="$LOG_DIR/T3.4.svcout"
+        timeout 90 ros2 service call /feature_matching_service tinker_vision_msgs/srv/FeatureMatching \
+            "{camera: 'realsense', features: ['person'], max_distance: 3.0, target_frame: 'base_link'}" 2>&1 \
+            | head -c 4000 >"$out" || true
+        if grep -qE 'Traceback' "$out"; then
+            fail "T3.4" "traceback in response"
+        elif grep -qE 'status=[01]' "$out" && grep -qE 'centroids=' "$out"; then
+            st=$(grep -oE 'status=[01]' "$out" | head -1)
+            pass "T3.4 matching node talked to generalist ($st)"
+        else
+            fail "T3.4" "head: $(head -c 400 "$out")"
+        fi
+    else
+        fail "T3.4" "feature_matching_service not advertised"
+    fi
+    stop_all_nodes
+else
+    skip "T3.4" "no valid OPENROUTER_API_KEY"
+fi
+
 section "T3.3 — pan_tilt/ctrl TF + follow_head"
 if [ -c "$SERVO_DEVICE" ]; then
     start_node ctrl_t3 pan_tilt ctrl --ros-args -p "device:=$SERVO_DEVICE"

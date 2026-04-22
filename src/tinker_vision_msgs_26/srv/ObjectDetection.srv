@@ -1,0 +1,52 @@
+# Generalist object-detection request.
+#
+# A clean redesign of tk23's tinker_vision_msgs/srv/ObjectDetection.srv:
+#   - string 'flags'    -> typed boolean sort + payload toggles
+#   - string 'category' -> dropped (was unused)
+#   - adds VLM+SAM-fallback knobs and a 'detection_source' output tag
+#
+# The Object[] response reuses tinker_vision_msgs/Object (tk23) by reference
+# so there is no parallel type-namespace split with the legacy service.
+
+# camera in ['realsense', 'orbbec']
+string camera
+
+# Natural-language or class name. If it matches a YOLO class name, YOLO runs.
+# Otherwise the VLM+SAM fallback may run (see flags below).
+string prompt
+
+# TF frame to express centroids in. Empty string = raw camera frame.
+string target_frame
+
+# --- sorting (replaces the 'sort_closest'/'sort_highest' substrings in the old string 'flags') ---
+bool sort_closest
+bool sort_highest
+
+# --- payload toggles (replaces 'request_image'/'request_segments' substrings) ---
+bool return_rgb_image
+bool return_depth_image
+bool return_segments
+
+# --- generalist-specific ---
+# Always use the VLM+SAM path, even if YOLO could answer.
+bool force_vlm_sam
+# Allow VLM+SAM fallback when `prompt` is not in the YOLO class list, or when
+# YOLO returns zero matches. When false the server returns status=1 for
+# out-of-vocabulary prompts.
+bool use_vlm_sam_fallback
+
+---
+
+std_msgs/Header header
+# 0 = ok; 1 = empty / failure (see error_msg)
+int32 status
+string error_msg
+# Kept for ABI parity with tk23; generalist does not register people, so 0.
+int32 person_id
+tinker_vision_msgs/Object[] objects
+# 'yolo' | 'vlm_sam' | 'none' — tells the caller which branch produced results.
+string detection_source
+
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image
+sensor_msgs/Image[] segments

@@ -27,8 +27,8 @@ from geometry_msgs.msg import PointStamped
 from openai import OpenAI
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from tinker_vision_msgs.srv import FeatureMatching
-from tinker_vision_msgs_26.srv import ObjectDetection
+from tinker_vision_msgs_26.srv import FeatureMatching
+from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
 from ._env import base_url, default_model, load_env, require_api_key
 

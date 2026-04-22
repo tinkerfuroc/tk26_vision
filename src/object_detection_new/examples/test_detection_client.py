@@ -8,7 +8,7 @@ sorting modes and request segmentation masks.
 
 import rclpy
 from rclpy.node import Node
-from tinker_vision_msgs.srv import ObjectDetection
+from tinker_vision_msgs_26.srv import ObjectDetection
 
 
 class DetectionTestClient(Node):

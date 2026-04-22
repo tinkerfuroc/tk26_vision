@@ -3,7 +3,7 @@
 
 import unittest
 from geometry_msgs.msg import Point, PoseStamped
-from tinker_vision_msgs.msg import Object
+from tinker_vision_msgs_26.msg import Object
 
 
 class TestSpotOnShelfUtils(unittest.TestCase):

@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-from tinker_vision_msgs.srv import DetectWaving
+from tinker_vision_msgs_26.srv import DetectWaving
 import time
 
 

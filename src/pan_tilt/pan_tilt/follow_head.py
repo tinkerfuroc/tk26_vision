@@ -24,9 +24,9 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
-from tinker_vision_msgs.action import FollowHeadAction
-from tinker_vision_msgs.msg import PanTiltCtrl
-from tinker_vision_msgs.srv import FollowHead
+from tinker_vision_msgs_26.action import FollowHeadAction
+from tinker_vision_msgs_26.msg import PanTiltCtrl
+from tinker_vision_msgs_26.srv import FollowHead
 from ultralytics import YOLO
 
 

@@ -33,8 +33,8 @@ from scipy.cluster.vq import kmeans2
 from sensor_msgs.msg import PointCloud2
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-from tinker_vision_msgs.action import Categorize
-from tinker_vision_msgs_26.srv import ObjectDetection
+from tinker_vision_msgs_26.action import Categorize
+from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
 from ._env import base_url, default_model, load_env, require_api_key
 

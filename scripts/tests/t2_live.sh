@@ -80,7 +80,7 @@ if wait_for_service /object_detection 30; then
     sleep 8  # warmup: let ApproximateTimeSynchronizer buffer a few frame pairs
     for cam in orbbec realsense; do
         out="$LOG_DIR/T2.1_${cam}.svcout"
-        svc_call "$out" 30 /object_detection tinker_vision_msgs/srv/ObjectDetection \
+        svc_call "$out" 30 /object_detection tinker_vision_msgs_26/srv/ObjectDetection \
             "{camera: '$cam', prompt: 'person', flags: '', target_frame: '', category: ''}"
         assert_objdet_ok "T2.1/T2.2 [$cam]" "$out"
     done
@@ -94,7 +94,7 @@ start_node yolo_custom_node object_detection_new yolo_seg_node
 if wait_for_service /object_detection_yolo 30; then
     sleep 8
     out="$LOG_DIR/T2.3.svcout"
-    svc_call "$out" 30 /object_detection_yolo tinker_vision_msgs/srv/ObjectDetection \
+    svc_call "$out" 30 /object_detection_yolo tinker_vision_msgs_26/srv/ObjectDetection \
         "{camera: 'orbbec', prompt: 'person', flags: '', target_frame: '', category: ''}"
     assert_objdet_ok "T2.3" "$out"
 else
@@ -106,7 +106,7 @@ section "T2.4 — /door_detection_srv"
 start_node door_detection vision_util door_detection
 if wait_for_service /door_detection_srv 15; then
     out="$LOG_DIR/T2.4.svcout"
-    svc_call "$out" 15 /door_detection_srv tinker_vision_msgs/srv/DoorDetection "{camera: 'orbbec'}"
+    svc_call "$out" 15 /door_detection_srv tinker_vision_msgs_26/srv/DoorDetection "{camera: 'orbbec'}"
     if grep -qE 'Traceback' "$out"; then
         fail "T2.4" "traceback in response"
     elif grep -qE 'status=0' "$out" && grep -qE 'is_open=[01]' "$out"; then
@@ -125,7 +125,7 @@ if wait_for_service /get_point_cloud_service 15; then
     sleep 8
     for cam in orbbec realsense; do
         out="$LOG_DIR/T2.5_${cam}.svcout"
-        svc_call "$out" 20 /get_point_cloud_service tinker_vision_msgs/srv/GetPointCloud \
+        svc_call "$out" 20 /get_point_cloud_service tinker_vision_msgs_26/srv/GetPointCloud \
             "{camera: '$cam'}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.5/T2.6 [$cam]" "traceback"
@@ -147,7 +147,7 @@ if have_api_key; then
     start_node feature_recognition kimi_api feature_recognition
     if wait_for_service /feature_extraction_service 20; then
         out="$LOG_DIR/T2.7.svcout"
-        svc_call "$out" 60 /feature_extraction_service tinker_vision_msgs/srv/FeatureExtraction \
+        svc_call "$out" 60 /feature_extraction_service tinker_vision_msgs_26/srv/FeatureExtraction \
             "{camera: 'orbbec'}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.7" "traceback"
@@ -157,7 +157,7 @@ if have_api_key; then
             fail "T2.7" "head: $(head -c 500 "$out")"
         fi
         out="$LOG_DIR/T2.8.svcout"
-        svc_call "$out" 60 /seat_recommend_service tinker_vision_msgs/srv/SeatRecommendation \
+        svc_call "$out" 60 /seat_recommend_service tinker_vision_msgs_26/srv/SeatRecommendation \
             "{camera: 'orbbec', names: ['alice'], features: ['adult wearing glasses']}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.8" "traceback"
@@ -181,7 +181,7 @@ if have_api_key; then
     start_node feature_matching kimi_api feature_matching
     if wait_for_service /feature_matching_service 20; then
         out="$LOG_DIR/T2.9.svcout"
-        svc_call "$out" 60 /feature_matching_service tinker_vision_msgs/srv/FeatureMatching \
+        svc_call "$out" 60 /feature_matching_service tinker_vision_msgs_26/srv/FeatureMatching \
             "{camera: 'orbbec', features: ['red bottle'], max_distance: 2.0, target_frame: 'base_link'}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.9" "traceback"
@@ -207,7 +207,7 @@ if [ -c "$SERVO_DEVICE" ]; then
     if wait_for_action /follow_head_action 20; then
         sleep 5  # let follow_head buffer camera frames
         out="$LOG_DIR/T2.10.actout"
-        act_call "$out" 15 /follow_head_action tinker_vision_msgs/action/FollowHeadAction \
+        act_call "$out" 15 /follow_head_action tinker_vision_msgs_26/action/FollowHeadAction \
             '{start_following: true}' '--feedback'
         if grep -qE 'Traceback' "$out"; then
             fail "T2.10" "traceback"
@@ -234,7 +234,7 @@ if have_api_key; then
     if wait_for_action /grocery_categorize 20; then
         out="$LOG_DIR/T2.11.actout"
         goal='{n_layers: 2, prompt: "", img_table: {}, segment_object: {}, pt_shelf_left: {header: {frame_id: "base_link"}, point: {x: 1.0, y: 0.3, z: 0.0}}, pt_shelf_right: {header: {frame_id: "base_link"}, point: {x: 1.0, y: -0.3, z: 0.0}}, flags: "", target_frame: "base_link"}'
-        act_call "$out" 60 /grocery_categorize tinker_vision_msgs/action/Categorize "$goal"
+        act_call "$out" 60 /grocery_categorize tinker_vision_msgs_26/action/Categorize "$goal"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.11" "traceback"
         elif grep -qE 'Goal finished|Result:|status=' "$out"; then
@@ -276,7 +276,7 @@ if wait_for_service /object_detection_generalist 30; then
     sleep 8  # sync warmup
     # YOLO branch — prompt is in pretrained COCO vocab, no fallback needed
     out="$LOG_DIR/T2.14_yolo.svcout"
-    svc_call "$out" 30 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetection \
+    svc_call "$out" 30 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetectionGeneralist \
         "{camera: 'realsense', prompt: 'bottle', use_vlm_sam_fallback: false}"
     if grep -qE 'Traceback' "$out"; then
         fail "T2.14 YOLO" "traceback"
@@ -291,7 +291,7 @@ if wait_for_service /object_detection_generalist 30; then
     if have_api_key; then
         out="$LOG_DIR/T2.14_vlm.svcout"
         # 90 s timeout: Gemini 2.5 Pro is 9-14 s/call plus FastSAM + sync warmup
-        svc_call "$out" 90 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetection \
+        svc_call "$out" 90 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetectionGeneralist \
             "{camera: 'realsense', prompt: 'spatula', use_vlm_sam_fallback: true}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.14 VLM" "traceback"

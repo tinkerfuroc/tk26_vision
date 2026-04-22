@@ -52,16 +52,16 @@ ifaces=(
     tinker_vision_msgs_26/action/TrackPerson
     tinker_vision_msgs_26/action/SpotOnShelf
     tinker_vision_msgs_26/srv/ObjectDetection
-    tinker_vision_msgs/srv/ObjectDetection
-    tinker_vision_msgs/srv/DoorDetection
-    tinker_vision_msgs/srv/GetPointCloud
-    tinker_vision_msgs/srv/FeatureExtraction
-    tinker_vision_msgs/srv/FeatureMatching
-    tinker_vision_msgs/srv/SeatRecommendation
-    tinker_vision_msgs/srv/FollowHead
-    tinker_vision_msgs/action/FollowHeadAction
-    tinker_vision_msgs/action/Categorize
-    tinker_vision_msgs/msg/PanTiltCtrl
+    tinker_vision_msgs_26/srv/ObjectDetectionGeneralist
+    tinker_vision_msgs_26/srv/DoorDetection
+    tinker_vision_msgs_26/srv/GetPointCloud
+    tinker_vision_msgs_26/srv/FeatureExtraction
+    tinker_vision_msgs_26/srv/FeatureMatching
+    tinker_vision_msgs_26/srv/SeatRecommendation
+    tinker_vision_msgs_26/srv/FollowHead
+    tinker_vision_msgs_26/action/FollowHeadAction
+    tinker_vision_msgs_26/action/Categorize
+    tinker_vision_msgs_26/msg/PanTiltCtrl
 )
 iface_bad=0
 for i in "${ifaces[@]}"; do

@@ -16,6 +16,7 @@ find_package(sensor_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/SpotOnShelf.action"
   "action/TrackPerson.action"
+  "srv/DetectWaving.srv"
   DEPENDENCIES geometry_msgs std_msgs sensor_msgs
 )
 

@@ -6,12 +6,14 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 import cv2
 import time
+import queue
 import numpy as np
 import mediapipe as mp
 from ultralytics import YOLO
 import threading
 from geometry_msgs.msg import PointStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 import tf2_ros
 import tf2_geometry_msgs
 
@@ -47,7 +49,9 @@ class DetectWavingPersonsNode(Node):
 
         self.bridge = CvBridge()
         self.yolo = YOLO('yolov8s.pt')
-        self.pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.mp_pose = mp.solutions.pose
+        self.mp_draw = mp.solutions.drawing_utils
+        self.pose = self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
         self.lock = threading.Lock()
         self.rgb_image = None
@@ -58,7 +62,44 @@ class DetectWavingPersonsNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.get_logger().info('Detect Waving Persons node started')
+        self.declare_parameter('show_window', True)
+        self.show_window = self.get_parameter('show_window').get_parameter_value().bool_value
+
+        self._frame_queue = None
+        self._display_thread = None
+        if self.show_window:
+            self._frame_queue = queue.Queue(maxsize=2)
+            self._display_thread = threading.Thread(target=self._display_loop, daemon=True)
+            self._display_thread.start()
+
+        self.get_logger().info(f'Detect Waving Persons node started (show_window={self.show_window})')
+
+    def _display_loop(self):
+        while rclpy.ok():
+            try:
+                frame = self._frame_queue.get(timeout=0.1)
+                cv2.imshow('waving_persons', frame)
+            except queue.Empty:
+                pass
+            cv2.waitKey(1)
+        cv2.destroyAllWindows()
+
+    def _annotate_frame(self, rgb_bgr, waving_annotations, waving_centroids):
+        frame = rgb_bgr.copy()
+        for idx, ((x1, y1, x2, y2, landmarks), point_stamped) in enumerate(
+            zip(waving_annotations, waving_centroids), start=1
+        ):
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            label = f'waving #{idx} z={point_stamped.point.z:.2f}m'
+            cv2.putText(
+                frame, label, (x1, max(0, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
+            )
+            if landmarks is not None:
+                roi = frame[y1:y2, x1:x2]
+                if roi.size > 0:
+                    self.mp_draw.draw_landmarks(roi, landmarks, self.mp_pose.POSE_CONNECTIONS)
+        return frame
 
     def camera_info_callback(self, msg):
         if self.camera_k is None:
@@ -96,7 +137,7 @@ class DetectWavingPersonsNode(Node):
         right_hand_above_elbow = right_hand.y < right_elbow.y
         left_hand_above_elbow = left_hand.y < left_elbow.y
 
-        right_elbow_above_shoulder = right_elbow.y <= (right_shoulder.y + int(img_h + 0.1))
+        right_elbow_above_shoulder = right_elbow.y <= (right_shoulder.y + int(img_h * 0.1))
         left_elbow_above_shoulder = left_elbow.y <= (left_shoulder.y + int(img_h * 0.1))
 
         # log in separate lines, both pose landmarks and boolean values
@@ -160,6 +201,7 @@ class DetectWavingPersonsNode(Node):
         self.get_logger().info(f'YOLO inference done. Found {total_boxes} candidate box(es).')
 
         waving_persons_centroids = []
+        waving_annotations = []
         person_candidates = 0
         if boxes is not None:
             for box in boxes:
@@ -194,13 +236,27 @@ class DetectWavingPersonsNode(Node):
                                     point_stamped.point.y = float(centroid[1])
                                     point_stamped.point.z = float(centroid[2])
                                     waving_persons_centroids.append(point_stamped)
+                                    waving_annotations.append((x1, y1, x2, y2, pose_results.pose_landmarks))
                                     self.get_logger().info(
                                         f'Detected waving person #{len(waving_persons_centroids)} '
                                         f'at ({point_stamped.point.x:.3f}, {point_stamped.point.y:.3f}, {point_stamped.point.z:.3f})'
                                     )
         self.get_logger().info(f'Person candidates checked: {person_candidates}')
-        # sort waving person centroids from closest to farthest
-        waving_persons_centroids.sort(key=lambda p: p.point.z)
+        # sort waving person centroids from closest to farthest (keep annotations aligned)
+        if waving_persons_centroids:
+            paired = sorted(
+                zip(waving_persons_centroids, waving_annotations),
+                key=lambda pair: pair[0].point.z,
+            )
+            waving_persons_centroids = [p for p, _ in paired]
+            waving_annotations = [a for _, a in paired]
+
+        if self.show_window and self._frame_queue is not None and waving_persons_centroids:
+            annotated = self._annotate_frame(rgb_image, waving_annotations, waving_persons_centroids)
+            try:
+                self._frame_queue.put_nowait(annotated)
+            except queue.Full:
+                pass
 
         if request.target_frame and waving_persons_centroids:
             if request.target_frame != header.frame_id:
@@ -233,8 +289,14 @@ class DetectWavingPersonsNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = DetectWavingPersonsNode()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

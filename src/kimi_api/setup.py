@@ -1,8 +1,6 @@
 from setuptools import find_packages, setup
-import os
-from glob import glob
 
-package_name = 'object_detection_new'
+package_name = 'kimi_api'
 
 setup(
     name=package_name,
@@ -12,20 +10,19 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
-        (os.path.join('share', package_name, 'models'), glob('models/*.pt')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='cindy',
     maintainer_email='cindy.w0135@gmail.com',
-    description='Simplified YOLO segmentation for object detection',
+    description='LLM-backed feature extraction, matching, and grocery categorization (OpenRouter) for Tinker 2026',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'yolo_seg_node = object_detection_new.object_seg_yolo:main',
-            'yolo_seg_default_node = object_detection_new.object_seg_yolo_default:main',
+            'feature_recognition = kimi_api.feature_recognition:main',
+            'feature_matching = kimi_api.feature_matching:main',
+            'grocery_categorize = kimi_api.grocery_categorize:main',
         ],
     },
 )

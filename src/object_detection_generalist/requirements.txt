@@ -1,0 +1,5 @@
+openai>=1.0
+python-dotenv>=1.0
+ultralytics>=8.4.33
+numpy>=1.21
+opencv-python>=4.5

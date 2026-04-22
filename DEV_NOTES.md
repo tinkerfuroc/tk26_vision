@@ -184,3 +184,172 @@ Orbbec color ↔ depth header-stamp drift with `enable_frame_sync:=false`: **med
 
 No source files (Python or C++) were modified. No vendored thirdparty drivers were patched.
 
+---
+
+## 2026-04-22 — Migration audit, three small fixes, + generalist VLM+SAM service
+
+One longer session tracked two threads:
+1. Re-audit of the tk23→tk26 vision migration to catch leftover regressions.
+2. Adding a new open-vocabulary detection service so a retrained, person-free specialist model can coexist with a pretrained fallback.
+
+Live-camera verification was done on this workstation; both cameras were up via the canonical bringup from the previous entry.
+
+### What shipped
+
+**Audit fixes (merged the same session):**
+
+1. **`DetectWaving` namespace collision.** `tk25_decision/GPSR/custom_nodes.py:3` imports `DetectWaving` from `tinker_vision_msgs` (tk23), but `tk_vision_specialized/waving_person_server.py:3` advertised `/detect_waving_persons` under `tinker_vision_msgs_26.srv.DetectWaving`. The `.srv` bodies were byte-identical, but ROS service type identity is `package/srv/Type` — the two sides could never match. Removed `srv/DetectWaving.srv` from `tinker_vision_msgs_26` (CMakeLists + file), repointed the server + client at the tk23 type. `ros2 interface list` now shows the single `tinker_vision_msgs/srv/DetectWaving`.
+2. **`img_sync_thres=0.00` default starved detection.** `object_seg_yolo.py:112` declared the threshold at zero, so `(call_time − recent_time) > 0` was true for every frame and the service logged `Skipping detection: no recent data within sync threshold` on healthy 30 Hz cameras. Raised the default to `0.20` (2× the ApproximateTimeSynchronizer slop of `0.1`).
+3. **`tracking_active` race in `vision_track/person_track_node.py`.** `_goal_callback` checked `self.tracking_active` without a lock while `_execute_callback` wrote it under none. Under the MultiThreadedExecutor two concurrent goals could both observe `False` and both get accepted. Added `lock_lifecycle` around read+test-and-set in `_goal_callback` and the matching writes in `_execute_callback` / `_cleanup_tracking`.
+
+**New generalist detection service:**
+
+- New ament_python package `object_detection_generalist/` — subclasses `YOLOSegmentationNode` so camera sync, TF, depth projection, 3D centroid, and sort-mode logic are reused (not duplicated).
+- New srv `tinker_vision_msgs_26/srv/ObjectDetection.srv` with typed boolean flags replacing the old string-parsed `flags` / `category`. Adds `force_vlm_sam`, `use_vlm_sam_fallback`, and a `detection_source` response tag. `Object[]` references `tinker_vision_msgs/Object` by rosidl dependency, so there is no duplicate type namespace (the pattern that caused the DetectWaving split is avoided).
+- VLM client = Gemini 2.5 Pro via OpenRouter (`vlm_bbox.py`). Strict JSON schema, `[y0,x0,y1,x1]` 0–1000-normalized decode, retry loop mirroring `feature_matching.py`, **lazy** `OPENROUTER_API_KEY` check so the node starts without a key (unlike kimi_api which fails at `__init__`).
+- SAM = `FastSAM-s.pt` via ultralytics' built-in class (`sam_mask.py`). Loaded once at node init on `self.device` (GPU if available).
+- Specialist change: added `excluded_classes` ROS param to `YOLOSegmentationNode`; new `object_seg_yolo_specialist.py` wrapper sets it to `['person']` and `setup.py`'s `yolo_seg_node` entry now points at the wrapper. The default node and the generalist inherit `[]` so existing callers of `/object_detection` (e.g. `kimi_api.feature_matching` with `prompt='person'`) are unaffected.
+- `scripts/fix_venv_shebangs.sh` — added `object_detection_generalist` to the default package list; one-time shebang repair was needed since the build wrapper defers to that script.
+
+### Live-camera verification (RealSense path)
+
+| Case | Expectation | Result |
+|---|---|---|
+| `/object_detection` prompt=`chair` / `tv` (pretrained YOLO) | status=0, populated | ✅ chair (1.06,0.26,-0.01), tv (1.14,-0.24,0.41) |
+| `/object_detection_yolo` startup | log "`Excluded classes: ['person']`" | ✅ |
+| `/object_detection_yolo` routine prompts (chair, tv) | routes through YOLO, filter untouched when the class isn't excluded | ✅ model detected tv + suitcases; filter did not alter behavior for non-excluded prompts |
+| `/object_detection_generalist` prompt=`chair`, auto-fallback=on | YOLO returns [] → VLM+SAM | ✅ Gemini bbox → FastSAM mask → centroid (2.76, 0.47, 0.38); `detection_source=vlm_sam` |
+| `/object_detection_generalist` prompt=`"monitor screen"`, `use_vlm_sam_fallback=true` | open-vocab direct to VLM+SAM | ✅ centroid (2.53, -2.00, -0.08); `detection_source=vlm_sam` |
+| Gemini empty response handling | status=1 with meaningful `error_msg` | ✅ `"VLM+SAM produced no detections for \"person\""` |
+
+Measured round-trip: YOLO ≈ 90 ms, Gemini 2.5 Pro 9–14 s, FastSAM bbox-prompt ≈ 100 ms.
+
+### What still awaits testing (needs either a staged scene, a human subject, or Orbbec in a 5-float cloud layout)
+
+| Item | Tier / How | Notes |
+|---|---|---|
+| Specialist `excluded_classes` filter firing on a real YOLO `'person'` detection | T4 | No person walked in front of the camera during the session. Startup log proves the param is loaded; a positive observation needs someone in frame. |
+| Orbbec camera path for all three detection nodes | T2 | Blocked by a pre-existing `_pointcloud_to_array` bug (see Follow-ups #1). Tested on RealSense instead. |
+| Extending the automated test tiers to cover the new generalist | T0 / T1 / T2 additions | Called out in the plan, deferred. See Follow-ups #3. |
+| Manual Gemini-bbox-decode fixture that eyeballs the `[y0,x0,y1,x1]` convention against a saved image | manual | The "monitor screen" live call showed a plausible centroid, but a saved bbox overlay was not produced. See Follow-ups #6. |
+
+### Follow-ups — ordered roughly by impact
+
+1. **Pre-existing bug in `_pointcloud_to_array` (orthogonal to this session).** `object_seg_yolo.py:399-401` hardcodes 5 floats per point, but the canonical Femto Bolt launch publishes `/camera/depth/points` with `point_step=16` (xyz only, no rgb). Every orbbec call after the first few fails with `cannot reshape array of size X into shape (Y,5)`. Two fixes possible; neither done here:
+    - *Launch-side*: add `enable_colored_point_cloud:=true` to the canonical orbbec invocation in `CAMERA_BRINGUP.md` so the cloud is xyzrgb (matches the existing 5-float assumption).
+    - *Code-side*: derive `floats_per_point = pc_msg.point_step // 4` inside `_pointcloud_to_array` — one-line change that also makes the node robust to future layout swaps.
+2. **Scan tk25_decision + tk25_manipulation for legacy `ObjectDetection` use and migrate open-vocabulary callers to `/object_detection_generalist`.** Known call sites from the session's earlier audit:
+    - `src/tk25_decision/src/behavior_tree/behavior_tree/TemplateNodes/Vision.py:81` `BtNode_ScanFor` (currently `/object_detection_yolo`)
+    - `src/tk25_decision/src/behavior_tree/behavior_tree/TemplateNodes/Vision.py:210` `BtNode_TrackPerson` (currently `/object_detection`, prompt=`person`) — should target the generalist once callers are ready
+    - `src/tk25_decision/src/behavior_tree/behavior_tree/TemplateNodes/Vision.py:356` `BtNode_FindObj` (currently `/object_detection`) — arena items, should point at `/object_detection_yolo`
+    - `src/tk25_decision/src/behavior_tree/behavior_tree/StoringGroceries/customNodes.py:24` `BtNode_FindObjTable` (currently `/object_detection`) — arena items, should point at `/object_detection_yolo`
+    - `src/tk25_decision/src/behavior_tree/behavior_tree/GPSR/custom_nodes.py:549` `BtNode_ScanForWavingPerson` — open-vocab, good generalist target
+    - `src/tk25_decision/src/behavior_tree/behavior_tree/Restaurant/custumNodes.py:15` `BtNode_DetectCallingCustomer` — open-vocab, good generalist target
+    - `src/tk25_decision/src/behavior_tree/behavior_tree/HelpMeCarry/customNodes.py:22` `BtNode_FindPointedLuggage` — arena items, `/object_detection_yolo`
+    - `src/tk25_manipulation/arm_api/grasp_demo.py:19` and `grasp_demo_place.py:21` — already on `/object_detection_yolo`; no change, just sanity check
+    - `src/tk25_manipulation/arm_api/anygrasp_test.py:30` — open-vocab grasping, good generalist candidate
+    Each retarget requires either a `detection_service` param flip at launch (for callers that have one) or a one-line default change in the BT node. Migrating `feature_matching` and `grocery_categorize` (both already parameterized) is the lowest-risk first step.
+3. **kimi_api srv migration**: `feature_matching` and `grocery_categorize` import from `tinker_vision_msgs.srv` today. They should optionally target the new `tinker_vision_msgs_26/srv/ObjectDetection` so open-vocab prompts work end-to-end. Requires a parallel `ObjectDetection` client type alongside the existing one (or a launch-time pick via an env var). See the srv field mapping in `tinker_vision_msgs_26/README.md` for what needs to change in the call site.
+4. **Test tier extensions** (`src/tk26_vision/scripts/tests/`):
+    - T0: `ros2 interface show tinker_vision_msgs_26/srv/ObjectDetection` returns a doc containing `force_vlm_sam` + `detection_source`; `python -c "from object_detection_generalist.generalist_node import GeneralistDetectionNode; from ultralytics import FastSAM"` in the venv exits 0.
+    - T1: spawn `generalist_node` with and without `OPENROUTER_API_KEY`, assert it advertises the service in both cases and SIGTERMs cleanly. Negative: service call with `prompt='unicorn'`, `use_vlm_sam_fallback=true` under no-key → status=1, `error_msg` mentions `OPENROUTER_API_KEY`.
+    - T2: one live call with `prompt='bottle'` (YOLO branch) and one with `prompt='spatula'`, `use_vlm_sam_fallback=true` (VLM+SAM branch), and one against the specialist with `prompt='person'` on a scene with a person in frame (excluded_classes positive case).
+5. **Log seen images + overlays for user verification.** Today the generalist returns only `(cls, conf, centroid)` and optionally the raw rgb/segments — no overlay. Auditing whether Gemini's bbox and FastSAM's mask look right is tedious. Add a `vision_log_folder` dump of:
+    - `req_{ts}.json` — request params + the branch taken + VLM raw JSON.
+    - `orig_{ts}.jpg` — the RGB frame used.
+    - `overlay_{ts}.jpg` — same frame with YOLO/VLM bboxes drawn + SAM/YOLO masks tinted.
+    Gate behind a `debug_log_overlays` ROS param so it's off in production. `object_seg_yolo.py` already has a `visualization` param but it uses `cv2.imshow`, which requires a display — the new behavior should write PNGs instead. Consider extending to the specialist + default nodes as well so all three services produce comparable audit artifacts.
+6. **Manual Gemini-bbox-decode fixture** (`scripts/tests/manual/gemini_bbox_decode.py`). Loads a saved image, calls `vlm_bbox.request_bboxes(img, 'spatula', model='google/gemini-2.5-pro')`, draws the returned xyxy on the image, writes an overlay PNG + the raw JSON response. Running it once confirms the `[y0,x0,y1,x1]` 0-1000 order matches what Gemini actually emits. Cheap; worth shipping before we rely on the VLM path in a demo.
+7. **Specialist model training.** `yolo_seg_node`'s whole purpose is a custom-trained YOLOv11-seg on competition items only (no `'person'` class — the `excluded_classes=['person']` filter is belt-and-suspenders). That model does not exist yet; the specialist currently serves `yolo11m-seg.pt` (pretrained COCO) which has none of the arena-specific classes. Parking the training task here so it doesn't get lost.
+8. **VLM latency**. Gemini 2.5 Pro at 9–14 s per call is fine for occasional open-vocab fallback but pushes total detection latency to ~15 s in the worst case. If the robot needs sub-second open-vocab detection, options are: cheaper model (`google/gemini-2.5-flash` — faster, worse bboxes), pre-cache common classes in YOLO via a few-shot fine-tune, or run a local open-vocab detector (GroundingDINO / OWL-ViT).
+9. **Double camera subscription.** Running specialist + generalist + default together means every color frame + depth stream is decoded three times into three `YOLOSegmentationNode` instances. Fine at 30 Hz but wasteful. Consolidation options: factor the camera-input half of `YOLOSegmentationNode` out as a shared `Node` that the three services *use* rather than subclass; or run one node that advertises all three services. Neither is urgent.
+10. **Per-VLM-detection confidence.** `generalist_node._build_vlm_sam_objects` hardcodes `obj.conf = 1.0` because Gemini's JSON shape doesn't carry a probability. If downstream callers start filtering on confidence, either lift a `score` from the VLM prompt ("also emit a 0-1 confidence per detection") or flag this as a known-constant so callers don't rely on it.
+
+### Files touched by this session
+
+| Path | Change |
+|---|---|
+| `src/tk26_vision/src/object_detection_new/object_detection_new/object_seg_yolo.py` | `excluded_classes` param + class filter; `img_sync_thres` default 0.00 → 0.20 |
+| `src/tk26_vision/src/object_detection_new/object_detection_new/object_seg_yolo_specialist.py` | New — wrapper sets `excluded_classes=['person']` |
+| `src/tk26_vision/src/object_detection_new/setup.py` | Repointed `yolo_seg_node` entry at the specialist wrapper |
+| `src/tk26_vision/src/vision_track/vision_track/person_track_node.py` | `lock_lifecycle` around `tracking_active` |
+| `src/tk26_vision/src/tk_vision_specialized/tk_vision_specialized/waving_person_server.py` | Import `DetectWaving` from tk23 package |
+| `src/tk26_vision/src/tk_vision_specialized/tk_vision_specialized/waving_client.py` | Same |
+| `src/tk26_vision/src/tk_vision_specialized/README.md` | Reflect tk23 srv namespace |
+| `src/tk26_vision/src/tinker_vision_msgs_26/srv/ObjectDetection.srv` | New — boolean-flag srv |
+| `src/tk26_vision/src/tinker_vision_msgs_26/srv/DetectWaving.srv` | Deleted (duplicate of tk23 type) |
+| `src/tk26_vision/src/tinker_vision_msgs_26/CMakeLists.txt` | Register new srv, `find_package(tinker_vision_msgs)`, drop DetectWaving |
+| `src/tk26_vision/src/tinker_vision_msgs_26/package.xml` | `<depend>tinker_vision_msgs</depend>` |
+| `src/tk26_vision/src/tinker_vision_msgs_26/README.md` | Rewritten — services table + tk23→tk26 field mapping |
+| `src/tk26_vision/src/object_detection_generalist/**` | New package (generalist_node, vlm_bbox, sam_mask, README, packaging) |
+| `src/tk26_vision/scripts/fix_venv_shebangs.sh` | Add `object_detection_generalist` to default package list |
+| `src/tk26_vision/CLAUDE.md` + `src/tk26_vision/README.md` | Architecture / running-nodes updates + `excluded_classes` gotcha |
+| `CLAUDE.md` (workspace) | `object_detection_generalist` row in the source tree |
+
+---
+
+## 2026-04-22 — Follow-up wave
+
+Executed the plan at `plans/plan-for-the-follow-keen-platypus.md`. Closed follow-ups #1–#5 and #9 from the prior session's list. Remaining open items (specialist training, VLM latency, triple-sub, plus a newly-surfaced TrackPerson/ScanForWavingPerson rearchitect) moved to the top of `CLAUDE.md § Known follow-ups`.
+
+### What shipped
+
+**Wave 1 — quick wins**
+- `object_seg_yolo.py:399-403` — `_pointcloud_to_array` now derives `floats_per_point = pc_msg.point_step // 4` instead of hardcoding 5. Unblocks the Orbbec path for all three detection nodes (specialist, default, generalist) without needing `enable_colored_point_cloud:=true` on the canonical bringup.
+- `generalist_node.py:_build_vlm_sam_objects` — docstring now states the `conf = 1.0` uniformity explicitly and points callers at `detection_source` for branch-level filtering.
+
+**Wave 2 — downstream migration**
+- New `ObjectDetectionGeneralist` shim in `behavior_tree/messages.py` + mock in `mock_messages.py`, following the existing `TrackPerson` try/except pattern. Real type resolves to `tinker_vision_msgs_26/srv/ObjectDetection`; falls back to a mock when tk26 isn't installed.
+- Arena-item BT callers flipped to the specialist (service name only, tk23 srv preserved):
+  - `behavior_tree/TemplateNodes/Vision.py:356` `BtNode_FindObj` → `/object_detection_yolo`
+  - `behavior_tree/StoringGroceries/customNodes.py:24` `BtNode_FindObjTable` → `/object_detection_yolo`
+  - `behavior_tree/HelpMeCarry/customNodes.py:22` `BtNode_FindPointedLuggage` → `/object_detection_yolo`
+- Open-vocabulary BT callers migrated to the generalist (service name + srv type + request field mapping):
+  - `behavior_tree/TemplateNodes/Vision.py:210` `BtNode_TrackPerson`
+  - `behavior_tree/GPSR/custom_nodes.py:549` `BtNode_ScanForWavingPerson`
+  - `behavior_tree/Restaurant/custumNodes.py:11` `BtNode_DetectCallingCustomer`
+  - `tk25_manipulation/.../arm_api/anygrasp_test.py` (import, client, request)
+- `kimi_api/feature_matching.py` + `kimi_api/grocery_categorize.py` — switched to `tinker_vision_msgs_26/srv/ObjectDetection`, boolean flag fields (`return_rgb_image`, `return_segments`, `use_vlm_sam_fallback`), default `detection_service` flipped to `'object_detection_generalist'`. `kimi_api/package.xml` gained `<depend>tinker_vision_msgs_26</depend>`. `tk25_manipulation/src/arm_api/package.xml` likewise.
+
+  Important: the tk26 detection nodes' `request.flags` parser only honors `sort_closest|sort_highest|sort_none` substrings. The legacy strings `"register_person"`, `"find_for_grasp"`, `"find_waving_person"`, `"detect_gesture"`, `"find_pointed_object"`, `"find_pointed_object"`, and `"scan"` are all no-ops — they've been silently eaten by every caller since the tk23→tk26 swap. Dropping them on migration is behavior-preserving, **not** a semantic change.
+
+  Caveat (see open follow-up #4 in CLAUDE.md): `BtNode_TrackPerson` still reads `result.person_id` and `BtNode_ScanForWavingPerson` still filters on `Object.being_pointed == 3`. Neither is populated by the generalist (or by tk26 detection nodes in general), so these two nodes are mechanically migrated but need a proper rearchitect.
+
+**Wave 3 — observability + coverage**
+- `debug_log_overlays` ROS param (default `False`) on `YOLOSegmentationNode`. When set, each service call dumps `orig_{ts}.jpg`, `overlay_{ts}.jpg`, `req_{ts}.json` under `vision_log_folder/`. Generalist overrides to produce equivalent artifacts on both the YOLO branch and the VLM+SAM branch (VLM raw bboxes included in the JSON payload).
+- `scripts/tests/manual/gemini_bbox_decode.py` — standalone fixture that loads a JPEG, calls `request_bboxes` with a given prompt + model, and writes `<stem>_overlay.png` + `<stem>_raw.json`. Use it to sanity-check the `[y0,x0,y1,x1]` 0-1000 decode convention after model bumps or `_SYSTEM_PROMPT` edits.
+- Test tier extensions:
+  - T0: generalist added to the shebang sweep, the venv-deps check (`FastSAM` import), a dedicated T0.3b module-import check, the interface-show list (`tinker_vision_msgs_26/srv/ObjectDetection`), and the entry-point import sweep. `object_detection_generalist` gets a smoke `OPENROUTER_API_KEY` during `--help` import just like kimi_api.
+  - T1.12: generalist advertises `/object_detection_generalist` both with and without `OPENROUTER_API_KEY` (the generalist checks the key lazily on the VLM branch — this is the contract that distinguishes it from kimi_api's fail-at-init).
+  - T2.14: live YOLO-branch call (prompt `'bottle'`) + live VLM+SAM-branch call (prompt `'spatula'`, `use_vlm_sam_fallback=true`). VLM case skips cleanly without a real key.
+  - T2.15: startup-log sanity on the specialist's `excluded_classes=['person']` param (live positive-case with a person in frame remains a T4 operator check).
+  - T3.4: `feature_matching ↔ generalist_node` pairing, mirroring the existing T3.1 pair against the default YOLO.
+
+### Verification (this workstation)
+
+- `./scripts/build.sh --packages-select object_detection_new object_detection_generalist tinker_vision_msgs_26 kimi_api` — clean, shebangs patched.
+- `colcon build --packages-select behavior_tree arm_api` — clean.
+- `./scripts/tests/t0_static.sh` — **18 pass / 0 fail / 0 skip**.
+- `./scripts/tests/t1_startup.sh` — **15 pass / 0 fail / 3 skip**. Skips are pre-existing (kimi_api no-key branches unreachable while `/home/tinker/tk25_ws/.env` carries a real key).
+- T2/T3 with live cameras not rerun in this session; reproduction steps unchanged from the 2026-04-22 entry above.
+
+### Files touched
+
+| Path | Change |
+|---|---|
+| `src/tk26_vision/src/object_detection_new/object_detection_new/object_seg_yolo.py` | `point_step`-derived reshape; `debug_log_overlays` param + `_write_debug_artifacts` helper; stash `_last_detection_info` / `_last_rgb_img` for the service callback |
+| `src/tk26_vision/src/object_detection_generalist/object_detection_generalist/generalist_node.py` | VLM-conf docstring; `debug_log_overlays` wiring for both YOLO and VLM+SAM branches |
+| `src/tk26_vision/src/kimi_api/kimi_api/feature_matching.py`, `grocery_categorize.py` | tk26 srv import, boolean flag fields, default service → generalist |
+| `src/tk26_vision/src/kimi_api/package.xml` | `+<depend>tinker_vision_msgs_26</depend>` |
+| `src/tk25_decision/src/behavior_tree/behavior_tree/messages.py`, `mock_messages.py` | Add `ObjectDetectionGeneralist` shim + mock |
+| `src/tk25_decision/.../TemplateNodes/Vision.py`, `GPSR/custom_nodes.py`, `Restaurant/custumNodes.py`, `StoringGroceries/customNodes.py`, `HelpMeCarry/customNodes.py` | Service-name + srv-type updates per plan table |
+| `src/tk25_manipulation/src/arm_api/arm_api/anygrasp_test.py` + `package.xml` | tk26 srv import, service name, request fields, msgs dep |
+| `src/tk26_vision/scripts/tests/t0_static.sh`, `t1_startup.sh`, `t2_live.sh`, `t3_interaction.sh` | Generalist coverage per Wave 3.2 |
+| `src/tk26_vision/scripts/tests/manual/gemini_bbox_decode.py` | New manual VLM-decode fixture |
+| `src/tk26_vision/CLAUDE.md` | Known-follow-ups trimmed to the 4 that remain open |
+
+### Not done (deferred, see CLAUDE.md § Known follow-ups)
+
+- Live T2/T3 regression pass and T4 operator scenarios (person-in-frame specialist positive case, servo motion, person ReID, shelf categorization with populated scene) — unchanged from the prior entry; still waiting on operator.
+- `BtNode_TrackPerson` + `BtNode_ScanForWavingPerson` semantic rearchitect (generalist doesn't populate `person_id` or `being_pointed`). Mechanical migration landed; proper fix needs routing TrackPerson at `/track_person` (person_track_server action) and replacing ScanForWavingPerson with the sibling `ScanForWavingPersonNew` that uses `DetectWaving`.
+

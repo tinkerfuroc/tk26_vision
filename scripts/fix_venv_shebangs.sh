@@ -21,6 +21,7 @@ VENV_PY="${VENV_PY:-$WS_ROOT/src/tk26_vision/.venv-vision-main/bin/python}"
 # Default package list; override via `PACKAGES="a b c" ./fix_venv_shebangs.sh`
 DEFAULT_PACKAGES=(
     object_detection_new
+    object_detection_generalist
     vision_util
     pan_tilt
     kimi_api

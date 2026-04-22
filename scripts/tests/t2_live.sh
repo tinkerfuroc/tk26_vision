@@ -270,6 +270,58 @@ else
 fi
 stop_all_nodes
 
+section "T2.14 — /object_detection_generalist (YOLO branch + VLM+SAM branch)"
+start_node generalist object_detection_generalist generalist_node
+if wait_for_service /object_detection_generalist 30; then
+    sleep 8  # sync warmup
+    # YOLO branch — prompt is in pretrained COCO vocab, no fallback needed
+    out="$LOG_DIR/T2.14_yolo.svcout"
+    svc_call "$out" 30 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetection \
+        "{camera: 'realsense', prompt: 'bottle', use_vlm_sam_fallback: false}"
+    if grep -qE 'Traceback' "$out"; then
+        fail "T2.14 YOLO" "traceback"
+    elif grep -qE "detection_source='(yolo|none)'" "$out" && grep -qE 'status=[01]' "$out"; then
+        src=$(grep -oE "detection_source='[^']*'" "$out" | head -1)
+        pass "T2.14 YOLO branch $src"
+    else
+        fail "T2.14 YOLO" "head: $(head -c 400 "$out")"
+    fi
+
+    # VLM+SAM branch — only run if we have a real key (Gemini call costs)
+    if have_api_key; then
+        out="$LOG_DIR/T2.14_vlm.svcout"
+        # 90 s timeout: Gemini 2.5 Pro is 9-14 s/call plus FastSAM + sync warmup
+        svc_call "$out" 90 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetection \
+            "{camera: 'realsense', prompt: 'spatula', use_vlm_sam_fallback: true}"
+        if grep -qE 'Traceback' "$out"; then
+            fail "T2.14 VLM" "traceback"
+        elif grep -qE "detection_source='(vlm_sam|none|yolo)'" "$out" && grep -qE 'status=[01]' "$out"; then
+            src=$(grep -oE "detection_source='[^']*'" "$out" | head -1)
+            pass "T2.14 VLM+SAM branch $src"
+        else
+            fail "T2.14 VLM" "head: $(head -c 400 "$out")"
+        fi
+    else
+        skip "T2.14 VLM" "no valid OPENROUTER_API_KEY"
+    fi
+else
+    fail "T2.14" "/object_detection_generalist never appeared"
+fi
+stop_all_nodes
+
+section "T2.15 — specialist /object_detection_yolo drops person (excluded_classes)"
+# Positive observation only possible when a person is actually in frame.
+# In empty-scene runs we fall back to confirming the param loads via log.
+start_node yolo_specialist_t2.15 object_detection_new yolo_seg_node
+sleep 3
+if grep -qE "Excluded classes: \['person'\]|excluded_classes.*person" "$LAST_LOG"; then
+    pass "T2.15 excluded_classes=['person'] loaded at startup"
+else
+    fail "T2.15" "excluded_classes log line missing (tail: $(tail -5 "$LAST_LOG" | tr '\n' '|'))"
+fi
+# Live positive-case check still needs operator (person in Orbbec frame) — left to T4.
+stop_all_nodes
+
 section "T2.13 — person_track action"
 start_node person_track vision_track person_track_server --ros-args -p enable_reid:=false
 if wait_for_action /track_person 30; then

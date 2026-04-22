@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+FastDDS profile that prefers shared-memory (SHM) over UDP for same-host ROS2
+traffic. Without this, ROS2 Humble's default FastDDS uses UDPv4 for user data;
+large image messages (848×480 RGB ≈ 1.2 MB) get fragmented into many UDP
+datagrams, and the kernel's default 208 KB socket receive buffer overflows —
+observed as ~3 Hz on `ros2 topic hz` and ~24 k/s RcvbufErrors on
+/proc/net/snmp, even when each camera is on its own USB 3 bus.
+
+Enable for any producer or consumer that handles the camera topics:
+    export FASTRTPS_DEFAULT_PROFILES_FILE=$(pwd)/src/tk26_vision/config/fastdds_shm.xml
+
+Both sides of a pub/sub need to have this env var set to negotiate SHM.
+Recommended: add the export to ~/.bashrc or ~/.zshrc so every shell inherits it.
+
+See src/tk26_vision/DEV_NOTES.md §"2026-04-22 — Camera bringup performance fix"
+for the full diagnosis.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>shm_transport</transport_id>
+            <type>SHM</type>
+            <segment_size>20971520</segment_size>
+            <port_queue_capacity>512</port_queue_capacity>
+            <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
+        </transport_descriptor>
+        <transport_descriptor>
+            <transport_id>udp_transport</transport_id>
+            <type>UDPv4</type>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="participant_profile_localhost" is_default_profile="true">
+        <rtps>
+            <userTransports>
+                <transport_id>shm_transport</transport_id>
+                <transport_id>udp_transport</transport_id>
+            </userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+        </rtps>
+    </participant>
+</profiles>

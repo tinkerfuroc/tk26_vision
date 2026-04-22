@@ -34,7 +34,7 @@ from sensor_msgs.msg import PointCloud2
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tinker_vision_msgs.action import Categorize
-from tinker_vision_msgs.srv import ObjectDetection
+from tinker_vision_msgs_26.srv import ObjectDetection
 
 from ._env import base_url, default_model, load_env, require_api_key
 
@@ -69,7 +69,7 @@ class GroceryCategorizeAction(Node):
         self.push_in_distance = 0.05
 
         self.declare_parameter('llm_model', default_model())
-        self.declare_parameter('detection_service', 'object_detection')
+        self.declare_parameter('detection_service', 'object_detection_generalist')
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
 
@@ -153,7 +153,9 @@ class GroceryCategorizeAction(Node):
         detection_req = ObjectDetection.Request()
         detection_req.camera = 'orbbec'
         detection_req.prompt = goal_handle.request.prompt + ' . shelf'
-        detection_req.flags = 'request_image|request_segments'
+        detection_req.return_rgb_image = True
+        detection_req.return_segments = True
+        detection_req.use_vlm_sam_fallback = True
         detection_req.target_frame = goal_handle.request.target_frame
 
         detection_future = self.detection_cli.call_async(detection_req)

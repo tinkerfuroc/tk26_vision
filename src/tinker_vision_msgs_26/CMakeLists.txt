@@ -11,13 +11,14 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(tinker_vision_msgs REQUIRED)
 
-# Generate action files
+# Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/SpotOnShelf.action"
   "action/TrackPerson.action"
-  "srv/DetectWaving.srv"
-  DEPENDENCIES geometry_msgs std_msgs sensor_msgs
+  "srv/ObjectDetection.srv"
+  DEPENDENCIES geometry_msgs std_msgs sensor_msgs tinker_vision_msgs
 )
 
 if(BUILD_TESTING)

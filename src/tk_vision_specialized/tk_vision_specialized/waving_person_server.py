@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from tinker_vision_msgs_26.srv import DetectWaving
+from tinker_vision_msgs.srv import DetectWaving
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge

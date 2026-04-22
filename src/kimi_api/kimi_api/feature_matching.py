@@ -27,7 +27,8 @@ from geometry_msgs.msg import PointStamped
 from openai import OpenAI
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from tinker_vision_msgs.srv import FeatureMatching, ObjectDetection
+from tinker_vision_msgs.srv import FeatureMatching
+from tinker_vision_msgs_26.srv import ObjectDetection
 
 from ._env import base_url, default_model, load_env, require_api_key
 
@@ -61,7 +62,7 @@ class FeatureMatchingService(Node):
 
         self.declare_parameter('log_prompts', True)
         self.declare_parameter('llm_model', default_model())
-        self.declare_parameter('detection_service', 'object_detection')
+        self.declare_parameter('detection_service', 'object_detection_generalist')
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
@@ -106,7 +107,9 @@ class FeatureMatchingService(Node):
         detection_req = ObjectDetection.Request()
         detection_req.camera = request.camera
         detection_req.prompt = 'person'
-        detection_req.flags = 'request_image|request_segments'
+        detection_req.return_rgb_image = True
+        detection_req.return_segments = True
+        detection_req.use_vlm_sam_fallback = True
         detection_req.target_frame = request.target_frame
 
         detection_future = self.detection_cli.call_async(detection_req)

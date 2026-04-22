@@ -19,7 +19,7 @@ while IFS= read -r f; do
     if [ "$first" != "$EXPECTED_SHEBANG" ]; then
         fail "T0.1" "bad shebang in $f: $first"; bad=1
     fi
-done < <(find "$WS_ROOT/install"/{object_detection_new,vision_util,pan_tilt,kimi_api,vision_track,tk_vision_specialized}/lib -maxdepth 2 -type f 2>/dev/null)
+done < <(find "$WS_ROOT/install"/{object_detection_new,object_detection_generalist,vision_util,pan_tilt,kimi_api,vision_track,tk_vision_specialized}/lib -maxdepth 2 -type f 2>/dev/null)
 [ "$seen" -eq 0 ] && fail "T0.1" "no install-tree entry scripts found — has the workspace been built?"
 [ "$bad" -eq 0 ] && [ "$seen" -gt 0 ] && pass "T0.1 ($seen scripts, all correct)"
 
@@ -34,16 +34,24 @@ else
 fi
 
 section "T0.3 — Venv deps importable"
-if "$VENV_PY" -c "import ultralytics, openai, dotenv, serial, scipy, torch, cv2" 2>"$LOG_DIR/t0.3.err"; then
+if "$VENV_PY" -c "import ultralytics, openai, dotenv, serial, scipy, torch, cv2; from ultralytics import FastSAM" 2>"$LOG_DIR/t0.3.err"; then
     pass "T0.3"
 else
     fail "T0.3" "$(cat "$LOG_DIR/t0.3.err")"
+fi
+
+section "T0.3b — Generalist module importable"
+if "$VENV_PY" -c "from object_detection_generalist.generalist_node import GeneralistDetectionNode; from object_detection_generalist.vlm_bbox import request_bboxes; from object_detection_generalist.sam_mask import FastSAMPredictor" 2>"$LOG_DIR/t0.3b.err"; then
+    pass "T0.3b"
+else
+    fail "T0.3b" "$(cat "$LOG_DIR/t0.3b.err")"
 fi
 
 section "T0.4 — ROS interfaces built"
 ifaces=(
     tinker_vision_msgs_26/action/TrackPerson
     tinker_vision_msgs_26/action/SpotOnShelf
+    tinker_vision_msgs_26/srv/ObjectDetection
     tinker_vision_msgs/srv/ObjectDetection
     tinker_vision_msgs/srv/DoorDetection
     tinker_vision_msgs/srv/GetPointCloud
@@ -68,6 +76,7 @@ section "T0.5 — Entry-point imports (--help exit clean)"
 entries=(
     object_detection_new:yolo_seg_node
     object_detection_new:yolo_seg_default_node
+    object_detection_generalist:generalist_node
     vision_util:door_detection
     vision_util:get_point_cloud
     pan_tilt:ctrl
@@ -86,7 +95,9 @@ for pair in "${entries[@]}"; do
     extra_args=()
     env_prefix=()
     case "$pkg" in
-        kimi_api) env_prefix=(env OPENROUTER_API_KEY=smoke) ;;
+        # The generalist checks the key lazily on the VLM branch, so it starts
+        # without one; pass a smoke key to keep `env` symmetry with kimi_api.
+        kimi_api|object_detection_generalist) env_prefix=(env OPENROUTER_API_KEY=smoke) ;;
     esac
     case "$entry" in
         ctrl) extra_args=(--ros-args -p device:=/dev/null) ;;

@@ -182,4 +182,30 @@ section "T1.11 — person_track_server advertises /track_person action"
 # enable_reid:=False keeps startup under 5 s on cold load
 t1_check T1.11 action /track_person vision_track person_track_server --ros-args -p enable_reid:=false
 
+section "T1.12 — generalist_node: no-key + with-key both advertise"
+# Unlike kimi_api, the generalist checks the key lazily on the VLM branch —
+# it MUST advertise cleanly even without a key so out-of-vocab fallback fails
+# gracefully at call time instead of killing the node at startup.
+start_node T1.12_nokey object_detection_generalist generalist_node
+if wait_for_service /object_detection_generalist 20; then
+    pass "T1.12 no-key: service advertised (key is checked lazily)"
+    # Sanity: log must not contain a traceback in the first seconds
+    if grep -qE 'Traceback' "$LAST_LOG"; then
+        fail "T1.12 no-key traceback" "$(tail -5 "$LAST_LOG" | tr '\n' '|')"
+    fi
+else
+    fail "T1.12 no-key" "service not advertised"
+fi
+stop_all_nodes
+
+OPENROUTER_API_KEY=smoke start_node T1.12_withkey object_detection_generalist generalist_node
+if wait_for_service /object_detection_generalist 20; then
+    pass "T1.12 with-key: service advertised"
+else
+    fail "T1.12 with-key" "service not advertised"
+fi
+stop_all_nodes
+# Negative-path VLM call (out-of-vocab + fallback under no key → OPENROUTER_API_KEY
+# error) requires live cameras to get past the recent-frame wait, so it lives in T2.
+
 summary

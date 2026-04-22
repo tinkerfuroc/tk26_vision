@@ -43,8 +43,9 @@ Optional: `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `LLM_M
 source install/setup.bash
 
 # Object detection
-ros2 run object_detection_new yolo_seg_node          # /object_detection_yolo (custom yolo11m-seg)
-ros2 run object_detection_new yolo_seg_default_node  # /object_detection (pretrained yolo11n-seg)
+ros2 run object_detection_new yolo_seg_node                 # /object_detection_yolo (specialist, excludes 'person')
+ros2 run object_detection_new yolo_seg_default_node         # /object_detection (pretrained COCO, backward-compat)
+ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + Gemini/FastSAM fallback)
 
 # Tracking / shelves
 ros2 run vision_track person_track_server            # action /track_person
@@ -68,18 +69,25 @@ ros2 run vision_util get_point_cloud                 # /get_point_cloud_service
 
 ```
 src/tk26_vision/src/
-├── tinker_vision_msgs_26/    # action/TrackPerson, action/SpotOnShelf
-├── object_detection_new/     # YOLO-seg: yolo_seg_node + yolo_seg_default_node (same class, different params)
-├── vision_track/             # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
-├── tk_vision_specialized/    # SpotOnShelf action server
-├── pan_tilt/                 # ctrl (serial + TF) + follow_head (YOLO@1Hz w/ blur gate)
-├── kimi_api/                 # OpenRouter LLM services; _env.py centralizes key loading
-└── vision_util/              # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay)
+├── tinker_vision_msgs_26/         # action/TrackPerson, action/SpotOnShelf, srv/ObjectDetection (new generalist)
+├── object_detection_new/          # YOLO-seg: specialist (yolo_seg_node, excludes 'person') + default (yolo_seg_default_node, pretrained COCO)
+├── object_detection_generalist/   # Pretrained YOLO + Gemini 2.5 Pro bbox + FastSAM mask fallback, tk26 srv
+├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
+├── tk_vision_specialized/         # SpotOnShelf action + waving detector
+├── pan_tilt/                      # ctrl (serial + TF) + follow_head (YOLO@1Hz w/ blur gate)
+├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
+└── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay)
 ```
 
 **Notes:**
+- Three object-detection services now coexist. Canonical targets going forward:
+  - `/object_detection_yolo` (specialist, custom-trained model, `excluded_classes=['person']`) — arena/competition items.
+  - `/object_detection_generalist` (new, tk26 srv with boolean flags) — the recommended target for open-vocabulary / non-arena callers (person detection, seat-rec helpers, any class YOLO doesn't recognize).
+  - `/object_detection` (pretrained COCO, tk23 srv, `excluded_classes=[]`) — kept for backward compatibility with tk25_decision BT nodes that still hard-code this name. Prefer the generalist for new code.
+- The specialist (`yolo_seg_node`) now silently drops the `'person'` class regardless of what the (future) custom model emits. To detect people, use the generalist or the default node.
 - `kimi_api` calls `object_detection` (generalist) via the `detection_service` ROS param — retargetable without rebuilding.
 - All migrated nodes import from `tinker_vision_msgs` (tk23's package), not `tinker_vision_msgs_26`. Intentional — `tk25_decision/messages.py` also imports from it. Consolidation deferred.
+- The new `tinker_vision_msgs_26/srv/ObjectDetection` references `tinker_vision_msgs/Object` by rosidl dependency, so there is no duplicate type namespace (same pattern that avoided the `DetectWaving` split).
 - Cameras: RealSense = aligned depth-to-color Image + pinhole intrinsics (ROS convention: x=fwd, y=left, z=up); Orbbec = PointCloud2 reprojected to image grid (standard ROS convention from the cloud).
 
 ## Models
@@ -128,3 +136,12 @@ See `scripts/tests/README.md` for env vars and skip conditions. Logs in `scripts
 - kimi_api loads `.env` via `load_dotenv()` from CWD upward at startup. Negative "no key" tests must move `.env` aside.
 
 Per-run results and operator-in-the-loop matrix in [`DEV_NOTES.md`](./DEV_NOTES.md).
+
+## Known follow-ups
+
+Actionable work that remains open. Full context, rationale, and prioritization in [`DEV_NOTES.md § Follow-ups`](./DEV_NOTES.md#follow-ups--ordered-roughly-by-impact). Items 1–5 and 9 from the previous follow-up list were addressed in the 2026-04-22 "Follow-up wave" session — see that DEV_NOTES entry.
+
+1. **Specialist model training.** The custom-trained competition YOLO does not exist yet — `yolo_seg_node` currently serves pretrained `yolo11m-seg.pt`. `excluded_classes=['person']` is belt-and-suspenders for the future retrain.
+2. **VLM latency** (9–14 s/call on Gemini 2.5 Pro) is the dominant cost on the fallback path. Options: lighter model (`gemini-2.5-flash`), few-shot-tune YOLO on the open-vocab classes you care about, or swap in a local open-vocab detector.
+3. **Triple-subscription of camera streams** when specialist + default + generalist all run together. Not urgent, but worth factoring the input half of `YOLOSegmentationNode` into a shared node if we keep the three-service split.
+4. **`BtNode_TrackPerson` / `BtNode_ScanForWavingPerson` / `BtNode_FindPointedLuggage` rearchitect** — these BT nodes were migrated to the tk26 generalist srv mechanically in Wave 2.1, but their *semantics* depend on tk23-only response fields the tk26 detection nodes never populate (`result.person_id`, `Object.being_pointed`). The full catalog of broken nodes, live-task blast radius, and recommended fix per node lives alongside the code in [`src/tk25_decision/CLAUDE.md § Known issues & broken nodes`](../../src/tk25_decision/CLAUDE.md#known-issues--broken-nodes).

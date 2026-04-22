@@ -15,8 +15,9 @@ Vision module for Tinker 2026 based on ROS2 Humble.
 
 | Package | Description |
 |---------|-------------|
-| `tinker_vision_msgs_26` | Custom message and action definitions (`TrackPerson`, `SpotOnShelf`) |
-| `object_detection_new` | YOLO segmentation detection — two service variants (`object_detection_yolo` custom, `object_detection` default) |
+| `tinker_vision_msgs_26` | Custom interface definitions (`TrackPerson`, `SpotOnShelf`, new boolean-flag `ObjectDetection.srv`) |
+| `object_detection_new` | YOLO segmentation detection — specialist `object_detection_yolo` (custom model, excludes `'person'`) + pretrained `object_detection` (backward-compat) |
+| `object_detection_generalist` | Clean pretrained YOLO + optional Gemini 2.5 Pro (bbox) + FastSAM (mask) open-vocabulary detection on `/object_detection_generalist` |
 | `vision_track` | Person tracking action server with ReID |
 | `tk_vision_specialized` | `SpotOnShelf` action server |
 | `pan_tilt` | Pan-tilt servo control + YOLO head follow (migrated from tk23_vision) |
@@ -103,8 +104,9 @@ source .venv-vision-main/bin/activate
 source install/setup.bash
 
 # Detection
-ros2 run object_detection_new yolo_seg_node           # /object_detection_yolo (custom model)
-ros2 run object_detection_new yolo_seg_default_node   # /object_detection (default model)
+ros2 run object_detection_new yolo_seg_node                 # /object_detection_yolo (specialist, custom model, excludes 'person')
+ros2 run object_detection_new yolo_seg_default_node         # /object_detection (pretrained COCO, backward-compat)
+ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + Gemini/FastSAM fallback)
 
 # Person tracking
 ros2 run vision_track person_track_server

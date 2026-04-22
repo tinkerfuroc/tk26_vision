@@ -26,7 +26,7 @@ from pathlib import Path
 import os
 
 # ROS2 messages
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped, Point
 from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformListener
@@ -114,7 +114,7 @@ class PersonTrackNode(Node):
         
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')
-        self.declare_parameter('depth_topic', '/camera/depth_registered/points')
+        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
         
         # Tracking parameters
@@ -316,14 +316,14 @@ class PersonTrackNode(Node):
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=1
         )
-        
+
         cb_group = MutuallyExclusiveCallbackGroup()
-        
+
         # Synchronized RGB and depth subscribers
         image_sub = Subscriber(self, Image, self.image_topic, qos_profile=qos_profile)
-        depth_sub = Subscriber(self, PointCloud2, self.depth_topic, qos_profile=qos_profile)
+        depth_sub = Subscriber(self, Image, self.depth_topic, qos_profile=qos_profile)
         
         sync = ApproximateTimeSynchronizer(
             [image_sub, depth_sub],
@@ -367,60 +367,46 @@ class PersonTrackNode(Node):
                 self.get_logger().info(f'Camera info received: resolution {msg.width}x{msg.height}')
             self.camera_intrinsic = msg
 
-    def _camera_callback(self, rgb_msg: Image, depth_msg: PointCloud2):
+    def _camera_callback(self, rgb_msg: Image, depth_msg: Image):
         """Process synchronized RGB and depth messages."""
         with self.lock_msg:
             self.recent_sync_msg = (rgb_msg, depth_msg)
             self.recent_msg_time = self.get_clock().now()
             self.frame_seq += 1
 
-    def _pointcloud_to_array(self, pc_msg: PointCloud2, intrinsic: CameraInfo) -> tuple:
+    def _depth_image_to_points(self, depth_msg: Image, intrinsic: CameraInfo) -> tuple:
         """
-        Convert PointCloud2 to point array (Orbbec format).
-        
+        Unproject a registered depth image (encoding 16UC1, mm) to per-pixel XYZ.
+
+        Depth is already aligned to color (frame_id=camera_color_optical_frame),
+        so color intrinsics apply directly.
+
         Returns:
-            points: np.ndarray of shape (H, W, 3) containing 3D points
+            points: np.ndarray of shape (H, W, 3) containing 3D points (meters)
             valid_mask: np.ndarray of shape (H, W) with valid depth mask
         """
-        # Get resolution from camera intrinsics (dynamic, not hardcoded)
-        h = intrinsic.height
-        w = intrinsic.width
-        K = np.array(intrinsic.k).reshape((3, 3))
-        
-        # Parse point cloud - detect the point step size
-        point_step = pc_msg.point_step
-        floats_per_point = point_step // 4  # Assuming float32 (4 bytes)
-        
-        # Parse point cloud
-        arr = np.frombuffer(pc_msg.data, dtype='<f4')
-        N = len(arr) // floats_per_point
-        points_raw = arr.reshape((N, floats_per_point))[:, [0, 1, 2]]  # x, y, z
-        
-        # Filter invalid points
-        valid = ~np.isnan(points_raw[:, 2]) & (points_raw[:, 2] > 0)
-        points_valid = points_raw[valid]
-        
-        if len(points_valid) == 0:
-            return np.zeros((h, w, 3)), np.zeros((h, w), dtype=bool)
-        
-        # Project to image coordinates
-        z = points_valid[:, 2:3]
-        z[z == 0] = 1e-6  # Avoid division by zero
-        points_homo = points_valid / np.repeat(z, 3, axis=1)
-        coor_homo = (K @ points_homo.T).T
-        coor = np.rint(coor_homo[:, :2]).astype(int)
-        
-        # Create depth image
-        depth_img = np.zeros((h, w, 3))
-        valid_coords = (coor[:, 0] >= 0) & (coor[:, 0] < w) & \
-                       (coor[:, 1] >= 0) & (coor[:, 1] < h)
-        depth_img[coor[valid_coords, 1], coor[valid_coords, 0], :] = points_valid[valid_coords]
-        
-        # Valid mask
-        valid_mask = (depth_img[:, :, 2] > self.min_depth) & \
-                     (depth_img[:, :, 2] < self.max_depth)
-        
-        return depth_img, valid_mask
+        h, w = depth_msg.height, depth_msg.width
+        fx, fy = intrinsic.k[0], intrinsic.k[4]
+        cx, cy = intrinsic.k[2], intrinsic.k[5]
+
+        # Orbbec Femto Bolt default: 16UC1 depth in millimeters.
+        depth = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(h, w).astype(np.float32) * 0.001
+
+        valid_mask = (depth > self.min_depth) & (depth < self.max_depth)
+
+        # Cache meshgrid across calls at this resolution.
+        cache = getattr(self, '_uv_cache', None)
+        if cache is None or cache[0] != (h, w):
+            u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+            self._uv_cache = ((h, w), u, v)
+        _, u, v = self._uv_cache
+
+        z = depth
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+        points = np.stack([x, y, z], axis=-1)
+
+        return points, valid_mask
 
     def _calculate_centroid(
             self, 
@@ -702,7 +688,10 @@ class PersonTrackNode(Node):
             return None
 
         try:
-            rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+            # Avoid CvBridge's extra copy; image is already bgr8 on the wire.
+            rgb_img = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
+                rgb_msg.height, rgb_msg.width, 3
+            )
         except Exception as e:
             self.get_logger().warn(f'Failed to convert RGB image: {e}')
             return None
@@ -734,7 +723,7 @@ class PersonTrackNode(Node):
         params,
     ):
         try:
-            points, valid_mask = self._pointcloud_to_array(depth_msg, intrinsic)
+            points, valid_mask = self._depth_image_to_points(depth_msg, intrinsic)
         except Exception as e:
             self.get_logger().warn(f'Failed to process pointcloud: {e}')
             points, valid_mask = None, None

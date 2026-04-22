@@ -75,6 +75,9 @@ class PersonTrackNode(Node):
         self.lock_msg = threading.Lock()
         self.lock_info = threading.Lock()
         self.lock_tracker = threading.Lock()
+        # Guards tracking_active + goal_handle so goal_callback can atomically
+        # test-and-set without two concurrent ACCEPTs under MultiThreadedExecutor.
+        self.lock_lifecycle = threading.Lock()
         
         # Camera data storage
         self.camera_intrinsic: CameraInfo = None
@@ -560,12 +563,17 @@ class PersonTrackNode(Node):
         if not has_data or not has_intrinsic:
             self.get_logger().warn('No camera data available, rejecting goal')
             return GoalResponse.REJECT
-        
-        # Check if already tracking
-        if self.tracking_active:
-            self.get_logger().warn('Already tracking, rejecting new goal')
-            return GoalResponse.REJECT
-        
+
+        # Atomic test-and-set: reserve the tracking slot here so a second
+        # concurrent goal_callback sees tracking_active=True and rejects.
+        # _execute_callback / _cleanup_tracking release the slot under the
+        # same lock.
+        with self.lock_lifecycle:
+            if self.tracking_active:
+                self.get_logger().warn('Already tracking, rejecting new goal')
+                return GoalResponse.REJECT
+            self.tracking_active = True
+
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, goal_handle):
@@ -583,8 +591,10 @@ class PersonTrackNode(Node):
         3. Handles target loss and cancellation
         """
         self.get_logger().info('Executing track_person action')
-        self.tracking_active = True
-        self.goal_handle = goal_handle
+        # tracking_active was already set True under lock_lifecycle in
+        # _goal_callback; we just record the goal handle here.
+        with self.lock_lifecycle:
+            self.goal_handle = goal_handle
 
         params = {
             "return_rgb_img": goal_handle.request.return_rgb_img,
@@ -833,8 +843,9 @@ class PersonTrackNode(Node):
 
     def _cleanup_tracking(self):
         """Clean up tracking state."""
-        self.tracking_active = False
-        self.goal_handle = None
+        with self.lock_lifecycle:
+            self.tracking_active = False
+            self.goal_handle = None
 
         if self.target_point_pub is not None:
             self.destroy_publisher(self.target_point_pub)

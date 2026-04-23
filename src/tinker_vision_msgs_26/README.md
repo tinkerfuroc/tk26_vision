@@ -8,7 +8,9 @@ As of the tk23→tk26 migration, the tk23 `tinker_vision_msgs` package has been 
 
 ### Messages
 
-`BoundingBox`, `Face`, `FaceResult`, `Object`, `Objects`, `PanTiltCtrl`.
+`BoundingBox`, `Face`, `FaceResult`, `Object`, `Objects`, `PanTiltCommand`,
+`PanTiltState`, `PanTiltCtrl` (legacy interface only; current `pan_tilt`
+runtime nodes do not subscribe to it).
 
 ### Actions
 
@@ -29,7 +31,19 @@ Two `ObjectDetection`-shaped services coexist in this package, deliberately name
 | `srv/ObjectDetection.srv` | `object_detection_new/yolo_seg_node` (specialist) + `yolo_seg_default_node` (pretrained COCO) | Legacy string-flag schema inherited from tk23. Kept for back-compat with tk25_decision BTs that hard-code `/object_detection`. |
 | `srv/ObjectDetectionGeneralist.srv` | `object_detection_generalist/generalist_node` | Clean YOLO + optional VLM+SAM open-vocabulary detection with typed boolean flags. |
 
-Additional services: `DetectWaving`, `DoorDetection`, `FaceRegister`, `FeatureExtraction`, `FeatureMatching`, `FollowHead`, `GetImage`, `GetPointCloud`, `ObjectDetectionImage`, `PointDirection`, `SeatRecommendation`.
+Additional services: `DetectWaving`, `DoorDetection`, `FaceRegister`,
+`FeatureExtraction`, `FeatureMatching`, `FollowHead`, `GetImage`,
+`GetPointCloud`, `ObjectDetectionImage`, `PointDirection`, `SeatRecommendation`,
+`SetTorque`, `SetZero`.
+
+### Pan-tilt low-level interfaces
+
+| File | Purpose |
+|---|---|
+| `msg/PanTiltCommand.msg` | Native pan-tilt command API. Uses radians and a `mode` field for absolute vs relative commands. |
+| `msg/PanTiltState.msg` | Native pan-tilt state feedback. Publishes radians plus connection / feedback health flags. |
+| `srv/SetTorque.srv` | Enable or disable pan-tilt torque from ROS. |
+| `srv/SetZero.srv` | Persist the current hardware pose as pan / tilt zero, matching the firmware workflow in `src/pan_tilt/about_pantilt.md`. |
 
 #### Generalist vs. legacy `ObjectDetection` — field mapping
 
@@ -105,4 +119,3 @@ tracking rate (independent of BT tick cadence), but **only** when the target
 is not lost and the TF transform to `target_frame` succeeded. This gating
 means `tk26_nav/tracking_server`'s own LOST timer engages cleanly when the
 stream goes silent.
-

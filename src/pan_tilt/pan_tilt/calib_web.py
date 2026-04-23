@@ -45,7 +45,6 @@ import yaml
 from cv_bridge import CvBridge
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, JointState
@@ -456,12 +455,24 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     app = FastAPI(title="pan_tilt calibrate_web", docs_url="/api/docs")
 
     # --- static UI ---------------------------------------------------------
+    # We serve index/style/app via explicit routes rather than StaticFiles.
+    # StaticFiles with a symlinked install-tree `share/pan_tilt/webui` dir
+    # silently 404'd in testing (likely due to how colcon --symlink-install
+    # symlinks individual files); explicit FileResponse routes are more
+    # predictable and the asset count is tiny.
     if webui_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(webui_dir)), name="static")
-
         @app.get("/")
         def root():
-            return FileResponse(webui_dir / "index.html")
+            return FileResponse(webui_dir / "index.html", media_type="text/html")
+
+        @app.get("/static/style.css")
+        def static_css():
+            return FileResponse(webui_dir / "style.css", media_type="text/css")
+
+        @app.get("/static/app.js")
+        def static_js():
+            return FileResponse(webui_dir / "app.js",
+                                media_type="application/javascript")
     else:
         @app.get("/")
         def root_missing():

@@ -9,14 +9,21 @@
 # invokes the venv python instead.
 #
 # Usage:
-#   ./src/tk26_vision/scripts/fix_venv_shebangs.sh
+#   ./scripts/fix_venv_shebangs.sh
 #   WS_ROOT=/path VENV_PY=/path/to/venv/bin/python ./fix_venv_shebangs.sh
 #   PACKAGES="pan_tilt kimi_api" ./fix_venv_shebangs.sh
 
 set -euo pipefail
 
-WS_ROOT="${WS_ROOT:-$HOME/tk25_ws}"
-VENV_PY="${VENV_PY:-$WS_ROOT/src/tk26_vision/.venv-vision-main/bin/python}"
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
+FALLBACK_VENV_PY="$(cd "$REPO_ROOT/../.." && pwd)/src/tk26_vision/.venv-vision-main/bin/python"
+
+WS_ROOT="${WS_ROOT:-$REPO_ROOT}"
+VENV_PY="${VENV_PY:-$WS_ROOT/.venv-vision-main/bin/python}"
+if [ ! -x "$VENV_PY" ] && [ -x "$FALLBACK_VENV_PY" ]; then
+    VENV_PY="$FALLBACK_VENV_PY"
+fi
 
 # Default package list; override via `PACKAGES="a b c" ./fix_venv_shebangs.sh`
 DEFAULT_PACKAGES=(

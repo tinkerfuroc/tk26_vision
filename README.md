@@ -6,7 +6,7 @@ Vision module for Tinker 2026 based on ROS2 Humble.
 
 - **Object Detection**: YOLO11-seg based detection and segmentation, plus a default-YOLO variant for generalist queries
 - **Person Tracking**: YOLO + ByteTrack + ReID for persistent identity tracking
-- **Pan-tilt Head Control**: Serial servo driver with TF broadcasting + YOLO head-following
+- **Pan-tilt Head Control**: Serial controller + joint-state/URDF TF + YOLO head-following
 - **LLM-backed Services (OpenRouter)**: Person feature extraction, description-to-image matching, and grocery-shelf categorization
 - **Utility Services**: Door detection (Orbbec depth heuristic), point-cloud relay
 - **Specialized Vision Tasks**: Spot-on-shelf action server
@@ -33,7 +33,7 @@ Corresponding tk23 packages are `COLCON_IGNORE`'d — see [CLAUDE.md § Revertin
 - ROS2 Humble installed
 - Python 3.10
 - CUDA-capable GPU (recommended for real-time performance)
-- Serial device at `/dev/ttyUSB0` if using `pan_tilt/ctrl` (override via `-p device:=…`)
+- Serial device at `/dev/ttyUSB0` if using `pan_tilt.launch.py` or `pan_tilt/controller`
 
 ### 1. Create Virtual Environment
 
@@ -61,7 +61,7 @@ ROS2_PTH_WARNED=1 pip install "numpy<2" "opencv-python<4.10" ultralytics netifac
 
 # Per-package extras (installed the first time the migration was applied; leave here for reproducibility)
 ROS2_PTH_WARNED=1 pip install -r src/kimi_api/requirements.txt      # openai, python-dotenv, scipy
-ROS2_PTH_WARNED=1 pip install -r src/pan_tilt/requirements.txt      # pyserial, transforms3d (ultralytics/opencv already present)
+ROS2_PTH_WARNED=1 pip install -r src/pan_tilt/requirements.txt      # pyserial (ultralytics/opencv already present)
 ROS2_PTH_WARNED=1 pip install -r src/vision_track/requirements.txt  # torch, etc.
 ```
 
@@ -76,18 +76,21 @@ cp src/kimi_api/.env.example <workspace-root>/.env
 
 ### 5. Build — use the wrapper
 
-Use `src/tk26_vision/scripts/build.sh`, which sources venv + ROS, runs `colcon build --symlink-install`, and patches install-tree shebangs so `ros2 run` invokes the venv python. Plain `colcon build` produces `#!/usr/bin/python3` shebangs that can't import from the venv.
+Use `./scripts/build.sh`, which sources venv + ROS, runs
+`colcon build --symlink-install`, and patches install-tree shebangs so
+`ros2 run` invokes the venv python. Plain `colcon build` produces
+`#!/usr/bin/python3` shebangs that can't import from the venv.
 
 ```bash
-# From workspace root (~/tk25_ws)
-./src/tk26_vision/scripts/build.sh
-./src/tk26_vision/scripts/build.sh --packages-select pan_tilt kimi_api
-./src/tk26_vision/scripts/build.sh --packages-up-to object_detection_new
+# From the tk26_vision repo root / worktree root
+./scripts/build.sh
+./scripts/build.sh --packages-select pan_tilt kimi_api
+./scripts/build.sh --packages-up-to object_detection_new
 ```
 
 If you build with plain `colcon`, follow up with:
 ```bash
-./src/tk26_vision/scripts/fix_venv_shebangs.sh
+./scripts/fix_venv_shebangs.sh
 ```
 (idempotent; covers `object_detection_new`, `vision_util`, `pan_tilt`, `kimi_api`, `vision_track`, `tk_vision_specialized`).
 
@@ -116,8 +119,13 @@ ros2 run vision_track person_track_test_client
 ros2 run tk_vision_specialized spot_on_shelf_server
 
 # Pan-tilt
-ros2 run pan_tilt ctrl --ros-args -p device:=/dev/ttyUSB0
+ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
+ros2 run pan_tilt controller --ros-args -p device:=/dev/ttyUSB0   # low-level only
+ros2 run pan_tilt state_publisher                                  # low-level only
 ros2 run pan_tilt follow_head
+
+# Module docs / breaking changes
+# See src/pan_tilt/README.md
 
 # LLM-backed (requires OPENROUTER_API_KEY in env or .env)
 ros2 run kimi_api feature_recognition
@@ -163,13 +171,13 @@ Supported models:
 
 | Issue | Solution |
 |-------|----------|
-| `ModuleNotFoundError: No module named 'openai'` (or `dotenv`, `ultralytics`, `serial`) when running `ros2 run …` | Shebangs were built with `/usr/bin/python3`. Run `./src/tk26_vision/scripts/fix_venv_shebangs.sh` or rebuild via `build.sh`. |
+| `ModuleNotFoundError: No module named 'openai'` (or `dotenv`, `ultralytics`, `serial`) when running `ros2 run …` | Shebangs were built with `/usr/bin/python3`. Run `./scripts/fix_venv_shebangs.sh` or rebuild via `build.sh`. |
 | `RuntimeError: OPENROUTER_API_KEY is not set` | Copy `src/kimi_api/.env.example` to a `.env` at workspace root (or ancestor of CWD), fill in the key. |
 | `bad interpreter: ../../.venv-vision-main/bin/python` (on `vision_track`) | Relative shebang from a stale build; rerun the shebang fixer (or `build.sh`). |
 | `numpy` version conflict with `cv_bridge` | Use `numpy<2` (cv_bridge compiled against NumPy 1.x). |
 | CUDA out of memory | Use smaller model (yolo11n-seg.pt) or reduce `inference_size`. |
 | Build fails for `tinker_vision_msgs_26` | `rm -rf build/tinker_vision_msgs_26 install/tinker_vision_msgs_26 && colcon build --packages-select tinker_vision_msgs_26` |
-| `serial.serialutil.SerialException` opening `/dev/ttyUSB0` | No servo attached, or override with `--ros-args -p device:=/dev/ttyUSB1`. |
+| `serial.serialutil.SerialException` opening `/dev/ttyUSB0` | No servo attached, wrong device, or your local test harness still assumes `/dev/ttyUSB1`; override `device:=...` or export `SERVO_DEVICE=...` as needed. |
 | kimi_api service client hangs on `object_detection` | Make sure `ros2 run object_detection_new yolo_seg_default_node` is running (it serves the generalist `object_detection` service). |
 
 ## Architecture
@@ -187,8 +195,10 @@ src/tk26_vision/src/
 ├── tk_vision_specialized/
 │   └── tk_vision_specialized/spot_on_shelf_server.py
 ├── pan_tilt/
-│   ├── pan_tilt/{pan_tilt_ctrl.py, follow_head.py, calibration/}
-│   └── config/specs.json
+│   ├── pan_tilt/{pan_tilt_controller.py, pan_tilt_state_publisher.py, follow_head.py, calibration/}
+│   ├── config/pan_tilt.yaml
+│   ├── launch/pan_tilt.launch.py
+│   └── urdf/pan_tilt.urdf.xacro
 ├── kimi_api/
 │   ├── kimi_api/{feature_recognition,feature_matching,grocery_categorize,_env}.py
 │   └── .env.example
@@ -210,4 +220,5 @@ See [CLAUDE.md § Reverting](./CLAUDE.md#reverting) for step-by-step revert proc
 ## Related Documentation
 
 - [CLAUDE.md](./CLAUDE.md) — detailed architecture, env setup, running nodes, revert procedure
+- [src/pan_tilt/README.md](./src/pan_tilt/README.md) — pan-tilt runtime stack, firmware assumptions, and breaking changes from the clean refactor
 - Workspace root: `/home/tinker/tk25_ws/CLAUDE.md`

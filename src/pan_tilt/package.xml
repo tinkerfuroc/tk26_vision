@@ -8,14 +8,16 @@
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_ros_py</depend>
-  <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
   <depend>message_filters</depend>
   <depend>cv_bridge</depend>
   <depend>tinker_vision_msgs_26</depend>
   <depend>ament_index_python</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
   <exec_depend>vision_util</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

@@ -79,9 +79,9 @@ else
     skip "T3.4" "no valid OPENROUTER_API_KEY"
 fi
 
-section "T3.3 — pan_tilt/ctrl TF + follow_head"
+section "T3.3 — pan_tilt stack TF + follow_head"
 if [ -c "$SERVO_DEVICE" ]; then
-    start_node ctrl_t3 pan_tilt ctrl --ros-args -p "device:=$SERVO_DEVICE"
+    start_launch ctrl_t3 pan_tilt pan_tilt.launch.py "device:=$SERVO_DEVICE"
     sleep 3
     tf_ok=0
     if timeout 5 ros2 run tf2_ros tf2_echo base_link camera_link >"$LOG_DIR/T3.3.tf" 2>&1 & then

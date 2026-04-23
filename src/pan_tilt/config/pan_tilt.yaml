@@ -32,7 +32,7 @@ pan_tilt_state_publisher:
 follow_head_node:
   ros__parameters:
     # Runtime + I/O
-    yolo_model: yolov8s-seg.pt
+    yolo_model: yolo11s-pose.pt
     # Vision logging does synchronous disk IO (two JPEGs + one JSON per
     # detection). At 5 Hz this blocks the action loop ~30-40 ms per tick.
     # Leave off for real tracking; flip on for debugging specific frames.
@@ -66,6 +66,17 @@ follow_head_node:
     target_ttl_sec: 0.8
     ema_alpha: 0.7                        # was 0.4 — prioritize fresh data
     reassoc_dist_m: 0.4
+
+    # Pose-target params (YOLO-pose face aiming). kp_confidence_threshold is
+    # the per-keypoint conf floor used to decide which fallback branch runs
+    # (triangle > eye_window > single_eye > nose > ear > head_proxy).
+    # face_depth_window_px is the square window edge used by all non-triangle
+    # branches for depth sampling. min_triangle_valid_depth_pixels is both
+    # the triangle's minimum fill AND the floor applied to every branch's
+    # depth sample to reject sparse / all-invalid regions.
+    kp_confidence_threshold: 0.5
+    face_depth_window_px: 11
+    min_triangle_valid_depth_pixels: 10
 
     # Phase E — config surface + motion profile
     blur_threshold: 80.0

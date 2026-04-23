@@ -10,8 +10,8 @@ pan_tilt_controller:
     pan_max_deg: 180.0
     tilt_min_deg: -30.0
     tilt_max_deg: 90.0
-    default_speed_raw: 120
-    default_accel_raw: 20
+    default_speed_raw: 240
+    default_accel_raw: 40
     send_force_gimbal_on_startup: true
     send_enable_feedback_on_startup: true
     invert_pan: false
@@ -31,9 +31,48 @@ pan_tilt_state_publisher:
 
 follow_head_node:
   ros__parameters:
+    # Runtime + I/O
+    yolo_model: yolov8s-seg.pt
+    # Vision logging does synchronous disk IO (two JPEGs + one JSON per
+    # detection). At 5 Hz this blocks the action loop ~30-40 ms per tick.
+    # Leave off for real tracking; flip on for debugging specific frames.
+    vision_logging_enabled: false
+    vision_log_folder: vision_log
     command_topic: /pan_tilt_controller/cmd
     state_topic: /pan_tilt_controller/state
     home_pan_deg: 0.0
     home_tilt_deg: 45.0
-    pan_deadband_deg: 3.0
-    tilt_deadband_deg: 3.0
+    # Deadband on target-vs-state error (degrees). Smaller = more responsive
+    # (fires commands even for small errors); larger = less twitchy.
+    pan_deadband_deg: 1.5
+    tilt_deadband_deg: 1.5
+    # Minimum change between successive COMMANDS to avoid micro-spam. With
+    # the aggressive settle params below, keep this tight so we re-command
+    # as soon as the target drifts meaningfully.
+    min_command_change_deg: 0.5
+
+    # Phase B — feedback-gated settle. Lowered aggressively so new detections
+    # translate into motion fast, accepting some jerk in exchange for speed.
+    min_detection_interval_sec: 0.1       # 10 Hz YOLO cap (was 0.2 / 5 Hz)
+    max_settle_timeout_sec: 0.3           # watchdog fires fast (was 1.5)
+    steady_pan_eps_deg: 3.0               # very loose (was 0.5)
+    steady_tilt_eps_deg: 3.0              # very loose (was 0.5)
+    steady_velocity_eps_deg_per_sec: 60.0 # ω ≈ 0 threshold relaxed
+    steady_sample_count: 1                # single sample is enough
+    state_stale_timeout_sec: 0.3
+
+    # Phase C — identity continuity + smoothing. Higher alpha = faster
+    # response, less smoothing (trade: noisier).
+    target_ttl_sec: 0.8
+    ema_alpha: 0.7                        # was 0.4 — prioritize fresh data
+    reassoc_dist_m: 0.4
+
+    # Phase E — config surface + motion profile
+    blur_threshold: 80.0
+    # No speed scaling — always use controller default, which we've bumped
+    # to be fast. The tiny-error threshold is effectively moot when both
+    # branches send the same speed.
+    small_error_deg: 0.5
+    command_speed_raw_small: 0   # 0 => controller default
+    command_speed_raw_large: 0   # 0 => controller default
+    command_accel_raw: 0          # 0 => controller default

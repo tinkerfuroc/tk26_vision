@@ -34,6 +34,7 @@ setup(
             'controller = pan_tilt.pan_tilt_controller:main',
             'state_publisher = pan_tilt.pan_tilt_state_publisher:main',
             'follow_head = pan_tilt.follow_head:main',
+            'calibrate_collect = pan_tilt.calibrate_collect:main',
         ],
     },
 )

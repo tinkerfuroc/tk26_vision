@@ -1,0 +1,77 @@
+# Pan-tilt calibration collector configuration.
+#
+# Pass to the node as:
+#   ros2 run pan_tilt calibrate_collect --ros-args \
+#     -p config:=/path/to/calibration.yaml \
+#     -p out_dir:=/path/to/output \
+#     -p phase:=both   # or phase1 | phase2 | sanity
+#
+# All xArm joint angles are in RADIANS in the order the xArm driver expects
+# (typically the 6 or 7 revolute joints J1..J6/J7 starting from base). The
+# waypoints here are PLACEHOLDERS - replace with values recorded in RViz that
+# you have verified keep the ChArUco in view and clear of collisions.
+
+collector:
+  # Topics and services. Override if your robot names them differently.
+  image_topic: /camera/color/image_raw
+  camera_info_topic: /camera/color/camera_info
+  pantilt_cmd_topic: /pan_tilt_controller/cmd
+  pantilt_state_topic: /pan_tilt_controller/state
+  xarm_service: /xarm/set_servo_angle
+  base_frame: base_link
+  ee_frame: link_eef
+
+  xarm_speed: 0.3
+  xarm_acc: 0.3
+  xarm_settle_sec: 0.6
+  xarm_service_timeout_sec: 20.0
+
+  pantilt_speed_raw: 120
+  pantilt_accel_raw: 20
+  servo_settle_tol_deg: 0.3
+  servo_settle_hold_sec: 0.5
+  servo_backlash_overshoot_deg: 2.0
+  servo_backlash_pause_sec: 0.2
+
+  frames_per_cell: 10
+  frame_min_interval_ms: 40.0
+  sample_stamp_skew_max_ms: 20.0
+
+  # Pan-tilt grid (firmware-reported degrees). Physical tilt = firmware + 45 deg
+  # (because servo zero is at the 45 deg downward pose). Observability requires
+  # tilt coverage >= +/-25 deg and pan coverage >= +/-40 deg.
+  pan_grid_deg: [-60.0, -30.0, 0.0, 30.0, 60.0]
+  tilt_grid_deg: [-25.0, -10.0, 0.0, 15.0, 35.0]
+
+  # Phase 1 xArm waypoints (board at pan-tilt zero; vary xArm to generate
+  # hand-eye data). Aim for >= 60 deg orientation change between consecutive
+  # poses. Compact configurations (wrist near base) minimise gravity sag.
+  phase1_waypoints:
+    - [0.0, -0.4, -0.4,  0.0,  0.8,  0.0]
+    # TODO: record 12-15 more distinct poses. Replace placeholder above.
+
+  # Phase 2 xArm waypoints (xArm frozen at each, pan-tilt sweeps full grid).
+  # Pick 2-3 poses where the board stays in view across the whole sweep.
+  phase2_waypoints:
+    - [0.0, -0.3, -0.3,  0.0,  0.6,  0.0]
+    # TODO: add 1-2 alternate poses.
+
+  # Sanity pose captured before + after the session. Any pose; just needs to
+  # be reproducible. A mid-reach, board-visible pose works.
+  sanity_xarm_angles_rad:
+    [0.0, -0.35, -0.35,  0.0,  0.7,  0.0]
+
+safety:
+  # Software envelope checked against T_base_ee before every xArm motion.
+  z_floor_m: 0.25
+  mast_xy_center: [-0.275, -0.013]
+  mast_radius_m: 0.12
+  mast_z_max: 1.70
+
+board:
+  # ChArUco board generated via `python -m pan_tilt.calibration.charuco_generate`.
+  squares_x: 5
+  squares_y: 7
+  square_len_m: 0.040
+  marker_len_m: 0.030
+  dict: DICT_5X5_100

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>pan_tilt calibrate_web</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>pan_tilt · calibrate_web</h1>
+    <nav>
+      <button class="tab active" data-tab="live">Live View</button>
+      <button class="tab" data-tab="xarm">xArm Waypoints</button>
+      <button class="tab" data-tab="pantilt">Pan-tilt Jog</button>
+    </nav>
+    <span id="conn-indicator" class="badge">WS: connecting…</span>
+  </header>
+
+  <main>
+    <!-- ==================== Live View ==================== -->
+    <section id="tab-live" class="tab-panel active">
+      <div class="live-grid">
+        <div class="live-frame">
+          <img id="camera-img" src="/api/frame.jpg" alt="live camera" />
+          <div class="frame-overlay" id="detection-badge">–</div>
+        </div>
+        <aside class="live-side">
+          <h2>State</h2>
+          <table class="kv">
+            <tr><td>camera</td><td id="s-camera">–</td></tr>
+            <tr><td>pan_tilt</td><td id="s-pt">–</td></tr>
+            <tr><td>xArm TF (base→ee)</td><td id="s-tf">–</td></tr>
+            <tr><td>xArm joints</td><td id="s-joints">–</td></tr>
+          </table>
+          <h2>Pan / Tilt</h2>
+          <table class="kv">
+            <tr><td>pan</td><td id="s-pan">–</td></tr>
+            <tr><td>tilt</td><td id="s-tilt">–</td></tr>
+            <tr><td>feedback_ok</td><td id="s-ptok">–</td></tr>
+          </table>
+          <h2>T<sub>base→ee</sub></h2>
+          <pre id="s-tmat">–</pre>
+          <h2>Safety envelope</h2>
+          <pre id="s-safety">–</pre>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ==================== xArm Waypoints ==================== -->
+    <section id="tab-xarm" class="tab-panel">
+      <div class="split">
+        <div class="pane">
+          <h2>Author new waypoint</h2>
+          <div class="joint-editor">
+            <div class="unit-toggle">
+              <label><input type="radio" name="unit" value="rad" checked> radians</label>
+              <label><input type="radio" name="unit" value="deg"> degrees</label>
+            </div>
+            <div id="joint-inputs"></div>
+            <div class="joint-controls">
+              <button id="btn-load-current" type="button">Load current</button>
+              <button id="btn-zero" type="button">Zero all</button>
+            </div>
+          </div>
+          <h2>Send to robot</h2>
+          <p class="warn">
+            Clicking <b>Move</b> commands the xArm immediately with wait=True.
+            Pre-validate in RViz; the safety envelope below is an envelope
+            check against the <i>current</i> TF, not a collision check.
+          </p>
+          <button id="btn-xarm-move" class="primary" type="button">Move xArm to these joints</button>
+          <p id="xarm-move-status" class="status-line"></p>
+
+          <h2>Current EE safety envelope</h2>
+          <p id="xarm-safety-status" class="status-line">–</p>
+        </div>
+        <div class="pane">
+          <h2>Waypoint lists</h2>
+          <div id="waypoint-lists"></div>
+
+          <h2>Save</h2>
+          <p class="muted">
+            Writes a draft YAML next to <code>calibration.yaml</code>
+            (default: <code>calibration.draft.yaml</code>). Never overwrites
+            the original — promote manually when satisfied.
+          </p>
+          <button id="btn-save" class="primary" type="button">Save to draft YAML</button>
+          <p id="save-status" class="status-line"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== Pan-tilt Jog ==================== -->
+    <section id="tab-pantilt" class="tab-panel">
+      <div class="split">
+        <div class="pane">
+          <h2>Jog to absolute (pan, tilt) in degrees</h2>
+          <div class="jog">
+            <label>pan (deg)  <input id="jog-pan" type="number" step="1" value="0"></label>
+            <label>tilt (deg) <input id="jog-tilt" type="number" step="1" value="0"></label>
+            <button id="btn-pt-move" class="primary" type="button">Move pan-tilt</button>
+          </div>
+          <h3>Quick actions</h3>
+          <div class="jog-buttons">
+            <button data-pan="0" data-tilt="0">Home (0, 0)</button>
+            <button data-pan="-60" data-tilt="-25">Corner (−60, −25)</button>
+            <button data-pan="-60" data-tilt="35">Corner (−60, +35)</button>
+            <button data-pan="60" data-tilt="-25">Corner (+60, −25)</button>
+            <button data-pan="60" data-tilt="35">Corner (+60, +35)</button>
+          </div>
+          <p id="pt-move-status" class="status-line"></p>
+        </div>
+        <div class="pane">
+          <h2>Live view</h2>
+          <img id="camera-img-2" src="/api/frame.jpg" alt="live camera" class="pt-preview"/>
+          <p class="muted">
+            Jog to each corner of the pan/tilt grid to confirm the board stays
+            in view from this xArm pose. If it falls out at any corner, adjust
+            the xArm waypoint in the previous tab.
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>

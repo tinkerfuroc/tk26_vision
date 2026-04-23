@@ -46,6 +46,7 @@ from vision_track.track_yolo import YOLOTracker, TrackerState, TrackingResult
 
 # Shared logger
 from vision_util.vision_logging import VisionLogger
+from vision_util.weights_cache import resolve_weights
 
 
 class PersonTrackNode(Node):
@@ -179,8 +180,7 @@ class PersonTrackNode(Node):
         self.get_logger().info('Initializing YOLO Tracker...')
         
         try:
-            # Find model path
-            model_file = self._find_model_path(self.model_path)
+            model_file = resolve_weights(self.model_path)
             # Allow loss duration to be governed by time, not fixed frames.
             # Use whichever is larger: explicit max_frames_lost or rate * lost_timeout.
             max_frames_allowed = (
@@ -223,116 +223,6 @@ class PersonTrackNode(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to initialize tracker: {e}')
             raise
-
-    def _find_model_path(self, model_path: str) -> Path:
-        """Find the model file path."""
-        model_file = Path(model_path)
-        preferred_order = [
-            'yolo11x-seg.pt',
-            'yolo11l-seg.pt',
-            'yolo11m-seg.pt',
-            'yolo11s-seg.pt',
-            'yolo11n-seg.pt',
-        ]
-        
-        if model_file.is_absolute() and model_file.exists():
-            return model_file
-        
-        # Try package share directory (in models subfolder)
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            share_dir = Path(get_package_share_directory('vision_track'))
-            model_dirs = [share_dir / 'models', share_dir]
-            for d in model_dirs:
-                share_model = d / model_path
-                if share_model.exists():
-                    self.get_logger().info(f'Found model in share: {share_model}')
-                    return share_model
-            
-            # If requested model missing, pick the best available in share/models
-            for d in model_dirs:
-                if not d.exists():
-                    continue
-                for candidate in preferred_order:
-                    candidate_path = d / candidate
-                    if candidate_path.exists():
-                        self.get_logger().warn(
-                            f"Requested model '{model_path}' not found; using available model '{candidate_path.name}'"
-                        )
-                        return candidate_path
-        except Exception as e:
-            self.get_logger().warn(f'Could not check share directory: {e}')
-        
-        # Try source directory - package root (where setup.py is)
-        pkg_dir = Path(__file__).parent.parent
-        src_model = pkg_dir / model_path
-        if src_model.exists():
-            self.get_logger().info(f'Found model in source directory: {src_model}')
-            return src_model
-        
-        # Try source models subdirectory
-        src_model = pkg_dir / 'models' / model_path
-        if src_model.exists():
-            self.get_logger().info(f'Found model in source/models: {src_model}')
-            return src_model
-        
-        # Try object_detection_new package (has yolo11m-seg.pt)
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            od_share_dir = Path(get_package_share_directory('object_detection_new'))
-            od_model = od_share_dir / 'models' / model_path
-            if od_model.exists():
-                self.get_logger().info(f'Found model in object_detection_new: {od_model}')
-                return od_model
-            # Try alternative model (yolo11m-seg.pt instead of yolo11n-seg.pt)
-            alt_model = 'yolo11m-seg.pt'
-            od_model = od_share_dir / 'models' / alt_model
-            if od_model.exists():
-                self.get_logger().info(f'Using alternative model from object_detection_new: {od_model}')
-                return od_model
-        except Exception:
-            pass
-        
-        # Try HuggingFace download as a final fallback
-        downloaded = self._download_model_from_hf(model_path)
-        if downloaded is not None and downloaded.exists():
-            return downloaded
-        
-        # Return as-is (YOLO will try to download if needed)
-        self.get_logger().warn(f'Model not found locally and download failed, will try YOLO auto-download: {model_path}')
-        return Path(model_path)
-
-    def _download_model_from_hf(self, model_name: str) -> Path:
-        """
-        Attempt to download the requested model from HuggingFace.
-        
-        Returns:
-            Path to the downloaded file, or None if download not possible.
-        """
-        try:
-            from huggingface_hub import hf_hub_download
-        except Exception as exc:
-            self.get_logger().warn(f'HuggingFace download unavailable ({exc}); skipping download attempt.')
-            return None
-        
-        # Map common model names to the ultralytics repo filenames
-        repo_id = "ultralytics/YOLO11"
-        filename = model_name
-        # Ensure output directory exists
-        cache_dir = Path.home() / ".cache" / "vision_track" / "models"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            downloaded_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                cache_dir=cache_dir
-            )
-            self.get_logger().info(f"Downloaded model from HuggingFace: {downloaded_path}")
-            return Path(downloaded_path)
-        except Exception as exc:
-            self.get_logger().warn(f"Failed to download model '{model_name}' from HuggingFace: {exc}")
-            return None
 
     def _init_subscribers(self):
         """Initialize camera subscribers with synchronization."""

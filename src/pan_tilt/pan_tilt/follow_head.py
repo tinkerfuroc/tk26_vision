@@ -31,6 +31,7 @@ from ultralytics import YOLO
 
 # Shared logger
 from vision_util.vision_logging import VisionLogger
+from vision_util.weights_cache import resolve_weights
 
 
 def get_array_from_points(points: PointCloud2, cam_K: np.array):
@@ -107,7 +108,7 @@ class FollowHeadNode(Node):
 
         self.orbbec_K = None
 
-        self.model = YOLO(yolo_model)
+        self.model = YOLO(str(resolve_weights(yolo_model)))
         self.bridge = CvBridge()
 
         self.pan_tilt_abs_pub = self.create_publisher(PanTiltCtrl, 'pan_tilt_ctrl', 1)

@@ -32,6 +32,7 @@ from cv_bridge import CvBridge
 
 # Shared logger
 from vision_util.vision_logging import VisionLogger
+from vision_util.weights_cache import resolve_weights
 
 
 class YOLOSegmentationNode(Node):
@@ -192,44 +193,7 @@ class YOLOSegmentationNode(Node):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.get_logger().info(f'Using device: {self.device}')
         try:
-            model_file = Path(self.model_path)
-            found = False
-
-            # If not absolute path, search for it
-            if not model_file.is_absolute():
-                # Try to find in installed share directory first
-                try:
-                    from ament_index_python.packages import get_package_share_directory
-                    share_dir = Path(get_package_share_directory('object_detection_new'))
-                    self.get_logger().info(f'Package share directory: {share_dir}')
-                    share_model = 'models/' + self.model_path
-                    file_path = os.path.join(share_dir, share_model)
-                    self.get_logger().info(f'Checking share directory: {file_path}')
-                    if os.path.exists(file_path):
-                        model_file = file_path
-                        found = True
-                        self.get_logger().info('Found model in share directory')
-                except Exception as e:
-                    self.get_logger().warn(f'Could not check share directory: {e}')
-
-                # Try to find in package source directory
-                if not found:
-                    pkg_dir = Path(__file__).parent.parent
-                    src_model = pkg_dir / 'models' / self.model_path
-                    self.get_logger().info(f'Checking source directory: {src_model}')
-                    if os.path.exists(src_model):
-                        model_file = src_model
-                        found = True
-                        self.get_logger().info('Found model in source directory')
-            else:
-                found = os.path.exists(model_file)
-
-            if not found:
-                self.get_logger().warn(
-                    f'Model not found, will try to download {self.model_path}'
-                )
-                model_file = Path(self.model_path)
-
+            model_file = resolve_weights(self.model_path)
             self.model = YOLO(str(model_file))
             self.model.to(self.device)
             self.get_logger().info(f'YOLO model loaded from {model_file}')

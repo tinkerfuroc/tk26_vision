@@ -19,6 +19,7 @@ import tf2_geometry_msgs
 
 # Shared logger
 from vision_util.vision_logging import VisionLogger
+from vision_util.weights_cache import resolve_weights
 
 def get_array_from_points(points: PointCloud2, cam_K: np.array) -> tuple[np.array, np.array]:
     h, w = 720, 1280
@@ -51,7 +52,9 @@ class DetectWavingPersonsNode(Node):
         self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
 
         self.bridge = CvBridge()
-        self.yolo = YOLO('yolov8s.pt')
+        self.declare_parameter('model_path', 'yolov8s.pt')
+        model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        self.yolo = YOLO(str(resolve_weights(model_path)))
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
         self.pose = self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)

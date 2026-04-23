@@ -113,13 +113,20 @@ for pair in "${entries[@]}"; do
     fi
 done
 
-section "T0.6 — .env sanity"
-if have_api_key; then
-    pass "T0.6 (API key populated)"
-elif [ -f "$ENV_FILE" ]; then
-    skip "T0.6" "$ENV_FILE exists but key is placeholder; live-LLM tests will skip"
+section "T0.6 — weights_cache import + cache dir"
+if python3 -c "from vision_util.weights_cache import resolve_weights, _writable_cache; _writable_cache()" 2>"$LOG_DIR/t0.6_weights_cache.log"; then
+    pass "T0.6 (vision_util.weights_cache importable, cache dir writable)"
 else
-    skip "T0.6" "$ENV_FILE absent; live-LLM tests will skip"
+    fail "T0.6" "import/cache-dir failure (see $LOG_DIR/t0.6_weights_cache.log)"
+fi
+
+section "T0.7 — .env sanity"
+if have_api_key; then
+    pass "T0.7 (API key populated)"
+elif [ -f "$ENV_FILE" ]; then
+    skip "T0.7" "$ENV_FILE exists but key is placeholder; live-LLM tests will skip"
+else
+    skip "T0.7" "$ENV_FILE absent; live-LLM tests will skip"
 fi
 
 summary

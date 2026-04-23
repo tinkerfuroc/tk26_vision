@@ -55,6 +55,41 @@ document.querySelectorAll('input[name="view-mode"]').forEach(r => {
   });
 });
 
+// ---- camera retarget --------------------------------------------------------
+
+const BTN_RESUB = $('#btn-resubscribe');
+if (BTN_RESUB) {
+  BTN_RESUB.addEventListener('click', async () => {
+    const topic = $('#topic-select').value;
+    const status = $('#topic-status');
+    if (!topic) {
+      status.textContent = 'pick a topic first';
+      status.className = 'status-line warn';
+      return;
+    }
+    status.textContent = `subscribing to ${topic}…`;
+    status.className = 'status-line warn';
+    try {
+      const r = await fetch('/api/camera/resubscribe', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ image_topic: topic }),
+      });
+      const body = await r.json();
+      if (r.ok && body.ok) {
+        status.textContent = `subscribed → image: ${body.image_topic}  info: ${body.camera_info_topic}`;
+        status.className = 'status-line ok';
+      } else {
+        status.textContent = 'FAIL: ' + (body.detail || JSON.stringify(body));
+        status.className = 'status-line err';
+      }
+    } catch (e) {
+      status.textContent = 'ERROR: ' + e;
+      status.className = 'status-line err';
+    }
+  });
+}
+
 // ---- WebSocket state --------------------------------------------------------
 
 const INDICATOR = $('#conn-indicator');
@@ -92,6 +127,7 @@ function fmt(v, n = 4) {
 function renderState(s) {
   $('#s-camera').textContent = s.have_camera ? 'streaming' : '—';
   $('#s-image-topic').textContent = s.image_topic || '—';
+  $('#s-domain').textContent = s.ros_domain_id || '—';
   $('#s-frame-count').textContent = s.frame_count ?? 0;
   if (s.frame_age_sec === null || s.frame_age_sec === undefined) {
     $('#s-frame-age').textContent = '—';
@@ -102,6 +138,24 @@ function renderState(s) {
   $('#s-frame-hz').textContent = s.frame_hz ? s.frame_hz.toFixed(1) + ' Hz' : '—';
   const phTopic = $('#placeholder-topic');
   if (phTopic) phTopic.textContent = s.image_topic || '/camera/color/image_raw';
+
+  // Populate the topic dropdown — preserve current selection when possible.
+  const sel = $('#topic-select');
+  if (sel && Array.isArray(s.available_image_topics)) {
+    const prev = sel.value;
+    const topics = s.available_image_topics;
+    const currentSub = s.image_topic || '';
+    const preferred = prev || currentSub;
+    const newOptions = topics.length === 0
+      ? ['<option value="">(no Image topics on this ROS_DOMAIN_ID)</option>']
+      : topics.map(t => `<option value="${t}"${t === preferred ? ' selected' : ''}>${t}${t === currentSub ? '  ← subscribed' : ''}</option>`);
+    // Avoid rewriting on every tick if nothing changed (keeps focus/caret).
+    const hash = newOptions.join('|');
+    if (sel.dataset.hash !== hash) {
+      sel.innerHTML = newOptions.join('');
+      sel.dataset.hash = hash;
+    }
+  }
   $('#s-pt').textContent = s.have_pt_state ? (s.pt_connected ? 'connected' : 'disconnected') : '—';
   $('#s-tf').textContent = s.have_tf ? 'ok' : '—';
   $('#s-joints').textContent = s.have_xarm_joints

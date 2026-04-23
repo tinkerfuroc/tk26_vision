@@ -108,6 +108,14 @@ h3 { font-size: 13px; margin: 14px 0 6px; color: var(--fg-muted); }
 .live-frame.no-frame .frame-placeholder { display: block; }
 
 .live-side { background: var(--bg-panel); padding: 12px 16px; border-radius: 4px; border: 1px solid var(--border); }
+.topic-picker { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.topic-picker select {
+  flex: 1; min-width: 0;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 3px;
+  padding: 4px 6px;
+  font-family: var(--mono); font-size: 12px;
+}
 
 table.kv { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
 table.kv td { padding: 3px 0; vertical-align: top; }

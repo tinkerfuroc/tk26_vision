@@ -37,13 +37,30 @@
           <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/camera/color/image_raw</span></div>
         </div>
         <aside class="live-side">
-          <h2>State</h2>
+          <h2>Camera</h2>
           <table class="kv">
-            <tr><td>camera</td><td id="s-camera">–</td></tr>
-            <tr><td>image topic</td><td id="s-image-topic">–</td></tr>
+            <tr><td>status</td><td id="s-camera">–</td></tr>
+            <tr><td>subscribed to</td><td id="s-image-topic">–</td></tr>
+            <tr><td>ROS_DOMAIN_ID</td><td id="s-domain">–</td></tr>
             <tr><td>frames received</td><td id="s-frame-count">0</td></tr>
             <tr><td>last frame age</td><td id="s-frame-age">–</td></tr>
             <tr><td>frame rate (rolling)</td><td id="s-frame-hz">–</td></tr>
+          </table>
+
+          <h3>Discovered Image topics</h3>
+          <div class="topic-picker">
+            <select id="topic-select"><option value="">(scanning…)</option></select>
+            <button id="btn-resubscribe" type="button">Subscribe</button>
+          </div>
+          <p id="topic-status" class="status-line"></p>
+          <p class="muted">
+            If this list is empty, the camera publisher is on a different
+            <code>ROS_DOMAIN_ID</code> than this node. Restart the server
+            without overriding <code>ROS_DOMAIN_ID</code>.
+          </p>
+
+          <h2>Robot state</h2>
+          <table class="kv">
             <tr><td>pan_tilt</td><td id="s-pt">–</td></tr>
             <tr><td>xArm TF (base→ee)</td><td id="s-tf">–</td></tr>
             <tr><td>xArm joints</td><td id="s-joints">–</td></tr>

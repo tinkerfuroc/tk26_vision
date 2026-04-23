@@ -16,6 +16,30 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-04-22 — Vision logging unification
+
+Generalized the `debug_log_overlays` hook already present on `YOLOSegmentationNode` into a shared `VisionLogger` (in `vision_util`) and wired it into every vision node whose service/action output carries a bbox, segmentation mask, or centroid:
+
+- Default flipped **on**. Old param `debug_log_overlays` is gone; the new boolean is `vision_logging_enabled` (default `True`). Existing `vision_log_folder` param stays, but its default is now `'vision_log'` (not `tmp/vision_log<ts>`) — the logger appends a `<YYYYmmdd_HHMMSS>/` subfolder on first write, so each process gets an isolated run directory without baking the timestamp into the param default.
+- Coverage added: `person_track_node` (only on `TRACKING→LOST` and `LOST→TRACKING` transitions — last-good frame + current frame at the transition; no steady-state logging), `waving_person_server` (one artifact per service call; also removed the ad-hoc `person_roi<ts>.png` CWD writeout from `is_waving`), `follow_head` (piggybacks on the existing 1 Hz YOLO tick; tags the chosen centroid in JSON).
+- Artifact schema additions: JSON payload now carries a `detections` list (bbox / cls_name / conf / centroid per entry, mask stripped) in addition to the existing `branch` / `request` / `n_detections`. Overlay draws a red dot at 2-D centroids when supplied.
+- To opt out per-run: `ros2 run <pkg> <node> --ros-args -p vision_logging_enabled:=false`. To redirect: `-p vision_log_folder:=/some/abs/path`.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `src/vision_util/vision_util/vision_logging.py` | **new** — `VisionLogger` class, lazy run-dir creation, shared overlay/JSON writer |
+| `src/object_detection_new/object_detection_new/object_seg_yolo.py` | param rename + default flip; `_write_debug_artifacts` now delegates to `VisionLogger` |
+| `src/object_detection_generalist/object_detection_generalist/generalist_node.py` | attribute rename (`self.debug_log_overlays` → `self._vision_logger.enabled`) |
+| `src/vision_track/vision_track/person_track_node.py` | params + logger; lost/reclaim transition hooks in `_handle_{tracked,lost}_frame`; reset in `_cleanup_tracking` |
+| `src/tk_vision_specialized/tk_vision_specialized/waving_person_server.py` | params + logger; drop `person_roi<ts>.png` imwrite |
+| `src/pan_tilt/pan_tilt/follow_head.py` | params + logger at the existing 1 Hz detection site |
+| five `package.xml` files | `<exec_depend>vision_util</exec_depend>` |
+| `src/tk26_vision/CLAUDE.md` + `src/tk_vision_specialized/README.md` | docs |
+
+---
+
 ## Verification run — 2026-04-22
 
 **Workstation:**

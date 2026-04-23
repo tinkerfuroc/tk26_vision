@@ -29,6 +29,9 @@ from tinker_vision_msgs_26.msg import PanTiltCtrl
 from tinker_vision_msgs_26.srv import FollowHead
 from ultralytics import YOLO
 
+# Shared logger
+from vision_util.vision_logging import VisionLogger
+
 
 def get_array_from_points(points: PointCloud2, cam_K: np.array):
     """Convert Orbbec PointCloud2 to (H,W,3) ndarray + valid mask.
@@ -55,6 +58,16 @@ class FollowHeadNode(Node):
 
         self.declare_parameter('yolo_model', 'yolov8s-seg.pt')
         yolo_model = self.get_parameter('yolo_model').get_parameter_value().string_value
+
+        # Vision logging runs at the node's existing 1 Hz YOLO cadence
+        # (control_interval=1.0), so no extra throttle state machine is needed.
+        self.declare_parameter('vision_logging_enabled', True)
+        self.declare_parameter('vision_log_folder', 'vision_log')
+        self._vision_logger = VisionLogger(
+            self,
+            self.get_parameter('vision_logging_enabled').get_parameter_value().bool_value,
+            self.get_parameter('vision_log_folder').get_parameter_value().string_value,
+        )
 
         image_sub = Subscriber(self, Image, '/camera/color/image_raw')
         point_cloud_sub = Subscriber(self, PointCloud2, '/camera/depth_registered/points')
@@ -176,9 +189,12 @@ class FollowHeadNode(Node):
                 f'Image shape ({h}, {w}) is not a multiple of 32. Padded so YOLO does not scale it.'
             )
 
+        _yolo_t0 = time.perf_counter()
         results = self.model(color_img, imgsz=(H, W))
+        _yolo_elapsed = time.perf_counter() - _yolo_t0
 
         person_centroids_3d = []
+        log_detections = []  # image-space bboxes + masks for the overlay dump
         if results[0].masks is not None:
             for i, box in enumerate(results[0].boxes):
                 if self.model.names[int(box.cls[0])] == 'person':
@@ -206,12 +222,38 @@ class FollowHeadNode(Node):
 
                     if person_centroid[2] > 0:
                         person_centroids_3d.append(person_centroid)
+                        box_xyxy = [int(v) for v in results[0].boxes.xyxy[i].tolist()]
+                        log_detections.append({
+                            'bbox': box_xyxy,
+                            'mask': mask.astype(bool),
+                            'cls_name': 'person',
+                            'conf': float(box.conf[0]) if box.conf is not None else None,
+                            'centroid_3d': [float(c) for c in person_centroid],
+                        })
 
         if not person_centroids_3d:
+            if self._vision_logger.enabled:
+                self._vision_logger.write(
+                    color_img[:h, :w], None,
+                    request_ctx={}, branch='follow_head',
+                    extras={'event': 'no_person'},
+                    timings={'yolo': _yolo_elapsed},
+                )
             self.get_logger().info('No valid person centroid found.')
             return None, 'No valid person centroid found'
 
         closest_centroid = min(person_centroids_3d, key=lambda c: c[2])
+        if self._vision_logger.enabled:
+            for det in log_detections:
+                det['is_chosen'] = (
+                    tuple(det['centroid_3d']) == tuple(float(c) for c in closest_centroid)
+                )
+            self._vision_logger.write(
+                color_img[:h, :w], log_detections,
+                request_ctx={}, branch='follow_head',
+                extras={'chosen_centroid_3d': [float(c) for c in closest_centroid]},
+                timings={'yolo': _yolo_elapsed},
+            )
         self.get_logger().info(f'Closest person at {closest_centroid}')
 
         x, y, z = closest_centroid

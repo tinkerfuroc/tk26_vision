@@ -48,7 +48,6 @@ ros2 service call /detect_waving_persons tinker_vision_msgs_26/srv/DetectWaving 
 ### Known issues (filed for follow-up, not fixed during migration)
 
 - `waving_person_server.py:99` — `right_elbow.y <= right_shoulder.y + int(img_h + 0.1)` almost certainly meant `img_h * 0.1` (mirroring line 100). The right-arm branch is effectively always true.
-- `waving_person_server.py:118` — writes `person_roi<ts>.png` to CWD on every call; unbounded disk fill. Gate behind a debug flag and route to `vision_log_folder`.
 
 ## check_waving_inference
 

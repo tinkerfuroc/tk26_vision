@@ -41,11 +41,19 @@ python -m pan_tilt.calibration.charuco_generate --out ~/calib/charuco_5x7
 ```
 
 Produces:
-- `charuco_5x7.pdf`  — A3 at exact physical scale. Print at **100%** (no "fit to page"). Check the square size with calipers after printing; if your printer shrank the output, re-run with adjusted `--square-len`.
+- `charuco_5x7.pdf`  — A4 at exact physical scale. Print at **100%** (no "fit to page" or "scale to fit"). Check the square size with calipers after printing; if your printer shrank the output, re-run with adjusted `--square-len`.
 - `charuco_5x7.png`  — source image.
 - `charuco_5x7.json` — machine-readable spec; referenced later for detection.
 
-Default is 5 × 7 squares of 40 mm (markers 30 mm) from `DICT_5X5_100`. To use a different board, pass `--squares-x`, `--squares-y`, `--square-len`, `--marker-len` and make sure you also update the `board:` section of `calibration.yaml` (step 4) to match.
+Default is 5 × 7 squares of 40 mm (markers 30 mm) from `DICT_5X5_100`. The printed board is 200 × 280 mm, which fits A4 (210 × 297 mm) with only ~5 mm / ~8 mm margins — if your printer refuses to print that close to the edge, drop to 35 mm squares / 26 mm markers:
+
+```bash
+python -m pan_tilt.calibration.charuco_generate \
+    --square-len 0.035 --marker-len 0.026 \
+    --out ~/calib/charuco_5x7
+```
+
+This gives a 175 × 245 mm board with comfortable A4 margins. If you change the board dimensions, also update the `board:` section of `calibration.yaml` (step 4) to match.
 
 ### 2. Mount the board and verify streams
 

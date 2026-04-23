@@ -24,9 +24,9 @@ done < <(find "$WS_ROOT/install"/{object_detection_new,object_detection_generali
 [ "$bad" -eq 0 ] && [ "$seen" -gt 0 ] && pass "T0.1 ($seen scripts, all correct)"
 
 section "T0.2 — fix_venv_shebangs.sh is idempotent"
-out=$("$WS_ROOT/src/tk26_vision/scripts/fix_venv_shebangs.sh" 2>&1)
+out=$("$WS_ROOT/scripts/fix_venv_shebangs.sh" 2>&1)
 echo "$out" | tail -1
-out2=$("$WS_ROOT/src/tk26_vision/scripts/fix_venv_shebangs.sh" 2>&1)
+out2=$("$WS_ROOT/scripts/fix_venv_shebangs.sh" 2>&1)
 if echo "$out2" | tail -1 | grep -qE 'done — 0 script\(s\) updated'; then
     pass "T0.2"
 else
@@ -61,7 +61,10 @@ ifaces=(
     tinker_vision_msgs_26/srv/FollowHead
     tinker_vision_msgs_26/action/FollowHeadAction
     tinker_vision_msgs_26/action/Categorize
-    tinker_vision_msgs_26/msg/PanTiltCtrl
+    tinker_vision_msgs_26/msg/PanTiltCommand
+    tinker_vision_msgs_26/msg/PanTiltState
+    tinker_vision_msgs_26/srv/SetTorque
+    tinker_vision_msgs_26/srv/SetZero
 )
 iface_bad=0
 for i in "${ifaces[@]}"; do
@@ -79,7 +82,8 @@ entries=(
     object_detection_generalist:generalist_node
     vision_util:door_detection
     vision_util:get_point_cloud
-    pan_tilt:ctrl
+    pan_tilt:controller
+    pan_tilt:state_publisher
     pan_tilt:follow_head
     kimi_api:feature_recognition
     kimi_api:feature_matching
@@ -87,8 +91,7 @@ entries=(
     tk_vision_specialized:spot_on_shelf_server
     vision_track:person_track_server
 )
-# For kimi_api nodes, give a smoke key so _env.require_api_key() doesn't kill them during --help parsing.
-# For pan_tilt/ctrl, give a harmless device path so serial open doesn't kill it.
+# For kimi_api nodes, give a smoke key so _env.require_api_key() doesn't kill them during node boot.
 for pair in "${entries[@]}"; do
     pkg="${pair%%:*}"; entry="${pair##*:}"
     log="$LOG_DIR/t0.5_${pkg}_${entry}.log"
@@ -100,7 +103,7 @@ for pair in "${entries[@]}"; do
         kimi_api|object_detection_generalist) env_prefix=(env OPENROUTER_API_KEY=smoke) ;;
     esac
     case "$entry" in
-        ctrl) extra_args=(--ros-args -p device:=/dev/null) ;;
+        controller) extra_args=(--ros-args -p device:=/dev/ttyUSB_nonexistent) ;;
     esac
     # --ros-args --help exits immediately after printing; we just want to confirm
     # no ImportError/ModuleNotFoundError in the first 3 seconds of node boot.

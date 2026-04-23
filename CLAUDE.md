@@ -51,8 +51,10 @@ ros2 run object_detection_generalist generalist_node        # /object_detection_
 ros2 run vision_track person_track_server            # action /track_person
 ros2 run tk_vision_specialized spot_on_shelf_server  # action /spot_on_shelf
 
-# Pan-tilt (servo on /dev/ttyUSB0; override via -p device:=…)
-ros2 run pan_tilt ctrl                               # serial driver + TF
+# Pan-tilt (servo on /dev/ttyUSB0; see src/pan_tilt/README.md)
+ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
+ros2 run pan_tilt controller --ros-args -p device:=/dev/ttyUSB0
+ros2 run pan_tilt state_publisher
 ros2 run pan_tilt follow_head                        # /follow_head_action + /follow_head_service
 
 # LLM-backed (kimi_api)
@@ -74,7 +76,7 @@ src/tk26_vision/src/
 ├── object_detection_generalist/   # Pretrained YOLO + Gemini 2.5 Pro bbox + FastSAM mask fallback, tk26 srv
 ├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
 ├── tk_vision_specialized/         # SpotOnShelf action + waving detector
-├── pan_tilt/                      # ctrl (serial + TF) + follow_head (YOLO@1Hz w/ blur gate)
+├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head
 ├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
 └── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay)
 ```
@@ -97,8 +99,9 @@ YOLO `.pt` files pre-bundled under `object_detection_new/models/` / `vision_trac
 
 Key ROS2 parameters:
 - `object_detection_new`: `service_name`, `model_path`, camera topics, `sort_mode`
-- `pan_tilt/ctrl`: `device`, `specs_path`
-- `pan_tilt/follow_head`: `yolo_model`
+- `pan_tilt/controller`: `device`, startup/feedback timing, limits, invert/trim, default speed/accel
+- `pan_tilt/state_publisher`: `state_topic`, `joint_state_topic`, joint names, stale timeout
+- `pan_tilt/follow_head`: `yolo_model`, `command_topic`, `state_topic`, `home_pan_deg`, `home_tilt_deg`
 - `kimi_api/*`: `llm_model`, `detection_service`, `log_prompts`
 - `vision_logging_enabled` (default `true`) + `vision_log_folder` (default `'vision_log'`) on the five bbox/seg/centroid-producing nodes: `yolo_seg_{node,default_node}`, `generalist_node`, `person_track_node`, `waving_person_server`, `follow_head`. Each run creates `vision_log/<YYYYmmdd_HHMMSS>/` relative to CWD and drops `orig_*.jpg` + `overlay_*.jpg` + `req_*.json` per call (tracker: only on lost/reclaim transitions; follow_head: at its existing 1 Hz tick). Pass `-p vision_logging_enabled:=false` to opt out.
 
@@ -124,8 +127,21 @@ Integration smoke suite at `scripts/tests/`, four tiers each gated by the previo
 | T0 | `t0_static.sh` | shebangs, venv deps, ROS interfaces, entry-point imports, `.env` sanity | venv only |
 | T1 | `t1_startup.sh` | all 11 nodes start + advertise + SIGTERM clean; pan_tilt serial pos/neg; kimi_api key pos/neg | venv + (opt) servo |
 | T2 | `t2_live.sh` | one call per node with live cameras (empty scene OK) | orbbec + realsense running |
-| T3 | `t3_interaction.sh` | cross-node: feature_matching↔yolo, spot_on_shelf↔yolo, ctrl↔follow_head TF | T2 + servo |
+| T3 | `t3_interaction.sh` | cross-node: feature_matching↔yolo, spot_on_shelf↔yolo, controller↔state_publisher↔follow_head TF | T2 + servo |
 | T4 | `t4_hardware.sh {servo_motion\|servo_tracking\|shelf_scene\|person\|all}` | hardware-in-the-loop, staged scenes | operator |
+
+## Pan-tilt refactor notes
+
+The old monolithic `pan_tilt/ctrl` path is gone on purpose.
+
+- `ros2 run pan_tilt ctrl` no longer exists.
+- `/pan_tilt_ctrl` and `/pan_tilt_ctrl_modify` are not used by current runtime nodes.
+- `PanTiltCtrl` still exists as an interface artifact, but the current
+  `pan_tilt` package does not subscribe to it.
+- Runtime TF comes from `/joint_states` plus `robot_state_publisher`, not from
+  the serial driver.
+- `config/specs.json` is retained only as reference data; runtime geometry now
+  lives in `src/pan_tilt/urdf/pan_tilt.urdf.xacro`.
 
 See `scripts/tests/README.md` for env vars and skip conditions. Logs in `scripts/tests/logs/`.
 

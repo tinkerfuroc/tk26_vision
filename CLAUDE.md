@@ -150,7 +150,7 @@ Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13�
 
 ### Procedure
 
-1. **Generate the board.** `python -m pan_tilt.calibration.charuco_generate --out ~/calib/charuco_5x7` → PDF + PNG + JSON spec. Print on A3 matte, mount on 3 mm aluminum composite, re-measure square size with calipers.
+1. **Generate the board.** `python -m pan_tilt.calibration.charuco_generate --out ~/calib/charuco_5x7` → PDF + PNG + JSON spec. Print on A4 matte at 100% scale, mount on 3 mm aluminum composite, re-measure square size with calipers. (Default 5×7 40 mm squares = 200×280 mm on A4; shrink to `--square-len 0.035 --marker-len 0.026` if your printer can't handle 5 mm edge margins.)
 2. **Fill config.** Edit `src/pan_tilt/config/calibration.yaml` — replace the placeholder xArm joint waypoints with 12–15 hand-eye poses (Phase 1) and 2–3 grid-anchor poses (Phase 2). Pre-validate each in RViz with the full URDF loaded. The node enforces a software Z-floor + mast exclusion cylinder but does no general collision checking.
 3. **Collect.**
    ```bash

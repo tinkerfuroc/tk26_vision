@@ -8,12 +8,17 @@ Usage (standalone):
 
 Outputs:
     <out>.png   - high-res board image (300 DPI at the target physical size)
-    <out>.pdf   - A3 PDF with the board centered at exact scale
+    <out>.pdf   - A4 PDF with the board centered at exact scale
     <out>.json  - board spec, for programmatic re-instantiation at detection time
 
-Print the PDF on **matte A3**, mount on 3 mm aluminium composite, and re-measure
+Print the PDF on **matte A4**, mount on 3 mm aluminium composite, and re-measure
 the printed square size with calipers before trusting the extrinsic calibration
 — even "100%" print settings warp slightly.
+
+A 5x7 board at 40 mm squares is 200 x 280 mm, which leaves only ~5 mm and
+~8 mm margins on A4. If your printer can't print that close to the edge,
+drop to 35 mm squares / 26 mm markers (175 x 245 mm) via --square-len 0.035
+--marker-len 0.026, and update calibration.yaml `board:` to match.
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ def board_image(spec: BoardSpec, dpi: int = DPI) -> np.ndarray:
 
 
 def write_pdf(png_path: Path, pdf_path: Path, spec: BoardSpec) -> None:
-    """Embed the board image into an A3 PDF at exact physical scale.
+    """Embed the board image into an A4 PDF at exact physical scale.
 
     We write a minimal hand-crafted PDF (no external deps) — the image is
     embedded as a raw JPEG stream and positioned so that the printed square
@@ -60,21 +65,22 @@ def write_pdf(png_path: Path, pdf_path: Path, spec: BoardSpec) -> None:
         raise RuntimeError("JPEG encode failed")
     jpeg_bytes = buf.tobytes()
 
-    # A3 portrait: 297mm x 420mm. PDF unit = 1/72 inch.
-    A3_W_PT = 297.0 / 25.4 * 72.0
-    A3_H_PT = 420.0 / 25.4 * 72.0
+    # A4 portrait: 210mm x 297mm. PDF unit = 1/72 inch.
+    PAGE_W_PT = 210.0 / 25.4 * 72.0
+    PAGE_H_PT = 297.0 / 25.4 * 72.0
 
     board_w_pt = spec.squares_x * spec.square_len_m * INCH_PER_M * 72.0
     board_h_pt = spec.squares_y * spec.square_len_m * INCH_PER_M * 72.0
 
-    if board_w_pt > A3_W_PT or board_h_pt > A3_H_PT:
+    if board_w_pt > PAGE_W_PT or board_h_pt > PAGE_H_PT:
         raise ValueError(
             f"Board {board_w_pt / 72 * 25.4:.1f}x{board_h_pt / 72 * 25.4:.1f}mm "
-            f"exceeds A3; reduce squares or square_len."
+            f"exceeds A4 (210x297mm); reduce squares or square_len "
+            f"(e.g. --square-len 0.035 --marker-len 0.026 gives 175x245mm)."
         )
 
-    x_pt = (A3_W_PT - board_w_pt) / 2.0
-    y_pt = (A3_H_PT - board_h_pt) / 2.0
+    x_pt = (PAGE_W_PT - board_w_pt) / 2.0
+    y_pt = (PAGE_H_PT - board_h_pt) / 2.0
 
     # Minimal PDF: 5 objects (Catalog, Pages, Page, XObject Image, Contents).
     objs = [None]  # 1-indexed
@@ -101,7 +107,7 @@ def write_pdf(png_path: Path, pdf_path: Path, spec: BoardSpec) -> None:
     contents_id = add(contents_obj)
 
     page_obj = (
-        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {A3_W_PT} {A3_H_PT}]"
+        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W_PT} {PAGE_H_PT}]"
         f" /Resources << /XObject << /Im0 {image_id} 0 R >> >>"
         f" /Contents {contents_id} 0 R >>"
     ).encode("ascii")
@@ -112,7 +118,7 @@ def write_pdf(png_path: Path, pdf_path: Path, spec: BoardSpec) -> None:
     # Pages always object 2; fix up via reordering.
     # We assembled: [1]=image, [2]=contents, [3]=page, [4]=pages. Rewrite page parent.
     objs[page_id] = (
-        f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {A3_W_PT} {A3_H_PT}]"
+        f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {PAGE_W_PT} {PAGE_H_PT}]"
         f" /Resources << /XObject << /Im0 {image_id} 0 R >> >>"
         f" /Contents {contents_id} 0 R >>"
     ).encode("ascii")

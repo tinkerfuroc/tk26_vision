@@ -132,16 +132,21 @@ Integration smoke suite at `scripts/tests/`, four tiers each gated by the previo
 
 ## Pan-tilt / head camera extrinsic calibration
 
-Two-phase solver with xArm FK as the ground-truth anchor and a ChArUco board on the EE as the observation target. Parameters fit:
+Two-phase solver with xArm FK as the ground-truth anchor and a ChArUco board on the EE as the observation target.
 
-| Block | DOF | Init | Notes |
-|---|---|---|---|
-| T_A trans (base_link→pan axis) | 3 | URDF xyz | rotation locked identity |
-| T_B trans (tilt_end→camera_link body) | 3 | URDF xyz | rotation locked identity (unlockable in polish phase) |
-| T_ee_marker | 6 | identity | unknown board mount on EE |
-| θ_t_offset | 1 | −π/4 | firmware zero parks tilt at 45° down |
+**Hardware note.** The camera is mounted at roughly 90° to the tilt arm — at firmware `tilt = 45°` (arm pointing straight up) the optical axis is horizontal; at firmware `tilt = 0°` (servo-zero set via `T:502`) it points ~45° down. This means T_B has a **large non-identity rotation** (~π/2 about X in tilt_link coordinates), not a small mount-tolerance correction. The calibration handles this by warm-starting T_B from the Phase-1 reference pose rather than from the URDF's stale rpy.
 
-Total: 13 DOF baseline. `θ_p_offset` (pan bias) is opt-in.
+Parameters fit:
+
+| Block | DOF | Init | Phase-2 fit? | Notes |
+|---|---|---|---|---|
+| T_A trans (base_link→pan axis) | 3 | URDF xyz | yes | rotation locked identity |
+| T_B trans (tilt_end→camera_link body) | 3 | from warm-start | yes | |
+| T_B rotation (rotvec) | 3 | from warm-start | **no** (Phase-2) / yes (polish) | Y-component is degenerate with θ_t_offset; unlock only in joint polish where Phase-1 data breaks the degeneracy |
+| T_ee_marker | 6 | identity | Phase-1 only | Phase-1 hand-eye then frozen |
+| θ_t_offset | 1 | −π/4 | yes | absorbs servo-zero-set noise |
+
+Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13–14.
 
 ### Procedure
 
@@ -158,10 +163,15 @@ Total: 13 DOF baseline. `θ_p_offset` (pan bias) is opt-in.
 5. **Solve.**
    ```bash
    python -m pan_tilt.calibration.run_calibration handeye calib_out/phase1_handeye.json --out calib_out
-   python -m pan_tilt.calibration.run_calibration chain calib_out/phase2_chain.json --handeye calib_out/handeye.json --fit-pan-offset --out calib_out
+   python -m pan_tilt.calibration.run_calibration chain  calib_out/phase2_chain.json --handeye calib_out/handeye.json --fit-pan-offset --out calib_out
    python -m pan_tilt.calibration.run_calibration validate calib_out
    ```
-   Optional polish: `python -m pan_tilt.calibration.run_calibration polish calib_out/phase1_handeye.json calib_out/phase2_chain.json --seed calib_out/chain.json --out calib_out`.
+   The chain step warm-starts T_B from the Phase-1 `Z₀`, which handles the ~90° mount angle automatically. T_B rotation stays frozen through the chain fit to avoid the `T_B(Y) ↔ θ_t_offset` degeneracy.
+
+   Optional polish (unlocks T_B rotation):
+   ```bash
+   python -m pan_tilt.calibration.run_calibration polish calib_out/phase1_handeye.json calib_out/phase2_chain.json --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
+   ```
 6. **Emit URDF diff.** `python -m pan_tilt.calibration.apply_to_urdf --results calib_out/chain.json --xacro src/pan_tilt/urdf/pan_tilt.urdf.xacro` prints a unified diff for review. Apply manually with `patch` once you're satisfied, then rebuild pan_tilt.
 
 ### Phase gates

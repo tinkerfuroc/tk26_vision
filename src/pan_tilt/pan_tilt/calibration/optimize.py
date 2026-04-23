@@ -84,8 +84,12 @@ def _predict_chain_gt(samples, t_ee_marker: np.ndarray):
     return out
 
 
-def _chain_residuals(x, samples, template, fit_pan_offset, t_base_cam_gt):
-    params = unpack_chain(x, template, fit_pan_offset=fit_pan_offset)
+def _chain_residuals(x, samples, template, fit_pan_offset, fit_tb_rotation, t_base_cam_gt):
+    params = unpack_chain(
+        x, template,
+        fit_pan_offset=fit_pan_offset,
+        fit_tb_rotation=fit_tb_rotation,
+    )
     res = []
     for s, T_gt in zip(samples, t_base_cam_gt):
         theta_p, theta_t, _, _ = sample_to_matrices(s)
@@ -100,6 +104,7 @@ def fit_chain(
     t_ee_marker: np.ndarray,
     initial: Optional[PanTiltParams] = None,
     fit_pan_offset: bool = False,
+    fit_tb_rotation: bool = False,
     loss: str = "soft_l1",
     verbose: int = 0,
 ) -> tuple[PanTiltParams, OptReport]:
@@ -112,28 +117,88 @@ def fit_chain(
     t_ee_marker
         4x4 transform from Phase-1 hand-eye calibration.
     initial
-        Optional starting params; defaults to URDF guesses + theta_t_offset = -pi/4.
+        Starting params. **You should seed T_B via `warm_start_t_b_rotation`
+        from the Phase-1 `t_base_cam_ref` before calling this** — otherwise T_B
+        rotation stays at identity, which is wrong for any robot whose camera
+        is not axis-aligned with the tilt arm (e.g. the ~90 deg perpendicular
+        mount on this setup).
     fit_pan_offset
         Whether to include theta_p_offset in the parameter vector.
+    fit_tb_rotation
+        Default **False**. T_B rotation about the tilt axis (+Y) is
+        mathematically degenerate with `theta_t_offset` — any Y-rotation of
+        T_B gets absorbed into the scalar offset. Freezing T_B rotation at
+        the warm-start value avoids that degeneracy. Unlock only during the
+        polish phase, where Phase-1 data jointly anchors T_ee_marker and
+        breaks the degeneracy.
     loss
         scipy.optimize.least_squares `loss` kwarg; soft_l1 is robust to outliers.
     """
     template = initial or PanTiltParams()
-    x0 = pack_chain(template, fit_pan_offset=fit_pan_offset)
+    x0 = pack_chain(
+        template,
+        fit_pan_offset=fit_pan_offset,
+        fit_tb_rotation=fit_tb_rotation,
+    )
+
     t_base_cam_gt = _predict_chain_gt(samples, t_ee_marker)
 
     result = least_squares(
         _chain_residuals,
         x0,
-        args=(samples, template, fit_pan_offset, t_base_cam_gt),
+        args=(samples, template, fit_pan_offset, fit_tb_rotation, t_base_cam_gt),
         method="trf",
         loss=loss,
         verbose=verbose,
     )
 
-    params = unpack_chain(result.x, template, fit_pan_offset=fit_pan_offset)
+    params = unpack_chain(
+        result.x, template,
+        fit_pan_offset=fit_pan_offset,
+        fit_tb_rotation=fit_tb_rotation,
+    )
     report = _build_report(result, samples, params, t_base_cam_gt=t_base_cam_gt)
     return params, report
+
+
+def warm_start_t_b_rotation(
+    template: PanTiltParams,
+    t_base_cam_ref: np.ndarray,
+) -> PanTiltParams:
+    """Back-solve T_B from the Phase-1 reference pose `Z_0 = T_base_cam(0, 0)`.
+
+    From the FK identity at (theta_p=0, theta_t=0):
+        Z_0 = translate(t_a) @ R_z(-theta_p_off) @ translate(L_pan z)
+              @ R_y(theta_t_off) @ T_B
+    we solve T_B and copy it into a fresh `PanTiltParams` block. This pulls a
+    (potentially large, e.g. 90 deg) T_B rotation into the init so the chain
+    optimizer starts inside the right convergence basin.
+    """
+    from scipy.spatial.transform import Rotation
+
+    T_a = np.eye(4)
+    T_a[:3, 3] = template.t_a
+    R_pan0 = np.eye(4)
+    R_pan0[:3, :3] = Rotation.from_euler('z', -template.theta_p_offset).as_matrix()
+    T_lp = np.eye(4)
+    T_lp[:3, 3] = [0, 0, template.l_pan]
+    R_tilt0 = np.eye(4)
+    R_tilt0[:3, :3] = Rotation.from_euler('y', template.theta_t_offset).as_matrix()
+
+    pre = T_a @ R_pan0 @ T_lp @ R_tilt0
+    T_b = invert_transform(pre) @ t_base_cam_ref
+
+    out = PanTiltParams(
+        t_a=template.t_a.copy(),
+        t_b_trans=T_b[:3, 3].copy(),
+        t_b_rotvec=Rotation.from_matrix(T_b[:3, :3]).as_rotvec(),
+        t_ee_marker_rotvec=template.t_ee_marker_rotvec.copy(),
+        t_ee_marker_trans=template.t_ee_marker_trans.copy(),
+        theta_t_offset=template.theta_t_offset,
+        theta_p_offset=template.theta_p_offset,
+        l_pan=template.l_pan,
+    )
+    return out
 
 
 # ---- joint (polish) fit -----------------------------------------------------

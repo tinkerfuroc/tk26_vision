@@ -3,6 +3,7 @@
 import collections
 import math
 import os
+import sys
 import threading
 import time
 
@@ -16,8 +17,9 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from sensor_msgs.msg import CameraInfo, Image
 from tinker_vision_msgs_26.action import FollowHeadAction
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 from tinker_vision_msgs_26.srv import FollowHead
@@ -27,50 +29,6 @@ from pan_tilt.head_tracking_helpers import PersonTracker, WorldTargetEMA
 # Shared logger
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
-
-
-def get_array_from_points(
-    points: PointCloud2, cam_K: np.array, image_shape=None,
-):
-    """Convert a PointCloud2 into an (H, W, 3) xyz grid + valid-pixel mask.
-
-    Dimensions are derived from the PointCloud2 when it is organized
-    (`height > 1`); otherwise they come from ``image_shape`` (the companion
-    color image) so we do not assume 720×1280. The per-point stride is
-    ``point_step // 4`` float32 entries — matches the pattern used by
-    object_seg_yolo.
-    """
-    floats_per_point = max(points.point_step // 4, 3)
-    arr = np.frombuffer(points.data, dtype='<f4')
-    N = len(arr) // floats_per_point
-    pts = arr.reshape((N, floats_per_point))[:, :3]
-
-    if points.height > 1 and points.width > 0:
-        h, w = int(points.height), int(points.width)
-    elif image_shape is not None:
-        h, w = int(image_shape[0]), int(image_shape[1])
-    else:
-        h, w = 720, 1280
-
-    z_col = pts[:, 2:3]
-    # Avoid divide-by-zero: keep rows with positive z only.
-    valid_z = z_col[:, 0] > 1e-6
-    pts_v = pts[valid_z]
-    points_homo = pts_v / np.repeat(pts_v[:, 2:3], 3, axis=1)
-    coor_homo = (cam_K @ points_homo.T).T
-    coor = np.rint(coor_homo[:, :2]).astype(int)
-
-    in_bounds = (
-        (coor[:, 0] >= 0) & (coor[:, 0] < w)
-        & (coor[:, 1] >= 0) & (coor[:, 1] < h)
-    )
-    coor = coor[in_bounds]
-    pts_v = pts_v[in_bounds]
-
-    depth_img = np.zeros((h, w, 3), dtype=np.float64)
-    depth_img[coor[:, 1], coor[:, 0], :] = pts_v
-    mask = (depth_img[:, :, 2] > 1e-3).astype(int)
-    return depth_img, mask
 
 
 class FollowHeadNode(Node):
@@ -104,6 +62,10 @@ class FollowHeadNode(Node):
         self.declare_parameter('target_ttl_sec', 0.8)
         self.declare_parameter('ema_alpha', 0.4)
         self.declare_parameter('reassoc_dist_m', 0.4)
+        # Pose-target params (YOLO-pose face aiming)
+        self.declare_parameter('kp_confidence_threshold', 0.5)
+        self.declare_parameter('face_depth_window_px', 11)
+        self.declare_parameter('min_triangle_valid_depth_pixels', 10)
         # Phase E — config surface + motion profile
         self.declare_parameter('blur_threshold', 80.0)
         self.declare_parameter('small_error_deg', 10.0)
@@ -188,6 +150,21 @@ class FollowHeadNode(Node):
             .get_parameter_value()
             .double_value
         )
+        self.kp_conf_thr = (
+            self.get_parameter('kp_confidence_threshold')
+            .get_parameter_value()
+            .double_value
+        )
+        self.face_depth_window_px = int(
+            self.get_parameter('face_depth_window_px')
+            .get_parameter_value()
+            .integer_value
+        )
+        self.min_triangle_valid_depth_pixels = int(
+            self.get_parameter('min_triangle_valid_depth_pixels')
+            .get_parameter_value()
+            .integer_value
+        )
         self.blur_threshold = (
             self.get_parameter('blur_threshold')
             .get_parameter_value()
@@ -223,14 +200,22 @@ class FollowHeadNode(Node):
             ttl_sec=self.target_ttl_sec,
         )
 
-        image_sub = Subscriber(self, Image, '/camera/color/image_raw')
-        point_cloud_sub = Subscriber(
-            self,
-            PointCloud2,
-            '/camera/depth_registered/points',
+        # Mirror person_track_node.py:229-246 — BEST_EFFORT on the high-rate
+        # color+depth streams and subscribe to the aligned depth image, not
+        # the (heavier, reprojected) PointCloud2.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        image_sub = Subscriber(
+            self, Image, '/camera/color/image_raw', qos_profile=sensor_qos,
+        )
+        depth_sub = Subscriber(
+            self, Image, '/camera/depth/image_raw', qos_profile=sensor_qos,
         )
         image_sync_sub = ApproximateTimeSynchronizer(
-            [image_sub, point_cloud_sub], queue_size=3, slop=0.05,
+            [image_sub, depth_sub], queue_size=3, slop=0.05,
         )
         image_sync_sub.registerCallback(self.img_orbbec_callback)
 
@@ -257,9 +242,11 @@ class FollowHeadNode(Node):
         )
         self.is_canceled = False
         self.recent_img = None
-        self.recent_point_cloud = None
+        self.recent_depth_msg = None
         self.recent_header = None
         self.last_used_header = None
+        # Cached (u, v) meshgrid for depth unprojection — keyed on (h, w).
+        self._uv_cache = None
         self.lock_msg = threading.Lock()
         self.lock_info = threading.Lock()
         self.lock_state = threading.Lock()
@@ -272,6 +259,23 @@ class FollowHeadNode(Node):
         self._last_commanded_pan_rad = None
         self._last_commanded_tilt_rad = None
         self._last_detection_time = None
+        # Blur-gate cache: Laplacian only every Kth detection tick; reuse
+        # the verdict on intermediate ticks.
+        self._blur_counter = 0
+        self._blur_check_every = 3
+        self._last_blur_result = False
+        # Timing counters (reset every 2 s in follow_head_logic). Tracks
+        # callback rate, per-stage durations, and early-return reasons.
+        self._perf_window_start = time.monotonic()
+        self._perf_window_sec = 2.0
+        self._perf_sync_count = 0
+        self._perf_logic_count = 0
+        self._perf_yolo_count = 0
+        self._perf_sum = {
+            'pc_parse': 0.0, 'blur': 0.0, 'yolo': 0.0,
+            'extract': 0.0, 'total': 0.0,
+        }
+        self._perf_early = collections.Counter()
         # Phase D — last observability snapshot from follow_head_logic
         self._last_logic_info = {
             'person_visible': False,
@@ -293,6 +297,12 @@ class FollowHeadNode(Node):
         self.last_command_time = None
 
         self.get_logger().info('Follow Head Node has been started.')
+        print(
+            '[follow_head] started — perf instrumentation active '
+            '(stderr, every 2s or 100 ticks)',
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _resolve_model_path(self, model_path: str) -> str:
         if os.path.isabs(model_path) and os.path.exists(model_path):
@@ -338,33 +348,40 @@ class FollowHeadNode(Node):
                 ),
             )
 
-    def img_orbbec_callback(self, image_msg, point_cloud_msg):
+    def img_orbbec_callback(self, image_msg, depth_msg):
         while not self.lock_msg.acquire(timeout=0.1):
             self.get_logger().debug(
-                'Waiting for lock to process new image/point-cloud messages...',
+                'Waiting for lock to process new image/depth messages...',
             )
         self.recent_img = image_msg
-        self.recent_point_cloud = point_cloud_msg
+        self.recent_depth_msg = depth_msg
         self.recent_header = image_msg.header
+        self._perf_sync_count += 1
         self.lock_msg.release()
 
     def follow_head_logic(self):
         self.get_logger().debug('Follow Head logic initiated.')
+        self._perf_logic_count += 1
+        self._perf_maybe_flush()
+
+        _total_t0 = time.perf_counter()
 
         while not self.lock_msg.acquire(timeout=0.1):
             self.get_logger().debug('Waiting for lock to process follow head logic...')
-        if self.recent_img is None or self.recent_point_cloud is None:
+        if self.recent_img is None or self.recent_depth_msg is None:
             self.lock_msg.release()
-            self.get_logger().warn('No image or point cloud received yet.')
-            return None, 'No image or point cloud received yet.'
+            self._perf_early['no_msg'] += 1
+            self.get_logger().warn('No image or depth received yet.')
+            return None, 'No image or depth received yet.'
 
         recent_img = self.recent_img
-        recent_point_cloud = self.recent_point_cloud
+        recent_depth_msg = self.recent_depth_msg
         recent_header = self.recent_header
         self.lock_msg.release()
 
         if self.last_used_header:
             if self.last_used_header == recent_header:
+                self._perf_early['already_used'] += 1
                 return None, f'image already used (header: {self.last_used_header})'
             self.get_logger().debug(f'Using new image with header: {recent_header}')
 
@@ -384,22 +401,27 @@ class FollowHeadNode(Node):
                 self.min_detection_interval_sec
                 - (now_mono - self._last_detection_time)
             )
+            self._perf_early['min_interval'] += 1
             return None, f'Waiting {remaining:.2f}s for min detection interval.'
 
         self.last_used_header = recent_header
 
         color_img = self.bridge.imgmsg_to_cv2(recent_img, desired_encoding='bgr8')
-        # Laplacian blur gate — cheap enough to always apply, useful when
-        # the camera is genuinely blurred (e.g. large motion, low light).
-        if self._is_image_blurred(color_img):
+        # Laplacian blur gate — Laplacian + cvtColor is ~5-10 ms on 720×1280,
+        # so we run it every Nth tick and cache the verdict. YOLO itself
+        # handles mild blur better than the Laplacian threshold does.
+        _blur_t0 = time.perf_counter()
+        self._blur_counter += 1
+        if self._blur_counter % self._blur_check_every == 0:
+            self._last_blur_result = self._is_image_blurred(color_img)
+        self._perf_sum['blur'] += time.perf_counter() - _blur_t0
+        if self._last_blur_result:
+            self._perf_early['blurred'] += 1
             return None, 'Image blurred, waiting for stable frame.'
         self._last_detection_time = now_mono
-        image_shape = color_img.shape
-        points, validmask_points = get_array_from_points(
-            recent_point_cloud,
-            self.orbbec_K,
-            image_shape=image_shape,
-        )
+        _pc_t0 = time.perf_counter()
+        points, validmask_points = self._depth_image_to_points(recent_depth_msg)
+        self._perf_sum['pc_parse'] += time.perf_counter() - _pc_t0
 
         h, w, _ = color_img.shape
         H, W = (h + 31) // 32 * 32, (w + 31) // 32 * 32
@@ -422,55 +444,57 @@ class FollowHeadNode(Node):
         _yolo_t0 = time.perf_counter()
         results = self.model(color_img, imgsz=(H, W))
         _yolo_elapsed = time.perf_counter() - _yolo_t0
+        self._perf_sum['yolo'] += _yolo_elapsed
+        self._perf_yolo_count += 1
 
         person_centroids_3d = []
-        log_detections = []  # image-space bboxes + masks for the overlay dump
-        if results[0].masks is not None:
+        log_detections = []  # image-space bboxes + pose targets for the overlay/JSON
+        # Pose results: no segmentation masks. Keypoints shape (N, 17, 2/conf).
+        kps_obj = getattr(results[0], 'keypoints', None)
+        _extract_t0 = time.perf_counter()
+        if (
+            kps_obj is not None
+            and getattr(kps_obj, 'xy', None) is not None
+            and getattr(kps_obj, 'conf', None) is not None
+        ):
+            kps_xy = kps_obj.xy.cpu().numpy()
+            kps_cf = kps_obj.conf.cpu().numpy()
             for i, box in enumerate(results[0].boxes):
-                if self.model.names[int(box.cls[0])] == 'person':
-                    y1, x1, y2, x2 = results[0].boxes.xyxy[i]
-                    bbox = (
-                        min(int(x1), h - 1),
-                        min(int(y1), w - 1),
-                        min(int(x2), h - 1),
-                        min(int(y2), w - 1),
-                    )
-                    x1, y1, x2, y2 = bbox
-                    y1 = max(0, y1 - ((y2 - y1) // 3) * 2)
+                if self.model.names[int(box.cls[0])] != 'person':
+                    continue
+                bbox_xyxy = results[0].boxes.xyxy[i].cpu().numpy()
+                xyz_cam, target_px, meta = self._extract_face_target(
+                    kps_xy[i], kps_cf[i], bbox_xyxy,
+                    points, validmask_points, (h, w),
+                )
+                if xyz_cam is None:
+                    continue
 
-                    mask = results[0].masks[i].data.cpu().numpy().squeeze()
-                    mask = mask[:h, :w]
+                person_centroids_3d.append(xyz_cam)
+                box_xyxy_int = [int(v) for v in bbox_xyxy.tolist()]
+                log_detections.append(
+                    {
+                        'bbox': box_xyxy_int,
+                        'cls_name': 'person',
+                        'conf': (
+                            float(box.conf[0])
+                            if box.conf is not None
+                            else None
+                        ),
+                        'keypoints': [
+                            [float(kps_xy[i, k, 0]),
+                             float(kps_xy[i, k, 1]),
+                             float(kps_cf[i, k])]
+                            for k in range(kps_xy.shape[1])
+                        ],
+                        'target_pixel': [int(target_px[0]), int(target_px[1])],
+                        'depth_region': meta['depth_region'],
+                        'region_pixel_count': meta['region_pixel_count'],
+                        'centroid_3d': [float(c) for c in xyz_cam],
+                    },
+                )
 
-                    mask_pt = mask[x1:x2, y1:y2] * validmask_points[x1:x2, y1:y2]
-                    if mask_pt.sum() < 10:
-                        self.get_logger().warn(
-                            f'Detected {box.cls} with invalid depth info, skipped.',
-                        )
-                        continue
-                    sum_pt = mask_pt.sum()
-                    cent_pts = [
-                        (points[x1:x2, y1:y2, i] * mask_pt).sum() / sum_pt
-                        for i in range(3)
-                    ]
-
-                    person_centroid = cent_pts[0], cent_pts[1], cent_pts[2]
-
-                    if person_centroid[2] > 0:
-                        person_centroids_3d.append(person_centroid)
-                        box_xyxy = [int(v) for v in results[0].boxes.xyxy[i].tolist()]
-                        log_detections.append(
-                            {
-                                'bbox': box_xyxy,
-                                'mask': mask.astype(bool),
-                                'cls_name': 'person',
-                                'conf': (
-                                    float(box.conf[0])
-                                    if box.conf is not None
-                                    else None
-                                ),
-                                'centroid_3d': [float(c) for c in person_centroid],
-                            },
-                        )
+        self._perf_sum['extract'] += time.perf_counter() - _extract_t0
 
         if not person_centroids_3d:
             self._last_logic_info['person_visible'] = False
@@ -482,6 +506,8 @@ class FollowHeadNode(Node):
                     timings={'yolo': _yolo_elapsed},
                 )
             self.get_logger().info('No valid person centroid found.')
+            self._perf_early['no_person'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'No valid person centroid found'
 
         # Transform every candidate into a pan-tilt-rooted Cartesian frame
@@ -493,6 +519,8 @@ class FollowHeadNode(Node):
             cur_pan_deg = self.current_pan_deg
             cur_tilt_deg = self.current_tilt_deg
         if cur_pan_deg is None or cur_tilt_deg is None:
+            self._perf_early['no_state'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'Pan-tilt state not yet received; cannot anchor target.'
         cur_pan_rad = math.radians(cur_pan_deg)
         cur_tilt_rad = math.radians(cur_tilt_deg)
@@ -509,12 +537,16 @@ class FollowHeadNode(Node):
             candidates_cam.append(cam_xyz)
 
         if not candidates_root:
+            self._perf_early['no_positive_depth'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'No candidates with positive depth.'
 
         now_mono = time.monotonic()
         chosen_root = self._person_tracker.update(candidates_root, now_mono)
         if chosen_root is None:
             self._last_logic_info['person_visible'] = False
+            self._perf_early['tracker_no_lock'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'PersonTracker returned no lock.'
         target_xyz_root = self._world_target_ema.update(chosen_root, now_mono)
 
@@ -600,6 +632,8 @@ class FollowHeadNode(Node):
                 f'pan_err={pan_err_deg:.2f} deg, tilt_err={tilt_err_deg:.2f} deg, '
                 'holding position.',
             )
+            self._perf_early['deadband'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
             return (target_pan_deg, target_tilt_deg), ''
 
         # Feedback-gated settle on the COMMAND only. Detection already ran
@@ -608,6 +642,8 @@ class FollowHeadNode(Node):
         settle_state, settle_reason = self._classify_settle_state()
         if settle_state == 'wait':
             self.get_logger().debug(f'Command held: {settle_reason}')
+            self._perf_early['settle_wait'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
             return (target_pan_deg, target_tilt_deg), ''
 
         # Anti-chatter: if the new target barely differs from the last
@@ -629,6 +665,8 @@ class FollowHeadNode(Node):
                     'Target within min_command_change_deg of last command; '
                     'holding.',
                 )
+                self._perf_early['min_cmd_change'] += 1
+                self._perf_sum['total'] += time.perf_counter() - _total_t0
                 return (target_pan_deg, target_tilt_deg), ''
 
         # Speed scaling: small errors get a slower profile to reduce motion
@@ -643,6 +681,8 @@ class FollowHeadNode(Node):
             target_pan_rad, target_tilt_rad,
             speed_raw=speed_raw, accel_raw=self.command_accel_raw,
         )
+        self._perf_early['cmd_issued'] += 1
+        self._perf_sum['total'] += time.perf_counter() - _total_t0
         return (target_pan_deg, target_tilt_deg), ''
 
     def _publish_absolute_command(
@@ -718,17 +758,18 @@ class FollowHeadNode(Node):
                     self.get_logger().debug(
                         f'follow_head_logic returned error: {error_msg}',
                     )
-                    # Short sleep — min_detection_interval_sec already paces
-                    # YOLO work from inside follow_head_logic; here we just
-                    # yield so the spinner can service state/TF callbacks.
-                    time.sleep(0.05)
+                    # Short yield — min_detection_interval_sec already paces
+                    # YOLO work from inside follow_head_logic; a long sleep
+                    # here just multiplies the per-iteration cost of the
+                    # early-return branches (e.g. "image already used").
+                    time.sleep(0.005)
                     continue
 
                 pan_deg, tilt_deg = pan_tilt
                 self._populate_feedback(feedback_msg, pan_deg, tilt_deg)
                 goal_handle.publish_feedback(feedback_msg)
 
-                time.sleep(0.05)
+                time.sleep(0.005)
         except Exception as e:
             self.get_logger().error(f'Error in loop: {e}')
             goal_handle.abort()
@@ -792,10 +833,273 @@ class FollowHeadNode(Node):
         else:
             feedback_msg.error_deg = 0.0
 
+    def _perf_maybe_flush(self):
+        """Emit per-stage timings every ~2 s OR every 100 logic ticks.
+
+        Uses BOTH ``self.get_logger().warn`` and an unconditional
+        ``print()`` to stderr. The print bypasses any rclpy log-filter or
+        output-redirection that could be swallowing the line when the node
+        is launched from a launch file or via composed executables. The
+        iteration-count fallback guarantees the line appears even if
+        ``time.monotonic()`` has somehow not advanced (e.g. a debugger is
+        attached, or the window_start was reset oddly).
+        """
+        now = time.monotonic()
+        elapsed = now - self._perf_window_start
+        time_ready = elapsed >= self._perf_window_sec
+        count_ready = self._perf_logic_count >= 100
+        if not (time_ready or count_ready):
+            return
+        # Guard: if nothing has happened at all (e.g. node just started and
+        # follow_head_logic never ran), skip — we don't want NaN/divide-by-0.
+        if self._perf_logic_count == 0:
+            return
+        n_logic = max(self._perf_logic_count, 1)
+        n_yolo = max(self._perf_yolo_count, 1)
+        elapsed_safe = max(elapsed, 1e-3)
+        avg_ms = {
+            'pc_parse': 1000.0 * self._perf_sum['pc_parse'] / n_yolo,
+            'blur': 1000.0 * self._perf_sum['blur'] / n_logic,
+            'yolo': 1000.0 * self._perf_sum['yolo'] / n_yolo,
+            'extract': 1000.0 * self._perf_sum['extract'] / n_yolo,
+            'total': 1000.0 * self._perf_sum['total'] / n_logic,
+        }
+        sync_hz = self._perf_sync_count / elapsed_safe
+        logic_hz = self._perf_logic_count / elapsed_safe
+        yolo_hz = self._perf_yolo_count / elapsed_safe
+        early_str = ', '.join(
+            f'{k}={v}' for k, v in sorted(self._perf_early.items())
+        )
+        line = (
+            f'[follow_head perf {elapsed:.1f}s] sync={sync_hz:.1f}Hz '
+            f'logic={logic_hz:.1f}Hz yolo={yolo_hz:.1f}Hz | '
+            f'ms/yolo: pc={avg_ms["pc_parse"]:.1f} '
+            f'blur={avg_ms["blur"]:.1f} yolo={avg_ms["yolo"]:.1f} '
+            f'extract={avg_ms["extract"]:.1f} total={avg_ms["total"]:.1f} | '
+            f'branches: {early_str}'
+        )
+        try:
+            self.get_logger().warn(line)
+        except Exception:  # pragma: no cover
+            pass
+        # Unconditional stderr dump — shows up even under buffered launch
+        # outputs and even if the rclpy logger is somehow filtered.
+        print(line, file=sys.stderr, flush=True)
+        # Reset window.
+        self._perf_window_start = now
+        self._perf_sync_count = 0
+        self._perf_logic_count = 0
+        self._perf_yolo_count = 0
+        for k in self._perf_sum:
+            self._perf_sum[k] = 0.0
+        self._perf_early.clear()
+
     def _is_image_blurred(self, bgr_img: np.ndarray) -> bool:
         gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
         return variance < self.blur_threshold
+
+    def _depth_image_to_points(self, depth_msg: Image):
+        """Unproject a 16UC1 aligned depth image to (H, W, 3) xyz + valid mask.
+
+        Mirrors ``person_track_node._depth_image_to_points`` — depth is
+        registered to color (Orbbec ``depth_registration:=true``), so the
+        color intrinsics (``self.orbbec_K``) apply directly. Cached meshgrid
+        keeps the per-tick cost ~1-3 ms versus 30-80 ms for the old
+        PointCloud2 reproject-and-scatter path.
+        """
+        h, w = int(depth_msg.height), int(depth_msg.width)
+        # Orbbec Femto Bolt default: 16UC1, millimeters.
+        depth = (
+            np.frombuffer(depth_msg.data, dtype=np.uint16)
+            .reshape(h, w)
+            .astype(np.float32)
+            * 0.001
+        )
+        # Valid-depth band: reuse the same "any positive depth" semantics the
+        # old path used (> 1e-3 m). Also cap at a generous upper bound so
+        # stray max-range values don't poison the median.
+        valid_mask = (depth > 1e-3) & (depth < 10.0)
+
+        if self._uv_cache is None or self._uv_cache[0] != (h, w):
+            u, v = np.meshgrid(
+                np.arange(w, dtype=np.float32),
+                np.arange(h, dtype=np.float32),
+            )
+            self._uv_cache = ((h, w), u, v)
+        _, u, v = self._uv_cache
+
+        K = self.orbbec_K
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        z = depth
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+        points = np.stack([x, y, z], axis=-1)
+        return points, valid_mask
+
+    def _depth_in_mask_median(self, points, region_mask_bool):
+        """Median (x, y, z) of valid-depth pixels under a boolean (H, W) mask.
+
+        Returns None if the intersection with z>0 is below
+        ``self.min_triangle_valid_depth_pixels``. Median matches the
+        tk26_vision standard (e.g. object_seg_yolo.py:813,830).
+        """
+        if region_mask_bool.sum() < self.min_triangle_valid_depth_pixels:
+            return None
+        pts_in = points[region_mask_bool]
+        pts_in = pts_in[pts_in[:, 2] > 1e-6]
+        if pts_in.shape[0] < self.min_triangle_valid_depth_pixels:
+            return None
+        return np.median(pts_in, axis=0)
+
+    def _extract_face_target(
+        self, kxy, kconf, bbox_xyxy, points, validmask, img_hw,
+    ):
+        """Pick a face/head target + depth region from COCO-17 pose keypoints.
+
+        Tries (in order): triangle(eyes+nose), both-eye window, single-eye
+        window, nose window, ear-midpoint window, shoulder+upper-bbox head
+        proxy. Returns ``(xyz_cam, (px, py), meta)`` on the first branch whose
+        (region ∩ valid-depth) passes the min-pixel floor, else
+        ``(None, None, None)``. ``validmask`` is the (H, W) bool mask
+        returned by ``_depth_image_to_points``.
+        """
+        h, w = img_hw
+        NOSE, L_EYE, R_EYE, L_EAR, R_EAR, L_SH, R_SH = 0, 1, 2, 3, 4, 5, 6
+
+        def ok(idx):
+            x, y = float(kxy[idx, 0]), float(kxy[idx, 1])
+            c = float(kconf[idx])
+            # Ultralytics sometimes emits (0, 0) for undetected keypoints
+            # alongside a nonzero conf — guard with both.
+            return (
+                c >= self.kp_conf_thr
+                and (x > 0 or y > 0)
+                and 0 <= x < w and 0 <= y < h
+            )
+
+        def clip_px(x, y):
+            return (
+                int(np.clip(round(x), 0, w - 1)),
+                int(np.clip(round(y), 0, h - 1)),
+            )
+
+        def window_mask(px, py):
+            r = self.face_depth_window_px // 2
+            m = np.zeros((h, w), dtype=bool)
+            y0, y1 = max(0, py - r), min(h, py + r + 1)
+            x0, x1 = max(0, px - r), min(w, px + r + 1)
+            m[y0:y1, x0:x1] = True
+            return m
+
+        valid_bool = validmask if validmask.dtype == bool else validmask.astype(bool)
+
+        def try_region(target_px, region_mask, depth_region):
+            combined = region_mask & valid_bool
+            xyz = self._depth_in_mask_median(points, combined)
+            if xyz is None or xyz[2] <= 0:
+                return None
+            return (
+                (float(xyz[0]), float(xyz[1]), float(xyz[2])),
+                target_px,
+                {
+                    'depth_region': depth_region,
+                    'region_pixel_count': int(combined.sum()),
+                },
+            )
+
+        # 1. Triangle (eyes + nose) — the canonical "stare at mid-eye" case.
+        if ok(L_EYE) and ok(R_EYE) and ok(NOSE):
+            l_px = clip_px(kxy[L_EYE, 0], kxy[L_EYE, 1])
+            r_px = clip_px(kxy[R_EYE, 0], kxy[R_EYE, 1])
+            n_px = clip_px(kxy[NOSE, 0], kxy[NOSE, 1])
+            target_px = (
+                int(round((l_px[0] + r_px[0]) / 2)),
+                int(round((l_px[1] + r_px[1]) / 2)),
+            )
+            tri = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(
+                tri,
+                np.array([l_px, r_px, n_px], dtype=np.int32),
+                1,
+            )
+            res = try_region(target_px, tri.astype(bool), 'triangle')
+            if res is not None:
+                return res
+
+        # 2. Both eyes without a usable nose — still aim between eyes.
+        if ok(L_EYE) and ok(R_EYE):
+            l_px = clip_px(kxy[L_EYE, 0], kxy[L_EYE, 1])
+            r_px = clip_px(kxy[R_EYE, 0], kxy[R_EYE, 1])
+            target_px = (
+                int(round((l_px[0] + r_px[0]) / 2)),
+                int(round((l_px[1] + r_px[1]) / 2)),
+            )
+            res = try_region(
+                target_px, window_mask(*target_px), 'eye_window',
+            )
+            if res is not None:
+                return res
+
+        # 3. One eye (prefer left, then right — deterministic).
+        for eye_idx, tag in (
+            (L_EYE, 'single_eye_left_window'),
+            (R_EYE, 'single_eye_right_window'),
+        ):
+            if ok(eye_idx):
+                e_px = clip_px(kxy[eye_idx, 0], kxy[eye_idx, 1])
+                res = try_region(e_px, window_mask(*e_px), tag)
+                if res is not None:
+                    return res
+
+        # 4. Nose alone.
+        if ok(NOSE):
+            n_px = clip_px(kxy[NOSE, 0], kxy[NOSE, 1])
+            res = try_region(n_px, window_mask(*n_px), 'nose_window')
+            if res is not None:
+                return res
+
+        # 5. Ears — faces away, but still a head-level target.
+        ear_pxs = []
+        if ok(L_EAR):
+            ear_pxs.append(clip_px(kxy[L_EAR, 0], kxy[L_EAR, 1]))
+        if ok(R_EAR):
+            ear_pxs.append(clip_px(kxy[R_EAR, 0], kxy[R_EAR, 1]))
+        if ear_pxs:
+            target_px = (
+                int(round(sum(p[0] for p in ear_pxs) / len(ear_pxs))),
+                int(round(sum(p[1] for p in ear_pxs) / len(ear_pxs))),
+            )
+            res = try_region(
+                target_px, window_mask(*target_px), 'ear_window',
+            )
+            if res is not None:
+                return res
+
+        # 6. Shoulder + bbox-top head proxy — last resort when no face
+        # keypoints survive. Aim above the shoulders; sample depth over the
+        # bbox upper third (torso/neck region).
+        if ok(L_SH) and ok(R_SH):
+            l_px = clip_px(kxy[L_SH, 0], kxy[L_SH, 1])
+            r_px = clip_px(kxy[R_SH, 0], kxy[R_SH, 1])
+            x1b, y1b, x2b, y2b = (float(v) for v in bbox_xyxy)
+            bbox_height = max(1.0, y2b - y1b)
+            mid_x = (l_px[0] + r_px[0]) / 2.0
+            mid_y = (l_px[1] + r_px[1]) / 2.0 - 0.1 * bbox_height
+            target_px = clip_px(mid_x, mid_y)
+            x1i = int(np.clip(round(x1b), 0, w - 1))
+            x2i = int(np.clip(round(x2b), 0, w))
+            y1i = int(np.clip(round(y1b), 0, h - 1))
+            y2i = int(np.clip(round(y2b), 0, h))
+            if x2i > x1i and y2i > y1i:
+                upper = np.zeros((h, w), dtype=bool)
+                upper[y1i : y1i + max(1, (y2i - y1i) // 3), x1i:x2i] = True
+                res = try_region(target_px, upper, 'head_proxy')
+                if res is not None:
+                    return res
+
+        return (None, None, None)
 
     def _classify_settle_state(self):
         """Decide whether we can act on a fresh frame given the servo state.

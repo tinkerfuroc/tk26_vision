@@ -36,7 +36,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .aruco_detect import BoardSpec, build_board, detect_pose
-from .optimize import fit_chain, fit_joint, solve_handeye
+from .optimize import fit_chain, fit_joint, solve_handeye, warm_start_t_b_rotation
 from .pan_tilt_model import PanTiltParams, forward_kinematics
 from .utils import (
     invert_transform,
@@ -172,6 +172,10 @@ def cmd_chain(args):
         handeye["t_ee_marker"]["translation"],
         handeye["t_ee_marker"]["rotation"],
     )
+    t_base_cam_ref = pose_to_matrix(
+        handeye["t_base_cam_ref"]["translation"],
+        handeye["t_base_cam_ref"]["rotation"],
+    )
 
     # Hold out a random 20% split for validation.
     rng = np.random.default_rng(args.val_seed)
@@ -182,10 +186,23 @@ def cmd_chain(args):
     val = [s for i, s in enumerate(samples) if i in val_idxs]
     print(f"train={len(train)} val={len(val)}")
 
+    # Warm-start T_B rotation from Phase 1's reference pose. On this robot the
+    # camera is mounted ~90 deg off the tilt arm, so starting T_B_rot at identity
+    # would drop the optimizer into a bad basin.
+    initial = warm_start_t_b_rotation(PanTiltParams(), t_base_cam_ref)
+    if args.verbose:
+        print(
+            f"T_B warm start: trans={np.round(initial.t_b_trans, 4)}  "
+            f"rotvec={np.round(initial.t_b_rotvec, 4)} "
+            f"(norm={np.linalg.norm(initial.t_b_rotvec):.3f} rad)"
+        )
+
     params, report = fit_chain(
         train,
         t_ee_marker=t_ee_marker,
+        initial=initial,
         fit_pan_offset=args.fit_pan_offset,
+        fit_tb_rotation=not args.lock_tb_rotation,
         loss=args.loss,
     )
     print("TRAIN:", report.summary())
@@ -215,6 +232,7 @@ def cmd_chain(args):
         "n_train": len(train),
         "n_val": len(val),
         "fit_pan_offset": args.fit_pan_offset,
+        "fit_tb_rotation": not args.lock_tb_rotation,
         "handeye_source": str(Path(args.handeye)),
     })
     print(f"Wrote {out_path}")
@@ -334,8 +352,12 @@ def main(argv=None):
     pc.add_argument("--handeye", required=True)
     pc.add_argument("--out", default="results")
     pc.add_argument("--fit-pan-offset", action="store_true")
+    pc.add_argument("--lock-tb-rotation", action="store_true",
+                    help="freeze T_B rotation at init (default: fit it, since the "
+                         "physical camera mount has a ~90 deg twist vs the tilt arm)")
     pc.add_argument("--loss", default="soft_l1")
     pc.add_argument("--val-seed", type=int, default=0)
+    pc.add_argument("--verbose", action="store_true")
     pc.set_defaults(func=cmd_chain)
 
     pp = sub.add_parser("polish", help="Phase 3: joint refinement.")

@@ -16,7 +16,12 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from pan_tilt.calibration.optimize import fit_chain, fit_joint, solve_handeye
+from pan_tilt.calibration.optimize import (
+    fit_chain,
+    fit_joint,
+    solve_handeye,
+    warm_start_t_b_rotation,
+)
 from pan_tilt.calibration.pan_tilt_model import PanTiltParams, forward_kinematics
 from pan_tilt.calibration.utils import (
     invert_transform,
@@ -173,6 +178,55 @@ def test_handeye_recovers_t_ee_marker():
     # 0.5 deg is the plan's gate.
     assert trans_err < 0.006, f"t_ee_marker trans err {trans_err*1000:.2f}mm"
     assert np.degrees(rot_err) < 0.8, f"t_ee_marker rot err {np.degrees(rot_err):.3f}deg"
+
+
+def test_chain_with_90deg_mount_and_warm_start():
+    """90 deg perpendicular mount: T_B has a real +pi/2 about X (camera looks along tilt_link +Z).
+
+    Phase-2 chain fit must still recover T_A, T_B translation, and theta_t_offset
+    after warm-starting T_B from a synthetic Phase-1 reference pose. T_B
+    rotation is frozen (not fit) because the optimizer would otherwise absorb
+    the Y-component into theta_t_offset.
+    """
+    truth = PanTiltParams(
+        t_a=np.array([-0.28, -0.02, 1.55]),
+        t_b_trans=np.array([-0.07, -0.01, 0.08]),
+        t_b_rotvec=np.array([np.pi / 2, 0.0, 0.0]),  # 90 deg about X
+        theta_t_offset=-np.pi / 4 + np.deg2rad(1.0),
+        theta_p_offset=np.deg2rad(0.3),
+        l_pan=0.135,
+    )
+    # Arbitrary T_ee_marker (known exactly because we fabricate it).
+    Rem = Rotation.from_euler("xyz", [0.2, 0.4, -0.1]).as_matrix()
+    t_ee_marker = np.eye(4)
+    t_ee_marker[:3, :3] = Rem
+    t_ee_marker[:3, 3] = np.array([0.03, 0.0, -0.10])
+
+    noise_rng = np.random.default_rng(RNG_SEED + 400)
+    phase2 = _phase2_samples(truth, t_ee_marker, noise_rng=noise_rng)
+
+    # Synthesize a Phase-1 reference pose (Z_0 at servo zero).
+    t_base_cam_ref = forward_kinematics(0.0, 0.0, truth)
+    initial = warm_start_t_b_rotation(PanTiltParams(), t_base_cam_ref)
+    # Warm start should put T_B_rotvec close to truth (pi/2 about X).
+    # (Some Y-component may leak in because warm-start uses the default
+    # theta_t_offset of -pi/4 which differs from truth.)
+    assert abs(np.linalg.norm(initial.t_b_rotvec) - np.pi / 2) < 0.05
+
+    params, report = fit_chain(
+        phase2,
+        t_ee_marker=t_ee_marker,
+        initial=initial,
+        fit_pan_offset=True,
+        fit_tb_rotation=False,
+        loss="soft_l1",
+    )
+    assert report.success
+    # Residuals are bounded by the injected 1 mm / 0.1 deg noise.
+    assert report.trans_rmse_m < 0.004, report.summary()
+    assert np.degrees(report.rot_rmse_rad) < 0.35, report.summary()
+    assert np.linalg.norm(params.t_a - truth.t_a) < 0.004
+    assert np.linalg.norm(params.t_b_trans - truth.t_b_trans) < 0.004
 
 
 def test_joint_polish_tightens_result():

@@ -17,8 +17,8 @@ Safety
 Every xArm target is validated against:
   - a software Z-floor (configurable, default 0.25 m)
   - a cylindrical exclusion around the pan-tilt mast
-before the `set_servo_angle` service call is issued. A violation aborts the
-session cleanly; we do not partially succeed.
+before the JointMove action goal is sent. A violation aborts the session
+cleanly; we do not partially succeed.
 
 The node does not depend on MoveIt and does not do collision checking against
 other robot links beyond the coarse envelope; operators must pre-validate the
@@ -62,8 +62,8 @@ from .calibration.utils import (
 )
 
 
-# xarm_msgs is imported lazily at node construction so this module stays
-# importable on hosts without the xarm_ros2 stack installed.
+# tinker_arm_msgs is imported lazily at node construction so this module stays
+# importable on hosts without the tinker_manipulation stack installed.
 
 
 # ---- config -----------------------------------------------------------------
@@ -85,19 +85,19 @@ class CollectConfig:
     servo_backlash_overshoot_deg: float = 2.0
     servo_backlash_pause_sec: float = 0.2
     xarm_settle_sec: float = 0.5
-    xarm_service_timeout_sec: float = 15.0
+    arm_action_timeout_sec: float = 30.0
     sample_stamp_skew_max_ms: float = 20.0
     frames_per_cell: int = 10
     frame_min_interval_ms: float = 40.0
 
-    # Topics / services (override via yaml).
+    # Topics / actions (override via yaml).
     image_topic: str = "/camera/color/image_raw"
     camera_info_topic: str = "/camera/color/camera_info"
     pantilt_cmd_topic: str = "/pan_tilt_controller/cmd"
     pantilt_state_topic: str = "/pan_tilt_controller/state"
-    xarm_service: str = "/xarm/set_servo_angle"
-    xarm_speed: float = 0.3
-    xarm_acc: float = 0.3
+    # tinker_arm_msgs actions on the pick_and_place GraspNode.
+    joint_move_action: str = "joint_move_action"
+    cartesian_move_action: str = "cartesian_move_action"
     base_frame: str = "base_link"
     ee_frame: str = "link_eef"
 
@@ -177,16 +177,19 @@ class CalibrateCollectNode(Node):
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
-        # ---- xArm service client -------------------------------------------------
+        # ---- tinker_arm_msgs JointMove action client ---------------------------
         try:
-            from xarm_msgs.srv import MoveJoint  # type: ignore
+            from rclpy.action import ActionClient
+            from tinker_arm_msgs.action import JointMove  # type: ignore
         except ImportError:
             self.get_logger().error(
-                "xarm_msgs not available; install/source the xarm_ros2 packages."
+                "tinker_arm_msgs not available; build/source the tinker_manipulation stack."
             )
             raise
-        self._xarm_srv_type = MoveJoint
-        self._xarm_client = self.create_client(MoveJoint, self._cfg.xarm_service)
+        self._joint_move_type = JointMove
+        self._joint_move_client = ActionClient(
+            self, JointMove, self._cfg.joint_move_action,
+        )
 
     # ---- subs --------------------------------------------------------------
 
@@ -287,24 +290,50 @@ class CalibrateCollectNode(Node):
         return self._wait_pt_settle(pan_deg, tilt_deg, timeout_sec=6.0)
 
     def _send_xarm_joint(self, angles_rad) -> bool:
-        if not self._xarm_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error(f"xArm service {self._cfg.xarm_service} not available")
+        """Send a JointMove action goal. Pads to 7 joints for xarm7."""
+        if not self._joint_move_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error(
+                f"JointMove action '{self._cfg.joint_move_action}' not available"
+            )
             return False
-        req = self._xarm_srv_type.Request()
-        req.angles = [float(a) for a in angles_rad]
-        req.speed = float(self._cfg.xarm_speed)
-        req.acc = float(self._cfg.xarm_acc)
-        req.mvtime = 0.0
-        req.wait = True
-        req.timeout = float(self._cfg.xarm_service_timeout_sec)
-        fut = self._xarm_client.call_async(req)
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=self._cfg.xarm_service_timeout_sec)
-        if not fut.done():
-            self.get_logger().error("xArm service call timed out")
+
+        from sensor_msgs.msg import PointCloud2
+        goal = self._joint_move_type.Goal()
+        a = list(angles_rad) + [0.0] * max(0, 7 - len(angles_rad))
+        goal.joint0 = float(a[0])
+        goal.joint1 = float(a[1])
+        goal.joint2 = float(a[2])
+        goal.joint3 = float(a[3])
+        goal.joint4 = float(a[4])
+        goal.joint5 = float(a[5])
+        goal.joint6 = float(a[6])
+        goal.env_points = PointCloud2()  # no env cloud; MoveIt server-side still
+                                         # enforces self-collision + joint limits
+
+        timeout = float(self._cfg.arm_action_timeout_sec)
+        send_fut = self._joint_move_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut, timeout_sec=5.0)
+        if not send_fut.done():
+            self.get_logger().error("JointMove send_goal timed out")
             return False
-        resp = fut.result()
-        if resp.ret != 0:
-            self.get_logger().error(f"xArm service returned ret={resp.ret}: {resp.message}")
+        gh = send_fut.result()
+        if not gh.accepted:
+            self.get_logger().error("JointMove goal rejected")
+            return False
+
+        result_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, result_fut, timeout_sec=timeout)
+        if not result_fut.done():
+            self.get_logger().error(f"JointMove result timed out after {timeout:.0f}s")
+            try:
+                gh.cancel_goal_async()
+            except Exception:
+                pass
+            return False
+
+        result = result_fut.result().result
+        if not getattr(result, "success", False):
+            self.get_logger().error("JointMove reported success=False")
             return False
         time.sleep(self._cfg.xarm_settle_sec)
         return True

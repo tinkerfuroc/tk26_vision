@@ -10,8 +10,9 @@ Then open http://127.0.0.1:8765 in a browser.
 The tool provides:
   - Live camera view with ChArUco detection overlay (tab 1).
   - xArm waypoint authoring: joint-angle input, safety envelope check against
-    the current TF, "send to robot" (via xarm set_servo_angle), and draft
-    waypoint lists (tab 2).
+    the current TF, "send to robot" (via tinker_arm_msgs JointMove action),
+    and draft waypoint lists (tab 2). A secondary panel accepts a Cartesian
+    target pose and relays it via tinker_arm_msgs CartesianMove.
   - Pan-tilt jog controls for manual visibility checks from the current xArm
     pose (tab 2, same screen).
 
@@ -61,6 +62,18 @@ from .calibration.utils import matrix_to_pose, pose_to_matrix
 
 
 log = logging.getLogger("calib_web")
+
+
+def _empty_pointcloud():
+    """Zero-field PointCloud2 used when no live depth cloud is available.
+
+    The tinker_arm_msgs actions require an `env_points` field; MoveIt on the
+    server side converts it to an octomap for collision avoidance. An empty
+    cloud yields no obstacles — fine for calibration moves where the safety
+    envelope + operator pre-validation are doing the collision-avoidance work.
+    """
+    from sensor_msgs.msg import PointCloud2
+    return PointCloud2()
 
 
 def _sanitize_for_json(obj):
@@ -132,13 +145,16 @@ class CalibWebNode(Node):
         self.declare_parameter("camera_info_topic", "/camera/color/camera_info")
         self.declare_parameter("pantilt_cmd_topic", "/pan_tilt_controller/cmd")
         self.declare_parameter("pantilt_state_topic", "/pan_tilt_controller/state")
-        self.declare_parameter("xarm_service", "/xarm/set_servo_angle")
+        # Arm motion uses tinker_arm_msgs actions (JointMove / CartesianMove).
+        # Both actions are served by the pick_and_place GraspNode and drive
+        # MoveIt under the hood, so motion is collision-checked using
+        # `env_points` (optional PointCloud2, left empty for calibration).
+        self.declare_parameter("joint_move_action", "joint_move_action")
+        self.declare_parameter("cartesian_move_action", "cartesian_move_action")
         self.declare_parameter("xarm_joint_state_topic", "/xarm/joint_states")
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("ee_frame", "link_eef")
-        self.declare_parameter("xarm_speed", 0.3)
-        self.declare_parameter("xarm_acc", 0.3)
-        self.declare_parameter("xarm_service_timeout_sec", 20.0)
+        self.declare_parameter("arm_action_timeout_sec", 30.0)
         self.declare_parameter("pantilt_speed_raw", 120)
         self.declare_parameter("pantilt_accel_raw", 20)
 
@@ -209,17 +225,26 @@ class CalibWebNode(Node):
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
-        self._xarm_client = None
+        self._joint_move_client = None
+        self._cartesian_move_client = None
+        self._joint_move_type = None
+        self._cartesian_move_type = None
         try:
-            from xarm_msgs.srv import MoveJoint  # type: ignore
-            self._xarm_srv_type = MoveJoint
-            self._xarm_client = self.create_client(
-                MoveJoint, self.get_parameter("xarm_service").value,
+            from rclpy.action import ActionClient
+            from tinker_arm_msgs.action import CartesianMove, JointMove  # type: ignore
+            self._joint_move_type = JointMove
+            self._cartesian_move_type = CartesianMove
+            self._joint_move_client = ActionClient(
+                self, JointMove, self.get_parameter("joint_move_action").value,
+            )
+            self._cartesian_move_client = ActionClient(
+                self, CartesianMove,
+                self.get_parameter("cartesian_move_action").value,
             )
         except ImportError:
-            self._xarm_srv_type = None
             self.get_logger().warn(
-                "xarm_msgs not found; /api/xarm/move will return 503 until installed."
+                "tinker_arm_msgs not found; /api/xarm/move* will return 503 "
+                "until the tinker_arm_msgs package is built and sourced."
             )
 
         # Refresh overlay + TF at 10 Hz.
@@ -443,30 +468,90 @@ class CalibWebNode(Node):
         msg.accel_raw = int(self.get_parameter("pantilt_accel_raw").value)
         self._pt_pub.publish(msg)
 
-    def call_xarm(self, angles_rad) -> tuple[bool, str]:
-        if self._xarm_client is None:
-            return False, "xarm_msgs not installed in this venv"
-        if not self._xarm_client.wait_for_service(timeout_sec=1.5):
-            return False, f"xarm service {self.get_parameter('xarm_service').value} unavailable"
-        req = self._xarm_srv_type.Request()
-        req.angles = [float(a) for a in angles_rad]
-        req.speed = float(self.get_parameter("xarm_speed").value)
-        req.acc = float(self.get_parameter("xarm_acc").value)
-        req.mvtime = 0.0
-        req.wait = True
-        req.timeout = float(self.get_parameter("xarm_service_timeout_sec").value)
+    def call_joint_move(self, angles_rad, env_points=None) -> tuple[bool, str]:
+        """Send a JointMove action goal. angles_rad is padded/truncated to 7 floats
+        (joint0..joint6) to match the tinker_arm_msgs action definition.
+        """
+        if self._joint_move_client is None:
+            return False, "tinker_arm_msgs not available on the Python path"
 
-        fut = self._xarm_client.call_async(req)
-        timeout = float(self.get_parameter("xarm_service_timeout_sec").value)
+        action_name = self.get_parameter("joint_move_action").value
+        if not self._joint_move_client.wait_for_server(timeout_sec=1.5):
+            return False, f"action '{action_name}' unavailable"
+
+        goal = self._joint_move_type.Goal()
+        a = list(angles_rad) + [0.0] * max(0, 7 - len(angles_rad))
+        goal.joint0 = float(a[0])
+        goal.joint1 = float(a[1])
+        goal.joint2 = float(a[2])
+        goal.joint3 = float(a[3])
+        goal.joint4 = float(a[4])
+        goal.joint5 = float(a[5])
+        goal.joint6 = float(a[6])
+        goal.env_points = env_points if env_points is not None else _empty_pointcloud()
+
+        return self._run_action(self._joint_move_client, goal, action_name)
+
+    def call_cartesian_move(self, pose_dict: dict, env_points=None) -> tuple[bool, str]:
+        """Send a CartesianMove action goal. pose_dict: {"translation": [x,y,z],
+        "rotation": [qx,qy,qz,qw]} in base_link coordinates.
+        """
+        if self._cartesian_move_client is None:
+            return False, "tinker_arm_msgs not available on the Python path"
+
+        action_name = self.get_parameter("cartesian_move_action").value
+        if not self._cartesian_move_client.wait_for_server(timeout_sec=1.5):
+            return False, f"action '{action_name}' unavailable"
+
+        from geometry_msgs.msg import Pose, Point, Quaternion
+        try:
+            t = pose_dict["translation"]
+            r = pose_dict["rotation"]
+            pose = Pose(
+                position=Point(x=float(t[0]), y=float(t[1]), z=float(t[2])),
+                orientation=Quaternion(
+                    x=float(r[0]), y=float(r[1]), z=float(r[2]), w=float(r[3]),
+                ),
+            )
+        except (KeyError, IndexError, TypeError) as e:
+            return False, f"bad pose payload: {e}"
+
+        goal = self._cartesian_move_type.Goal()
+        goal.target_pose = pose
+        goal.env_points = env_points if env_points is not None else _empty_pointcloud()
+
+        return self._run_action(self._cartesian_move_client, goal, action_name)
+
+    def _run_action(self, client, goal, action_name: str) -> tuple[bool, str]:
+        """Send a goal and block-wait for the result. rclpy.spin runs in the
+        main thread so futures are driven independently of this helper."""
+        timeout = float(self.get_parameter("arm_action_timeout_sec").value)
+        send_fut = client.send_goal_async(goal)
         t0 = time.monotonic()
-        while not fut.done() and (time.monotonic() - t0) < timeout:
+        while not send_fut.done() and time.monotonic() - t0 < 5.0:
             time.sleep(0.05)
-        if not fut.done():
-            return False, "xarm service timed out"
-        resp = fut.result()
-        if resp.ret != 0:
-            return False, f"xarm returned ret={resp.ret}: {resp.message}"
-        return True, "ok"
+        if not send_fut.done():
+            return False, f"{action_name}: send_goal timed out"
+
+        goal_handle = send_fut.result()
+        if not goal_handle.accepted:
+            return False, f"{action_name}: goal rejected"
+
+        result_fut = goal_handle.get_result_async()
+        while not result_fut.done() and time.monotonic() - t0 < timeout:
+            time.sleep(0.05)
+        if not result_fut.done():
+            # Attempt a cancel so the server doesn't keep executing.
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+            return False, f"{action_name}: result timed out after {timeout:.0f}s"
+
+        wrapped = result_fut.result()
+        result = getattr(wrapped, "result", wrapped)
+        success = bool(getattr(result, "success", False))
+        return success, "ok" if success else f"{action_name} returned success=False"
 
     # ---- waypoint store ------------------------------------------------------
 
@@ -651,11 +736,25 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
 
     @app.post("/api/xarm/move")
     async def api_xarm_move(req: dict):
+        """Send a JointMove goal to the tinker_arm_msgs action server."""
         angles = req.get("angles_rad")
         if not isinstance(angles, list) or not angles:
             raise HTTPException(400, "'angles_rad' must be a non-empty list of floats")
         loop = asyncio.get_event_loop()
-        ok, msg = await loop.run_in_executor(None, node.call_xarm, angles)
+        ok, msg = await loop.run_in_executor(None, node.call_joint_move, angles)
+        return {"ok": ok, "message": msg}
+
+    @app.post("/api/xarm/move_cartesian")
+    async def api_xarm_move_cartesian(req: dict):
+        """Send a CartesianMove goal (target_pose in base_link).
+
+        Payload: {"translation": [x,y,z], "rotation": [qx,qy,qz,qw]}.
+        """
+        pose = req.get("target_pose", req)
+        if "translation" not in pose or "rotation" not in pose:
+            raise HTTPException(400, "payload must have 'translation' and 'rotation'")
+        loop = asyncio.get_event_loop()
+        ok, msg = await loop.run_in_executor(None, node.call_cartesian_move, pose)
         return {"ok": ok, "message": msg}
 
     @app.post("/api/pantilt/move")

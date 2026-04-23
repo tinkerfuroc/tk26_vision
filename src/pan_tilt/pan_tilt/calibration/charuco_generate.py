@@ -1,10 +1,23 @@
 """Generate a print-ready ChArUco board image + PDF.
 
 Usage (standalone):
+    # Named preset (recommended)
+    python -m pan_tilt.calibration.charuco_generate --preset default --out /tmp/charuco
+    python -m pan_tilt.calibration.charuco_generate --preset compact --out /tmp/charuco
+
+    # Explicit overrides
     python -m pan_tilt.calibration.charuco_generate \\
         --squares-x 5 --squares-y 7 \\
         --square-len 0.040 --marker-len 0.030 \\
-        --out /tmp/charuco_5x7_40_30
+        --out /tmp/charuco
+
+Presets:
+    default  5x7 @ 40mm squares, 30mm markers -> 200x280 mm board
+             Fills more of the camera frame; best accuracy at 0.5-1.5 m range.
+             Tight A4 margins (~5mm / ~8mm).
+    compact  5x5 @ 20mm squares, 15mm markers -> 100x100 mm board
+             Fits a small EE-mount fixture (10x10 cm). Comfortable A4
+             margins. Use when the physical EE real-estate is limited.
 
 Outputs:
     <out>.png   - high-res board image (300 DPI at the target physical size)
@@ -15,10 +28,8 @@ Print the PDF on **matte A4**, mount on 3 mm aluminium composite, and re-measure
 the printed square size with calipers before trusting the extrinsic calibration
 — even "100%" print settings warp slightly.
 
-A 5x7 board at 40 mm squares is 200 x 280 mm, which leaves only ~5 mm and
-~8 mm margins on A4. If your printer can't print that close to the edge,
-drop to 35 mm squares / 26 mm markers (175 x 245 mm) via --square-len 0.035
---marker-len 0.026, and update calibration.yaml `board:` to match.
+Whichever preset you use, update the `board:` section of calibration.yaml to
+match so the collector's detector is instantiated with the correct spec.
 """
 
 from __future__ import annotations
@@ -149,22 +160,40 @@ def write_pdf(png_path: Path, pdf_path: Path, spec: BoardSpec) -> None:
     pdf_path.write_bytes(buffer.getvalue())
 
 
+PRESETS = {
+    "default": dict(squares_x=5, squares_y=7, square_len=0.040, marker_len=0.030),
+    "compact": dict(squares_x=5, squares_y=5, square_len=0.020, marker_len=0.015),
+}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate a ChArUco board for calibration.")
-    parser.add_argument("--squares-x", type=int, default=5)
-    parser.add_argument("--squares-y", type=int, default=7)
-    parser.add_argument("--square-len", type=float, default=0.040, help="square side, meters")
-    parser.add_argument("--marker-len", type=float, default=0.030, help="marker side, meters")
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESETS.keys()),
+        default=None,
+        help="named geometry preset; overridden by explicit --squares-* / --*-len",
+    )
+    parser.add_argument("--squares-x", type=int, default=None)
+    parser.add_argument("--squares-y", type=int, default=None)
+    parser.add_argument("--square-len", type=float, default=None, help="square side, meters")
+    parser.add_argument("--marker-len", type=float, default=None, help="marker side, meters")
     parser.add_argument("--dict", type=str, default="DICT_5X5_100")
     parser.add_argument("--out", type=Path, required=True, help="output path stem (no extension)")
     args = parser.parse_args(argv)
 
+    preset_vals = PRESETS[args.preset] if args.preset else PRESETS["default"]
+    squares_x = args.squares_x or preset_vals["squares_x"]
+    squares_y = args.squares_y or preset_vals["squares_y"]
+    square_len = args.square_len or preset_vals["square_len"]
+    marker_len = args.marker_len or preset_vals["marker_len"]
+
     dict_id = getattr(cv2.aruco, args.dict)
     spec = BoardSpec(
-        squares_x=args.squares_x,
-        squares_y=args.squares_y,
-        square_len_m=args.square_len,
-        marker_len_m=args.marker_len,
+        squares_x=squares_x,
+        squares_y=squares_y,
+        square_len_m=square_len,
+        marker_len_m=marker_len,
         dict_id=dict_id,
     )
 

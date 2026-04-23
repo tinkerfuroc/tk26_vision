@@ -33,27 +33,36 @@ Fitted parameters (13 DOF baseline):
 
 ## Step-by-step walkthrough
 
-### 1. Generate and print the ChArUco board
+### 1. Print a ChArUco board
+
+Two pre-generated boards live in `pan_tilt/calibration/boards/` (also installed under `share/pan_tilt/calibration/boards/`). Pick the one that fits your EE mount:
+
+| Preset  | Board size | Squares | Square / marker | Best at | A4 margins |
+|---|---|---|---|---|---|
+| `default` | 200 × 280 mm | 5 × 7 | 40 / 30 mm | 0.5 – 1.5 m range | ~5 / ~8 mm (tight) |
+| `compact` | 100 × 100 mm | 5 × 5 | 20 / 15 mm | EE mounts limited to ~10 × 10 cm | comfortable |
+
+Both PDFs are sized for A4 at exact physical scale. Print at **100%** (no "fit to page" or "scale to fit"). Verify with calipers — if the squares don't measure exactly the spec'd size, re-print with the printer's scaling adjusted.
+
+If you need a non-standard size, regenerate:
 
 ```bash
 source src/tk26_vision/.venv-vision-main/bin/activate
-python -m pan_tilt.calibration.charuco_generate --out ~/calib/charuco_5x7
-```
-
-Produces:
-- `charuco_5x7.pdf`  — A4 at exact physical scale. Print at **100%** (no "fit to page" or "scale to fit"). Check the square size with calipers after printing; if your printer shrank the output, re-run with adjusted `--square-len`.
-- `charuco_5x7.png`  — source image.
-- `charuco_5x7.json` — machine-readable spec; referenced later for detection.
-
-Default is 5 × 7 squares of 40 mm (markers 30 mm) from `DICT_5X5_100`. The printed board is 200 × 280 mm, which fits A4 (210 × 297 mm) with only ~5 mm / ~8 mm margins — if your printer refuses to print that close to the edge, drop to 35 mm squares / 26 mm markers:
-
-```bash
+# Named preset
+python -m pan_tilt.calibration.charuco_generate --preset compact --out ~/calib/board
+# Or fully custom (e.g. 35mm squares for more A4 margin)
 python -m pan_tilt.calibration.charuco_generate \
+    --squares-x 5 --squares-y 7 \
     --square-len 0.035 --marker-len 0.026 \
-    --out ~/calib/charuco_5x7
+    --out ~/calib/board
 ```
 
-This gives a 175 × 245 mm board with comfortable A4 margins. If you change the board dimensions, also update the `board:` section of `calibration.yaml` (step 4) to match.
+Each invocation produces:
+- `<out>.pdf`  — A4 page, board centered at exact scale.
+- `<out>.png`  — source image (300 DPI).
+- `<out>.json` — machine-readable board spec. Reference this from `calibration.yaml`.
+
+**Whichever board you use, update `calibration.yaml`'s `board:` section to match its dimensions** — the collector instantiates the detector from those values.
 
 ### 2. Mount the board and verify streams
 

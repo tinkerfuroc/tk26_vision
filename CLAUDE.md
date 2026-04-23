@@ -45,7 +45,7 @@ source install/setup.bash
 # Object detection
 ros2 run object_detection_new yolo_seg_node                 # /object_detection_yolo (specialist, excludes 'person')
 ros2 run object_detection_new yolo_seg_default_node         # /object_detection (pretrained COCO, backward-compat)
-ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + Gemini/FastSAM fallback)
+ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + YOLO-World/FastSAM fallback; flip to Gemini via -p enable_vlm:=true)
 
 # Tracking / shelves
 ros2 run vision_track person_track_server            # action /track_person
@@ -71,7 +71,7 @@ ros2 run vision_util get_point_cloud                 # /get_point_cloud_service
 src/tk26_vision/src/
 ├── tinker_vision_msgs_26/         # canonical vision interfaces — all msgs/srvs/actions live here (absorbed tk23's tinker_vision_msgs)
 ├── object_detection_new/          # YOLO-seg: specialist (yolo_seg_node, excludes 'person') + default (yolo_seg_default_node, pretrained COCO)
-├── object_detection_generalist/   # Pretrained YOLO + Gemini 2.5 Pro bbox + FastSAM mask fallback, tk26 srv
+├── object_detection_generalist/   # Pretrained YOLO + YOLO-World (default fallback) or Gemini 2.5 Flash (enable_vlm) + FastSAM mask, tk26 srv
 ├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
 ├── tk_vision_specialized/         # SpotOnShelf action + waving detector
 ├── pan_tilt/                      # ctrl (serial + TF) + follow_head (YOLO@1Hz w/ blur gate)
@@ -142,6 +142,6 @@ Per-run results and operator-in-the-loop matrix in [`DEV_NOTES.md`](./DEV_NOTES.
 Actionable work that remains open. Full context, rationale, and prioritization in [`DEV_NOTES.md § Follow-ups`](./DEV_NOTES.md#follow-ups--ordered-roughly-by-impact). Items 1–5 and 9 from the previous follow-up list were addressed in the 2026-04-22 "Follow-up wave" session — see that DEV_NOTES entry.
 
 1. **Specialist model training.** The custom-trained competition YOLO does not exist yet — `yolo_seg_node` currently serves pretrained `yolo11m-seg.pt`. `excluded_classes=['person']` is belt-and-suspenders for the future retrain.
-2. **VLM latency** (9–14 s/call on Gemini 2.5 Pro) is the dominant cost on the fallback path. Options: lighter model (`gemini-2.5-flash`), few-shot-tune YOLO on the open-vocab classes you care about, or swap in a local open-vocab detector.
+2. **VLM latency** (5–10 s/call on Gemini 2.5 Flash) is the dominant cost when `enable_vlm=True`. Default fallback is now YOLO-World (~150–400 ms/call locally) — only flip `enable_vlm` on if YOLO-World can't recognise the target class.
 3. **Triple-subscription of camera streams** when specialist + default + generalist all run together. Not urgent, but worth factoring the input half of `YOLOSegmentationNode` into a shared node if we keep the three-service split.
 4. **`BtNode_TrackPerson` / `BtNode_ScanForWavingPerson` / `BtNode_FindPointedLuggage` rearchitect** — these BT nodes were migrated to the tk26 generalist srv mechanically in Wave 2.1, but their *semantics* depend on tk23-only response fields the tk26 detection nodes never populate (`result.person_id`, `Object.being_pointed`). The full catalog of broken nodes, live-task blast radius, and recommended fix per node lives alongside the code in [`src/tk25_decision/CLAUDE.md § Known issues & broken nodes`](../../src/tk25_decision/CLAUDE.md#known-issues--broken-nodes).

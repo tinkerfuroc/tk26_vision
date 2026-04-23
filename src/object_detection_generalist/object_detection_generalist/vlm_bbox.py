@@ -29,15 +29,53 @@ Bbox = Tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixel coords
 
 
 _SYSTEM_PROMPT = (
-    "You detect instances of the user's target class in the image. "
-    "Respond ONLY as strict JSON of the form "
-    "{\"detections\": [{\"label\": \"<class>\", "
-    "\"box_2d\": [y0, x0, y1, x1]}, ...]}. "
-    "Coordinates are normalized integers in [0, 1000] where (0,0) is "
-    "the top-left of the image and (1000,1000) is the bottom-right. "
-    "Return an empty detections list if no matches. "
-    "No markdown, no prose, no explanation."
+    # Canonical Gemini spatial-understanding phrasing — Google's training
+    # docs warn that even small wording changes (e.g. flipping the axis
+    # order to xmin,ymin,xmax,ymax) measurably degrade accuracy on the
+    # 2.x family. Keep this string close to the official cookbook.
+    "Return bounding boxes as an array of objects with labels. "
+    "Never return masks. Limit to 25 objects. "
+    "If an object is present multiple times, give each object a unique "
+    "label according to its distinct characteristics "
+    "(colors, size, position, etc.). "
+    "The box_2d MUST be exactly four integers [ymin, xmin, ymax, xmax] "
+    "normalized to 0-1000, where (0,0) is the top-left of the image. "
+    "Do NOT return 3D coordinates, depth, rotation, or any extra values. "
+    "If no instances match the target class, return an empty detections list."
 )
+
+
+# JSON Schema for the structured-output response_format. Critical: by
+# pinning `box_2d` to exactly 4 integer items, the model is structurally
+# prevented from emitting 9-value 3D bbox payloads (a known Gemini 2.5
+# failure mode where the prompt mentions a 3D-like object — see
+# generalist_node smoke-test notes). OpenRouter forwards json_schema to
+# Gemini's native structured output mode.
+_RESPONSE_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'detections': {
+            'type': 'array',
+            'maxItems': 25,
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'label': {'type': 'string'},
+                    'box_2d': {
+                        'type': 'array',
+                        'items': {'type': 'integer'},
+                        'minItems': 4,
+                        'maxItems': 4,
+                    },
+                },
+                'required': ['label', 'box_2d'],
+                'additionalProperties': False,
+            },
+        },
+    },
+    'required': ['detections'],
+    'additionalProperties': False,
+}
 
 
 def _encode_data_url(rgb_bgr: np.ndarray) -> str:
@@ -54,11 +92,17 @@ def _encode_data_url(rgb_bgr: np.ndarray) -> str:
 
 
 def _decode_bbox(box_2d, w: int, h: int) -> Bbox | None:
-    """Decode a Gemini [y0, x0, y1, x1] 0-1000 normalized box to xyxy pixels."""
-    if not isinstance(box_2d, (list, tuple)) or len(box_2d) != 4:
+    """Decode a Gemini [y0, x0, y1, x1] 0-1000 normalized box to xyxy pixels.
+
+    Tolerant of >4-element payloads: when Gemini slips into 3D-bbox mode
+    despite the schema (e.g. `[y0, x0, y1, x1, depth, dx, dy, dz, yaw]`),
+    take the first 4 values which are still y0/x0/y1/x1 in the 2.x family.
+    Reject anything shorter than 4.
+    """
+    if not isinstance(box_2d, (list, tuple)) or len(box_2d) < 4:
         return None
     try:
-        y0, x0, y1, x1 = (float(v) for v in box_2d)
+        y0, x0, y1, x1 = (float(box_2d[i]) for i in range(4))
     except (TypeError, ValueError):
         return None
 
@@ -99,6 +143,8 @@ def request_bboxes(
     max_retries: int = 3,
     timeout_s: float = 20.0,
     logger=None,
+    abandon_event=None,
+    client_holder: dict | None = None,
 ) -> tuple[List[Bbox], float]:
     """Ask Gemini for every xyxy bounding box matching `prompt` in the image.
 
@@ -106,6 +152,21 @@ def request_bboxes(
     for the entire VLM call (including retries). Returns an empty list on parse
     exhaustion or an explicit "no matches" response. Raises `VlmBboxError` only
     for configuration problems we want the caller to surface (missing API key).
+
+    Cancellation
+    ------------
+    If ``abandon_event`` (a ``threading.Event``) is set, the loop returns
+    early on the next retry boundary OR when an exception is raised by the
+    in-flight HTTP call (typical case: the caller closed ``client_holder['client']``
+    from another thread, which interrupts httpx and surfaces a ReadError /
+    ConnectError here). This lets the race coordinator abandon a VLM call
+    without waiting for it to time out naturally.
+
+    ``client_holder`` is an optional dict (passed by the caller) into which
+    this function publishes its OpenAI client so the caller can close it
+    cross-thread to force-cancel the HTTP. The function still owns the
+    client's lifetime (closes it in `finally`); the caller's close() just
+    accelerates termination.
     """
 
     load_env()
@@ -120,63 +181,128 @@ def request_bboxes(
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key, base_url=base_url())
-    data_url = _encode_data_url(rgb_bgr)
-    h, w = rgb_bgr.shape[:2]
-
-    messages = [
-        {'role': 'system', 'content': _SYSTEM_PROMPT},
-        {
-            'role': 'user',
-            'content': [
-                {'type': 'image_url', 'image_url': {'url': data_url}},
-                {'type': 'text', 'text': f'Target class: {prompt}'},
-            ],
-        },
-    ]
+    if client_holder is not None:
+        client_holder['client'] = client
 
     _t0 = time.perf_counter()
-    last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            completion = client.with_options(timeout=timeout_s).chat.completions.create(
-                model=model,
-                messages=messages,
-                response_format={'type': 'json_object'},
+    try:
+        data_url = _encode_data_url(rgb_bgr)
+        h, w = rgb_bgr.shape[:2]
+
+        messages = [
+            {'role': 'system', 'content': _SYSTEM_PROMPT},
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'image_url', 'image_url': {'url': data_url}},
+                    {'type': 'text', 'text': f'Target class: {prompt}'},
+                ],
+            },
+        ]
+
+        # Prefer JSON-Schema structured output (enforces box_2d shape at
+        # the model level). Fall back to plain json_object on the first
+        # call that errors with response_format mismatch — some
+        # OpenRouter routes / older Gemini variants don't accept the
+        # json_schema form.
+        response_format_strict = {
+            'type': 'json_schema',
+            'json_schema': {
+                'name': 'detections_response',
+                'strict': True,
+                'schema': _RESPONSE_SCHEMA,
+            },
+        }
+        response_format_loose = {'type': 'json_object'}
+        use_strict = True
+
+        last_error: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            if abandon_event is not None and abandon_event.is_set():
+                if logger is not None:
+                    logger.info(
+                        f'VLM call abandoned before attempt '
+                        f'{attempt}/{max_retries}'
+                    )
+                return [], time.perf_counter() - _t0
+            response_format = (
+                response_format_strict if use_strict
+                else response_format_loose
             )
-            raw = completion.choices[0].message.content or ''
-            parsed = json.loads(raw)
-            detections = parsed.get('detections', []) or []
-
-            boxes: List[Bbox] = []
-            for det in detections:
-                box_2d = det.get('box_2d') if isinstance(det, dict) else None
-                decoded = _decode_bbox(box_2d, w, h)
-                if decoded is not None:
-                    boxes.append(decoded)
-
-            if logger is not None:
-                logger.info(
-                    f'VLM returned {len(detections)} raw detection(s), '
-                    f'{len(boxes)} valid box(es) after decode (attempt '
-                    f'{attempt}/{max_retries}).'
+            try:
+                completion = client.with_options(timeout=timeout_s).chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    response_format=response_format,
                 )
-            return boxes, time.perf_counter() - _t0
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
-            last_error = exc
-            if logger is not None:
-                logger.warning(
-                    f'VLM JSON parse failed (attempt {attempt}/{max_retries}): {exc}'
-                )
-        except Exception as exc:  # noqa: BLE001 — network/API layer is broad
-            last_error = exc
-            if logger is not None:
-                logger.warning(
-                    f'VLM call failed (attempt {attempt}/{max_retries}): {exc}'
-                )
+                raw = completion.choices[0].message.content or ''
+                parsed = json.loads(raw)
+                detections = parsed.get('detections', []) or []
 
-    if logger is not None:
-        logger.error(
-            f'VLM bbox request exhausted {max_retries} retries; '
-            f'last error: {last_error}'
-        )
-    return [], time.perf_counter() - _t0
+                boxes: List[Bbox] = []
+                for det in detections:
+                    box_2d = det.get('box_2d') if isinstance(det, dict) else None
+                    decoded = _decode_bbox(box_2d, w, h)
+                    if decoded is not None:
+                        boxes.append(decoded)
+
+                if logger is not None:
+                    logger.info(
+                        f'VLM returned {len(detections)} raw detection(s), '
+                        f'{len(boxes)} valid box(es) after decode (attempt '
+                        f'{attempt}/{max_retries}).'
+                    )
+                return boxes, time.perf_counter() - _t0
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+                last_error = exc
+                if logger is not None:
+                    logger.warning(
+                        f'VLM JSON parse failed (attempt {attempt}/{max_retries}): {exc}'
+                    )
+            except Exception as exc:  # noqa: BLE001 — network/API layer is broad
+                # If the caller closed our client to abandon the call, httpx
+                # raises an error here. Detect that and exit cleanly instead
+                # of treating it as a retryable failure.
+                if abandon_event is not None and abandon_event.is_set():
+                    if logger is not None:
+                        logger.info(
+                            f'VLM call abandoned mid-flight '
+                            f'({type(exc).__name__}: {exc}); exiting'
+                        )
+                    return [], time.perf_counter() - _t0
+                # If json_schema isn't supported by this route (typical
+                # signature: HTTP 400 with response_format / schema in the
+                # message), drop to plain json_object for remaining
+                # attempts. Heuristic match on the exception text.
+                exc_text = str(exc).lower()
+                if use_strict and (
+                    'json_schema' in exc_text
+                    or 'response_format' in exc_text
+                    or 'schema' in exc_text
+                ):
+                    if logger is not None:
+                        logger.warning(
+                            'VLM route rejected json_schema response_format '
+                            f'({exc}); falling back to json_object for the '
+                            'rest of this call.'
+                        )
+                    use_strict = False
+                last_error = exc
+                if logger is not None:
+                    logger.warning(
+                        f'VLM call failed (attempt {attempt}/{max_retries}): {exc}'
+                    )
+
+        if logger is not None:
+            logger.error(
+                f'VLM bbox request exhausted {max_retries} retries; '
+                f'last error: {last_error}'
+            )
+        return [], time.perf_counter() - _t0
+    finally:
+        # Always close the client we own. Idempotent — caller may have
+        # already closed it as part of the abandon path.
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass

@@ -17,6 +17,8 @@ setup(
             glob('config/*.json') + glob('config/*.yaml')),
         (os.path.join('share', package_name, 'calibration', 'data'),
             glob('pan_tilt/calibration/data/*')),
+        (os.path.join('share', package_name, 'calibration', 'boards'),
+            glob('pan_tilt/calibration/boards/*')),
         (os.path.join('share', package_name, 'launch'),
             glob('launch/*.py')),
         (os.path.join('share', package_name, 'urdf'),

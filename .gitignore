@@ -6,6 +6,10 @@ log/
 
 scripts/tests/logs/
 
+# Scratch outputs from calibration CLI / tests.
+calib_log/
+calib_out/
+*.draft.yaml
 
 thirdparty/
 !thirdparty/README.md

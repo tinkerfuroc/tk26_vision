@@ -74,6 +74,15 @@ def _sanitize_for_json(obj):
     return obj
 
 
+def _downscale(bgr: np.ndarray, target_w: int = 960) -> np.ndarray:
+    """Downsize a BGR image to target_w on the long edge (for bandwidth)."""
+    h, w = bgr.shape[:2]
+    if w <= target_w:
+        return bgr
+    scale = target_w / w
+    return cv2.resize(bgr, (target_w, int(h * scale)))
+
+
 # ---- shared state -----------------------------------------------------------
 
 @dataclass
@@ -96,6 +105,13 @@ class SharedState:
     last_detection_n_corners: int = 0
     last_detection_rms: float = float("inf")
     last_detection_ok: bool = False
+
+    # Diagnostics for the browser UI
+    image_topic: str = ""
+    camera_info_topic: str = ""
+    frame_count: int = 0
+    frame_age_sec: float = float("inf")   # age of the most recent frame
+    frame_hz: float = 0.0                 # smoothed over recent 10 frames
 
     safety: dict = field(default_factory=lambda: SafetyEnvelope().to_dict())
 
@@ -147,7 +163,14 @@ class CalibWebNode(Node):
         self._latest_K: Optional[np.ndarray] = None
         self._latest_D: Optional[np.ndarray] = None
         self._overlay_jpeg: Optional[bytes] = None
+        self._raw_jpeg: Optional[bytes] = None
         self._overlay_lock = threading.Lock()
+        # Rolling buffer of frame arrival times (monotonic seconds) for Hz estimate.
+        self._frame_times: list = []
+        self._last_frame_monotonic: float = 0.0
+
+        self.state.image_topic = self.get_parameter("image_topic").value
+        self.state.camera_info_topic = self.get_parameter("camera_info_topic").value
 
         # Draft waypoint state — authored in-browser, not persisted to disk
         # until the user explicitly hits Save.
@@ -207,13 +230,27 @@ class CalibWebNode(Node):
     def _on_image(self, msg: Image):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception:
+        except Exception as exc:
+            self.get_logger().warn(
+                f"cv_bridge conversion failed ({exc}); is the topic publishing bgr8?",
+                throttle_duration_sec=5.0,
+            )
             return
         stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        now = time.monotonic()
         with self.lock:
             self._latest_bgr = img
             self._latest_stamp_ns = stamp_ns
             self.state.have_camera = True
+            self.state.frame_count += 1
+            # Keep the last N=10 arrival times for a rolling Hz estimate.
+            self._frame_times.append(now)
+            if len(self._frame_times) > 10:
+                self._frame_times.pop(0)
+            if len(self._frame_times) >= 2:
+                dt = self._frame_times[-1] - self._frame_times[0]
+                self.state.frame_hz = (len(self._frame_times) - 1) / dt if dt > 0 else 0.0
+        self._last_frame_monotonic = now
 
     def _on_camera_info(self, msg: CameraInfo):
         K = np.array(msg.k, dtype=float).reshape(3, 3)
@@ -262,24 +299,35 @@ class CalibWebNode(Node):
             bgr = None if self._latest_bgr is None else self._latest_bgr.copy()
             K = None if self._latest_K is None else self._latest_K.copy()
             D = None if self._latest_D is None else self._latest_D.copy()
+            # Update frame-age diagnostic every tick so the UI sees it go stale.
+            if self._last_frame_monotonic > 0:
+                self.state.frame_age_sec = time.monotonic() - self._last_frame_monotonic
 
         if bgr is None:
             return
 
+        # Always encode a raw JPEG (downscaled) for the debug toggle, even if
+        # we have no intrinsics yet — this is the fastest way to tell whether
+        # the camera topic is really producing frames.
+        raw_small = _downscale(bgr, 960)
+        ok_r, buf_r = cv2.imencode(".jpg", raw_small, [cv2.IMWRITE_JPEG_QUALITY, 72])
+
+        det = None
         if K is not None and D is not None:
             det = detect_pose(bgr, K, D, board=self._board, detector=self._detector)
             with self.lock:
                 self.state.last_detection_n_corners = det.n_corners
                 self.state.last_detection_rms = det.reprojection_rms_px if det.success else float("inf")
                 self.state.last_detection_ok = det.success
-        else:
-            det = None
 
         overlay = self._draw_overlay(bgr, det)
-        ok, buf = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        if ok:
-            with self._overlay_lock:
-                self._overlay_jpeg = buf.tobytes()
+        ok_o, buf_o = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 70])
+
+        with self._overlay_lock:
+            if ok_r:
+                self._raw_jpeg = buf_r.tobytes()
+            if ok_o:
+                self._overlay_jpeg = buf_o.tobytes()
 
     def _draw_overlay(self, bgr, det) -> np.ndarray:
         # Downscale for bandwidth.
@@ -325,9 +373,9 @@ class CalibWebNode(Node):
         # JSON can't encode inf/nan; sanitize recursively before returning.
         return _sanitize_for_json(d)
 
-    def get_jpeg(self) -> Optional[bytes]:
+    def get_jpeg(self, raw: bool = False) -> Optional[bytes]:
         with self._overlay_lock:
-            return self._overlay_jpeg
+            return self._raw_jpeg if raw else self._overlay_jpeg
 
     def validate_t_base_ee(self, T: np.ndarray) -> Optional[str]:
         return self._safety_env.validate(T)
@@ -486,8 +534,15 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         return node.snapshot_state()
 
     @app.get("/api/frame.jpg")
-    def api_frame():
-        buf = node.get_jpeg()
+    def api_frame(raw: int = 0):
+        """Latest camera frame as JPEG.
+
+        Query params:
+          raw=1  -> raw BGR, no detection overlay. Useful for debugging when
+                   the overlay path fails (e.g. missing camera_info) or just
+                   to confirm that frames are arriving at all.
+        """
+        buf = node.get_jpeg(raw=bool(raw))
         if buf is None:
             raise HTTPException(404, "no camera frame yet")
         return Response(buf, media_type="image/jpeg", headers={

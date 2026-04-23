@@ -130,7 +130,11 @@ def forward_kinematics(
 #   - "chain"  (7 or 8 params): T_A_trans (3) + T_B_trans (3) + theta_t_off [+ theta_p_off]
 #   - "joint"  (13 or 16)     : above + T_ee_marker (6) + T_B_rotvec (3 if unlocked)
 
-def pack_chain(params: PanTiltParams, fit_pan_offset: bool = False) -> np.ndarray:
+def pack_chain(
+    params: PanTiltParams,
+    fit_pan_offset: bool = False,
+    fit_tb_rotation: bool = True,
+) -> np.ndarray:
     flat = [
         params.t_a,
         params.t_b_trans,
@@ -138,20 +142,39 @@ def pack_chain(params: PanTiltParams, fit_pan_offset: bool = False) -> np.ndarra
     ]
     if fit_pan_offset:
         flat.append(np.array([params.theta_p_offset]))
+    if fit_tb_rotation:
+        flat.append(params.t_b_rotvec)
     return np.concatenate(flat)
 
 
 def unpack_chain(
-    x: np.ndarray, template: PanTiltParams, fit_pan_offset: bool = False
+    x: np.ndarray,
+    template: PanTiltParams,
+    fit_pan_offset: bool = False,
+    fit_tb_rotation: bool = True,
 ) -> PanTiltParams:
+    offset = 0
+
+    def take(n):
+        nonlocal offset
+        out = x[offset:offset + n].copy()
+        offset += n
+        return out
+
+    t_a = take(3)
+    t_b_trans = take(3)
+    theta_t = float(take(1)[0])
+    theta_p = float(take(1)[0]) if fit_pan_offset else template.theta_p_offset
+    t_b_rotvec = take(3) if fit_tb_rotation else template.t_b_rotvec.copy()
+
     return PanTiltParams(
-        t_a=x[0:3].copy(),
-        t_b_trans=x[3:6].copy(),
-        t_b_rotvec=template.t_b_rotvec.copy(),
+        t_a=t_a,
+        t_b_trans=t_b_trans,
+        t_b_rotvec=t_b_rotvec,
         t_ee_marker_rotvec=template.t_ee_marker_rotvec.copy(),
         t_ee_marker_trans=template.t_ee_marker_trans.copy(),
-        theta_t_offset=float(x[6]),
-        theta_p_offset=float(x[7]) if fit_pan_offset else template.theta_p_offset,
+        theta_t_offset=theta_t,
+        theta_p_offset=theta_p,
         l_pan=template.l_pan,
     )
 

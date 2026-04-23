@@ -25,11 +25,18 @@ bool return_depth_image
 bool return_segments
 
 # --- generalist-specific ---
-# Always use the VLM+SAM path, even if YOLO could answer.
+# Operator override: skip YOLO entirely and run VLM + FastSAM only,
+# regardless of the node-level `enable_vlm` parameter. Field name is
+# historical (kept for ABI compatibility).
 bool force_vlm_sam
-# Allow VLM+SAM fallback when `prompt` is not in the YOLO class list, or when
-# YOLO returns zero matches. When false the server returns status=1 for
-# out-of-vocabulary prompts.
+# Per-request opt-in for the open-vocab fallback when `prompt` is not in
+# the YOLO class list, or when YOLO returns zero matches. When set, the
+# server runs YOLO-World and Gemini VLM concurrently; if YOLO-World
+# returns objects first, the VLM result is abandoned (the network call
+# continues in the background but is discarded). Otherwise the server
+# waits for the VLM and returns its result. When false, the auto-fallback
+# path is governed by the node-level `enable_vlm` / `allow_auto_fallback`
+# parameters.
 bool use_vlm_sam_fallback
 
 ---
@@ -41,7 +48,7 @@ string error_msg
 # Kept for ABI parity with the legacy srv; generalist does not register people, so 0.
 int32 person_id
 Object[] objects
-# 'yolo' | 'vlm_sam' | 'none' — tells the caller which branch produced results.
+# 'yolo' | 'yolo_world' | 'vlm_sam' | 'none' — which branch produced results.
 string detection_source
 
 sensor_msgs/Image rgb_image

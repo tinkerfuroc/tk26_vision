@@ -63,7 +63,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
     def _declare_parameters(self):
         super()._declare_parameters()
         self.declare_parameter('allow_auto_fallback', True)
-        self.declare_parameter('vlm_model', 'google/gemini-2.5-pro')
+        self.declare_parameter('vlm_model', 'google/gemini-2.5-flash')
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('fastsam_weights', 'FastSAM-s.pt')
@@ -100,6 +100,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         request: ObjectDetectionGeneralist.Request,
         response: ObjectDetectionGeneralist.Response,
     ) -> ObjectDetectionGeneralist.Response:
+        _t0 = time.perf_counter()
         response.header = Header(stamp=self.get_clock().now().to_msg())
         response.status = 1
         response.person_id = 0
@@ -180,7 +181,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         if branch == 'vlm_sam':
             try:
-                bboxes = request_bboxes(
+                bboxes, vlm_elapsed = request_bboxes(
                     rgb_img,
                     prompt,
                     model=self.vlm_model,
@@ -199,7 +200,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 )
                 return response
 
-            masks = self._sam.segment(rgb_img, bboxes)
+            masks, sam_elapsed = self._sam.segment(rgb_img, bboxes)
             objects, segments = self._build_vlm_sam_objects(
                 prompt, bboxes, masks, points, valid_mask, camera,
                 return_segments=request.return_segments,
@@ -235,7 +236,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 for seg in segments
             ]
 
-        if self.debug_log_overlays:
+        if self._vision_logger.enabled:
             request_ctx = {
                 'service': 'generalist_ObjectDetection',
                 'prompt': prompt,
@@ -253,6 +254,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     self._last_detection_info,
                     request_ctx=request_ctx,
                     branch='yolo',
+                    timings={'yolo': time.perf_counter() - _t0},
                 )
             elif used_source == 'vlm_sam':
                 detections = [
@@ -263,7 +265,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                         'conf': 1.0,
                     }
                     for bbox, mask in zip(bboxes, masks)
-                    if mask is not None
+                    if mask is not None and mask.sum() > 0
                 ]
                 self._write_debug_artifacts(
                     rgb_img,
@@ -271,6 +273,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     request_ctx=request_ctx,
                     branch='vlm_sam',
                     vlm_raw=[list(bbox) for bbox in bboxes],
+                    timings={'vlm': vlm_elapsed, 'sam': sam_elapsed},
                 )
 
         return response

@@ -44,6 +44,9 @@ from cv_bridge import CvBridge
 # Import YOLOTracker
 from vision_track.track_yolo import YOLOTracker, TrackerState, TrackingResult
 
+# Shared logger
+from vision_util.vision_logging import VisionLogger
+
 
 class PersonTrackNode(Node):
     """
@@ -67,6 +70,15 @@ class PersonTrackNode(Node):
         self.tracker: YOLOTracker = None
         self.tracking_active = False
         self.goal_handle = None
+
+        # Track-state cache for lost/reclaim logging (last successful frame)
+        self._last_tracked_rgb = None
+        self._last_tracked_detection = None
+        self._was_lost = False
+
+        self._vision_logger = VisionLogger(
+            self, self.vision_logging_enabled, self.vision_log_folder,
+        )
         self.target_point_pub = None
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -125,6 +137,11 @@ class PersonTrackNode(Node):
         self.declare_parameter('lost_timeout', 300.0)  # seconds before declaring failure
         self.declare_parameter('target_point_topic', '/target_points')  # default PointStamped pub topic
 
+        # Vision logging (default-on). Tracker logs only on lost/reclaim
+        # transitions — no per-frame artifacts during steady-state tracking.
+        self.declare_parameter('vision_logging_enabled', True)
+        self.declare_parameter('vision_log_folder', 'vision_log')
+
         self.get_logger().info('Parameters declared')
 
     def _load_parameters(self):
@@ -145,6 +162,9 @@ class PersonTrackNode(Node):
         self.tracking_rate = self.get_parameter('tracking_rate').value
         self.lost_timeout = self.get_parameter('lost_timeout').value
         self.default_target_point_topic = self.get_parameter('target_point_topic').value
+
+        self.vision_logging_enabled = self.get_parameter('vision_logging_enabled').value
+        self.vision_log_folder = self.get_parameter('vision_log_folder').value
         
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Enable ReID: {self.enable_reid}')
@@ -801,6 +821,28 @@ class PersonTrackNode(Node):
 
         goal_handle.publish_feedback(feedback)
 
+        # Cache the latest good frame for the lost-transition dump, and emit
+        # a 'reclaimed' artifact if we're just coming back from a lost state.
+        self._last_tracked_rgb = rgb_img.copy()
+        self._last_tracked_detection = {
+            'bbox': list(track_result.bbox) if track_result.bbox is not None else None,
+            'mask': track_result.mask,
+            'cls_name': 'person',
+            'conf': float(getattr(track_result, 'confidence', 0.0) or 0.0),
+            'centroid': [
+                float(position.x), float(position.y), float(position.z)
+            ] if position is not None else None,
+            'track_id': int(track_result.track_id),
+        }
+        if self._was_lost and self._vision_logger.enabled:
+            self._vision_logger.write(
+                rgb_img, [self._last_tracked_detection],
+                request_ctx={'target_frame': params.get('target_frame')},
+                branch='person_track',
+                extras={'event': 'reclaimed'},
+            )
+        self._was_lost = False
+
     def _handle_lost_frame(
         self,
         last_seen_time: float,
@@ -812,6 +854,26 @@ class PersonTrackNode(Node):
         result,
     ) -> bool:
         time_since_seen = time.time() - last_seen_time
+
+        # First tick after a TRACKING → LOST transition: dump the last-good
+        # frame and the current (failed) frame. Subsequent lost ticks don't
+        # log, so a long occlusion produces exactly two artifacts.
+        if (not self._was_lost) and self._vision_logger.enabled:
+            if self._last_tracked_rgb is not None and self._last_tracked_detection is not None:
+                self._vision_logger.write(
+                    self._last_tracked_rgb, [self._last_tracked_detection],
+                    request_ctx={'target_frame': params.get('target_frame')},
+                    branch='person_track',
+                    extras={'event': 'lost', 'time_since_seen_s': float(time_since_seen)},
+                )
+            self._vision_logger.write(
+                rgb_img, None,
+                request_ctx={'target_frame': params.get('target_frame')},
+                branch='person_track',
+                extras={'event': 'lost_current', 'time_since_seen_s': float(time_since_seen)},
+            )
+        self._was_lost = True
+
         feedback.target_lost = True
         feedback.target_track_id = self.tracker.original_track_id if self.tracker.original_track_id else -1
         feedback.target_position = PointStamped()
@@ -846,6 +908,10 @@ class PersonTrackNode(Node):
         with self.lock_lifecycle:
             self.tracking_active = False
             self.goal_handle = None
+
+        self._last_tracked_rgb = None
+        self._last_tracked_detection = None
+        self._was_lost = False
 
         if self.target_point_pub is not None:
             self.destroy_publisher(self.target_point_pub)

@@ -100,6 +100,7 @@ Key ROS2 parameters:
 - `pan_tilt/ctrl`: `device`, `specs_path`
 - `pan_tilt/follow_head`: `yolo_model`
 - `kimi_api/*`: `llm_model`, `detection_service`, `log_prompts`
+- `vision_logging_enabled` (default `true`) + `vision_log_folder` (default `'vision_log'`) on the five bbox/seg/centroid-producing nodes: `yolo_seg_{node,default_node}`, `generalist_node`, `person_track_node`, `waving_person_server`, `follow_head`. Each run creates `vision_log/<YYYYmmdd_HHMMSS>/` relative to CWD and drops `orig_*.jpg` + `overlay_*.jpg` + `req_*.json` per call (tracker: only on lost/reclaim transitions; follow_head: at its existing 1 Hz tick). Pass `-p vision_logging_enabled:=false` to opt out.
 
 ## Third-party drivers
 

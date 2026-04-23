@@ -8,6 +8,7 @@ amortize across requests.
 
 from __future__ import annotations
 
+import time
 from typing import Iterable, Sequence
 
 import cv2
@@ -38,16 +39,19 @@ class FastSAMPredictor:
         self,
         rgb_bgr: np.ndarray,
         bboxes: Sequence[Bbox],
-    ) -> list[np.ndarray]:
-        """Return one bool HxW mask per bbox, aligned 1:1 with the input."""
+    ) -> tuple[list[np.ndarray], float]:
+        """Return ``(masks, elapsed_s)`` where masks is one bool HxW mask per
+        bbox aligned 1:1 with the input, and ``elapsed_s`` is wall-clock
+        seconds for the ``model.predict()`` call only."""
 
         if not bboxes:
-            return []
+            return [], 0.0
 
         h, w = rgb_bgr.shape[:2]
         rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
         bbox_list = [list(b) for b in bboxes]
 
+        _t0 = time.perf_counter()
         results = self._model.predict(
             source=rgb,
             bboxes=bbox_list,
@@ -55,14 +59,15 @@ class FastSAMPredictor:
             retina_masks=True,
             verbose=False,
         )
+        _sam_elapsed = time.perf_counter() - _t0
 
         out: list[np.ndarray] = []
         if not results:
-            return [np.zeros((h, w), dtype=bool) for _ in bboxes]
+            return [np.zeros((h, w), dtype=bool) for _ in bboxes], _sam_elapsed
 
         masks = getattr(results[0], 'masks', None)
         if masks is None or masks.data is None:
-            return [np.zeros((h, w), dtype=bool) for _ in bboxes]
+            return [np.zeros((h, w), dtype=bool) for _ in bboxes], _sam_elapsed
 
         mask_tensor = masks.data  # (N, H', W') torch tensor
         try:
@@ -85,4 +90,4 @@ class FastSAMPredictor:
                 # Fewer masks than bboxes returned — emit empty mask so the
                 # caller keeps 1:1 alignment with its bbox list.
                 out.append(np.zeros((h, w), dtype=bool))
-        return out
+        return out, _sam_elapsed

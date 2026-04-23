@@ -74,10 +74,10 @@ t1_check T1.3 service /door_detection_srv vision_util door_detection
 section "T1.4 — get_point_cloud advertises /get_point_cloud_service"
 t1_check T1.4 service /get_point_cloud_service vision_util get_point_cloud
 
-section "T1.5 — pan_tilt/ctrl positive + negative cases"
+section "T1.5 — pan_tilt low-level stack positive + negative cases"
 # Positive: real device
 if [ -c "$SERVO_DEVICE" ]; then
-    start_node T1.5_pos pan_tilt ctrl --ros-args -p "device:=$SERVO_DEVICE"
+    start_launch T1.5_pos pan_tilt pan_tilt.launch.py "device:=$SERVO_DEVICE"
     sleep 3
     if kill -0 "${NODE_PIDS[-1]}" 2>/dev/null; then
         # Check TF chain appears
@@ -86,12 +86,12 @@ if [ -c "$SERVO_DEVICE" ]; then
             tf_pid=$!; sleep 3; kill "$tf_pid" 2>/dev/null || true; wait "$tf_pid" 2>/dev/null || true
         fi
         if grep -qE 'Translation|At time' "$LOG_DIR/t1.5_tf.log"; then
-            pass "T1.5 positive: ctrl alive on $SERVO_DEVICE, TF base_link→camera_link resolves"
+            pass "T1.5 positive: stack alive on $SERVO_DEVICE, TF base_link→camera_link resolves"
         else
             fail "T1.5 positive" "TF chain not published (see $LOG_DIR/t1.5_tf.log)"
         fi
     else
-        fail "T1.5 positive" "ctrl died within 3 s on $SERVO_DEVICE (log: $LAST_LOG)"
+        fail "T1.5 positive" "stack died within 3 s on $SERVO_DEVICE (log: $LAST_LOG)"
     fi
     stop_all_nodes
 else
@@ -99,7 +99,7 @@ else
 fi
 
 # Negative: unplugged path
-start_node T1.5_neg pan_tilt ctrl --ros-args -p device:=/dev/ttyUSB_nonexistent
+start_node T1.5_neg pan_tilt controller --ros-args -p device:=/dev/ttyUSB_nonexistent
 sleep 3
 if grep -qE 'SerialException|could not open port' "$LAST_LOG"; then
     pass "T1.5 negative: clean SerialException on missing device"

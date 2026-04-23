@@ -201,7 +201,7 @@ fi
 
 section "T2.10 — follow_head action feedback"
 if [ -c "$SERVO_DEVICE" ]; then
-    start_node ctrl_for_t2.10 pan_tilt ctrl --ros-args -p "device:=$SERVO_DEVICE"
+    start_launch ctrl_for_t2.10 pan_tilt pan_tilt.launch.py "device:=$SERVO_DEVICE"
     sleep 2
     start_node follow_head pan_tilt follow_head
     if wait_for_action /follow_head_action 20; then

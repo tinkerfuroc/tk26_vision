@@ -5,7 +5,3 @@ pyserial>=3.5
 ultralytics>=8.0
 opencv-python>=4.5
 numpy>=1.21
-# tf_transformations ships in apt (ros-${ROS_DISTRO}-tf-transformations) but
-# needs transforms3d to actually import, and apt doesn't install that into
-# the venv. Pin here so the venv can load pan_tilt.pan_tilt_ctrl.
-transforms3d>=0.4

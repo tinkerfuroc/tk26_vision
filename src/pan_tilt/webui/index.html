@@ -97,12 +97,35 @@
           </div>
           <h2>Send to robot</h2>
           <p class="warn">
-            Clicking <b>Move</b> commands the xArm immediately with wait=True.
-            Pre-validate in RViz; the safety envelope below is an envelope
-            check against the <i>current</i> TF, not a collision check.
+            Clicking <b>Move (joints)</b> sends a <code>tinker_arm_msgs/JointMove</code>
+            action goal. The server plans via MoveIt (self-collision + joint
+            limits enforced); empty <code>env_points</code> means no live
+            obstacle cloud, so pre-validate in RViz for collision-critical poses.
           </p>
-          <button id="btn-xarm-move" class="primary" type="button">Move xArm to these joints</button>
+          <button id="btn-xarm-move" class="primary" type="button">Move (joints)</button>
           <p id="xarm-move-status" class="status-line"></p>
+
+          <h2>Or send a Cartesian target</h2>
+          <p class="muted">
+            Sends a <code>tinker_arm_msgs/CartesianMove</code> action goal.
+            Translation in meters (base_link); rotation as a unit quaternion.
+            <b>Fill from current TF</b> prefills today's EE pose so you can
+            nudge a component.
+          </p>
+          <div class="cart-grid">
+            <label>x <input id="cart-x" type="number" step="0.01" value="0"></label>
+            <label>y <input id="cart-y" type="number" step="0.01" value="0"></label>
+            <label>z <input id="cart-z" type="number" step="0.01" value="0"></label>
+            <label>qx <input id="cart-qx" type="number" step="0.01" value="0"></label>
+            <label>qy <input id="cart-qy" type="number" step="0.01" value="0"></label>
+            <label>qz <input id="cart-qz" type="number" step="0.01" value="0"></label>
+            <label>qw <input id="cart-qw" type="number" step="0.01" value="1"></label>
+          </div>
+          <div class="joint-controls">
+            <button id="btn-cart-fill" type="button">Fill from current TF</button>
+            <button id="btn-cart-move" class="primary" type="button">Move (cartesian)</button>
+          </div>
+          <p id="cart-move-status" class="status-line"></p>
 
           <h2>Current EE safety envelope</h2>
           <p id="xarm-safety-status" class="status-line">–</p>

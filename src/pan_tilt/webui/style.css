@@ -147,7 +147,26 @@ pre {
   padding: 4px 6px;
   font-family: var(--mono); font-size: 13px;
 }
-.joint-controls { display: flex; gap: 8px; }
+.joint-controls { display: flex; gap: 8px; margin-top: 8px; }
+
+/* ---- cartesian editor ---- */
+.cart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.cart-grid label {
+  display: flex; flex-direction: column;
+  font-family: var(--mono); font-size: 11px; color: var(--fg-muted);
+}
+.cart-grid input {
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 3px;
+  padding: 3px 5px;
+  font-family: var(--mono); font-size: 12px;
+  width: 100%;
+}
 
 /* ---- buttons ---- */
 button {

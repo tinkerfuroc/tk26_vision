@@ -309,6 +309,94 @@ $('#btn-xarm-move').addEventListener('click', async () => {
   }
 });
 
+// ---- Cartesian move (tinker_arm_msgs CartesianMove) -------------------------
+
+function readCartPose() {
+  return {
+    translation: ['cart-x', 'cart-y', 'cart-z'].map(id => parseFloat($('#' + id).value) || 0),
+    rotation:    ['cart-qx', 'cart-qy', 'cart-qz', 'cart-qw'].map(id => parseFloat($('#' + id).value) || 0),
+  };
+}
+
+function writeCartPose(pose) {
+  const ids = ['cart-x','cart-y','cart-z','cart-qx','cart-qy','cart-qz','cart-qw'];
+  const vals = pose.translation.concat(pose.rotation);
+  ids.forEach((id, i) => $('#' + id).value = (vals[i] || 0).toFixed(5));
+}
+
+$('#btn-cart-fill').addEventListener('click', () => {
+  if (!lastState || !lastState.t_base_ee) {
+    alert('T_base_ee not yet received');
+    return;
+  }
+  const T = lastState.t_base_ee;
+  // Extract translation directly; convert rotation matrix to quaternion.
+  const tx = T[0][3], ty = T[1][3], tz = T[2][3];
+  // Basic matrix->quaternion (standard algorithm). Works for any valid rotation.
+  const m00 = T[0][0], m01 = T[0][1], m02 = T[0][2];
+  const m10 = T[1][0], m11 = T[1][1], m12 = T[1][2];
+  const m20 = T[2][0], m21 = T[2][1], m22 = T[2][2];
+  const tr = m00 + m11 + m22;
+  let qx, qy, qz, qw;
+  if (tr > 0) {
+    const s = 2 * Math.sqrt(tr + 1);
+    qw = 0.25 * s;
+    qx = (m21 - m12) / s;
+    qy = (m02 - m20) / s;
+    qz = (m10 - m01) / s;
+  } else if (m00 > m11 && m00 > m22) {
+    const s = 2 * Math.sqrt(1 + m00 - m11 - m22);
+    qw = (m21 - m12) / s;
+    qx = 0.25 * s;
+    qy = (m01 + m10) / s;
+    qz = (m02 + m20) / s;
+  } else if (m11 > m22) {
+    const s = 2 * Math.sqrt(1 + m11 - m00 - m22);
+    qw = (m02 - m20) / s;
+    qx = (m01 + m10) / s;
+    qy = 0.25 * s;
+    qz = (m12 + m21) / s;
+  } else {
+    const s = 2 * Math.sqrt(1 + m22 - m00 - m11);
+    qw = (m10 - m01) / s;
+    qx = (m02 + m20) / s;
+    qy = (m12 + m21) / s;
+    qz = 0.25 * s;
+  }
+  writeCartPose({ translation: [tx, ty, tz], rotation: [qx, qy, qz, qw] });
+});
+
+$('#btn-cart-move').addEventListener('click', async () => {
+  const status = $('#cart-move-status');
+  const pose = readCartPose();
+  const qn = Math.hypot(...pose.rotation);
+  if (qn < 1e-3) { status.textContent = 'rotation quaternion is zero'; status.className = 'status-line err'; return; }
+  // Normalise the quaternion before sending.
+  pose.rotation = pose.rotation.map(v => v / qn);
+  if (!confirm(`Cartesian move to t=(${pose.translation.map(v => v.toFixed(3)).join(',')}) `
+             + `q=(${pose.rotation.map(v => v.toFixed(3)).join(',')})?`)) return;
+  status.textContent = 'moving…';
+  status.className = 'status-line warn';
+  try {
+    const r = await fetch('/api/xarm/move_cartesian', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target_pose: pose }),
+    });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      status.textContent = 'move complete: ' + body.message;
+      status.className = 'status-line ok';
+    } else {
+      status.textContent = 'FAIL: ' + (body.message || body.detail || ('HTTP ' + r.status));
+      status.className = 'status-line err';
+    }
+  } catch (e) {
+    status.textContent = 'ERROR: ' + e;
+    status.className = 'status-line err';
+  }
+});
+
 // ---- waypoint lists ---------------------------------------------------------
 
 const PHASES = [

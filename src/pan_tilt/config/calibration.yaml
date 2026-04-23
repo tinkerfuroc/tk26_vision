@@ -12,19 +12,20 @@
 # you have verified keep the ChArUco in view and clear of collisions.
 
 collector:
-  # Topics and services. Override if your robot names them differently.
+  # Topics and actions. Override if your robot names them differently.
   image_topic: /camera/color/image_raw
   camera_info_topic: /camera/color/camera_info
   pantilt_cmd_topic: /pan_tilt_controller/cmd
   pantilt_state_topic: /pan_tilt_controller/state
-  xarm_service: /xarm/set_servo_angle
+  # tinker_arm_msgs action names (served by pick_and_place GraspNode).
+  # MoveIt internally plans + enforces joint limits and self-collisions.
+  joint_move_action: joint_move_action
+  cartesian_move_action: cartesian_move_action
   base_frame: base_link
   ee_frame: link_eef
 
-  xarm_speed: 0.3
-  xarm_acc: 0.3
   xarm_settle_sec: 0.6
-  xarm_service_timeout_sec: 20.0
+  arm_action_timeout_sec: 30.0
 
   pantilt_speed_raw: 120
   pantilt_accel_raw: 20

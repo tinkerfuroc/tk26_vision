@@ -49,6 +49,7 @@ from tinker_vision_msgs_26.msg import Object
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist
 
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
+from vision_util.weights_cache import resolve_weights
 
 from .sam_mask import FastSAMPredictor
 from .vlm_bbox import VlmBboxError, request_bboxes
@@ -68,7 +69,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # TF, locks, and the generalist service are all up. Construct the
         # FastSAM predictor once so weights & CUDA context amortize.
         self._sam = FastSAMPredictor(
-            weights_path=self.fastsam_weights,
+            weights_path=str(resolve_weights(self.fastsam_weights)),
             device=self.device,
             logger=self.get_logger(),
         )
@@ -86,7 +87,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         self._world: WorldDetector | None = None
         try:
             self._world = WorldDetector(
-                weights_path=self.world_weights,
+                weights_path=str(resolve_weights(self.world_weights)),
                 device=self.device,
                 conf_threshold=self.world_conf_threshold,
                 iou_threshold=self.world_iou_threshold,

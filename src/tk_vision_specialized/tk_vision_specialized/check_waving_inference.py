@@ -15,6 +15,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
+from vision_util.weights_cache import resolve_weights
+
 
 class WavingInferenceCheckNode(Node):
     def __init__(
@@ -29,7 +31,7 @@ class WavingInferenceCheckNode(Node):
         super().__init__(node_name)
 
         self.bridge = CvBridge()
-        self.yolo = YOLO(model_path)
+        self.yolo = YOLO(str(resolve_weights(model_path)))
         self.pose = mp.solutions.pose.Pose(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,

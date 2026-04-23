@@ -16,6 +16,7 @@
   <depend>cv_bridge</depend>
   <depend>tinker_vision_msgs_26</depend>
   <depend>ament_index_python</depend>
+  <exec_depend>vision_util</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

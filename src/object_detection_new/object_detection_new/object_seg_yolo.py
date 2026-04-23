@@ -30,6 +30,9 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 from ultralytics import YOLO
 from cv_bridge import CvBridge
 
+# Shared logger
+from vision_util.vision_logging import VisionLogger
+
 
 class YOLOSegmentationNode(Node):
     """
@@ -116,13 +119,15 @@ class YOLOSegmentationNode(Node):
         # 2x the ApproximateTimeSynchronizer slop of 0.1s.
         self.declare_parameter('img_sync_thres', 0.20)
 
-        # vision log folder
-        self.declare_parameter('vision_log_folder', f'tmp/vision_log{time.strftime("%Y%m%d_%H%M%S", time.localtime())}')
+        # Base folder for per-call artifacts; a run-timestamped subdir is
+        # created lazily on first write. Resolves relative to CWD when not
+        # absolute.
+        self.declare_parameter('vision_log_folder', 'vision_log')
 
-        # Per-call artifact dump (req_{ts}.json, orig_{ts}.jpg, overlay_{ts}.jpg)
-        # written under vision_log_folder. Off by default so production calls
-        # don't create file churn; flip to true for auditing detection output.
-        self.declare_parameter('debug_log_overlays', False)
+        # Per-call artifact dump (req_{ts}.json, orig_{ts}.jpg, overlay_{ts}.jpg).
+        # Default-on so every production call leaves an audit trail; pass
+        # `-p vision_logging_enabled:=false` to opt out.
+        self.declare_parameter('vision_logging_enabled', True)
         
         # Sorting mode: 'none', 'closest', 'highest'
         self.declare_parameter('sort_mode', 'none')
@@ -160,8 +165,12 @@ class YOLOSegmentationNode(Node):
         self.vision_log_folder = self.get_parameter('vision_log_folder').value
         self.get_logger().info(f'Vision log folder: {self.vision_log_folder}')
 
-        self.debug_log_overlays = self.get_parameter('debug_log_overlays').value
-        self.get_logger().info(f'Debug log overlays: {self.debug_log_overlays}')
+        self.vision_logging_enabled = self.get_parameter('vision_logging_enabled').value
+        self.get_logger().info(f'Vision logging enabled: {self.vision_logging_enabled}')
+
+        self._vision_logger = VisionLogger(
+            self, self.vision_logging_enabled, self.vision_log_folder
+        )
 
         self.sort_mode = self.get_parameter('sort_mode').value
         self.get_logger().info(f'Default sort mode: {self.sort_mode}')
@@ -177,9 +186,6 @@ class YOLOSegmentationNode(Node):
         if self.excluded_classes:
             self.get_logger().info(f'Excluded classes: {sorted(self.excluded_classes)}')
 
-        if not os.path.exists(self.vision_log_folder):
-            os.makedirs(self.vision_log_folder)
-            self.get_logger().info(f'Created vision log folder: {self.vision_log_folder}')
 
     def _init_model(self):
         """Initialize YOLO model."""
@@ -945,69 +951,21 @@ class YOLOSegmentationNode(Node):
         self.get_logger().info(f'Saved visualization to {filename}')
 
     def _write_debug_artifacts(self, rgb_img, detections, request_ctx,
-                               branch='yolo', vlm_raw=None):
-        """Dump orig_{ts}.jpg, overlay_{ts}.jpg, req_{ts}.json under
-        vision_log_folder. Callers check self.debug_log_overlays first."""
-        import json
-        try:
-            if not os.path.exists(self.vision_log_folder):
-                os.makedirs(self.vision_log_folder, exist_ok=True)
-            ts = time.strftime('%Y%m%d_%H%M%S', time.localtime()) \
-                + f'_{int(time.time() * 1000) % 1000:03d}'
-            orig_path = f'{self.vision_log_folder}/orig_{ts}.jpg'
-            overlay_path = f'{self.vision_log_folder}/overlay_{ts}.jpg'
-            req_path = f'{self.vision_log_folder}/req_{ts}.json'
-
-            cv2.imwrite(orig_path, rgb_img)
-
-            overlay = rgb_img.copy()
-            for det in (detections or []):
-                bbox = det.get('bbox')
-                if bbox is not None:
-                    x1, y1, x2, y2 = [int(v) for v in bbox]
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label_bits = []
-                    if det.get('cls_name'):
-                        label_bits.append(str(det['cls_name']))
-                    if det.get('conf') is not None:
-                        label_bits.append(f"{float(det['conf']):.2f}")
-                    if label_bits:
-                        cv2.putText(
-                            overlay, ' '.join(label_bits), (x1, max(y1 - 5, 12)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                        )
-                mask = det.get('mask')
-                if mask is not None and getattr(mask, 'shape', None) is not None:
-                    try:
-                        tint = overlay.copy()
-                        tint[mask] = (tint[mask] * 0.5 + np.array((0, 160, 255)) * 0.5
-                                       ).astype(np.uint8)
-                        overlay = cv2.addWeighted(overlay, 0.7, tint, 0.3, 0)
-                    except Exception:  # noqa: BLE001
-                        pass
-            cv2.imwrite(overlay_path, overlay)
-
-            payload = {
-                'branch': branch,
-                'request': request_ctx or {},
-                'n_detections': len(detections or []),
-            }
-            if vlm_raw is not None:
-                payload['vlm_raw'] = vlm_raw
-            with open(req_path, 'w') as fp:
-                json.dump(payload, fp, indent=2, default=str)
-
-            self.get_logger().info(
-                f'debug_log_overlays: wrote {orig_path}, {overlay_path}, {req_path}'
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f'debug_log_overlays failed: {exc}')
+                               branch='yolo', vlm_raw=None, timings=None):
+        """Dispatch to the shared VisionLogger; preserved as a compat wrapper
+        so subclasses (generalist_node) can keep their existing call sites."""
+        extras = {'vlm_raw': vlm_raw} if vlm_raw is not None else None
+        self._vision_logger.write(
+            rgb_img, detections, request_ctx=request_ctx,
+            branch=branch, extras=extras, timings=timings,
+        )
 
     def _detection_service_callback(
             self, request: ObjectDetection.Request,
             response: ObjectDetection.Response
     ) -> ObjectDetection.Response:
         """Handle detection service requests."""
+        _t0 = time.perf_counter()
         self.get_logger().info('Detection service request received')
 
         # Determine which camera to use
@@ -1137,7 +1095,7 @@ class YOLOSegmentationNode(Node):
             else:
                 response.segments = []
 
-            if self.debug_log_overlays:
+            if self._vision_logger.enabled:
                 self._write_debug_artifacts(
                     self._last_rgb_img,
                     self._last_detection_info,
@@ -1151,6 +1109,7 @@ class YOLOSegmentationNode(Node):
                         'n_all_detections': len(self._last_detection_info_all),
                     },
                     branch='yolo',
+                    timings={'yolo': time.perf_counter() - _t0},
                 )
 
         except Exception as e:

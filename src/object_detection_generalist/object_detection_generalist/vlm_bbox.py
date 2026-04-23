@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import tempfile
+import time
 from typing import List, Tuple
 
 import cv2
@@ -98,12 +99,13 @@ def request_bboxes(
     max_retries: int = 3,
     timeout_s: float = 20.0,
     logger=None,
-) -> List[Bbox]:
+) -> tuple[List[Bbox], float]:
     """Ask Gemini for every xyxy bounding box matching `prompt` in the image.
 
-    Returns an empty list on parse exhaustion or an explicit "no matches"
-    response. Raises `VlmBboxError` only for configuration problems we want
-    the caller to surface (missing API key).
+    Returns ``(boxes, elapsed_s)`` where ``elapsed_s`` is wall-clock seconds
+    for the entire VLM call (including retries). Returns an empty list on parse
+    exhaustion or an explicit "no matches" response. Raises `VlmBboxError` only
+    for configuration problems we want the caller to surface (missing API key).
     """
 
     load_env()
@@ -132,6 +134,7 @@ def request_bboxes(
         },
     ]
 
+    _t0 = time.perf_counter()
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -157,7 +160,7 @@ def request_bboxes(
                     f'{len(boxes)} valid box(es) after decode (attempt '
                     f'{attempt}/{max_retries}).'
                 )
-            return boxes
+            return boxes, time.perf_counter() - _t0
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
             last_error = exc
             if logger is not None:
@@ -176,4 +179,4 @@ def request_bboxes(
             f'VLM bbox request exhausted {max_retries} retries; '
             f'last error: {last_error}'
         )
-    return []
+    return [], time.perf_counter() - _t0

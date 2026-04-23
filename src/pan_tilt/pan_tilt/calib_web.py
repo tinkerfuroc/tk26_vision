@@ -109,9 +109,11 @@ class SharedState:
     # Diagnostics for the browser UI
     image_topic: str = ""
     camera_info_topic: str = ""
+    ros_domain_id: str = ""
     frame_count: int = 0
     frame_age_sec: float = float("inf")   # age of the most recent frame
     frame_hz: float = 0.0                 # smoothed over recent 10 frames
+    available_image_topics: list = field(default_factory=list)
 
     safety: dict = field(default_factory=lambda: SafetyEnvelope().to_dict())
 
@@ -171,6 +173,14 @@ class CalibWebNode(Node):
 
         self.state.image_topic = self.get_parameter("image_topic").value
         self.state.camera_info_topic = self.get_parameter("camera_info_topic").value
+        import os as _os
+        self.state.ros_domain_id = _os.environ.get("ROS_DOMAIN_ID", "0 (default)")
+        self._image_sub = None
+        self._camera_info_sub = None
+        self._sensor_qos = QoSProfile(
+            depth=5, reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
 
         # Draft waypoint state — authored in-browser, not persisted to disk
         # until the user explicitly hits Save.
@@ -180,18 +190,8 @@ class CalibWebNode(Node):
             "sanity_xarm_angles_rad": list(self._loaded_cfg.get("sanity_xarm_angles_rad", []) or []),
         }
 
-        qos_sensor = QoSProfile(
-            depth=5, reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-
-        self.create_subscription(
-            Image, self.get_parameter("image_topic").value,
-            self._on_image, qos_sensor,
-        )
-        self.create_subscription(
-            CameraInfo, self.get_parameter("camera_info_topic").value,
-            self._on_camera_info, qos_sensor,
+        self._subscribe_camera(
+            self.state.image_topic, self.state.camera_info_topic,
         )
         self.create_subscription(
             PanTiltState, self.get_parameter("pantilt_state_topic").value,
@@ -224,6 +224,8 @@ class CalibWebNode(Node):
 
         # Refresh overlay + TF at 10 Hz.
         self.create_timer(0.1, self._refresh_tick)
+        # Rescan available topics every 2 s so the UI dropdown stays current.
+        self.create_timer(2.0, self._scan_topics)
 
     # ---- subs ----------------------------------------------------------------
 
@@ -272,6 +274,55 @@ class CalibWebNode(Node):
             self.state.xarm_joint_names = list(msg.name)
             self.state.xarm_joint_positions = list(msg.position)
             self.state.have_xarm_joints = True
+
+    # ---- camera retarget + topic discovery ---------------------------------
+
+    def _subscribe_camera(self, image_topic: str, camera_info_topic: str):
+        """Destroy any existing camera subscriptions and resubscribe."""
+        if self._image_sub is not None:
+            self.destroy_subscription(self._image_sub)
+        if self._camera_info_sub is not None:
+            self.destroy_subscription(self._camera_info_sub)
+
+        self._image_sub = self.create_subscription(
+            Image, image_topic, self._on_image, self._sensor_qos,
+        )
+        self._camera_info_sub = self.create_subscription(
+            CameraInfo, camera_info_topic, self._on_camera_info, self._sensor_qos,
+        )
+
+        # Reset the frame counters so the UI reflects the new subscription.
+        with self.lock:
+            self.state.image_topic = image_topic
+            self.state.camera_info_topic = camera_info_topic
+            self.state.frame_count = 0
+            self.state.frame_hz = 0.0
+            self.state.frame_age_sec = float("inf")
+            self.state.have_camera = False
+            self._latest_bgr = None
+            self._latest_K = None
+            self._latest_D = None
+            self._frame_times = []
+        self._last_frame_monotonic = 0.0
+        with self._overlay_lock:
+            self._raw_jpeg = None
+            self._overlay_jpeg = None
+
+        self.get_logger().info(
+            f"subscribed to {image_topic} + {camera_info_topic}",
+        )
+
+    def _scan_topics(self):
+        """Populate state.available_image_topics with every sensor_msgs/Image topic."""
+        try:
+            pairs = self.get_topic_names_and_types()
+        except Exception:
+            return
+        image_topics = sorted(
+            name for name, types in pairs if "sensor_msgs/msg/Image" in types
+        )
+        with self.lock:
+            self.state.available_image_topics = image_topics
 
     # ---- periodic refresh ----------------------------------------------------
 
@@ -532,6 +583,38 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     @app.get("/api/state")
     def api_state():
         return node.snapshot_state()
+
+    @app.get("/api/topics/image")
+    def api_image_topics():
+        """Discovered sensor_msgs/Image topics on the current ROS graph."""
+        with node.lock:
+            return {"topics": list(node.state.available_image_topics)}
+
+    @app.post("/api/camera/resubscribe")
+    async def api_camera_resubscribe(req: dict):
+        image_topic = req.get("image_topic")
+        camera_info_topic = req.get("camera_info_topic") or ""
+        if not image_topic:
+            raise HTTPException(400, "'image_topic' required")
+        # If the caller didn't supply camera_info, derive by convention
+        # (.../image_raw -> .../camera_info) which matches the orbbec/realsense
+        # drivers' default graph.
+        if not camera_info_topic:
+            if image_topic.endswith("/image_raw"):
+                camera_info_topic = image_topic.rsplit("/", 1)[0] + "/camera_info"
+            else:
+                camera_info_topic = image_topic.rsplit("/", 1)[0] + "/camera_info"
+
+        def _do_resub():
+            node._subscribe_camera(image_topic, camera_info_topic)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _do_resub)
+        return {
+            "ok": True,
+            "image_topic": image_topic,
+            "camera_info_topic": camera_info_topic,
+        }
 
     @app.get("/api/frame.jpg")
     def api_frame(raw: int = 0):

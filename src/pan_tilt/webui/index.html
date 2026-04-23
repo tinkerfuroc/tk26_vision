@@ -22,13 +22,28 @@
     <section id="tab-live" class="tab-panel active">
       <div class="live-grid">
         <div class="live-frame">
-          <img id="camera-img" src="/api/frame.jpg" alt="live camera" />
+          <div class="frame-toolbar">
+            <label class="frame-mode">
+              <input type="radio" name="view-mode" value="annotated" checked>
+              annotated (detection overlay)
+            </label>
+            <label class="frame-mode">
+              <input type="radio" name="view-mode" value="raw">
+              raw (no overlay)
+            </label>
+          </div>
+          <img id="camera-img" alt="waiting for camera…" />
           <div class="frame-overlay" id="detection-badge">–</div>
+          <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/camera/color/image_raw</span></div>
         </div>
         <aside class="live-side">
           <h2>State</h2>
           <table class="kv">
             <tr><td>camera</td><td id="s-camera">–</td></tr>
+            <tr><td>image topic</td><td id="s-image-topic">–</td></tr>
+            <tr><td>frames received</td><td id="s-frame-count">0</td></tr>
+            <tr><td>last frame age</td><td id="s-frame-age">–</td></tr>
+            <tr><td>frame rate (rolling)</td><td id="s-frame-hz">–</td></tr>
             <tr><td>pan_tilt</td><td id="s-pt">–</td></tr>
             <tr><td>xArm TF (base→ee)</td><td id="s-tf">–</td></tr>
             <tr><td>xArm joints</td><td id="s-joints">–</td></tr>
@@ -113,11 +128,12 @@
         </div>
         <div class="pane">
           <h2>Live view</h2>
-          <img id="camera-img-2" src="/api/frame.jpg" alt="live camera" class="pt-preview"/>
+          <img id="camera-img-2" alt="waiting for camera…" class="pt-preview"/>
           <p class="muted">
             Jog to each corner of the pan/tilt grid to confirm the board stays
-            in view from this xArm pose. If it falls out at any corner, adjust
-            the xArm waypoint in the previous tab.
+            in view from this xArm pose. Uses the same raw/annotated toggle
+            as the Live View tab. If it falls out of view at any corner,
+            adjust the xArm waypoint in the previous tab.
           </p>
         </div>
       </div>

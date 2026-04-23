@@ -14,14 +14,46 @@ $$('.tab').forEach(b => b.addEventListener('click', () => activateTab(b.dataset.
 // ---- camera refresh (MJPEG-ish polling) -------------------------------------
 // Re-fetch /api/frame.jpg with cache-busting at ~3 Hz. Two <img> targets
 // keep the Live View + Pan-tilt tabs in sync.
+// `view-mode` radios toggle between the annotated (detection overlay) stream
+// and the raw camera feed — useful when overlay encoding fails (e.g. missing
+// camera_info) or when debugging why frames are black.
 const IMG_MAIN = $('#camera-img');
 const IMG_ALT  = $('#camera-img-2');
+const LIVE_FRAME = document.querySelector('.live-frame');
+
+let rawMode = false;
+let frameErrored = false;
+
+function currentFrameUrl() {
+  const base = '/api/frame.jpg';
+  const params = new URLSearchParams({ t: String(Date.now()) });
+  if (rawMode) params.set('raw', '1');
+  return `${base}?${params.toString()}`;
+}
+
 function refreshFrame() {
-  const url = '/api/frame.jpg?t=' + Date.now();
+  const url = currentFrameUrl();
   if (IMG_MAIN) IMG_MAIN.src = url;
   if (IMG_ALT)  IMG_ALT.src  = url;
 }
 setInterval(refreshFrame, 330);
+
+// Track whether the image actually loaded; toggle the placeholder overlay.
+function markFrameErrored(val) {
+  frameErrored = val;
+  if (LIVE_FRAME) LIVE_FRAME.classList.toggle('no-frame', val);
+}
+if (IMG_MAIN) {
+  IMG_MAIN.addEventListener('load', () => markFrameErrored(false));
+  IMG_MAIN.addEventListener('error', () => markFrameErrored(true));
+}
+
+document.querySelectorAll('input[name="view-mode"]').forEach(r => {
+  r.addEventListener('change', () => {
+    rawMode = (document.querySelector('input[name="view-mode"]:checked').value === 'raw');
+    refreshFrame();  // pick up the new URL without waiting for the next tick
+  });
+});
 
 // ---- WebSocket state --------------------------------------------------------
 
@@ -59,6 +91,17 @@ function fmt(v, n = 4) {
 
 function renderState(s) {
   $('#s-camera').textContent = s.have_camera ? 'streaming' : '—';
+  $('#s-image-topic').textContent = s.image_topic || '—';
+  $('#s-frame-count').textContent = s.frame_count ?? 0;
+  if (s.frame_age_sec === null || s.frame_age_sec === undefined) {
+    $('#s-frame-age').textContent = '—';
+  } else {
+    const age = Number(s.frame_age_sec);
+    $('#s-frame-age').textContent = age < 10 ? age.toFixed(2) + ' s' : '>10 s (stale)';
+  }
+  $('#s-frame-hz').textContent = s.frame_hz ? s.frame_hz.toFixed(1) + ' Hz' : '—';
+  const phTopic = $('#placeholder-topic');
+  if (phTopic) phTopic.textContent = s.image_topic || '/camera/color/image_raw';
   $('#s-pt').textContent = s.have_pt_state ? (s.pt_connected ? 'connected' : 'disconnected') : '—';
   $('#s-tf').textContent = s.have_tf ? 'ok' : '—';
   $('#s-joints').textContent = s.have_xarm_joints

@@ -130,6 +130,60 @@ Integration smoke suite at `scripts/tests/`, four tiers each gated by the previo
 | T3 | `t3_interaction.sh` | cross-node: feature_matching↔yolo, spot_on_shelf↔yolo, controller↔state_publisher↔follow_head TF | T2 + servo |
 | T4 | `t4_hardware.sh {servo_motion\|servo_tracking\|shelf_scene\|person\|all}` | hardware-in-the-loop, staged scenes | operator |
 
+## Pan-tilt / head camera extrinsic calibration
+
+Two-phase solver with xArm FK as the ground-truth anchor and a ChArUco board on the EE as the observation target. Parameters fit:
+
+| Block | DOF | Init | Notes |
+|---|---|---|---|
+| T_A trans (base_link→pan axis) | 3 | URDF xyz | rotation locked identity |
+| T_B trans (tilt_end→camera_link body) | 3 | URDF xyz | rotation locked identity (unlockable in polish phase) |
+| T_ee_marker | 6 | identity | unknown board mount on EE |
+| θ_t_offset | 1 | −π/4 | firmware zero parks tilt at 45° down |
+
+Total: 13 DOF baseline. `θ_p_offset` (pan bias) is opt-in.
+
+### Procedure
+
+1. **Generate the board.** `python -m pan_tilt.calibration.charuco_generate --out ~/calib/charuco_5x7` → PDF + PNG + JSON spec. Print on A3 matte, mount on 3 mm aluminum composite, re-measure square size with calipers.
+2. **Fill config.** Edit `src/pan_tilt/config/calibration.yaml` — replace the placeholder xArm joint waypoints with 12–15 hand-eye poses (Phase 1) and 2–3 grid-anchor poses (Phase 2). Pre-validate each in RViz with the full URDF loaded. The node enforces a software Z-floor + mast exclusion cylinder but does no general collision checking.
+3. **Collect.**
+   ```bash
+   ros2 run pan_tilt calibrate_collect --ros-args \
+     -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml \
+     -p out_dir:=$PWD/calib_out -p phase:=both
+   ```
+   Produces `phase1_handeye.json`, `phase2_chain.json`, `sanity.json`.
+4. **(Optional) Calibrate intrinsics.** If reprojection RMSE > 0.5 px during Phase 1, collect ~20 ChArUco shots and run `python -m pan_tilt.calibration.run_calibration intrinsic <images_dir> --out calib_out`.
+5. **Solve.**
+   ```bash
+   python -m pan_tilt.calibration.run_calibration handeye calib_out/phase1_handeye.json --out calib_out
+   python -m pan_tilt.calibration.run_calibration chain calib_out/phase2_chain.json --handeye calib_out/handeye.json --fit-pan-offset --out calib_out
+   python -m pan_tilt.calibration.run_calibration validate calib_out
+   ```
+   Optional polish: `python -m pan_tilt.calibration.run_calibration polish calib_out/phase1_handeye.json calib_out/phase2_chain.json --seed calib_out/chain.json --out calib_out`.
+6. **Emit URDF diff.** `python -m pan_tilt.calibration.apply_to_urdf --results calib_out/chain.json --xacro src/pan_tilt/urdf/pan_tilt.urdf.xacro` prints a unified diff for review. Apply manually with `patch` once you're satisfied, then rebuild pan_tilt.
+
+### Phase gates
+
+- Intrinsic RMSE < 0.5 px
+- Hand-eye trans RMSE < 3 mm, rot RMSE < 0.5°
+- Chain held-out trans RMSE < 3 mm, rot RMSE < 0.4°
+- Sanity-pose bracket (start vs end) < 2 mm / 0.2°
+
+### Robustness measures baked in
+
+- Per-axis backlash mitigation (overshoot-return per cell)
+- Servo settle check (feedback_ok + |cur − tgt| < 0.3° held 0.5 s)
+- MAD outlier rejection over 10-frame average per cell
+- Image-vs-state timestamp skew gate (≤ 20 ms)
+- SE(3) log residual (proper manifold metric) with `soft_l1` loss
+- 80/20 train/val split at the chain phase
+
+### Synthetic-data regression test
+
+`pytest src/pan_tilt/test/test_calibration.py` fabricates samples from a known ground-truth, runs every solver, and asserts recovery. Run this before touching `optimize.py` or `pan_tilt_model.py`.
+
 ## Pan-tilt refactor notes
 
 The old monolithic `pan_tilt/ctrl` path is gone on purpose.

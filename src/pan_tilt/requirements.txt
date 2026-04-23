@@ -5,3 +5,6 @@ pyserial>=3.5
 ultralytics>=8.0
 opencv-python>=4.5
 numpy>=1.21
+# Extrinsic calibration (calibrate_collect + run_calibration):
+scipy>=1.10
+PyYAML>=5.0

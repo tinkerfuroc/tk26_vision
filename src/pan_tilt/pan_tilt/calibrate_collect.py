@@ -54,6 +54,7 @@ from .calibration.aruco_detect import (
     detect_pose,
     robust_average,
 )
+from .calibration.safety import SafetyEnvelope
 from .calibration.utils import (
     matrix_to_pose_dict,
     optical_to_body,
@@ -66,14 +67,6 @@ from .calibration.utils import (
 
 
 # ---- config -----------------------------------------------------------------
-
-@dataclass
-class SafetyEnvelope:
-    z_floor_m: float = 0.25
-    mast_xy_center: tuple = (-0.275, -0.013)
-    mast_radius_m: float = 0.12
-    mast_z_max: float = 1.70
-
 
 @dataclass
 class CollectConfig:
@@ -242,17 +235,7 @@ class CalibrateCollectNode(Node):
 
     def _validate_ee_pose(self, T_base_ee: np.ndarray) -> Optional[str]:
         """Return None if safe, or a human-readable reason for rejection."""
-        z = float(T_base_ee[2, 3])
-        if z < self._cfg.safety.z_floor_m:
-            return f"z={z:.3f} below floor {self._cfg.safety.z_floor_m}"
-        dx = T_base_ee[0, 3] - self._cfg.safety.mast_xy_center[0]
-        dy = T_base_ee[1, 3] - self._cfg.safety.mast_xy_center[1]
-        if math.hypot(dx, dy) < self._cfg.safety.mast_radius_m and z < self._cfg.safety.mast_z_max:
-            return (
-                f"xy=({T_base_ee[0,3]:.3f},{T_base_ee[1,3]:.3f}) inside mast exclusion "
-                f"(radius={self._cfg.safety.mast_radius_m})"
-            )
-        return None
+        return self._cfg.safety.validate(T_base_ee)
 
     # ---- motion primitives -------------------------------------------------
 

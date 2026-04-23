@@ -23,6 +23,8 @@ setup(
             glob('launch/*.py')),
         (os.path.join('share', package_name, 'urdf'),
             glob('urdf/*.xacro')),
+        (os.path.join('share', package_name, 'webui'),
+            glob('webui/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -37,6 +39,7 @@ setup(
             'state_publisher = pan_tilt.pan_tilt_state_publisher:main',
             'follow_head = pan_tilt.follow_head:main',
             'calibrate_collect = pan_tilt.calibrate_collect:main',
+            'calibrate_web = pan_tilt.calib_web:main',
         ],
     },
 )

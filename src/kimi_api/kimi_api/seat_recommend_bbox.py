@@ -42,6 +42,8 @@ class SeatRecommendBboxService(Node):
         self.camera_types = ['orbbec']
 
         self.declare_parameter('log_prompts', True)
+        # Set to 'google/gemini-2.5-pro' for harder multi-seat scenes; Flash
+        # is cheaper / faster and works for most cases.
         self.declare_parameter('llm_model', 'google/gemini-2.5-flash')
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
@@ -52,6 +54,19 @@ class SeatRecommendBboxService(Node):
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
         self.declare_parameter('min_depth_m', 0.1)
         self.declare_parameter('max_depth_m', 10.0)
+        # Half-size in pixels of the bbox synthesized around the VLM pointing
+        # pixel for the response's `bbox` field (used for overlay and pan-tilt
+        # aiming; depth is sampled at the point itself, not the bbox centre).
+        self.declare_parameter('point_bbox_halfsize_px', 40)
+        # Snap-to-horizontal-surface: after the VLM returns a pixel, we fit a
+        # plane to a local depth patch and require the surface normal to point
+        # approximately along world-up. Backrests / walls / backpack fabric
+        # fail this test, so the snap search spirals outward until it hits a
+        # cushion-like surface (or gives up and fails clean).
+        self.declare_parameter('snap_enabled', True)
+        self.declare_parameter('snap_patch_half_px', 8)       # 17x17 plane fit
+        self.declare_parameter('snap_search_radius_px', 80)
+        self.declare_parameter('snap_min_horizontality', 0.6)  # |n_y|: 1=level, 0=vertical
 
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
@@ -71,6 +86,29 @@ class SeatRecommendBboxService(Node):
         )
         self.max_depth_m = (
             self.get_parameter('max_depth_m').get_parameter_value().double_value
+        )
+        self.point_bbox_halfsize_px = int(
+            self.get_parameter('point_bbox_halfsize_px')
+            .get_parameter_value()
+            .integer_value
+        )
+        self.snap_enabled = bool(
+            self.get_parameter('snap_enabled').get_parameter_value().bool_value
+        )
+        self.snap_patch_half_px = int(
+            self.get_parameter('snap_patch_half_px')
+            .get_parameter_value()
+            .integer_value
+        )
+        self.snap_search_radius_px = int(
+            self.get_parameter('snap_search_radius_px')
+            .get_parameter_value()
+            .integer_value
+        )
+        self.snap_min_horizontality = float(
+            self.get_parameter('snap_min_horizontality')
+            .get_parameter_value()
+            .double_value
         )
         self._vision_logger = VisionLogger(
             self,
@@ -129,7 +167,9 @@ class SeatRecommendBboxService(Node):
 
         self.get_logger().info(
             f'Seat-recommend-bbox service initialized '
-            f'(model={self.llm_model}, image={image_topic}, depth={depth_topic}).'
+            f'(model={self.llm_model}, image={image_topic}, depth={depth_topic}, '
+            f'snap={"on" if self.snap_enabled else "off"} '
+            f'r={self.snap_search_radius_px}px min|ny|={self.snap_min_horizontality:.2f}).'
         )
 
     def camera_info_orbbec_callback(self, info):
@@ -146,6 +186,109 @@ class SeatRecommendBboxService(Node):
         response.status = 1
         response.error_msg = msg
         return response
+
+    def _local_normal(
+        self,
+        depth_arr_m: np.ndarray,
+        K: tuple[float, float, float, float],
+        u: int,
+        v: int,
+    ) -> np.ndarray | None:
+        """Fit a plane to the local depth patch and return its unit normal.
+
+        Works in the camera's optical frame (X right, Y down, Z forward).
+        Returns None if the patch has fewer valid depth samples than needed
+        to fit a plane (sparse depth / holes).
+        """
+        h, w = depth_arr_m.shape
+        hp = self.snap_patch_half_px
+        u0 = max(0, u - hp)
+        v0 = max(0, v - hp)
+        u1 = min(w, u + hp + 1)
+        v1 = min(h, v + hp + 1)
+        patch = depth_arr_m[v0:v1, u0:u1]
+        valid = (
+            np.isfinite(patch)
+            & (patch > self.min_depth_m)
+            & (patch < self.max_depth_m)
+        )
+        if valid.sum() < max(25, patch.size // 3):
+            return None
+        vs, us = np.mgrid[v0:v1, u0:u1]
+        fx, fy, cx, cy = K
+        z = patch[valid].astype(np.float64)
+        x = (us[valid].astype(np.float64) - cx) * z / fx
+        y = (vs[valid].astype(np.float64) - cy) * z / fy
+        pts = np.stack([x, y, z], axis=1)
+        centroid = pts.mean(axis=0)
+        centered = pts - centroid
+        try:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return None
+        normal = vh[-1]
+        norm = float(np.linalg.norm(normal))
+        if norm < 1e-9:
+            return None
+        return normal / norm
+
+    def _snap_to_horizontal(
+        self,
+        depth_arr_m: np.ndarray,
+        K: tuple[float, float, float, float],
+        u: int,
+        v: int,
+    ):
+        """Spiral-search for the nearest horizontal (world-up) surface.
+
+        Returns (u', v', |n_y|, normal, ok). `ok` is True iff the best
+        candidate within ``snap_search_radius_px`` has |n_y| >=
+        ``snap_min_horizontality``. Returns None only if no pixel in the
+        search region had enough valid depth to fit any plane at all.
+        """
+        h, w = depth_arr_m.shape
+
+        def _score_at(uu: int, vv: int):
+            n = self._local_normal(depth_arr_m, K, uu, vv)
+            if n is None:
+                return None
+            return abs(float(n[1])), n
+
+        best_uv = None
+        best_score = -1.0
+        best_normal = None
+
+        hit = _score_at(u, v)
+        if hit is not None:
+            best_score, best_normal = hit
+            best_uv = (u, v)
+            if best_score >= self.snap_min_horizontality:
+                return best_uv[0], best_uv[1], best_score, best_normal, True
+
+        step = 4
+        for r in range(step, self.snap_search_radius_px + 1, step):
+            # One pixel per ~`step` arc-length keeps coverage uniform across rings.
+            num = max(12, int(2.0 * np.pi * r / step))
+            for k in range(num):
+                theta = 2.0 * np.pi * k / num
+                uu = u + int(round(r * np.cos(theta)))
+                vv = v + int(round(r * np.sin(theta)))
+                if not (0 <= uu < w and 0 <= vv < h):
+                    continue
+                hit = _score_at(uu, vv)
+                if hit is None:
+                    continue
+                score, normal = hit
+                if score > best_score:
+                    best_uv = (uu, vv)
+                    best_score = score
+                    best_normal = normal
+                    if score >= self.snap_min_horizontality:
+                        return best_uv[0], best_uv[1], best_score, best_normal, True
+
+        if best_uv is None:
+            return None
+        return best_uv[0], best_uv[1], best_score, best_normal, False
 
     def _sample_depth_at(self, depth_arr_m: np.ndarray, u: int, v: int):
         """Return depth (metres) at pixel (u, v) or None.
@@ -213,9 +356,9 @@ class SeatRecommendBboxService(Node):
         except Exception as exc:  # noqa: BLE001
             return self._fail(response, f'depth image decode failed: {exc}')
 
-        # 2. Gemini call.
+        # 2. Gemini call — returns a pointing pixel + short label.
         try:
-            rec_text, bbox_xyxy, vlm_elapsed = request_seat(
+            label, point_xy, visible_seats, vlm_elapsed = request_seat(
                 color_img,
                 request.names,
                 request.features,
@@ -229,11 +372,14 @@ class SeatRecommendBboxService(Node):
 
         if self.log_prompts:
             self.get_logger().info(
-                f'VLM seat recommendation: {rec_text!r} (elapsed {vlm_elapsed:.2f}s, '
-                f'bbox={bbox_xyxy})'
+                f'VLM seat point={point_xy}, label={label!r}, '
+                f'visible_seats={visible_seats} '
+                f'(elapsed {vlm_elapsed:.2f}s)'
             )
 
-        response.recommendation = rec_text
+        # Populate the recommendation field with the short label so
+        # callers reading the srv still get a human-readable identifier.
+        response.recommendation = label
 
         request_ctx = {
             'service': 'seat_recommend_bbox',
@@ -241,7 +387,8 @@ class SeatRecommendBboxService(Node):
             'names': list(request.names),
             'features': list(request.features),
             'target_frame': request.target_frame,
-            'recommendation': rec_text,
+            'label': label,
+            'visible_seats': visible_seats,
         }
         log_timings = {'vlm': vlm_elapsed}
         log_extras: dict = {}
@@ -260,37 +407,107 @@ class SeatRecommendBboxService(Node):
             _write_log(detections)
             return self._fail(response, msg)
 
-        if bbox_xyxy is None:
+        if point_xy is None:
             log_extras['event'] = 'no_empty_seat'
             _write_log(None)
             return self._fail(response, 'No empty seat detected by VLM.')
 
+        vlm_px = (int(point_xy[0]), int(point_xy[1]))
+        log_extras['vlm_point'] = [vlm_px[0], vlm_px[1]]
+
+        fx = float(intrinsic.k[0])
+        fy = float(intrinsic.k[4])
+        px = float(intrinsic.k[2])
+        py = float(intrinsic.k[5])
+        K = (fx, fy, px, py)
+
+        # Snap the VLM point to the nearest horizontal (world-up) surface.
+        # Backrests, walls, and backpack fabric fail the |n_y| test, so the
+        # spiral search walks outward until it hits a cushion-like surface.
+        # On a hard miss we fail clean — returning a 3D centroid on a wall
+        # is worse than telling the caller to retry.
+        if self.snap_enabled:
+            snap_res = self._snap_to_horizontal(depth_arr_m, K, vlm_px[0], vlm_px[1])
+            if snap_res is None:
+                cx, cy = vlm_px
+                log_extras['snap'] = {'status': 'skipped_sparse_depth'}
+            else:
+                su, sv, score, normal, ok = snap_res
+                log_extras['snap'] = {
+                    'status': 'ok' if ok else 'best_below_threshold',
+                    'horizontality': round(score, 3),
+                    'normal_camera': [
+                        round(float(normal[0]), 3),
+                        round(float(normal[1]), 3),
+                        round(float(normal[2]), 3),
+                    ],
+                    'moved_px': int(abs(su - vlm_px[0]) + abs(sv - vlm_px[1])),
+                }
+                if ok:
+                    cx, cy = int(su), int(sv)
+                else:
+                    log_extras['event'] = 'point_not_on_horizontal_surface'
+                    bad_det = {
+                        'bbox': (
+                            max(0, vlm_px[0] - 20), max(0, vlm_px[1] - 20),
+                            vlm_px[0] + 20, vlm_px[1] + 20,
+                        ),
+                        'cls_name': f'{label or "vlm_point"} (|n_y|={score:.2f})',
+                        'centroid': vlm_px,
+                    }
+                    return _fail_with_log(
+                        f'VLM point ({vlm_px[0]},{vlm_px[1]}) not on a '
+                        f'horizontal surface (best |n_y|={score:.2f}).',
+                        [bad_det],
+                    )
+        else:
+            cx, cy = vlm_px
+
+        # Synthesize a small bbox around the (possibly snapped) point for the
+        # response's bbox field (used by callers for overlay and pan-tilt aiming).
+        h_img, w_img = color_img.shape[:2]
+        r = max(1, int(self.point_bbox_halfsize_px))
+        bbox_xyxy = (
+            max(0, cx - r),
+            max(0, cy - r),
+            min(w_img - 1, cx + r),
+            min(h_img - 1, cy + r),
+        )
         response.bbox = BoundingBox(
             xmin=int(bbox_xyxy[0]),
             ymin=int(bbox_xyxy[1]),
             xmax=int(bbox_xyxy[2]),
             ymax=int(bbox_xyxy[3]),
         )
-        cx = (bbox_xyxy[0] + bbox_xyxy[2]) // 2
-        cy = (bbox_xyxy[1] + bbox_xyxy[3]) // 2
         log_det = {
             'bbox': bbox_xyxy,
-            'cls_name': 'empty_seat',
+            'cls_name': label or 'empty_seat',
             'centroid': (cx, cy),
         }
+        # When snap actually moved the point, log the VLM raw pixel as a
+        # second detection so the overlay shows both markers side-by-side.
+        extra_dets = []
+        if (cx, cy) != vlm_px:
+            extra_dets.append({
+                'bbox': (
+                    max(0, vlm_px[0] - 12), max(0, vlm_px[1] - 12),
+                    vlm_px[0] + 12, vlm_px[1] + 12,
+                ),
+                'cls_name': 'vlm_raw',
+                'centroid': vlm_px,
+            })
 
-        # 3. Unproject bbox centre from depth.
+        # 3. Unproject the (snapped) pixel from depth.
         sampled = self._sample_depth_at(depth_arr_m, cx, cy)
         if sampled is None:
-            log_extras['event'] = 'no_depth_at_centre'
+            log_extras['event'] = 'no_depth_at_point'
             log_extras['depth_frame'] = depth_msg.header.frame_id
             return _fail_with_log(
-                f'No valid depth near bbox centre ({cx},{cy}).', [log_det],
+                f'No valid depth near point ({cx},{cy}).',
+                [log_det] + extra_dets,
             )
         uu, vv, z = sampled
 
-        fx, fy = float(intrinsic.k[0]), float(intrinsic.k[4])
-        px, py = float(intrinsic.k[2]), float(intrinsic.k[5])
         x = (uu - px) * z / fx
         y = (vv - py) * z / fy
 
@@ -319,7 +536,7 @@ class SeatRecommendBboxService(Node):
                 log_extras['depth_frame'] = depth_msg.header.frame_id
                 return _fail_with_log(
                     f'TF {depth_msg.header.frame_id} -> {request.target_frame} failed: {exc}',
-                    [log_det],
+                    [log_det] + extra_dets,
                 )
 
         response.centroid = PointStamped(header=centroid_header, point=centroid_point)
@@ -336,7 +553,7 @@ class SeatRecommendBboxService(Node):
         log_extras['centroid_frame'] = centroid_header.frame_id
         log_extras['depth_frame'] = depth_msg.header.frame_id
         log_extras['depth_pixel'] = [int(uu), int(vv)]
-        _write_log([log_det])
+        _write_log([log_det] + extra_dets)
 
         self.get_logger().info(
             f'Seat recommended. Total time: {total_elapsed * 1e3:.2f} ms'

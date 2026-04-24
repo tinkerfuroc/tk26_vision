@@ -23,7 +23,7 @@ t4_servo_motion() {
     ros2 topic pub --once /pan_tilt_controller/cmd tinker_vision_msgs_26/msg/PanTiltCommand \
         '{mode: 1, pan_rad: 0.3, tilt_rad: 0.0, speed_raw: 0, accel_raw: 0}' >/dev/null 2>&1 || true
     sleep 2
-    timeout 3 ros2 run tf2_ros tf2_echo base_link camera_link >"$LOG_DIR/T4.1_after.tf" 2>&1 || true
+    timeout 3 ros2 run tf2_ros tf2_echo base_link head_camera_link >"$LOG_DIR/T4.1_after.tf" 2>&1 || true
     printf '  -> returning to home (pan=0.0, tilt=0.0)\n'
     ros2 topic pub --once /pan_tilt_controller/cmd tinker_vision_msgs_26/msg/PanTiltCommand \
         '{mode: 0, pan_rad: 0.0, tilt_rad: 0.0, speed_raw: 0, accel_raw: 0}' >/dev/null 2>&1 || true

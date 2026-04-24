@@ -866,6 +866,19 @@ def _resolve_webui_dir() -> Path:
 
 
 def main():
+    # Force UDPv4-only transport before rclpy.init() so Node() doesn't stall
+    # doing SHM discovery against the 150+ segments typically owned by
+    # camera + manipulation stacks on a live robot. The UI is not on a
+    # throughput-critical path — a downscaled preview at modest Hz is fine.
+    # Users who really need SHM (e.g. to cohost with a high-rate consumer)
+    # can pre-set FASTDDS_BUILTIN_TRANSPORTS themselves.
+    import os as _os
+    _os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
+    # The workspace shm.xml profile pins SHM as the preferred transport and
+    # overrides FASTDDS_BUILTIN_TRANSPORTS; ignore it for this node so we
+    # don't re-enter the SHM stall path.
+    _os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+
     rclpy.init()
     node = CalibWebNode()
     webui_dir = _resolve_webui_dir()

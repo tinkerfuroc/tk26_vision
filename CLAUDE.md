@@ -172,7 +172,7 @@ Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13â€
    ```bash
    python -m pan_tilt.calibration.run_calibration polish calib_out/phase1_handeye.json calib_out/phase2_chain.json --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
    ```
-6. **Emit URDF diff.** `python -m pan_tilt.calibration.apply_to_urdf --results calib_out/chain.json --xacro src/pan_tilt/urdf/pan_tilt.urdf.xacro` prints a unified diff for review. Apply manually with `patch` once you're satisfied, then rebuild pan_tilt.
+6. **Emit URDF diff.** The patcher auto-detects both xacro layouts: the `tk25_basic` macro form at `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` (the authoritative URDF the main robot bringup loads â€” patches `attach_xyz` default + `camera_mount_joint` origin) and the `tk26_vision` standalone form at `src/pan_tilt/urdf/pan_tilt.urdf.xacro` (used by `pan_tilt.launch.py` for dev bringup). Run `python -m pan_tilt.calibration.apply_to_urdf --results calib_out/chain.json --xacro <path>` against **both** so RViz and the live robot stay consistent, and apply the diffs manually once reviewed.
 
 ### Phase gates
 

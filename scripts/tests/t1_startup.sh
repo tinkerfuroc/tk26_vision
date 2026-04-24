@@ -81,12 +81,12 @@ if [ -c "$SERVO_DEVICE" ]; then
     sleep 3
     if kill -0 "${NODE_PIDS[-1]}" 2>/dev/null; then
         # Check TF chain appears
-        if timeout 5 ros2 run tf2_ros tf2_echo base_link camera_link >"$LOG_DIR/t1.5_tf.log" 2>&1 &
+        if timeout 5 ros2 run tf2_ros tf2_echo base_link head_camera_link >"$LOG_DIR/t1.5_tf.log" 2>&1 &
         then
             tf_pid=$!; sleep 3; kill "$tf_pid" 2>/dev/null || true; wait "$tf_pid" 2>/dev/null || true
         fi
         if grep -qE 'Translation|At time' "$LOG_DIR/t1.5_tf.log"; then
-            pass "T1.5 positive: stack alive on $SERVO_DEVICE, TF base_link→camera_link resolves"
+            pass "T1.5 positive: stack alive on $SERVO_DEVICE, TF base_link→head_camera_link resolves"
         else
             fail "T1.5 positive" "TF chain not published (see $LOG_DIR/t1.5_tf.log)"
         fi

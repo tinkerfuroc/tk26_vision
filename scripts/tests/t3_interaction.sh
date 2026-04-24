@@ -84,12 +84,12 @@ if [ -c "$SERVO_DEVICE" ]; then
     start_launch ctrl_t3 pan_tilt pan_tilt.launch.py "device:=$SERVO_DEVICE"
     sleep 3
     tf_ok=0
-    if timeout 5 ros2 run tf2_ros tf2_echo base_link camera_link >"$LOG_DIR/T3.3.tf" 2>&1 & then
+    if timeout 5 ros2 run tf2_ros tf2_echo base_link head_camera_link >"$LOG_DIR/T3.3.tf" 2>&1 & then
         tf_pid=$!; sleep 3; kill "$tf_pid" 2>/dev/null || true; wait "$tf_pid" 2>/dev/null || true
     fi
     grep -qE 'Translation|At time' "$LOG_DIR/T3.3.tf" && tf_ok=1
     if [ "$tf_ok" -eq 1 ]; then
-        pass "T3.3 TF base_link→camera_link resolves"
+        pass "T3.3 TF base_link→head_camera_link resolves"
     else
         fail "T3.3" "TF not present"
     fi

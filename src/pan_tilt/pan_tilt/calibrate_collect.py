@@ -297,7 +297,7 @@ class CalibrateCollectNode(Node):
             )
             return False
 
-        from sensor_msgs.msg import PointCloud2
+        from sensor_msgs.msg import PointCloud2, PointField
         goal = self._joint_move_type.Goal()
         a = list(angles_rad) + [0.0] * max(0, 7 - len(angles_rad))
         goal.joint0 = float(a[0])
@@ -307,8 +307,24 @@ class CalibrateCollectNode(Node):
         goal.joint4 = float(a[4])
         goal.joint5 = float(a[5])
         goal.joint6 = float(a[6])
-        goal.env_points = PointCloud2()  # no env cloud; MoveIt server-side still
-                                         # enforces self-collision + joint limits
+        # pick_and_place runs pcl::fromROSMsg + tf2 lookupTransform on
+        # env_points, so a default-constructed PointCloud2 would trip on
+        # missing x/y/z fields and empty frame_id. Build a zero-point cloud
+        # in base_link so the server short-circuits the transform step.
+        env = PointCloud2()
+        env.header.frame_id = "base_link"
+        env.height = 1
+        env.width = 0
+        env.is_bigendian = False
+        env.is_dense = True
+        env.point_step = 12
+        env.row_step = 0
+        env.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        goal.env_points = env
 
         timeout = float(self._cfg.arm_action_timeout_sec)
         send_fut = self._joint_move_client.send_goal_async(goal)

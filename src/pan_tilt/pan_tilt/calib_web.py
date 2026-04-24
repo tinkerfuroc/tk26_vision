@@ -64,16 +64,33 @@ from .calibration.utils import matrix_to_pose, pose_to_matrix
 log = logging.getLogger("calib_web")
 
 
-def _empty_pointcloud():
-    """Zero-field PointCloud2 used when no live depth cloud is available.
+def _empty_pointcloud(frame_id: str = "base_link"):
+    """Zero-point but well-formed PointCloud2 used when no live depth cloud is available.
 
-    The tinker_arm_msgs actions require an `env_points` field; MoveIt on the
-    server side converts it to an octomap for collision avoidance. An empty
-    cloud yields no obstacles — fine for calibration moves where the safety
-    envelope + operator pre-validation are doing the collision-avoidance work.
+    The tinker_arm_msgs action server (pick_and_place/pc_proc) unconditionally
+    runs `pcl::fromROSMsg` and (if frame_id != "base_link") a tf2
+    lookupTransform to base_link on `env_points`. So a default-constructed
+    PointCloud2 fails two ways: missing x/y/z fields (pcl warns / can't read)
+    and empty frame_id (tf2 aborts with "source_frame cannot be empty"). We
+    fix both by declaring x/y/z float32 fields with zero points and pinning
+    frame_id to base_link so the server short-circuits the transform step.
     """
-    from sensor_msgs.msg import PointCloud2
-    return PointCloud2()
+    from sensor_msgs.msg import PointCloud2, PointField
+    pc = PointCloud2()
+    pc.header.frame_id = frame_id
+    pc.height = 1
+    pc.width = 0
+    pc.is_bigendian = False
+    pc.is_dense = True
+    pc.point_step = 12  # 3 × float32
+    pc.row_step = 0
+    pc.fields = [
+        PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+    pc.data = b""
+    return pc
 
 
 def _sanitize_for_json(obj):

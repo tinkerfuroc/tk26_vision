@@ -1,6 +1,6 @@
 # Pan-tilt head camera extrinsic calibration
 
-End-to-end walkthrough for calibrating the transform chain from `base_link` through the pan-tilt head to the Orbbec camera's `camera_link` frame, using the xArm's forward kinematics as ground truth and a ChArUco board rigidly attached to the xArm end-effector as the observation target.
+End-to-end walkthrough for calibrating the transform chain from `base_link` through the pan-tilt head to the Orbbec camera's `head_camera_link` frame (renamed from `camera_link` to avoid collision with the xArm URDF's `link_eef → camera_link` edge), using the xArm's forward kinematics as ground truth and a ChArUco board rigidly attached to the xArm end-effector as the observation target.
 
 ## What this calibrates
 
@@ -9,7 +9,7 @@ base_link  ──T_A (trans only)──►  pan_axis
                               │
                               └─► [pan rot] ─ L_pan ─► tilt_axis
                                                     │
-                                                    └─► [tilt rot] ──T_B──► camera_link
+                                                    └─► [tilt rot] ──T_B──► head_camera_link
 ```
 
 Fitted parameters (13 DOF baseline):
@@ -17,7 +17,7 @@ Fitted parameters (13 DOF baseline):
 | Block | DOF | Meaning |
 |---|---|---|
 | `T_A` translation | 3 | base_link → pan axis (rotation assumed identity) |
-| `T_B` translation | 3 | tilt-end → camera_link |
+| `T_B` translation | 3 | tilt-end → head_camera_link |
 | `T_B` rotation | 3 | mounted camera twist — this robot has ~90° about X |
 | `T_ee_marker` | 6 | xArm EE flange → ChArUco origin (unknown mount on the EE) |
 | `θ_t_offset` | 1 | firmware tilt zero → physical tilt = 0 (default −π/4 because firmware zero parks the camera 45° down) |
@@ -196,34 +196,49 @@ Only run polish if Phase-2 residuals show *structured* (non-random) pattern — 
 
 ### 8. Review the URDF patch
 
-The solver writes `chain.json` (and optionally `polish.json`) with the fitted parameters. Generate a unified diff against the current URDF:
+The solver writes `chain.json` (and optionally `polish.json`) with the fitted parameters. There are **two xacro files** describing the same chain, both consumed at runtime:
+
+- `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` — the **authoritative** URDF, a `<xacro:macro name="pan_tilt_macro">` that `tracer_mini_manipulator.urdf.xacro` (loaded by the main robot bringup, e.g. `grasp_bringup`) instantiates with `parent=base_link`. Link name is `camera_link` here. **Patch this one** — it's what downstream TF consumers actually see.
+- `src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro` — the standalone form used by `ros2 launch pan_tilt pan_tilt.launch.py` for dev bringup without the full robot stack. Link name is `head_camera_link` (renamed to dodge the xArm's own `link_eef → camera_link` edge when the xArm macro is also instantiated). Patch this too so RViz-based dev stays representative.
+
+`apply_to_urdf.py` auto-detects which form it's given and patches the right slots:
 
 ```bash
+# Patch the macro form (live robot)
+python -m pan_tilt.calibration.apply_to_urdf \
+    --results chain.json \
+    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro
+
+# Patch the standalone form (dev bringup)
 python -m pan_tilt.calibration.apply_to_urdf \
     --results chain.json \
     --xacro src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro
 ```
 
-This prints (but does not apply) a diff updating:
-- `pan_joint` origin `xyz` → fitted `t_a` (rpy forced to `0 0 0`).
-- `camera_mount_joint` origin `xyz` → fitted `t_b_trans`, `rpy` → fitted `t_b_rotvec` (converted to XYZ Euler), or `0 0 0` if you're using `chain.json` (which froze T_B rotation).
+Each invocation prints (but does not apply) a diff. What gets updated:
 
-**The URDF is never auto-modified.** Sanity-check the diff — the new values should be within a cm and a few degrees of the current URDF — then apply manually:
+- **Standalone form:** `pan_joint` origin `xyz` → fitted `t_a` (rpy preserved); `camera_mount_joint` origin `xyz` → fitted `t_b_trans`, `rpy` → fitted `t_b_rotvec` (converted to XYZ Euler). If `t_b_rotvec` is zero (e.g. you're patching from `chain.json`, which froze T_B rotation), the existing `rpy` is preserved rather than zeroed.
+- **Macro form:** `attach_xyz:='...'` default in the macro params → fitted `t_a` (the `attach_rpy` default is preserved — T_A rotation is not fitted); `camera_mount_joint` origin `xyz`/`rpy` same as above.
+
+**The URDFs are never auto-modified.** Sanity-check the diff — the new values should be within a cm and a few degrees of the current URDF — then apply manually, one file at a time:
 
 ```bash
 python -m pan_tilt.calibration.apply_to_urdf \
     --results chain.json \
-    --xacro src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro \
+    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro \
     --out /tmp/patched.urdf.xacro
 
-# Inspect...
-diff src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro /tmp/patched.urdf.xacro
-
-# Apply if satisfied.
-cp /tmp/patched.urdf.xacro src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro
+diff src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro /tmp/patched.urdf.xacro
+cp /tmp/patched.urdf.xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro
 ```
 
-Rebuild: `./src/tk26_vision/scripts/build.sh --packages-select pan_tilt`, restart the stack.
+Rebuild both packages:
+```bash
+colcon build --packages-select tinker_urdf  # tk25_basic side
+./src/tk26_vision/scripts/build.sh --packages-select pan_tilt  # tk26_vision side
+```
+
+Restart the robot stack.
 
 **Important:** if you used `polish.json` (T_B rotation fit), don't mentally compare the new `rpy` to the *old* URDF's `rpy` — the old value was a known artifact from a different calibration convention. Compare against the physical mount direction instead.
 
@@ -260,7 +275,7 @@ cd src/tk26_vision/src/pan_tilt
 python -m pytest test/test_calibration.py -v
 ```
 
-These 5 tests fabricate samples from known ground-truth parameter blocks (including one with a 90° T_B mount) and assert that the solvers recover the truth inside tolerance. If any test fails after an edit, the fit will fail on real data too.
+These 6 tests fabricate samples from known ground-truth parameter blocks (including one with a 90° T_B mount) and assert that the solvers recover the truth inside tolerance. A separate regression test guards the URDF patcher against both the standalone and macro xacro forms. If any test fails after an edit, the fit will fail on real data too.
 
 ## File layout
 

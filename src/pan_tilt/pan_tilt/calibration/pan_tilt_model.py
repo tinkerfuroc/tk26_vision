@@ -15,7 +15,7 @@ Chain (body-frame convention: x-forward, y-left, z-up at every link):
     tilt_end
       |  T_B  (6-DOF; translation primary, rotation near identity)
       v
-    camera_link (body frame)
+    head_camera_link (body frame)
 
 L_tilt is intentionally absorbed into T_B translation (see plan Parameter vector);
 leaving it as a separate fixed length was a redundant reparameterization.
@@ -85,7 +85,7 @@ class PanTiltParams:
     # base_link -> pan_axis (translation only; rotation assumed identity).
     t_a: np.ndarray = field(default_factory=lambda: np.array([-0.2754, -0.0134, 1.5459]))
 
-    # tilt_end -> camera_link (body frame).
+    # tilt_end -> head_camera_link (body frame).
     t_b_trans: np.ndarray = field(default_factory=lambda: np.array([-0.0724, -0.009, 0.075]))
     # Rotvec for T_B rotation. Default identity. Locked during chain-phase; optionally freed
     # in polish phase if residuals show rotation structure.
@@ -115,7 +115,7 @@ def forward_kinematics(
     theta_tilt: float,
     params: PanTiltParams,
 ) -> np.ndarray:
-    """T_base_link_to_camera_link for firmware-reported (theta_p, theta_t) in **radians**."""
+    """T_base_link_to_head_camera_link for firmware-reported (theta_p, theta_t) in **radians**."""
     T_a = translation(params.t_a)
     R_pan = rotation_about_z(theta_pan + params.theta_p_offset)
     T_lp = translation([0.0, 0.0, params.l_pan])

@@ -264,3 +264,63 @@ def test_joint_polish_tightens_result():
     assert report.success
     assert report.trans_rmse_m < 0.003, report.summary()
     assert np.degrees(report.rot_rmse_rad) < 0.4, report.summary()
+
+
+def test_apply_to_urdf_patches_both_xacro_forms():
+    """Regression guard: `apply_to_urdf._patched_xacro` must handle both the
+    tk26_vision standalone form and the tk25_basic macro form."""
+    from pan_tilt.calibration.apply_to_urdf import _patched_xacro
+
+    t_a = np.array([-0.30, -0.02, 1.52])
+    t_b_trans = np.array([-0.08, -0.01, 0.08])
+
+    # Standalone form — literal pan_joint + camera_mount_joint
+    standalone = (
+        '<?xml version="1.0"?>\n'
+        '<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <parent link="base_link"/><child link="pan_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0.01 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <parent link="tilt_link"/><child link="head_camera_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0.1 0 3.0"/>\n'
+        '  </joint>\n'
+        '</robot>\n'
+    )
+    patched = _patched_xacro(standalone, t_a, t_b_trans, t_b_rotvec=np.zeros(3))
+    assert 'xyz="-0.3 -0.02 1.52"' in patched
+    assert 'rpy="0.01 0 0"' in patched  # preserved (T_A rotation not fitted)
+    assert 'xyz="-0.08 -0.01 0.08"' in patched
+    assert 'rpy="0.1 0 3.0"' in patched  # preserved (t_b_rotvec == 0)
+
+    # Macro form — parameterized attach_xyz default
+    macro = (
+        '<?xml version="1.0"?>\n'
+        '<robot xmlns:xacro="http://www.ros.org/wiki/xacro">\n'
+        '  <xacro:macro name="pan_tilt_macro" params="\n'
+        "    parent\n"
+        "    prefix:=''\n"
+        "    attach_xyz:='0 0 0'\n"
+        "    attach_rpy:='0.01 0 0'\">\n"
+        '    <joint name="${prefix}pan_joint" type="revolute">\n'
+        '      <origin xyz="${attach_xyz}" rpy="${attach_rpy}"/>\n'
+        '    </joint>\n'
+        '    <joint name="${prefix}camera_mount_joint" type="fixed">\n'
+        '      <origin xyz="0 0 0" rpy="0.1 0 3.0"/>\n'
+        '    </joint>\n'
+        '  </xacro:macro>\n'
+        '</robot>\n'
+    )
+    patched = _patched_xacro(macro, t_a, t_b_trans, t_b_rotvec=np.zeros(3))
+    assert "attach_xyz:='-0.3 -0.02 1.52'" in patched
+    assert "attach_rpy:='0.01 0 0'" in patched  # preserved
+    assert 'xyz="-0.08 -0.01 0.08"' in patched
+    assert 'rpy="0.1 0 3.0"' in patched  # preserved
+
+    # Non-zero t_b_rotvec must overwrite camera_mount rpy (both forms)
+    rotvec = np.array([1.5, 0.0, 0.0])  # ~90 deg about X
+    for src in (standalone, macro):
+        p = _patched_xacro(src, t_a, t_b_trans, rotvec)
+        assert 'rpy="0.1 0 3.0"' not in p, "old rpy should be gone"
+        assert 'xyz="-0.08 -0.01 0.08"' in p

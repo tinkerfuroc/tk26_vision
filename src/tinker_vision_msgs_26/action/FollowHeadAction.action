@@ -8,3 +8,9 @@ string message
 # Feedback
 float32 pan
 float32 tilt
+bool person_visible
+float32 current_pan
+float32 current_tilt
+float32 target_pan
+float32 target_tilt
+float32 error_deg

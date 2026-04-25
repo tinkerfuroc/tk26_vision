@@ -16,6 +16,53 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-04-23 — `follow_head` rewritten for the new pan_tilt stack
+
+The `ce3abec` refactor gave us `PanTiltCommand` (radians, ABSOLUTE/RELATIVE, speed/accel), `PanTiltState` (20 Hz hardware feedback), and `SetTorque`/`SetZero` services — but `follow_head` was still running the old pattern: 1 Hz detection, 1 s fixed settle, camera-frame relative deltas, closest-by-depth person selection, open-loop. This pass rewrites `follow_head.py` to exploit the new interface plus adds a small local tracker.
+
+### Architecture changes
+
+- **Pan-tilt-rooted absolute targeting (not TF / not base_link).** The original plan was to transform detections into `base_link` via TF, but the URDF's `camera_mount_joint` rpy has a ~175° yaw that didn't match the physical install — base-frame math sent the head 143° the wrong direction on the first live test. New approach: compute `target_angles = current_pan/tilt + camera-frame offset` directly from the servo's own feedback, no TF lookup needed. `_camera_to_pan_tilt_root` packs the candidate into a Cartesian frame rooted at the servo so the tracker + EMA have a servo-invariant distance metric; `_pan_tilt_root_to_angles` is the inverse. No dependency on `base_link` / URDF / `robot_state_publisher`.
+- **Feedback-gated settle replaces the 1 s time gate.** `PanTiltState` arrives at 20 Hz; we keep a 4-deep ring buffer. `_classify_settle_state()` returns `go` iff `|state − last_commanded| < ε` AND `|Δstate/dt| < ω_eps` for N consecutive samples. Fallbacks: `stale_feedback` falls back to the Laplacian blur gate; a `max_settle_timeout_sec` watchdog advances after the deadline to avoid deadlocks.
+- **Detection runs during settling.** Previously the settle gate held off the entire `follow_head_logic` including YOLO, so effective detection was ~0.67 Hz instead of 5 Hz. Moved the gate to sit *between* detection and publish, so the tracker + EMA keep consuming fresh frames even while the servo is mid-motion; the next command fires on the latest smoothed target.
+- **Anti-chatter on the command side.** `min_command_change_deg` skips the publish when the new target is within ~0.5° of the last commanded angle, so tiny detection jitter no longer produces a stream of near-identical commands that the Waveshare firmware interrupts each in turn.
+- **`PersonTracker` + `WorldTargetEMA`** in a new `pan_tilt/head_tracking_helpers.py`. Sticky nearest-neighbor lock with a `reassoc_dist_m` hysteresis + TTL (fixes "closest-by-depth jumps between similarly-distant people"); exponential moving average on the pan-tilt-root xyz. Both reset on goal start and on cancel.
+- **`FollowHeadAction.Feedback` enriched** with `person_visible, current_pan, current_tilt, target_pan, target_tilt, error_deg`. Wire-compatible — `BtNode_MaintainEyeContact` already accesses `pan`/`tilt` via `getattr`.
+
+### Tuning pass — live servo test 2026-04-23
+
+First live test surfaced two symptoms that the static smoke tests missed:
+
+1. **Slow convergence.** `command_speed_raw_small=60` cut motor speed in half for any error under 10°, giving ~2.7 °/s — a 4° correction took 1.5 s and tripped the watchdog. Removed the handicap (`command_speed_raw_small=0` → controller default) and tightened `small_error_deg` so speed scaling almost never kicks in.
+2. **Glitchy / twitchy motion.** Command chatter from the servo being interrupted by new commands at the detection rate, plus the synchronous `cv2.imwrite` from the vision logger blocking the action loop ~30-40 ms per tick. Fix: `vision_logging_enabled: false` by default in `pan_tilt.yaml`; `min_command_change_deg` added; deadbands and speed/accel bumped.
+
+Operator-requested final tuning is biased **responsiveness > smoothness** ("fast and glitchy is better than slow"):
+- `default_speed_raw: 240` (was 120) + `default_accel_raw: 40` in the controller
+- `min_detection_interval_sec: 0.1` (10 Hz YOLO)
+- `max_settle_timeout_sec: 0.3`, `steady_{pan,tilt}_eps_deg: 3.0`, `steady_velocity_eps_deg_per_sec: 60.0`, `steady_sample_count: 1`
+- `ema_alpha: 0.7` (was 0.4 — fresher over smoother)
+- `{pan,tilt}_deadband_deg: 1.5`, `min_command_change_deg: 0.5`
+
+If a later use case wants calmer motion, lower `ema_alpha` first, then tighten the `steady_*_eps_deg`.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `src/pan_tilt/pan_tilt/follow_head.py` | near-rewrite — pan-tilt-rooted targeting, feedback-gated settle, free-running detection, PersonTracker + EMA wiring, enriched feedback, anti-chatter, motion profile |
+| `src/pan_tilt/pan_tilt/head_tracking_helpers.py` | **new** — `PersonTracker` (sticky NN + hysteresis + TTL), `WorldTargetEMA` (α smoothing + TTL) |
+| `src/pan_tilt/config/pan_tilt.yaml` | bumped controller `default_speed_raw/accel_raw`; full follow_head param surface (~25 keys); `vision_logging_enabled: false` default |
+| `src/tinker_vision_msgs_26/action/FollowHeadAction.action` | appended Feedback fields (backward-compat with getattr-based clients) |
+| `src/pan_tilt/package.xml` | no new deps after reverting the base_link approach — TF listener removed |
+| `src/tk26_vision/CLAUDE.md` | updated follow_head param list + vision-logging note |
+
+### What still awaits testing
+
+- **T4.2 servo tracking convergence CSV.** Plan file at `/home/tinker/.claude-wjy-paid/plans/pan-tilt-has-been-modular-lecun.md` § Verification describes extending `t4_hardware.sh servo_tracking` to parse feedback into a CSV + assert monotone error decrease and < 3° residual. Not yet wired in.
+- **Auto-succeed-on-convergence.** `BtNode_MaintainEyeContact` docstring says "Server returns success after a single gaze lock" but the current server runs until canceled. Left as-is to preserve Receptionist + HRI parallel-with-speech semantics. Reopen if a caller needs the one-shot behavior.
+
+---
+
 ## 2026-04-22 — Vision logging unification
 
 Generalized the `debug_log_overlays` hook already present on `YOLOSegmentationNode` into a shared `VisionLogger` (in `vision_util`) and wired it into every vision node whose service/action output carries a bbox, segmentation mask, or centroid:

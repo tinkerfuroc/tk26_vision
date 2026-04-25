@@ -14,6 +14,24 @@ def generate_launch_description():
     )
     robot_description = Command([FindExecutable(name='xacro'), ' ', urdf_path])
 
+    # pan_tilt publishes its URDF + joint-state feed on private topics so that
+    # running this launch alongside the main robot bringup (grasp_bringup etc.)
+    # does not collide with the xArm's /robot_description latched topic or
+    # the shared /joint_states aggregator. /tf and /tf_static stay global so
+    # downstream consumers see one merged TF tree.
+    rsp_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        output='screen',
+        parameters=[{'robot_description': robot_description}],
+        remappings=[
+            ('/robot_description', '/pan_tilt/robot_description'),
+            ('/joint_states', '/pan_tilt/joint_states'),
+            ('robot_description', '/pan_tilt/robot_description'),
+            ('joint_states', '/pan_tilt/joint_states'),
+        ],
+    )
+
     return LaunchDescription(
         [
             DeclareLaunchArgument(
@@ -35,11 +53,6 @@ def generate_launch_description():
                 output='screen',
                 parameters=[config],
             ),
-            Node(
-                package='robot_state_publisher',
-                executable='robot_state_publisher',
-                output='screen',
-                parameters=[{'robot_description': robot_description}],
-            ),
+            rsp_node,
         ],
     )

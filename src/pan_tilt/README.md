@@ -11,7 +11,9 @@ publication, and TF generation.
 - `ros2 run pan_tilt controller`
   Owns `/dev/ttyUSB*`, sends firmware commands, and publishes low-level state.
 - `ros2 run pan_tilt state_publisher`
-  Converts `PanTiltState` into `/joint_states`.
+  Converts `PanTiltState` into a `JointState` stream on
+  `/pan_tilt/joint_states` (private, to avoid clashing with the main-robot
+  `/joint_states` aggregator; override via the `joint_state_topic` parameter).
 - `ros2 run pan_tilt follow_head`
   YOLO-based head following. Publishes native `PanTiltCommand` messages and
   still exposes `/follow_head_service` and `/follow_head_action`.
@@ -27,8 +29,18 @@ publication, and TF generation.
   Type: `tinker_vision_msgs_26/msg/PanTiltCommand`
 - Topic: `/pan_tilt_controller/state`
   Type: `tinker_vision_msgs_26/msg/PanTiltState`
-- Topic: `/joint_states`
-  Produced by `state_publisher` from `/pan_tilt_controller/state`
+- Topic: `/pan_tilt/joint_states`
+  Produced by `state_publisher` from `/pan_tilt_controller/state`. Private
+  so it does not collide with the main-robot `/joint_states` aggregator.
+- Topic: `/pan_tilt/robot_description`
+  Published by `robot_state_publisher` in the bringup launch. Private so it
+  does not collide with the main-robot `/robot_description` latched by
+  `grasp_bringup` / `xarm_description`.
+- TF frames (global `/tf`, `/tf_static`): `base_link -> pan_link ->
+  tilt_link -> head_camera_link`. `head_camera_link` was renamed away from
+  `camera_link` specifically so that the TF tree does not conflict with the
+  xArm URDF's `link_eef -> camera_link` edge when both bringups run
+  together.
 - Service: `/pan_tilt_controller/set_torque`
   Type: `tinker_vision_msgs_26/srv/SetTorque`
 - Service: `/pan_tilt_controller/set_zero`
@@ -52,13 +64,17 @@ Canonical:
 ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
 ```
 
-Manual low-level bringup:
+Manual low-level bringup (mirrors what `pan_tilt.launch.py` does, with
+explicit topic remaps so it can coexist with `grasp_bringup`):
 
 ```bash
 ros2 run pan_tilt controller --ros-args -p device:=/dev/ttyUSB0
-ros2 run pan_tilt state_publisher
+ros2 run pan_tilt state_publisher --ros-args \
+  -p joint_state_topic:=/pan_tilt/joint_states
 ros2 run robot_state_publisher robot_state_publisher \
-  --ros-args -p robot_description:="$(xacro src/pan_tilt/urdf/pan_tilt.urdf.xacro)"
+  --ros-args -p robot_description:="$(xacro src/pan_tilt/urdf/pan_tilt.urdf.xacro)" \
+  -r /robot_description:=/pan_tilt/robot_description \
+  -r /joint_states:=/pan_tilt/joint_states
 ```
 
 Native command example:
@@ -127,7 +143,7 @@ Verified in this worktree on `2026-04-23` against `/dev/ttyUSB0`:
 
 - controller opens the real serial device and receives `T:1001` feedback
 - `/pan_tilt_controller/state` reports `connected: true` and `feedback_ok: true`
-- `/joint_states` tracks the hardware state
-- `base_link -> camera_link` resolves through the launch stack
+- `/pan_tilt/joint_states` tracks the hardware state
+- `base_link -> head_camera_link` resolves through the launch stack
 - relative and absolute commands both move the hardware
 - the launch stack now exits cleanly on `SIGINT`

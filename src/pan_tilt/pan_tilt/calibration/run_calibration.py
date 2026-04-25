@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -276,6 +277,62 @@ def cmd_handeye(args):
 
     out_name = getattr(args, "out_name", None) or "handeye.json"
     out_path = Path(args.out) / out_name
+
+    # T_ee_marker is the pose of the marker on the xArm flange — a fixed
+    # mechanical attachment. Both `handeye.json` (canonical 45° park) and
+    # `handeye_custom.json` (operator-chosen park) describe the SAME physical
+    # board, so their solved T_ee_markers must agree within solver noise.
+    # When they don't, it almost always means: (a) the board was re-mounted
+    # between collects, or (b) one of the two phase-1 sample files is stale
+    # (the operator forgot to re-collect after touching the EE/board). Either
+    # way, the downstream chain + polish silently produce huge errors.
+    # Catch it here, before anyone wastes 8 minutes on a poisoned solve.
+    sibling = "handeye_custom.json" if out_name == "handeye.json" else "handeye.json"
+    sibling_path = Path(args.out) / sibling
+    if sibling_path.is_file() and not getattr(args, "allow_t_ee_marker_mismatch", False):
+        try:
+            sib = json.loads(sibling_path.read_text())
+            em_sib = pose_to_matrix(
+                sib["t_ee_marker"]["translation"],
+                sib["t_ee_marker"]["rotation"],
+            )
+        except (KeyError, ValueError, OSError) as exc:
+            print(f"  [warn] could not read {sibling_path} for cross-check: {exc}")
+        else:
+            te, re_ = pose_error_scalars(t_ee_marker, em_sib)
+            if te > 0.005 or re_ > np.deg2rad(1.0):
+                import datetime as _dt
+                sib_mtime = _dt.datetime.fromtimestamp(
+                    sibling_path.stat().st_mtime
+                ).strftime('%Y-%m-%d %H:%M:%S')
+                phase1_path = Path(args.phase1)
+                phase1_mtime = _dt.datetime.fromtimestamp(
+                    phase1_path.stat().st_mtime
+                ).strftime('%Y-%m-%d %H:%M:%S') if phase1_path.is_file() else "?"
+                msg = (
+                    f"\nT_ee_marker sibling cross-check FAILED.\n"
+                    f"  new solve   ({out_name}, from {phase1_path.name} @ {phase1_mtime}):\n"
+                    f"    trans={np.round(t_ee_marker[:3,3],4).tolist()}\n"
+                    f"  sibling     ({sibling} @ {sib_mtime}):\n"
+                    f"    trans={np.round(em_sib[:3,3],4).tolist()}\n"
+                    f"  disagreement: {te*1000:.1f} mm trans, {np.degrees(re_):.2f} deg rot\n"
+                    f"  (gate: 5 mm / 1 deg)\n\n"
+                    f"T_ee_marker is the rigid pose of the marker on the EE flange — both\n"
+                    f"handeye solves describe the same physical board, so they must agree.\n"
+                    f"Likely causes:\n"
+                    f"  • One of the phase-1 sample files is stale (you re-collected one\n"
+                    f"    park pose but not the other). Check the mtimes above.\n"
+                    f"  • The board was re-mounted on the EE between collects.\n"
+                    f"Recovery:\n"
+                    f"  • Re-collect BOTH phase-1 datasets in one sitting without\n"
+                    f"    touching the board, the EE, or the xArm zero. Re-run handeye.\n"
+                    f"  • OR pass --allow-t-ee-marker-mismatch if you genuinely intended\n"
+                    f"    to remount (e.g. swapping marker boards for evaluation).\n"
+                    f"Refusing to write {out_path}; existing sibling file is untouched.\n"
+                )
+                print(msg)
+                sys.exit(2)
+
     _save_json(out_path, {
         "t_ee_marker": matrix_to_pose_dict(t_ee_marker),
         "t_base_cam_ref": matrix_to_pose_dict(t_base_cam_ref),
@@ -325,25 +382,52 @@ def cmd_chain(args):
     # back-solve uses the FK at the actual park pose, not firmware zero.
     park_pan = float(handeye.get("phase1_park_pan_rad", 0.0))
     park_tilt = float(handeye.get("phase1_park_tilt_rad", 0.0))
-    initial = warm_start_t_b_rotation(
-        PanTiltParams(), t_base_cam_ref,
-        park_pan_rad=park_pan, park_tilt_rad=park_tilt,
-    )
-    if args.verbose:
-        print(
-            f"T_B warm start: trans={np.round(initial.t_b_trans, 4)}  "
-            f"rotvec={np.round(initial.t_b_rotvec, 4)} "
-            f"(norm={np.linalg.norm(initial.t_b_rotvec):.3f} rad)"
-        )
 
-    params, report = fit_chain(
-        train,
-        t_ee_marker=t_ee_marker,
-        initial=initial,
-        fit_pan_offset=args.fit_pan_offset,
-        fit_tb_rotation=not args.lock_tb_rotation,
-        loss=args.loss,
-    )
+    # Two-basin warm-start. The pan axis is rotationally periodic: solutions
+    # with theta_p_offset = θ and (θ + π) are both kinematically valid because
+    # the same FK chain can be expressed by flipping pan sign and rotating T_B
+    # by 180° about Z. The handeye solver doesn't pin pan basin (it parks the
+    # head and only sees one pan angle), so the URDF-default seed at
+    # theta_p_off = 0 may land us in the wrong half of the kinematic torus on
+    # hardware where the firmware reports pan with the opposite sign of what
+    # the FK assumes. Symptom on bad-basin: locked-T_B chain rot RMSE ~20°.
+    # We try both basins (θ_p_off ∈ {0, π}), run a locked-T_B chain fit from
+    # each, and pick the lower-residual result. Cheap (two scipy.least_squares
+    # calls); robust against firmware sign conventions; no operator action.
+    candidates = []
+    for basin_label, theta_p_seed in [("basin0", 0.0), ("basinπ", np.pi)]:
+        seed_template = PanTiltParams(theta_p_offset=theta_p_seed)
+        warm = warm_start_t_b_rotation(
+            seed_template, t_base_cam_ref,
+            park_pan_rad=park_pan, park_tilt_rad=park_tilt,
+        )
+        if args.verbose:
+            print(
+                f"T_B warm start [{basin_label}]: trans={np.round(warm.t_b_trans, 4)}  "
+                f"rotvec={np.round(warm.t_b_rotvec, 4)} "
+                f"(norm={np.linalg.norm(warm.t_b_rotvec):.3f} rad)"
+            )
+        params_c, report_c = fit_chain(
+            train,
+            t_ee_marker=t_ee_marker,
+            initial=warm,
+            fit_pan_offset=args.fit_pan_offset,
+            fit_tb_rotation=args.unlock_tb_rotation,
+            loss=args.loss,
+        )
+        candidates.append((basin_label, warm, params_c, report_c))
+        print(
+            f"  {basin_label}:  trans_rmse {report_c.trans_rmse_m*1000:.2f} mm  "
+            f"rot_rmse {np.degrees(report_c.rot_rmse_rad):.3f} deg"
+        )
+    # Pick the basin with the lower rot residual. Trans residual alone isn't
+    # discriminative — a wrong-basin fit can still place the camera roughly
+    # in the right spot (chain has 7 DOF and trans contributes 3); but the
+    # rotation residual sits ~20° in the wrong basin and well under 1° in
+    # the right one, making it a clean separator.
+    best = min(candidates, key=lambda c: c[3].rot_rmse_rad)
+    basin_label, initial, params, report = best
+    print(f"Chosen basin: {basin_label}")
     print("TRAIN:", report.summary())
 
     _, val_report = fit_chain(
@@ -377,37 +461,131 @@ def cmd_chain(args):
         "per_sample_trans_err_m": report.trans_rmse_per_sample.tolist(),
         "per_sample_rot_err_rad": report.rot_rmse_per_sample.tolist(),
         "fit_pan_offset": args.fit_pan_offset,
-        "fit_tb_rotation": not args.lock_tb_rotation,
+        "fit_tb_rotation": args.unlock_tb_rotation,
         "handeye_source": str(Path(args.handeye)),
     })
     print(f"Wrote {out_path}")
 
 
 def cmd_polish(args):
-    phase1 = _load_samples(Path(args.phase1))
+    # Phase 1 supports concatenation of multiple datasets (e.g. canonical-park
+    # phase1_handeye.json + custom-park phase1_handeye_custom.json) so polish can
+    # exercise more EE-rotation diversity. Files concatenate in the order given
+    # to --phase1; that order is also the index basis for --exclude-indices.
+    phase1_paths = [Path(p) for p in args.phase1]
+    phase1: list[dict] = []
+    for p in phase1_paths:
+        phase1 += _load_samples(p)
     phase2 = _load_samples(Path(args.phase2))
     seed = _params_from_dict(json.loads(Path(args.seed).read_text())["params"])
 
     samples = phase1 + phase2
-    params, report = fit_joint(
-        samples,
-        initial=seed,
-        fit_tb_rotation=args.unlock_tb_rotation,
-        fit_pan_offset=args.fit_pan_offset,
-        loss=args.loss,
+    n_total = len(samples)
+    if len(phase1_paths) > 1:
+        print(f"Merged {len(phase1_paths)} phase-1 datasets ({len(phase1)} samples) "
+              f"+ phase 2 ({len(phase2)} samples) = {n_total} total")
+
+    # Manual exclusions first. Indices are zero-based into the concatenated
+    # `phase1 + phase2` array: the first len(phase1) are phase1, the rest are phase2.
+    # This is the operator's escape hatch when they already know which sample is bad
+    # (e.g. handeye flagged it).
+    exclude_set = set(int(i) for i in (args.exclude_indices or []))
+    bad = [i for i in exclude_set if i < 0 or i >= n_total]
+    if bad:
+        raise ValueError(
+            f"--exclude-indices values out of range [0,{n_total}): {sorted(bad)}"
+        )
+    rejected_manual = sorted(exclude_set)
+    if rejected_manual:
+        for gi in rejected_manual:
+            print(
+                f"  manual reject sample #{gi} "
+                f"({samples[gi].get('label','?')})"
+            )
+
+    keep_idx = np.array(
+        [i for i in range(n_total) if i not in exclude_set], dtype=int
     )
+
+    # Iterative MAD-sigma refinement. Mirrors the handeye loop above: solve,
+    # find the worst-residual sample, drop it if it exceeds the MAD threshold,
+    # re-solve. Stops when no sample is above threshold, the rejection cap is
+    # hit, or we'd drop below the safety floor for a joint fit.
+    reject_sigma = float(getattr(args, "reject_sigma", 3.0))
+    max_reject_frac = float(getattr(args, "max_reject_frac", 0.10))
+    do_reject = not bool(getattr(args, "no_reject", False))
+    rejected_auto: list[dict] = []
+    params = seed
+    report = None
+    while True:
+        kept = [samples[i] for i in keep_idx]
+        params, report = fit_joint(
+            kept,
+            initial=seed,
+            fit_tb_rotation=args.unlock_tb_rotation,
+            fit_pan_offset=args.fit_pan_offset,
+            loss=args.loss,
+        )
+        if not do_reject:
+            break
+        trans_e = np.asarray(report.trans_rmse_per_sample)
+        rot_e = np.asarray(report.rot_rmse_per_sample)
+        combined = np.sqrt(trans_e ** 2 + rot_e ** 2)
+        med = float(np.median(combined))
+        mad = float(np.median(np.abs(combined - med))) + 1e-9
+        threshold = med + reject_sigma * 1.4826 * mad
+        worst_local = int(np.argmax(combined))
+        if combined[worst_local] <= threshold:
+            break
+        n_dropped_total = len(rejected_auto) + len(rejected_manual)
+        if n_dropped_total >= int(max_reject_frac * n_total):
+            print(f"  MAD reject cap reached ({n_dropped_total}/{n_total}); stopping")
+            break
+        if len(keep_idx) - 1 < 8:
+            print(f"  MAD reject floor reached (kept={len(keep_idx)-1} < 8); stopping")
+            break
+        worst_global = int(keep_idx[worst_local])
+        rejected_auto.append({
+            "index": worst_global,
+            "label": samples[worst_global].get("label", "?"),
+            "trans_err_m": float(trans_e[worst_local]),
+            "rot_err_rad": float(rot_e[worst_local]),
+        })
+        keep_idx = np.delete(keep_idx, worst_local)
+        print(
+            f"  MAD reject sample #{worst_global} "
+            f"({samples[worst_global].get('label','?')}): residual "
+            f"{trans_e[worst_local]*1000:.1f} mm / "
+            f"{np.degrees(rot_e[worst_local]):.2f} deg "
+            f"(threshold {threshold*1000:.1f} mm-equiv)"
+        )
+
     print("POLISH:", report.summary())
+    if rejected_manual or rejected_auto:
+        print(
+            f"Polish dropped {len(rejected_manual) + len(rejected_auto)}/{n_total} "
+            f"samples ({len(rejected_manual)} manual + {len(rejected_auto)} MAD); "
+            f"final solve uses {len(keep_idx)}"
+        )
 
     out_path = Path(args.out) / "polish.json"
     _save_json(out_path, {
         "params": _params_to_dict(params),
         "trans_rmse_m": report.trans_rmse_m,
         "rot_rmse_rad": report.rot_rmse_rad,
-        "n_samples": len(samples),
+        "n_samples_total": n_total,
+        "n_samples_used": int(len(keep_idx)),
+        "kept_indices": keep_idx.tolist(),
+        "rejected_indices_manual": rejected_manual,
+        "rejected_indices_auto": rejected_auto,
         "per_sample_trans_err_m": report.trans_rmse_per_sample.tolist(),
         "per_sample_rot_err_rad": report.rot_rmse_per_sample.tolist(),
         "fit_tb_rotation": args.unlock_tb_rotation,
         "fit_pan_offset": args.fit_pan_offset,
+        "reject_sigma": reject_sigma,
+        "max_reject_frac": max_reject_frac,
+        "phase1_sources": [str(p) for p in phase1_paths],
+        "phase2_source": str(args.phase2),
     })
     print(f"Wrote {out_path}")
 
@@ -507,6 +685,11 @@ def main(argv=None):
                     help="Drop samples with per-frame reprojection RMS above N px (default 1.5).")
     ph.add_argument("--no-quality-gate", action="store_true",
                     help="Solve on every sample regardless of stored detection_quality / reproj.")
+    ph.add_argument("--allow-t-ee-marker-mismatch", action="store_true",
+                    help="Skip the T_ee_marker cross-check against the sibling handeye solve "
+                         "(handeye.json ↔ handeye_custom.json). Use only when intentionally "
+                         "re-mounting the board between collects (e.g. evaluating a different "
+                         "marker board) — otherwise this gate catches stale-phase-1-file mistakes.")
     ph.set_defaults(func=cmd_handeye)
 
     pc = sub.add_parser("chain", help="Phase 2: pan-tilt chain fit.")
@@ -514,22 +697,44 @@ def main(argv=None):
     pc.add_argument("--handeye", required=True)
     pc.add_argument("--out", default="results")
     pc.add_argument("--fit-pan-offset", action="store_true")
-    pc.add_argument("--lock-tb-rotation", action="store_true",
-                    help="freeze T_B rotation at init (default: fit it, since the "
-                         "physical camera mount has a ~90 deg twist vs the tilt arm)")
+    pc.add_argument("--unlock-tb-rotation", action="store_true",
+                    help="Fit T_B rotation in the chain phase (default: lock at warm-start). "
+                         "T_B rotation about the tilt-Y axis is degenerate with theta_t_offset "
+                         "during Phase-2-only fitting; the warm-start from Phase-1 anchors it. "
+                         "Unlock only for debugging or comparison runs; the joint polish phase "
+                         "is the right place to refine T_B rotation against Phase-1 data.")
     pc.add_argument("--loss", default="soft_l1")
     pc.add_argument("--val-seed", type=int, default=0)
     pc.add_argument("--verbose", action="store_true")
     pc.set_defaults(func=cmd_chain)
 
     pp = sub.add_parser("polish", help="Phase 3: joint refinement.")
-    pp.add_argument("phase1")
-    pp.add_argument("phase2")
+    pp.add_argument("--phase1", nargs="+", required=True,
+                    help="One or more phase-1 sample JSONs to concatenate. Use multiple "
+                         "to merge datasets collected at different park poses (e.g. "
+                         "phase1_handeye.json + phase1_handeye_custom.json) — extra "
+                         "EE-rotation diversity helps break the T_B(Y) ↔ theta_t_offset "
+                         "degeneracy when --unlock-tb-rotation is also set.")
+    pp.add_argument("--phase2", required=True,
+                    help="Phase-2 sample JSON (single file).")
     pp.add_argument("--seed", required=True)
     pp.add_argument("--out", default="results")
     pp.add_argument("--unlock-tb-rotation", action="store_true")
     pp.add_argument("--fit-pan-offset", action="store_true")
     pp.add_argument("--loss", default="soft_l1")
+    pp.add_argument("--exclude-indices", type=int, nargs="+", default=[],
+                    help="Manual indices into the concatenated (phase1 + phase2) sample array "
+                         "to drop before fitting. Indices [0..len(phase1)-1] are phase1; the "
+                         "rest are phase2. Use this when handeye already flagged a sample as "
+                         "an outlier (it does not propagate to polish automatically).")
+    pp.add_argument("--reject-sigma", type=float, default=3.0,
+                    help="MAD-sigma threshold for the iterative auto-rejection loop (default 3.0).")
+    pp.add_argument("--max-reject-frac", type=float, default=0.10,
+                    help="Cap on fraction of samples (manual + auto) that may be dropped "
+                         "(default 0.10). Once this is hit the loop stops even if the MAD "
+                         "threshold still flags samples.")
+    pp.add_argument("--no-reject", action="store_true",
+                    help="Disable the iterative MAD-sigma rejection. --exclude-indices still applies.")
     pp.set_defaults(func=cmd_polish)
 
     pv = sub.add_parser("validate", help="Check results against plan gates.")

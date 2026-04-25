@@ -895,6 +895,9 @@ const CALIB = {
   fileCache: {},
   prereqs: {},        // cmd -> required session-relative filenames
   collectEnabled: true,
+  // Last session-detail files map; used by the dataset-selector change
+  // handlers to re-evaluate run-button enablement without a server round-trip.
+  lastFiles: {},
 };
 
 const CALIB_LOG = $('#calib-log');
@@ -976,8 +979,10 @@ async function calibLoadSessionDetail(name) {
   const body = await r.json();
   if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
   const files = body.files || {};
+  CALIB.lastFiles = files;
   calibRenderFiles(files);
   calibRenderGates(body.gates || []);
+  calibRenderDatasetSelectors(files);
   calibApplyRunEnablement(files);
   // polish.json takes precedence over chain.json when both are present.
   const paramsSource = ['polish.json', 'chain.json'].find(f => files[f]?.exists) || null;
@@ -1003,13 +1008,27 @@ async function calibFetchFile(session, filename) {
 // ---- files table -----------------------------------------------------------
 
 const CALIB_TRACKED_FILES = [
-  {name: 'phase1_handeye.json', kind: 'collector'},
-  {name: 'phase2_chain.json',   kind: 'collector'},
-  {name: 'sanity.json',         kind: 'collector'},
-  {name: 'handeye.json',        kind: 'analyser'},
-  {name: 'chain.json',          kind: 'analyser'},
-  {name: 'polish.json',         kind: 'analyser'},
+  {name: 'phase1_handeye.json',        kind: 'collector'},
+  {name: 'phase1_handeye_custom.json', kind: 'collector'},
+  {name: 'phase2_chain.json',          kind: 'collector'},
+  {name: 'sanity.json',                kind: 'collector'},
+  {name: 'handeye.json',               kind: 'analyser'},
+  {name: 'handeye_custom.json',        kind: 'analyser'},
+  {name: 'chain.json',                 kind: 'analyser'},
+  {name: 'polish.json',                kind: 'analyser'},
 ];
+
+// Backend session-detail returns mtimes as Unix seconds; format them for the
+// dataset-selector labels so an operator who forgot to re-collect sees the
+// staleness immediately.
+function _calibRelTime(unixSec) {
+  if (!unixSec) return '';
+  const dt = (Date.now() / 1000) - unixSec;
+  if (dt < 90) return 'just now';
+  if (dt < 3600) return `${Math.round(dt/60)}m ago`;
+  if (dt < 86400) return `${Math.round(dt/3600)}h ago`;
+  return new Date(unixSec * 1000).toLocaleDateString();
+}
 
 function calibRenderFiles(files) {
   const root = $('#calib-files-table');
@@ -1130,14 +1149,32 @@ async function calibRun(cmd, flags) {
     if (!yes) return;
   }
   CALIB_LOG.textContent = '';
+  // Per-cmd dataset choices ride alongside `flags` in the POST body. The web
+  // backend slots these into the subprocess argv after validating them
+  // against an allowlist.
+  const reqBody = {session: CALIB.currentSession, cmd, flags};
+  let datasetSummary = '';
+  if (cmd === 'chain') {
+    const sel = document.getElementById('chain-handeye-select');
+    if (sel) {
+      reqBody.handeye = sel.value;
+      datasetSummary = ` --handeye ${sel.value}`;
+    }
+  } else if (cmd === 'polish') {
+    const phase1 = $$('#polish-phase1-checks input[type="checkbox"]:checked').map(i => i.value);
+    if (phase1.length) {
+      reqBody.phase1 = phase1;
+      datasetSummary = ` --phase1 ${phase1.join(' ')}`;
+    }
+  }
   const banner = cmd.startsWith('collect_')
     ? '$ ros2 run pan_tilt calibrate_collect --ros-args -p phase:=' + cmd.replace('collect_', '')
-    : '$ python -m pan_tilt.calibration.run_calibration ' + cmd + ' ' + flags.join(' ');
+    : '$ python -m pan_tilt.calibration.run_calibration ' + cmd + datasetSummary + ' ' + flags.join(' ');
   calibLogAppend(banner, 'log-start');
   try {
     const r = await fetch('/api/calib/run', {
       method: 'POST', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({session: CALIB.currentSession, cmd, flags}),
+      body: JSON.stringify(reqBody),
     });
     const body = await r.json();
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
@@ -1153,6 +1190,21 @@ $$('#calib-run-buttons button[data-calib-cmd], #calib-run-buttons-collect button
     const cmd = b.dataset.calibCmd;
     const flags = (b.dataset.calibFlags || '').split(/\s+/).filter(Boolean);
     calibRun(cmd, flags);
+  });
+});
+
+// Re-evaluate run-button enablement when the dataset selectors change. The
+// underlying `files` map only refreshes on session-detail load, so we cache
+// it in CALIB.lastFiles and feed it back to calibApplyRunEnablement here.
+const _chainHandeyeSel = document.getElementById('chain-handeye-select');
+if (_chainHandeyeSel) {
+  _chainHandeyeSel.addEventListener('change', () => {
+    calibApplyRunEnablement(CALIB.lastFiles || {});
+  });
+}
+$$('#polish-phase1-checks input[type="checkbox"]').forEach(cb => {
+  cb.addEventListener('change', () => {
+    calibApplyRunEnablement(CALIB.lastFiles || {});
   });
 });
 
@@ -1546,27 +1598,51 @@ function _colorizeDiff(diff) {
   }).join('\n');
 }
 
-$('#calib-urdf-copy').addEventListener('click', async () => {
+$('#calib-urdf-apply-btn').addEventListener('click', async () => {
+  if (!CALIB.currentSession) {
+    $('#calib-urdf-status').textContent = 'pick a session first';
+    $('#calib-urdf-status').className = 'status-line warn';
+    return;
+  }
   const xacroPath = $('#calib-urdf-target').value;
+  if (!xacroPath) {
+    $('#calib-urdf-status').textContent = 'pick a URDF target first';
+    $('#calib-urdf-status').className = 'status-line warn';
+    return;
+  }
   const target = CALIB.urdfTargets.find(t => t.path === xacroPath);
-  const pkg = target?.build_package || 'pan_tilt';
   const resultsFile = $('#calib-urdf-results').value || 'polish.json';
-  const sessionPath = CALIB.currentSession ? `<session>/${resultsFile}` : `<path/to/${resultsFile}>`;
-  const cmds = [
-    '# Review the diff above, then (from the workspace root):',
-    `#   edit ${xacroPath} by hand OR use apply_to_urdf.py --out <path> and mv.`,
-    `python -m pan_tilt.calibration.apply_to_urdf --results ${sessionPath} --xacro ${xacroPath} --out ${xacroPath}.patched`,
-    `mv ${xacroPath}.patched ${xacroPath}`,
-    `./src/tk26_vision/scripts/build.sh --packages-select ${pkg}`,
-    `source install/setup.bash`,
-  ].join('\n');
+  const statusEl = $('#calib-urdf-status');
+  const rebuildEl = $('#calib-urdf-rebuild');
+  rebuildEl.hidden = true;
+  statusEl.textContent = 'applying…';
+  statusEl.className = 'status-line warn';
   try {
-    await navigator.clipboard.writeText(cmds);
-    $('#calib-urdf-status').textContent = 'apply commands copied to clipboard';
-    $('#calib-urdf-status').className = 'status-line ok';
+    const r = await fetch('/api/calib/urdf_apply', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({session: CALIB.currentSession, xacro_path: xacroPath, results_file: resultsFile}),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
+    if (!body.applied) {
+      statusEl.textContent = body.reason || 'no change — xacro already matches calibration';
+      statusEl.className = 'status-line ok';
+      return;
+    }
+    statusEl.textContent = `patched ${target?.label || xacroPath} — rebuild required`;
+    statusEl.className = 'status-line ok';
+    $('#calib-urdf-rebuild-cmd').textContent = body.build_command || '';
+    $('#calib-urdf-rebuild-hint').textContent = body.workspace_hint || '';
+    $('#calib-urdf-backup-hint').textContent = body.backup_path
+      ? `Backup: ${body.backup_path}`
+      : '';
+    rebuildEl.hidden = false;
+    if (body.diff_preview) {
+      $('#calib-urdf-diff').innerHTML = _colorizeDiff(body.diff_preview);
+    }
   } catch (e) {
-    $('#calib-urdf-status').textContent = 'clipboard failed: ' + e;
-    $('#calib-urdf-status').className = 'status-line err';
+    statusEl.textContent = 'FAIL: ' + e.message;
+    statusEl.className = 'status-line err';
   }
 });
 
@@ -1597,14 +1673,93 @@ function calibApplyRunEnablement(files) {
     }
     const prereqs = CALIB.prereqs[cmd] || [];
     const missing = prereqs.filter(f => !((files[f] || {}).exists));
-    if (missing.length > 0) {
+    // Dynamic prereqs: chain and polish accept per-request input choices, so
+    // their enablement depends on current selector state in addition to the
+    // static prereq list. Re-run on every dropdown / checkbox change.
+    const dynMissing = calibDynamicPrereqs(cmd, files);
+    const allMissing = missing.concat(dynMissing);
+    if (allMissing.length > 0) {
       b.disabled = true;
-      b.title = 'needs ' + missing.join(', ') + ' in the session first';
+      b.title = 'needs ' + allMissing.join(', ') + ' in the session first';
     } else {
       b.disabled = false;
       b.title = '';
     }
   });
+}
+
+function calibDynamicPrereqs(cmd, files) {
+  if (cmd === 'chain') {
+    const sel = $('#chain-handeye-select');
+    const chosen = sel ? sel.value : 'handeye.json';
+    return ((files[chosen] || {}).exists) ? [] : [chosen];
+  }
+  if (cmd === 'polish') {
+    const phase1 = $$('#polish-phase1-checks input[type="checkbox"]:checked')
+      .map(i => i.value);
+    const missing = [];
+    if (phase1.length === 0) missing.push('(at least one phase-1 dataset)');
+    for (const f of phase1) {
+      if (!((files[f] || {}).exists)) missing.push(f);
+    }
+    if (!((files['chain.json'] || {}).exists)) missing.push('chain.json');
+    return missing;
+  }
+  return [];
+}
+
+function calibRenderDatasetSelectors(files) {
+  // Disable / un-disable each option based on whether its file exists in the
+  // current session. Don't auto-rewrite checked state for the dropdown — keep
+  // operator's last selection if still valid; otherwise fall back to first
+  // enabled option. Also append a relative-time badge so an operator who
+  // forgot to re-collect sees "5h ago" next to a stale option.
+  const sel = $('#chain-handeye-select');
+  if (sel) {
+    let firstEnabled = null;
+    Array.from(sel.options).forEach(opt => {
+      const info = files[opt.value] || {};
+      const exists = !!info.exists;
+      opt.disabled = !exists;
+      // Cache original label once so re-renders don't accumulate badges.
+      if (!opt.dataset.baseLabel) opt.dataset.baseLabel = opt.text;
+      const stamp = exists ? _calibRelTime(info.mtime) : 'missing';
+      opt.text = stamp ? `${opt.dataset.baseLabel} — ${stamp}` : opt.dataset.baseLabel;
+      if (exists && firstEnabled === null) firstEnabled = opt.value;
+    });
+    if (sel.options[sel.selectedIndex]?.disabled && firstEnabled) {
+      sel.value = firstEnabled;
+    }
+  }
+  const checks = $$('#polish-phase1-checks input[type="checkbox"]');
+  let anyChecked = false;
+  checks.forEach(cb => {
+    const info = files[cb.value] || {};
+    const exists = !!info.exists;
+    cb.disabled = !exists;
+    if (cb.checked && !exists) cb.checked = false;
+    if (cb.checked) anyChecked = true;
+    // Replace the text node that follows the checkbox with "<base> — <when>".
+    const lbl = cb.parentElement;
+    if (lbl) {
+      if (!lbl.dataset.baseLabel) {
+        // First render — capture the original label content (text after the input).
+        const baseText = (lbl.textContent || '').trim();
+        lbl.dataset.baseLabel = baseText;
+      }
+      const stamp = exists ? _calibRelTime(info.mtime) : 'missing';
+      // Rebuild: keep the input element, drop other children, add fresh text.
+      while (lbl.childNodes.length > 1) lbl.removeChild(lbl.lastChild);
+      lbl.appendChild(document.createTextNode(
+        stamp ? ` ${lbl.dataset.baseLabel} — ${stamp}` : ` ${lbl.dataset.baseLabel}`
+      ));
+    }
+  });
+  // If nothing is checked but a dataset is available, default-check the first.
+  if (!anyChecked) {
+    const firstAvailable = checks.find(cb => !cb.disabled);
+    if (firstAvailable) firstAvailable.checked = true;
+  }
 }
 
 // ---- prune (preview-then-apply) -------------------------------------------

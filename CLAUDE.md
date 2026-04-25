@@ -166,12 +166,28 @@ Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13�
    python -m pan_tilt.calibration.run_calibration chain  calib_out/phase2_chain.json --handeye calib_out/handeye.json --fit-pan-offset --out calib_out
    python -m pan_tilt.calibration.run_calibration validate calib_out
    ```
-   The chain step warm-starts T_B from the Phase-1 `Z₀`, which handles the ~90° mount angle automatically. T_B rotation stays frozen through the chain fit to avoid the `T_B(Y) ↔ θ_t_offset` degeneracy.
+   The chain step warm-starts T_B from the Phase-1 `Z₀`, which handles the ~90° (about Y) mount rotation automatically. T_B rotation is **locked by default** through the chain fit to avoid the `T_B(Y) ↔ θ_t_offset` degeneracy; pass `--unlock-tb-rotation` only for debugging or comparison runs. To run chain against the custom-park solve instead of the canonical one, swap `--handeye calib_out/handeye_custom.json`.
 
-   Optional polish (unlocks T_B rotation):
+   Optional polish (unlocks T_B rotation; auto-rejects MAD-sigma outliers like handeye does):
    ```bash
-   python -m pan_tilt.calibration.run_calibration polish calib_out/phase1_handeye.json calib_out/phase2_chain.json --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
+   python -m pan_tilt.calibration.run_calibration polish \
+     --phase1 calib_out/phase1_handeye.json \
+     --phase2 calib_out/phase2_chain.json \
+     --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
    ```
+   Pass multiple `--phase1` files to concatenate datasets collected at different park poses — the extra EE-rotation diversity helps the joint fit, and is the recommended polish input when both `phase1_handeye.json` and `phase1_handeye_custom.json` exist:
+   ```bash
+   python -m pan_tilt.calibration.run_calibration polish \
+     --phase1 calib_out/phase1_handeye.json calib_out/phase1_handeye_custom.json \
+     --phase2 calib_out/phase2_chain.json \
+     --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
+   ```
+   Polish flags:
+   - `--phase1 PATH [PATH ...]` (required) — one or more phase-1 sample JSONs concatenated in argument order. `--exclude-indices` indexes into this concatenated array (phase1 first, then phase2).
+   - `--phase2 PATH` (required).
+   - `--exclude-indices N [N ...]` — drop manually-known-bad samples up front. Use this to propagate handeye's `rejected_sample_indices` across phases.
+   - `--reject-sigma` (default 3.0), `--max-reject-frac` (default 0.10) — control the iterative MAD-sigma rejection loop.
+   - `--no-reject` — skip auto rejection entirely; manual `--exclude-indices` still applies.
 6. **Emit URDF diff.** The patcher auto-detects both xacro layouts: the `tk25_basic` macro form at `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` (the authoritative URDF the main robot bringup loads — patches `attach_xyz` default + `camera_mount_joint` origin) and the `tk26_vision` standalone form at `src/pan_tilt/urdf/pan_tilt.urdf.xacro` (used by `pan_tilt.launch.py` for dev bringup). Run `python -m pan_tilt.calibration.apply_to_urdf --results calib_out/chain.json --xacro <path>` against **both** so RViz and the live robot stay consistent, and apply the diffs manually once reviewed.
 
 ### Phase gates
@@ -180,6 +196,8 @@ Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13�
 - Hand-eye trans RMSE < 3 mm, rot RMSE < 0.5°
 - Chain held-out trans RMSE < 3 mm, rot RMSE < 0.4°
 - Sanity-pose bracket (start vs end) < 2 mm / 0.2°
+
+> **Don't move the board between phase-1 collects.** `T_ee_marker` is the rigid pose of the marker on the EE flange — both `handeye.json` (canonical 45°) and `handeye_custom.json` (operator-chosen park) describe the *same* physical board, so the two solves must agree. The handeye solver cross-checks them and refuses to write if they disagree by more than 5 mm / 1°. Recovery: re-collect *both* phase-1 datasets in one sitting without touching the board, the EE, or the xArm zero. If you intentionally remounted the board (e.g. swapping marker prints for evaluation), pass `--allow-t-ee-marker-mismatch` on the handeye CLI to bypass the gate.
 
 ### Robustness measures baked in
 

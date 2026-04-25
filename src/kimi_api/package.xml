@@ -17,11 +17,6 @@
   <depend>cv_bridge</depend>
   <depend>message_filters</depend>
   <depend>vision_util</depend>
-  <!-- seat_recommend_bbox optionally calls /object_detection_generalist for
-       person-mask exclusion. No package dep: object_detection_generalist
-       already exec_depends on kimi_api (for _env.py), so a forward dep
-       would cycle. The srv type is available via tinker_vision_msgs_26. -->
-
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

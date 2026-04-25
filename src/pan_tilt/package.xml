@@ -20,6 +20,7 @@
   <depend>geometry_msgs</depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>xacro</exec_depend>
+  <exec_depend>tinker_urdf</exec_depend>
   <exec_depend>vision_util</exec_depend>
   <exec_depend>tinker_arm_msgs</exec_depend>
 

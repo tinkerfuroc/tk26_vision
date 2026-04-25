@@ -72,9 +72,19 @@ ros2 run pan_tilt controller --ros-args -p device:=/dev/ttyUSB0
 ros2 run pan_tilt state_publisher --ros-args \
   -p joint_state_topic:=/pan_tilt/joint_states
 ros2 run robot_state_publisher robot_state_publisher \
-  --ros-args -p robot_description:="$(xacro src/pan_tilt/urdf/pan_tilt.urdf.xacro)" \
-  -r /robot_description:=/pan_tilt/robot_description \
-  -r /joint_states:=/pan_tilt/joint_states
+  --ros-args -p robot_description:="$(xacro $(ros2 pkg prefix tinker_urdf)/share/tinker_urdf/src/pan_tilt_standalone.urdf.xacro)"
+```
+
+Running alongside `grasp_bringup` (combined xArm + pan-tilt): the MoveIt
+pipeline in `grasp_bringup.launch.py` already publishes the merged
+`mobile_manipulator` URDF (which now contains the pan-tilt chain), so
+`pan_tilt.launch.py` must not start a second `robot_state_publisher`. Pass
+`launch_robot_state_publisher:=false`:
+
+```bash
+ros2 launch mobile_bringup grasp_bringup.launch.py   # terminal 1
+ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0 \
+    launch_robot_state_publisher:=false              # terminal 2
 ```
 
 Native command example:
@@ -88,7 +98,15 @@ ros2 topic pub --once /pan_tilt_controller/cmd \
 ## Runtime Configuration
 
 - Runtime parameters live in [config/pan_tilt.yaml](./config/pan_tilt.yaml).
-- Runtime geometry lives in [urdf/pan_tilt.urdf.xacro](./urdf/pan_tilt.urdf.xacro).
+- Runtime geometry lives in `tinker_urdf`:
+  `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` is a
+  `pan_tilt_macro` (parent / prefix / attach_xyz / attach_rpy);
+  `pan_tilt_standalone.urdf.xacro` is the standalone wrapper this launch
+  loads, and `tracer_mini_manipulator.urdf.xacro` includes the same macro
+  with `parent="base_link"` for the combined `mobile_manipulator` URDF.
+  The geometry lives in `tinker_urdf` so the robot-description package does
+  not gain a runtime dependency on `pan_tilt`; `pan_tilt` depends on
+  `tinker_urdf` instead.
 - `config/specs.json` is retained as historical calibration/reference data only.
   The runtime stack does not load it anymore.
 

@@ -196,6 +196,7 @@ Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13�
 - Hand-eye trans RMSE < 3 mm, rot RMSE < 0.5°
 - Chain held-out trans RMSE < 3 mm, rot RMSE < 0.4°
 - Sanity-pose bracket (start vs end) < 2 mm / 0.2°
+- **Phase 4 end-to-end** (recommended after polish, before `apply_to_urdf`): self-consistency trans RMSE < 5 mm / rot RMSE < 0.5° (PASS), 10 mm / 1° (WARN). xArm-independent: place a ChArUco board anywhere stationary in `base_link` (tripod, fixture, taped to a wall), sweep the pan-tilt over N held-out `(θ_p, θ_t)`, and check that the base-frame marker pose is consistent across views. `python -m pan_tilt.calibration.run_calibration validate --phase4 phase4_validation.json --params polish.json --out <session>` — see `src/pan_tilt/pan_tilt/calibration/readme.md § Phase 4`.
 
 > **Don't move the board between phase-1 collects.** `T_ee_marker` is the rigid pose of the marker on the EE flange — both `handeye.json` (canonical 45°) and `handeye_custom.json` (operator-chosen park) describe the *same* physical board, so the two solves must agree. The handeye solver cross-checks them and refuses to write if they disagree by more than 5 mm / 1°. Recovery: re-collect *both* phase-1 datasets in one sitting without touching the board, the EE, or the xArm zero. If you intentionally remounted the board (e.g. swapping marker prints for evaluation), pass `--allow-t-ee-marker-mismatch` on the handeye CLI to bypass the gate.
 

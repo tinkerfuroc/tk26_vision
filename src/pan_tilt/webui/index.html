@@ -272,8 +272,27 @@
       <div class="joint-controls" id="calib-run-buttons">
         <button data-calib-cmd="handeye" type="button">handeye</button>
         <button data-calib-cmd="handeye_custom" type="button">handeye (custom)</button>
-        <button data-calib-cmd="chain" data-calib-flags="--fit-pan-offset" type="button">chain (+pan off)</button>
-        <button data-calib-cmd="polish" data-calib-flags="--unlock-tb-rotation" type="button">polish</button>
+
+        <span class="calib-cmd-group">
+          <label>handeye:
+            <select id="chain-handeye-select" title="Which handeye output the chain solver consumes.">
+              <option value="handeye.json" selected>handeye.json</option>
+              <option value="handeye_custom.json">handeye_custom.json</option>
+            </select>
+          </label>
+          <button data-calib-cmd="chain" data-calib-flags="--fit-pan-offset" type="button">chain (+pan off)</button>
+        </span>
+
+        <span class="calib-cmd-group">
+          <label>phase 1:
+            <span id="polish-phase1-checks" class="calib-multi" title="Phase-1 datasets to merge for polish (all checked are concatenated).">
+              <label><input type="checkbox" value="phase1_handeye.json" checked> level</label>
+              <label><input type="checkbox" value="phase1_handeye_custom.json"> custom</label>
+            </span>
+          </label>
+          <button data-calib-cmd="polish" data-calib-flags="--unlock-tb-rotation" type="button">polish</button>
+        </span>
+
         <button data-calib-cmd="validate" type="button">validate</button>
         <button id="calib-cancel-btn" type="button" disabled>cancel</button>
       </div>
@@ -343,10 +362,16 @@
           <option value="chain.json">chain.json</option>
         </select>
         <button id="calib-urdf-diff-btn" type="button">Show diff</button>
-        <button id="calib-urdf-copy" type="button">Copy apply commands</button>
+        <button id="calib-urdf-apply-btn" type="button">Apply patch</button>
       </div>
       <p id="calib-urdf-status" class="status-line"></p>
       <pre id="calib-urdf-diff" class="calib-diff">(no diff yet)</pre>
+      <div id="calib-urdf-rebuild" class="rebuild-prompt" hidden>
+        <p><b>Patch written.</b> Rebuild the package so the new geometry is loaded:</p>
+        <pre id="calib-urdf-rebuild-cmd"></pre>
+        <p class="muted" id="calib-urdf-rebuild-hint"></p>
+        <p class="muted" id="calib-urdf-backup-hint"></p>
+      </div>
     </section>
 
     <!-- ---------- Prune tab ---------- -->

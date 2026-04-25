@@ -175,17 +175,36 @@ python -m pan_tilt.calibration.run_calibration handeye \
 # Gate: < 3 mm / 0.5 deg.
 
 # Phase 2: chain fit (warm-starts T_B from Phase 1's Z_0).
+# T_B rotation is **locked** by default at the warm-start — it's degenerate
+# with theta_t_offset on the Y axis, so freezing it is the well-posed choice.
+# To override (debugging, comparison runs), pass --unlock-tb-rotation.
+# The solver tries TWO warm-start basins (theta_p_offset ∈ {0, π}) and picks
+# whichever has the lower rot RMSE — fixes the silent wrong-basin failure
+# on hardware whose pan firmware sign is opposite the FK assumption. The
+# chosen basin is printed alongside the residuals.
 python -m pan_tilt.calibration.run_calibration chain \
     phase2_chain.json --handeye handeye.json \
     --fit-pan-offset --verbose --out .
-# Prints training + validation residuals.
+# Prints training + validation residuals + the chosen pan basin.
 # Gate: val_trans_rmse_m < 0.003, val_rot_rmse_rad < 0.007 (< 3 mm / 0.4 deg).
 
-# (Optional) Phase 3: joint polish. Unlock T_B rotation now that Phase-1 data
-# is in the mix to break the Y-rotation degeneracy.
+# To run chain against the custom-park solve instead of the canonical one,
+# point --handeye at handeye_custom.json — the solver is otherwise identical.
+
+# (Optional) Phase 3: joint polish. Pass --unlock-tb-rotation now that Phase-1
+# data is in the mix and breaks the Y-rotation degeneracy.
 python -m pan_tilt.calibration.run_calibration polish \
-    phase1_handeye.json phase2_chain.json \
+    --phase1 phase1_handeye.json \
+    --phase2 phase2_chain.json \
     --seed chain.json \
+    --unlock-tb-rotation --fit-pan-offset --out .
+
+# To merge both phase-1 batches (canonical + custom park), pass them in
+# argument order to --phase1. Concatenated samples gain EE-rotation
+# diversity that further breaks the T_B(Y) ↔ theta_t_offset degeneracy:
+python -m pan_tilt.calibration.run_calibration polish \
+    --phase1 phase1_handeye.json phase1_handeye_custom.json \
+    --phase2 phase2_chain.json --seed chain.json \
     --unlock-tb-rotation --fit-pan-offset --out .
 
 # Check all gates in one go.
@@ -193,6 +212,14 @@ python -m pan_tilt.calibration.run_calibration validate .
 ```
 
 Only run polish if Phase-2 residuals show *structured* (non-random) pattern — e.g., rotation error that grows with |tilt|. If Phase-2 residuals already meet the gate, polish adds marginal value and can find worse local minima.
+
+**Polish outlier handling.** Polish auto-rejects samples whose joint-fit residual exceeds the median + N·MAD (mirrors the handeye solver). Tunable knobs:
+- `--reject-sigma 3.0` — MAD threshold; lower = stricter.
+- `--max-reject-frac 0.10` — cap on fraction of samples that may be auto-dropped.
+- `--no-reject` — disable the loop; manual exclusions still apply.
+- `--exclude-indices N [N ...]` — drop specified indices into the concatenated `(phase1 + phase2)` array up front (zero-based; `phase1` occupies the first `len(phase1)` slots, in argument order). Use this when handeye flagged a sample as an outlier — it doesn't propagate to polish automatically.
+
+The output `polish.json` records `phase1_sources`, `kept_indices`, `rejected_indices_manual`, and `rejected_indices_auto` so the run is self-describing.
 
 ### 8. Review the URDF patch
 
@@ -255,8 +282,11 @@ Restart the robot stack.
 | Phase 1 hand-eye RMSE > 5 mm | Insufficient orientation diversity, or flexing mount | Recapture with ≥ 60° orientation change between consecutive poses; re-tighten board mount |
 | Phase 2 chain RMSE much worse than Phase 1 | Backlash, servo zero drift, or tilt-range too narrow | Check `tilt_grid_deg` spans ≥ ±25°; ensure each grid cell uses overshoot-return (default); run a sanity bracket |
 | Chain fit `theta_t_offset` differs from −π/4 by >> 1° | Zero-set (`T:502`) was not where you thought it was | This is normal and what `theta_t_offset` is for. Fitted value is authoritative |
+| Chain fit `theta_p_offset` lands near ±180° | Two-basin warm-start picked the π basin — pan firmware sign is opposite the FK convention on this hardware | Not a problem; the chosen basin is logged at run time. Both basins are fitted; only the better one is saved |
 | Chain fit `t_b_rotvec` norm ≈ 1.57 rad | Expected: the ~90° physical mount | Not a problem. The warm-start put it there on purpose |
 | Polish residuals worse than chain residuals | Local minimum in the joint fit; T_B rotation unlock found an alias | Re-run polish with `--fit-pan-offset` off; or trust `chain.json` and skip polish |
+| `handeye` aborts with "T_ee_marker sibling cross-check FAILED" | Either a stale `phase1_handeye.json` (you re-collected one park but not the other) or the board was re-mounted between collects — disagreement > 5 mm / 1° | Re-collect both phase-1 datasets in one sitting without touching the board / EE / xArm zero; or pass `--allow-t-ee-marker-mismatch` if you genuinely intended to remount |
+| Polish trans RMSE huge (~250 mm) and rot residual ~30° | Almost always: chain seed was in the wrong pan basin (was a problem before the two-basin warm-start; if you see this now it usually means the seed `chain.json` is from a stale run) | Re-run chain — the new run will auto-pick the correct basin |
 | Envelope violation errors | A recorded xArm waypoint puts the EE inside the mast exclusion or below the floor | Re-record that waypoint in RViz; or widen `safety.z_floor_m` / `safety.mast_radius_m` if the envelope is too tight for your geometry |
 
 ## Running the synthetic regression tests

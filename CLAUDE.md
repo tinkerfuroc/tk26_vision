@@ -166,7 +166,7 @@ Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13�
    python -m pan_tilt.calibration.run_calibration chain  calib_out/phase2_chain.json --handeye calib_out/handeye.json --fit-pan-offset --out calib_out
    python -m pan_tilt.calibration.run_calibration validate calib_out
    ```
-   The chain step warm-starts T_B from the Phase-1 `Z₀`, which handles the ~90° (about Y) mount rotation automatically. T_B rotation is **locked by default** through the chain fit to avoid the `T_B(Y) ↔ θ_t_offset` degeneracy; pass `--unlock-tb-rotation` only for debugging or comparison runs. To run chain against the custom-park solve instead of the canonical one, swap `--handeye calib_out/handeye_custom.json`.
+   The chain step warm-starts T_B from the Phase-1 `Z₀`, which handles the ~90° (about Y) mount rotation automatically. T_B rotation is **locked by default** through the chain fit to avoid the `T_B(Y) ↔ θ_t_offset` degeneracy; pass `--unlock-tb-rotation` only for debugging or comparison runs. The chain solver auto-tries **two warm-start basins** (`θ_p_offset ∈ {0, π}`) and saves the lower-rot-RMSE result — fixes the silent wrong-basin failure on hardware whose pan firmware sign is opposite the FK assumption (symptom: locked-T_B chain rot RMSE stuck at ~20°). The chosen basin is printed alongside residuals. To run chain against the custom-park solve instead of the canonical one, swap `--handeye calib_out/handeye_custom.json`.
 
    Optional polish (unlocks T_B rotation; auto-rejects MAD-sigma outliers like handeye does):
    ```bash

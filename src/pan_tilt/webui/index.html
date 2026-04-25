@@ -266,6 +266,7 @@
         <button data-calib-cmd="collect_phase2"        type="button">Collect Phase 2 (sweep)</button>
         <button data-calib-cmd="collect_sanity"      type="button">Collect sanity pose</button>
         <button data-calib-cmd="collect_both"        type="button">Collect all (1 + 2 + sanity)</button>
+        <button data-calib-cmd="collect_phase4_validation" type="button" title="Phase 4 (xArm-independent): place a ChArUco board anywhere stationary in base_link, then sweep the pan-tilt across N (pan, tilt) poses and capture ChArUco at each. The validate analyzer checks that the FK chain projects the marker to a consistent base-frame pose across views.">Collect Phase 4 (validation sweep — xArm-free)</button>
       </div>
 
       <h2>2 · Analyse — file-only, fast</h2>
@@ -293,8 +294,25 @@
           <button data-calib-cmd="polish" data-calib-flags="--unlock-tb-rotation" type="button">polish</button>
         </span>
 
-        <button data-calib-cmd="validate" type="button">validate</button>
+        <span class="calib-cmd-group">
+          <label>params:
+            <select id="validate-params-select" title="Which params (polish.json preferred, chain.json fallback) to validate end-to-end.">
+              <option value="polish.json" selected>polish.json</option>
+              <option value="chain.json">chain.json</option>
+            </select>
+          </label>
+          <button data-calib-cmd="validate" type="button" title="Phase 4: pan-tilt sweep against a board fixed in base_link. xArm-independent.">validate (Phase 4)</button>
+        </span>
         <button id="calib-cancel-btn" type="button" disabled>cancel</button>
+      </div>
+      <div id="calib-validate-panel" class="calib-validate-panel" hidden>
+        <h3>Phase 4 verdict</h3>
+        <p class="muted">End-to-end self-consistency of base-frame marker pose across the validation sweep.</p>
+        <p>
+          <span id="calib-validate-verdict" class="calib-verdict-pill">—</span>
+          <span id="calib-validate-summary" class="muted"></span>
+        </p>
+        <table class="kv" id="calib-validate-metrics"></table>
       </div>
       <pre id="calib-log" class="calib-log">(no runs yet)</pre>
 

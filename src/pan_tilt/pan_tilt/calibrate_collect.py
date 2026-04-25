@@ -227,6 +227,23 @@ class CollectConfig:
     pantilt_speed_raw: int = 120
     pantilt_accel_raw: int = 20
 
+    # ---- Phase 4: end-to-end validation -----------------------------------
+    # Phase 4 expects a ChArUco board fixed in `base_link` (e.g. mounted on a
+    # tripod, taped to a fixture, sitting on a table — anywhere stationary
+    # within the camera's reachable FoV). The xArm is irrelevant: this phase
+    # neither commands JointMove nor reads link_eef TF. The pan-tilt sweeps
+    # across N (pan, tilt) poses; downstream `validate` then checks that the
+    # FK chain projects the marker to a consistent base_link pose across
+    # views.
+    #
+    # 5 corners + center are always included for coverage; remaining samples
+    # are uniform-random within (pan_range, tilt_range). Defaults to the
+    # convex hull of pan_grid_deg/tilt_grid_deg if unset.
+    n_validation_samples: int = 20
+    validation_seed: int = 0
+    validation_pan_range_deg: list = field(default_factory=list)   # [min, max]
+    validation_tilt_range_deg: list = field(default_factory=list)  # [min, max]
+
 
 def _load_config(path: Optional[str]) -> CollectConfig:
     cfg = CollectConfig()
@@ -259,7 +276,7 @@ class CalibrateCollectNode(Node):
 
         self.declare_parameter("config", "")
         self.declare_parameter("out_dir", "calibration_data")
-        self.declare_parameter("phase", "both")  # both | phase1 | phase2 | sanity
+        self.declare_parameter("phase", "both")  # both | phase1 | phase1_custom | phase2 | sanity | phase4_validation | dry_run
 
         config_path = self.get_parameter("config").value or None
         self._cfg = _load_config(config_path)
@@ -787,8 +804,8 @@ class CalibrateCollectNode(Node):
             [tf_msg.transform.rotation.x, tf_msg.transform.rotation.y, tf_msg.transform.rotation.z, tf_msg.transform.rotation.w],
         )
 
-    def _capture_cell(self, log_label: str) -> Optional[dict]:
-        """Capture N frames at the current (pan-tilt, xArm) state and assemble a sample dict.
+    def _capture_cell(self, log_label: str, *, require_ee: bool = True) -> Optional[dict]:
+        """Capture N frames at the current pan-tilt state and assemble a sample dict.
 
         Order of operations:
           1. Confirm pt feedback is healthy.
@@ -796,10 +813,17 @@ class CalibrateCollectNode(Node):
              to stop moving (replaces the old fixed pre_capture_quiet_sec).
              This is what catches mechanical ring-down + post-settle exposure
              drift; it's the load-bearing gate against duplicate-EE samples.
-          3. Lookup base→ee TF (this is the canonical T_base_ee for the sample).
+          3. (require_ee=True only) Lookup base→ee TF for the canonical
+             T_base_ee; phase-1/phase-2/sanity all need this because the
+             marker is on the EE.
           4. Capture frames; cluster_consensus picks the dominant pose.
-          5. Re-lookup base→ee; reject the sample if the EE drifted during
-             capture (arm was still moving while we collected frames).
+          5. (require_ee=True only) Re-lookup base→ee; reject if the EE
+             drifted during capture.
+
+        Phase 4 uses require_ee=False — the marker is fixed in base_link
+        (e.g. mounted on a tripod or fixture), so there's no EE pose to
+        record and no EE drift to guard against. The xArm need not even be
+        running. Output sample has no `t_base_ee` field in that mode.
         """
         pt_state = self._get_pt_state()
         if pt_state is None or not pt_state.feedback_ok:
@@ -813,9 +837,12 @@ class CalibrateCollectNode(Node):
             )
             return None
 
-        T_base_ee = self._lookup_base_ee(log_label)
-        if T_base_ee is None:
-            return None
+        if require_ee:
+            T_base_ee = self._lookup_base_ee(log_label)
+            if T_base_ee is None:
+                return None
+        else:
+            T_base_ee = None
 
         detections = []
         per_image_stamps_ns: list[tuple[int, int]] = []
@@ -888,27 +915,27 @@ class CalibrateCollectNode(Node):
         # Post-capture TF consistency check (A3). If the EE drifted during
         # capture, the recorded T_base_ee no longer matches the marker pose
         # we'd see now -- discard the sample rather than emit a mismatched
-        # pair.
-        T_base_ee_post = self._lookup_base_ee(log_label)
-        if T_base_ee_post is None:
-            return None
-        drift_t, drift_r = pose_error_scalars(T_base_ee, T_base_ee_post)
-        if (drift_t > self._cfg.capture_drift_max_trans_m
-                or drift_r > math.radians(self._cfg.capture_drift_max_rot_deg)):
-            self.get_logger().warn(
-                f"[{log_label}] EE drifted during capture: "
-                f"{drift_t*1000:.2f} mm / {math.degrees(drift_r):.3f} deg "
-                f"(thresh {self._cfg.capture_drift_max_trans_m*1000:.1f} mm / "
-                f"{self._cfg.capture_drift_max_rot_deg:.2f} deg); skipping"
-            )
-            return None
+        # pair. Skipped when require_ee=False (phase 4: no EE involved).
+        if require_ee:
+            T_base_ee_post = self._lookup_base_ee(log_label)
+            if T_base_ee_post is None:
+                return None
+            drift_t, drift_r = pose_error_scalars(T_base_ee, T_base_ee_post)
+            if (drift_t > self._cfg.capture_drift_max_trans_m
+                    or drift_r > math.radians(self._cfg.capture_drift_max_rot_deg)):
+                self.get_logger().warn(
+                    f"[{log_label}] EE drifted during capture: "
+                    f"{drift_t*1000:.2f} mm / {math.degrees(drift_r):.3f} deg "
+                    f"(thresh {self._cfg.capture_drift_max_trans_m*1000:.1f} mm / "
+                    f"{self._cfg.capture_drift_max_rot_deg:.2f} deg); skipping"
+                )
+                return None
 
         t_cam_marker_body = optical_to_body(consensus.pose_optical)
 
-        return {
+        sample = {
             "theta_pan_rad": float(pt_state.pan_rad),
             "theta_tilt_rad": float(pt_state.tilt_rad),
-            "t_base_ee": matrix_to_pose_dict(T_base_ee),
             "t_cam_marker_body": matrix_to_pose_dict(t_cam_marker_body),
             "image_stamp_ns": int(canonical_image_stamp_ns),
             "state_stamp_ns": int(canonical_pt_state_stamp_ns),
@@ -916,6 +943,9 @@ class CalibrateCollectNode(Node):
             "reprojection_rms_px": float(consensus.reprojection_rms_px),
             "label": log_label,
         }
+        if T_base_ee is not None:
+            sample["t_base_ee"] = matrix_to_pose_dict(T_base_ee)
+        return sample
 
     def _is_duplicate_ee(self, T_new: np.ndarray, prior_samples: list[dict]) -> Optional[str]:
         """Return the label of any prior sample whose T_base_ee duplicates T_new.
@@ -1153,6 +1183,99 @@ class CalibrateCollectNode(Node):
             return None
         return self._capture_cell("sanity")
 
+    def run_phase4_validation(self) -> dict:
+        """Phase 4: end-to-end calibration check, xArm-free.
+
+        Operator places a ChArUco board anywhere stationary in `base_link`
+        (tripod, taped to a wall, on a table) and visible across the
+        configured pan-tilt sweep. This routine drives the pan-tilt to a
+        deterministic 5-corner grid + N random samples within the sweep
+        range and snapshots ChArUco at each view. The xArm is not commanded
+        and `link_eef` is not read.
+
+        Downstream `cmd_validate` composes T_base_marker through the FK
+        chain and reports the spread across views.
+        """
+        self.get_logger().info("=== Phase 4: validation sweep (xArm-independent) ===")
+
+        # Resolve sweep bounds. Explicit ranges win; otherwise fall back to
+        # the convex hull of the phase-2 grids so phase 4 doesn't ask the
+        # head to move beyond what was characterised.
+        if (len(self._cfg.validation_pan_range_deg) == 2
+                and len(self._cfg.validation_tilt_range_deg) == 2):
+            pan_min, pan_max = sorted(map(float, self._cfg.validation_pan_range_deg))
+            tilt_min, tilt_max = sorted(map(float, self._cfg.validation_tilt_range_deg))
+        else:
+            if not self._cfg.pan_grid_deg or not self._cfg.tilt_grid_deg:
+                self.get_logger().error(
+                    "Phase 4: no validation_*_range_deg and no pan_grid_deg/"
+                    "tilt_grid_deg to fall back on; cannot pick sweep bounds."
+                )
+                return {"samples": [], "skipped": []}
+            pan_min = float(min(self._cfg.pan_grid_deg))
+            pan_max = float(max(self._cfg.pan_grid_deg))
+            tilt_min = float(min(self._cfg.tilt_grid_deg))
+            tilt_max = float(max(self._cfg.tilt_grid_deg))
+
+        # Deterministic 5-point corner grid + uniform-random fill. Covering
+        # the corners surfaces edge-of-sweep failures (where a wrong T_B
+        # rotation or a wrong theta_t_offset accumulates the most), and the
+        # random fill distinguishes systematic bias from a coincidental
+        # corner-only fit.
+        n_total = max(5, int(self._cfg.n_validation_samples))
+        rng = np.random.default_rng(int(self._cfg.validation_seed))
+        pan_mid = 0.5 * (pan_min + pan_max)
+        tilt_mid = 0.5 * (tilt_min + tilt_max)
+        corner_set = [
+            (pan_min, tilt_min),
+            (pan_max, tilt_min),
+            (pan_min, tilt_max),
+            (pan_max, tilt_max),
+            (pan_mid, tilt_mid),
+        ]
+        n_random = n_total - len(corner_set)
+        random_set = [
+            (float(rng.uniform(pan_min, pan_max)),
+             float(rng.uniform(tilt_min, tilt_max)))
+            for _ in range(n_random)
+        ]
+        sweep = corner_set + random_set
+        self.get_logger().info(
+            f"Phase 4: pan ∈ [{pan_min:+.1f}, {pan_max:+.1f}], "
+            f"tilt ∈ [{tilt_min:+.1f}, {tilt_max:+.1f}], "
+            f"{len(corner_set)} corner + {len(random_set)} random "
+            f"(seed={self._cfg.validation_seed})"
+        )
+
+        samples: list[dict] = []
+        skipped: list[dict] = []
+        for i, (pan_deg, tilt_deg) in enumerate(sweep):
+            label = f"phase4/{i:02d}_p{pan_deg:+.1f}t{tilt_deg:+.1f}"
+            self.get_logger().info(f"  cell {label}")
+            if not self._send_pt_with_backlash(pan_deg, tilt_deg):
+                skipped.append({"i": i, "pan_deg": pan_deg, "tilt_deg": tilt_deg,
+                                "reason": "pt_move_failed"})
+                continue
+            time.sleep(self._cfg.phase2_pantilt_settle_sec)
+            sample = self._capture_cell(label, require_ee=False)
+            if sample is None:
+                skipped.append({"i": i, "pan_deg": pan_deg, "tilt_deg": tilt_deg,
+                                "reason": "capture_failed"})
+                continue
+            samples.append(sample)
+
+        self.get_logger().info(
+            f"Phase 4: kept {len(samples)}/{len(sweep)} samples "
+            f"({len(skipped)} skipped)"
+        )
+        return {
+            "samples": samples,
+            "skipped": skipped,
+            "rng_seed": int(self._cfg.validation_seed),
+            "pan_range_deg": [pan_min, pan_max],
+            "tilt_range_deg": [tilt_min, tilt_max],
+        }
+
     # ---- driver ------------------------------------------------------------
 
     def run_dry(self) -> dict:
@@ -1200,6 +1323,17 @@ class CalibrateCollectNode(Node):
             self._out_dir.mkdir(parents=True, exist_ok=True)
             (self._out_dir / "dry_run.json").write_text(json.dumps(results, indent=2))
             self.get_logger().info(f"Wrote dry-run report to {self._out_dir}/dry_run.json")
+            return 0
+
+        if self._phase_select == "phase4_validation":
+            phase4 = self.run_phase4_validation()
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            (self._out_dir / "phase4_validation.json").write_text(
+                json.dumps(phase4, indent=2)
+            )
+            self.get_logger().info(
+                f"Wrote phase4_validation.json to {self._out_dir}"
+            )
             return 0
 
         sanity_start = self.run_sanity()

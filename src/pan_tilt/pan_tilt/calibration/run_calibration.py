@@ -36,7 +36,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .aruco_detect import BoardSpec, build_board, detect_pose
-from .optimize import fit_chain, fit_joint, solve_handeye, warm_start_t_b_rotation
+from .optimize import (
+    fit_chain,
+    fit_joint,
+    solve_handeye,
+    solve_handeye_with_consensus,
+    warm_start_t_b_rotation,
+)
 from .pan_tilt_model import PanTiltParams, forward_kinematics
 from .utils import (
     invert_transform,
@@ -46,6 +52,19 @@ from .utils import (
     pose_to_matrix,
     sample_to_matrices,
 )
+
+
+# Phase gates -- single source of truth for both `validate` (this module)
+# and the calib_web Calibrate-tab dashboard. Tuple shape: (filename, json key,
+# threshold in SI units, human label, unit). The unit string drives display
+# formatting downstream; the SI threshold is what we actually compare.
+GATES: list[tuple] = [
+    ("intrinsic.json", "rms_px",            0.5,                "< 0.5 px",        "px"),
+    ("handeye.json",   "trans_rmse_m",      0.003,              "< 3 mm trans",    "mm"),
+    ("handeye.json",   "rot_rmse_rad",      np.deg2rad(0.5),    "< 0.5 deg rot",   "deg"),
+    ("chain.json",     "val_trans_rmse_m",  0.003,              "< 3 mm trans",    "mm"),
+    ("chain.json",     "val_rot_rmse_rad",  np.deg2rad(0.4),    "< 0.4 deg rot",   "deg"),
+]
 
 
 # ---- I/O helpers ------------------------------------------------------------
@@ -142,17 +161,129 @@ def cmd_intrinsic(args):
 
 def cmd_handeye(args):
     samples = _load_samples(Path(args.phase1))
-    print(f"Loaded {len(samples)} Phase-1 samples")
+    n_loaded = len(samples)
+    print(f"Loaded {n_loaded} Phase-1 samples")
 
-    t_ee_marker, t_base_cam_ref, per_pose = solve_handeye(samples)
-    trans_errs = np.array([p[0] for p in per_pose])
-    rot_errs = np.array([p[1] for p in per_pose])
+    # Solver-side per-sample quality gate: drop samples whose stored
+    # detection_quality (corner count) or reprojection_rms_px would have
+    # failed the per-frame Detection.valid() gate. This catches noisy
+    # samples baked into JSONs collected when the per-frame gate was
+    # briefly relaxed. Defaults match the strict gate in aruco_detect.
+    quality_min_corners = int(getattr(args, "quality_min_corners", 10))
+    quality_max_reproj_px = float(getattr(args, "quality_max_reproj_px", 1.5))
+    if not bool(getattr(args, "no_quality_gate", False)):
+        kept = []
+        for s in samples:
+            nc = int(s.get("detection_quality", quality_min_corners))
+            rms = float(s.get("reprojection_rms_px", 0.0))
+            if nc < quality_min_corners or rms > quality_max_reproj_px:
+                print(
+                    f"  quality-gate reject sample {s.get('label','?')}: "
+                    f"corners={nc} (<{quality_min_corners}) or "
+                    f"reproj={rms:.2f}px (>{quality_max_reproj_px:.1f})"
+                )
+            else:
+                kept.append(s)
+        samples = kept
+        if len(samples) < n_loaded:
+            print(f"After quality gate: {len(samples)}/{n_loaded} samples")
 
-    out_path = Path(args.out) / "handeye.json"
+    # Two-stage outlier handling:
+    #
+    # 1. Cross-cell consensus pre-pass: provisional Park-Martin solve, then
+    #    drop any sample whose implied T_ee_marker rotation deviates from
+    #    the provisional median by more than `--prefilter-rot-deg` (default
+    #    5°). This catches per-cell IPPE flips at the absolute level, before
+    #    they pollute MAD statistics.
+    #
+    # 2. Iterative MAD-sigma refinement on what remains: continue dropping
+    #    the worst-residual sample until either the threshold passes or the
+    #    rejection cap kicks in.
+    #
+    # Knobs:
+    #   --prefilter-rot-deg: absolute rot-residual threshold for stage 1.
+    #   --max-reject-frac: cap on stage-2 rejections (default 0.25).
+    #   --reject-sigma: stage-2 MAD threshold (default 3.0).
+    #   --no-reject: skip both stages (e.g. for test fixtures).
+    prefilter_rot_deg = float(getattr(args, "prefilter_rot_deg", 5.0))
+    max_reject_frac = float(getattr(args, "max_reject_frac", 0.25))
+    reject_sigma = float(getattr(args, "reject_sigma", 3.0))
+    do_reject = not bool(getattr(args, "no_reject", False))
+
+    if do_reject:
+        _, _, _, prefilter_rejected = solve_handeye_with_consensus(
+            samples, pre_filter_rot_deg=prefilter_rot_deg,
+        )
+    else:
+        prefilter_rejected = []
+    keep_idx = np.array([i for i in range(len(samples)) if i not in set(prefilter_rejected)])
+    if len(prefilter_rejected) > 0:
+        for gi in prefilter_rejected:
+            print(
+                f"  pre-filter reject sample #{gi} "
+                f"({samples[gi].get('label', '?')}): "
+                f"implied marker rot >{prefilter_rot_deg:.1f} deg from cluster"
+            )
+
+    rejected_history: list[tuple[int, float, float]] = [(gi, float("nan"), float("nan"))
+                                                         for gi in prefilter_rejected]
+    while True:
+        kept = [samples[i] for i in keep_idx]
+        t_ee_marker, t_base_cam_ref, per_pose = solve_handeye(kept)
+        trans_errs = np.array([p[0] for p in per_pose])
+        rot_errs = np.array([p[1] for p in per_pose])
+        if not do_reject:
+            break
+        combined = np.sqrt(trans_errs ** 2 + rot_errs ** 2)
+        med = float(np.median(combined))
+        mad = float(np.median(np.abs(combined - med))) + 1e-9
+        threshold = med + reject_sigma * 1.4826 * mad
+        bad_local = np.where(combined > threshold)[0]
+        if len(bad_local) == 0:
+            break
+        n_dropped = len(samples) - len(keep_idx)
+        if n_dropped >= int(max_reject_frac * len(samples)):
+            break
+        if len(keep_idx) - 1 < 3:
+            break
+        worst_local = int(np.argmax(combined))
+        worst_global = int(keep_idx[worst_local])
+        rejected_history.append((
+            worst_global,
+            float(trans_errs[worst_local]),
+            float(rot_errs[worst_local]),
+        ))
+        keep_idx = np.delete(keep_idx, worst_local)
+        print(
+            f"  MAD reject sample #{worst_global} ({samples[worst_global].get('label','?')}): "
+            f"residual {trans_errs[worst_local]*1000:.1f} mm / "
+            f"{np.degrees(rot_errs[worst_local]):.2f} deg (threshold "
+            f"{threshold*1000:.1f} mm-equiv)"
+        )
+
+    if rejected_history:
+        print(f"Rejected {len(rejected_history)}/{len(samples)} samples "
+              f"({len(prefilter_rejected)} pre-filter + "
+              f"{len(rejected_history) - len(prefilter_rejected)} MAD); "
+              f"final solve uses {len(keep_idx)}")
+
+    # Record the pan-tilt park pose used during Phase 1. All samples share
+    # the same park pose by construction (Phase 1 parks the head once and
+    # then cycles xArm poses), so we average across samples to suppress
+    # per-sample servo jitter rather than trusting a single reading.
+    park_pan_rad = float(np.mean([float(s["theta_pan_rad"]) for s in samples]))
+    park_tilt_rad = float(np.mean([float(s["theta_tilt_rad"]) for s in samples]))
+
+    out_name = getattr(args, "out_name", None) or "handeye.json"
+    out_path = Path(args.out) / out_name
     _save_json(out_path, {
         "t_ee_marker": matrix_to_pose_dict(t_ee_marker),
         "t_base_cam_ref": matrix_to_pose_dict(t_base_cam_ref),
-        "n_samples": len(samples),
+        "phase1_park_pan_rad": park_pan_rad,
+        "phase1_park_tilt_rad": park_tilt_rad,
+        "n_samples_total": len(samples),
+        "n_samples_used": int(len(keep_idx)),
+        "rejected_sample_indices": [r[0] for r in rejected_history],
         "per_sample_trans_err_m": trans_errs.tolist(),
         "per_sample_rot_err_rad": rot_errs.tolist(),
         "trans_rmse_m": float(np.sqrt(np.mean(trans_errs ** 2))),
@@ -160,7 +291,8 @@ def cmd_handeye(args):
     })
     print(
         f"Hand-eye trans RMSE: {np.sqrt(np.mean(trans_errs**2))*1000:.2f} mm  "
-        f"rot RMSE: {np.degrees(np.sqrt(np.mean(rot_errs**2))):.3f} deg"
+        f"rot RMSE: {np.degrees(np.sqrt(np.mean(rot_errs**2))):.3f} deg  "
+        f"(on {len(keep_idx)}/{len(samples)} samples)"
     )
     print(f"Wrote {out_path}")
 
@@ -188,8 +320,15 @@ def cmd_chain(args):
 
     # Warm-start T_B rotation from Phase 1's reference pose. On this robot the
     # camera is mounted ~90 deg off the tilt arm, so starting T_B_rot at identity
-    # would drop the optimizer into a bad basin.
-    initial = warm_start_t_b_rotation(PanTiltParams(), t_base_cam_ref)
+    # would drop the optimizer into a bad basin. We thread the Phase-1 park
+    # angles (firmware radians, recorded in handeye.json) through so the
+    # back-solve uses the FK at the actual park pose, not firmware zero.
+    park_pan = float(handeye.get("phase1_park_pan_rad", 0.0))
+    park_tilt = float(handeye.get("phase1_park_tilt_rad", 0.0))
+    initial = warm_start_t_b_rotation(
+        PanTiltParams(), t_base_cam_ref,
+        park_pan_rad=park_pan, park_tilt_rad=park_tilt,
+    )
     if args.verbose:
         print(
             f"T_B warm start: trans={np.round(initial.t_b_trans, 4)}  "
@@ -231,6 +370,12 @@ def cmd_chain(args):
         "val_rot_rmse_rad": float(val_rot),
         "n_train": len(train),
         "n_val": len(val),
+        # Per-sample residuals on the training set — the solver already
+        # computes these (OptReport.*_rmse_per_sample). Surfaced so the
+        # browser Calibrate tab can render residual histogram + scatter
+        # without re-running the fit.
+        "per_sample_trans_err_m": report.trans_rmse_per_sample.tolist(),
+        "per_sample_rot_err_rad": report.rot_rmse_per_sample.tolist(),
         "fit_pan_offset": args.fit_pan_offset,
         "fit_tb_rotation": not args.lock_tb_rotation,
         "handeye_source": str(Path(args.handeye)),
@@ -259,6 +404,8 @@ def cmd_polish(args):
         "trans_rmse_m": report.trans_rmse_m,
         "rot_rmse_rad": report.rot_rmse_rad,
         "n_samples": len(samples),
+        "per_sample_trans_err_m": report.trans_rmse_per_sample.tolist(),
+        "per_sample_rot_err_rad": report.rot_rmse_per_sample.tolist(),
         "fit_tb_rotation": args.unlock_tb_rotation,
         "fit_pan_offset": args.fit_pan_offset,
     })
@@ -267,14 +414,7 @@ def cmd_polish(args):
 
 def cmd_validate(args):
     results_dir = Path(args.results_dir)
-    gates = [
-        ("intrinsic.json", "rms_px", 0.5, "< 0.5 px"),
-        ("handeye.json", "trans_rmse_m", 0.003, "< 3 mm trans"),
-        ("handeye.json", "rot_rmse_rad", np.deg2rad(0.5), "< 0.5 deg rot"),
-        ("chain.json", "val_trans_rmse_m", 0.003, "< 3 mm trans"),
-        ("chain.json", "val_rot_rmse_rad", np.deg2rad(0.4), "< 0.4 deg rot"),
-    ]
-    for fname, key, thresh, label in gates:
+    for fname, key, thresh, label, unit in GATES:
         p = results_dir / fname
         if not p.exists():
             print(f"  [skip ] {fname}:{key}  (missing)")
@@ -285,8 +425,7 @@ def cmd_validate(args):
             continue
         ok = val < thresh
         flag = "  OK  " if ok else " FAIL "
-        unit = "mm" if "trans" in key else ("deg" if "rot" in key else "px")
-        disp = val * 1000 if "trans" in key else (np.degrees(val) if "rot" in key else val)
+        disp = val * 1000 if unit == "mm" else (np.degrees(val) if unit == "deg" else val)
         print(f"  [{flag}] {fname}:{key} = {disp:.3f} {unit}  ({label})")
 
 
@@ -345,6 +484,29 @@ def main(argv=None):
     ph = sub.add_parser("handeye", help="Phase 1: hand-eye at servo zero.")
     ph.add_argument("phase1")
     ph.add_argument("--out", default="results")
+    ph.add_argument("--prefilter-rot-deg", type=float, default=5.0,
+                    help="Absolute rot-residual threshold (deg) for the cross-cell "
+                         "consensus pre-pass (default 5.0). Drops cells whose implied "
+                         "T_ee_marker is geometrically inconsistent with the bulk before "
+                         "the MAD-sigma loop runs.")
+    ph.add_argument("--max-reject-frac", type=float, default=0.25,
+                    help="Cap on fraction of samples that may be auto-rejected by the "
+                         "MAD-sigma stage (default 0.25). Pre-filter rejections are not "
+                         "counted toward this cap.")
+    ph.add_argument("--reject-sigma", type=float, default=3.0,
+                    help="MAD-sigma threshold above which a sample is treated as an outlier (default 3.0).")
+    ph.add_argument("--no-reject", action="store_true",
+                    help="Disable both the consensus pre-filter and iterative outlier rejection.")
+    ph.add_argument("--out-name", default=None,
+                    help="Output filename within --out (default: handeye.json). "
+                         "Use 'handeye_custom.json' when solving the operator's "
+                         "custom-park dataset so the canonical handeye.json is preserved.")
+    ph.add_argument("--quality-min-corners", type=int, default=10,
+                    help="Drop samples with fewer than N detected corners (default 10).")
+    ph.add_argument("--quality-max-reproj-px", type=float, default=1.5,
+                    help="Drop samples with per-frame reprojection RMS above N px (default 1.5).")
+    ph.add_argument("--no-quality-gate", action="store_true",
+                    help="Solve on every sample regardless of stored detection_quality / reproj.")
     ph.set_defaults(func=cmd_handeye)
 
     pc = sub.add_parser("chain", help="Phase 2: pan-tilt chain fit.")

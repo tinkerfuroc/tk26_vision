@@ -9,108 +9,117 @@
 <body>
   <header>
     <h1>pan_tilt · calibrate_web</h1>
-    <nav>
-      <button class="tab active" data-tab="live">Live View</button>
-      <button class="tab" data-tab="xarm">xArm Waypoints</button>
-      <button class="tab" data-tab="pantilt">Pan-tilt Jog</button>
-    </nav>
     <span id="conn-indicator" class="badge">WS: connecting…</span>
   </header>
 
-  <main>
-    <!-- ==================== Live View ==================== -->
-    <section id="tab-live" class="tab-panel active">
-      <div class="live-grid">
-        <div class="live-frame">
-          <div class="frame-toolbar">
-            <label class="frame-mode">
-              <input type="radio" name="view-mode" value="annotated" checked>
-              annotated (detection overlay)
-            </label>
-            <label class="frame-mode">
-              <input type="radio" name="view-mode" value="raw">
-              raw (no overlay)
-            </label>
-          </div>
-          <img id="camera-img" alt="waiting for camera…" />
-          <div class="frame-overlay" id="detection-badge">–</div>
-          <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/camera/color/image_raw</span></div>
+  <main class="main-grid">
+    <!-- ==================== Small corner camera ==================== -->
+    <div class="feed-col">
+      <div class="live-frame">
+        <div class="frame-toolbar">
+          <label class="frame-mode">
+            <input type="radio" name="view-mode" value="annotated" checked>
+            annotated
+          </label>
+          <label class="frame-mode">
+            <input type="radio" name="view-mode" value="raw">
+            raw
+          </label>
         </div>
-        <aside class="live-side">
-          <h2>Camera</h2>
-          <table class="kv">
-            <tr><td>status</td><td id="s-camera">–</td></tr>
-            <tr><td>subscribed to</td><td id="s-image-topic">–</td></tr>
-            <tr><td>ROS_DOMAIN_ID</td><td id="s-domain">–</td></tr>
-            <tr><td>frames received</td><td id="s-frame-count">0</td></tr>
-            <tr><td>last frame age</td><td id="s-frame-age">–</td></tr>
-            <tr><td>frame rate (rolling)</td><td id="s-frame-hz">–</td></tr>
-          </table>
-
-          <h3>Discovered Image topics</h3>
-          <div class="topic-picker">
-            <select id="topic-select"><option value="">(scanning…)</option></select>
-            <button id="btn-resubscribe" type="button">Subscribe</button>
-          </div>
-          <p id="topic-status" class="status-line"></p>
-          <p class="muted">
-            If this list is empty, the camera publisher is on a different
-            <code>ROS_DOMAIN_ID</code> than this node. Restart the server
-            without overriding <code>ROS_DOMAIN_ID</code>.
-          </p>
-
-          <h2>Robot state</h2>
-          <table class="kv">
-            <tr><td>pan_tilt</td><td id="s-pt">–</td></tr>
-            <tr><td>xArm TF (base→ee)</td><td id="s-tf">–</td></tr>
-            <tr><td>xArm joints</td><td id="s-joints">–</td></tr>
-          </table>
-          <h2>Pan / Tilt</h2>
-          <table class="kv">
-            <tr><td>pan</td><td id="s-pan">–</td></tr>
-            <tr><td>tilt</td><td id="s-tilt">–</td></tr>
-            <tr><td>feedback_ok</td><td id="s-ptok">–</td></tr>
-          </table>
-          <h2>T<sub>base→ee</sub></h2>
-          <pre id="s-tmat">–</pre>
-          <h2>Safety envelope</h2>
-          <pre id="s-safety">–</pre>
-        </aside>
+        <img id="camera-img" alt="waiting for camera…" />
+        <div class="frame-overlay" id="detection-badge">–</div>
+        <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/camera/color/image_raw</span></div>
       </div>
+      <div class="cam-resize" id="cam-resize" role="separator" aria-label="Resize camera"></div>
+    </div>
+
+    <!-- ==================== Tabbed controls (flows around camera) ==================== -->
+    <nav class="side-tabs">
+      <button class="side-tab active" data-side-tab="info">Info</button>
+      <button class="side-tab" data-side-tab="xarm">xArm Waypoints</button>
+      <button class="side-tab" data-side-tab="pantilt">Pan-Tilt Jog</button>
+      <button class="side-tab" data-side-tab="calibrate">Calibrate</button>
+      <button class="side-tab" data-side-tab="prune">Prune</button>
+    </nav>
+
+    <!-- ---------- Info tab ---------- -->
+    <section id="side-info" class="side-panel-content active">
+      <h2>Camera</h2>
+      <table class="kv">
+        <tr><td>status</td><td id="s-camera">–</td></tr>
+        <tr><td>subscribed to</td><td id="s-image-topic">–</td></tr>
+        <tr><td>ROS_DOMAIN_ID</td><td id="s-domain">–</td></tr>
+        <tr><td>frames received</td><td id="s-frame-count">0</td></tr>
+        <tr><td>last frame age</td><td id="s-frame-age">–</td></tr>
+        <tr><td>frame rate (rolling)</td><td id="s-frame-hz">–</td></tr>
+      </table>
+
+      <h3>Discovered Image topics</h3>
+      <div class="topic-picker">
+        <select id="topic-select"><option value="">(scanning…)</option></select>
+        <button id="btn-resubscribe" type="button">Subscribe</button>
+      </div>
+      <p id="topic-status" class="status-line"></p>
+      <p class="muted">
+        If this list is empty, the camera publisher is on a different
+        <code>ROS_DOMAIN_ID</code> than this node. Restart the server
+        without overriding <code>ROS_DOMAIN_ID</code>.
+      </p>
+
+      <h2>Robot state</h2>
+      <table class="kv">
+        <tr><td>pan_tilt</td><td id="s-pt">–</td></tr>
+        <tr><td>xArm TF (base→ee)</td><td id="s-tf">–</td></tr>
+        <tr><td>xArm joints</td><td id="s-joints">–</td></tr>
+      </table>
+      <h2>Pan / Tilt</h2>
+      <table class="kv">
+        <tr><td>pan</td><td id="s-pan">–</td></tr>
+        <tr><td>tilt</td><td id="s-tilt">–</td></tr>
+        <tr><td>feedback_ok</td><td id="s-ptok">–</td></tr>
+      </table>
+      <h2>T<sub>base→ee</sub></h2>
+      <pre id="s-tmat">–</pre>
+      <h2>ChArUco board</h2>
+      <table class="kv" id="board-spec">
+        <tr><td>grid</td><td id="s-board-grid">–</td></tr>
+        <tr><td>square</td><td id="s-board-square">–</td></tr>
+        <tr><td>marker</td><td id="s-board-marker">–</td></tr>
+        <tr><td>dict</td><td id="s-board-dict">–</td></tr>
+        <tr><td>inner corners</td><td id="s-board-corners">–</td></tr>
+        <tr><td>physical size</td><td id="s-board-size">–</td></tr>
+      </table>
+
+      <h2>Safety envelope</h2>
+      <pre id="s-safety">–</pre>
     </section>
 
-    <!-- ==================== xArm Waypoints ==================== -->
-    <section id="tab-xarm" class="tab-panel">
-      <div class="split">
-        <div class="pane">
-          <h2>Author new waypoint</h2>
-          <div class="joint-editor">
-            <div class="unit-toggle">
-              <label><input type="radio" name="unit" value="rad" checked> radians</label>
-              <label><input type="radio" name="unit" value="deg"> degrees</label>
-            </div>
-            <div id="joint-inputs"></div>
-            <div class="joint-controls">
-              <button id="btn-load-current" type="button">Load current</button>
-              <button id="btn-zero" type="button">Zero all</button>
-            </div>
+    <!-- ---------- xArm Waypoints tab ---------- -->
+    <section id="side-xarm" class="side-panel-content">
+      <div class="xarm-panels">
+        <div class="xarm-sub">
+          <h2>Move arm — joint editor</h2>
+          <div class="unit-toggle">
+            <label><input type="radio" name="unit" value="rad" checked> radians</label>
+            <label><input type="radio" name="unit" value="deg"> degrees</label>
           </div>
-          <h2>Send to robot</h2>
+          <div id="joint-inputs"></div>
+          <div class="joint-controls">
+            <button id="btn-load-current" type="button">Load current</button>
+            <button id="btn-zero" type="button">Zero all</button>
+          </div>
           <p class="warn">
-            Clicking <b>Move (joints)</b> sends a <code>tinker_arm_msgs/JointMove</code>
-            action goal. The server plans via MoveIt (self-collision + joint
-            limits enforced); empty <code>env_points</code> means no live
-            obstacle cloud, so pre-validate in RViz for collision-critical poses.
+            <b>Move (joints)</b> sends a <code>tinker_arm_msgs/JointMove</code>
+            action goal. Empty <code>env_points</code> means no live obstacle
+            cloud — pre-validate collision-critical poses in RViz.
           </p>
           <button id="btn-xarm-move" class="primary" type="button">Move (joints)</button>
           <p id="xarm-move-status" class="status-line"></p>
 
-          <h2>Or send a Cartesian target</h2>
+          <h2>Cartesian target</h2>
           <p class="muted">
-            Sends a <code>tinker_arm_msgs/CartesianMove</code> action goal.
-            Translation in meters (base_link); rotation as a unit quaternion.
-            <b>Fill from current TF</b> prefills today's EE pose so you can
-            nudge a component.
+            <code>tinker_arm_msgs/CartesianMove</code>. Translation (m, base_link);
+            unit quaternion. <b>Fill from TF</b> prefills today's EE pose.
           </p>
           <div class="cart-grid">
             <label>x <input id="cart-x" type="number" step="0.01" value="0"></label>
@@ -130,53 +139,307 @@
           <h2>Current EE safety envelope</h2>
           <p id="xarm-safety-status" class="status-line">–</p>
         </div>
-        <div class="pane">
+
+        <div class="xarm-sub">
           <h2>Waypoint lists</h2>
           <div id="waypoint-lists"></div>
 
           <h2>Save</h2>
           <p class="muted">
-            Writes a draft YAML next to <code>calibration.yaml</code>
-            (default: <code>calibration.draft.yaml</code>). Never overwrites
-            the original — promote manually when satisfied.
+            <b>Save to draft YAML</b> writes a draft next to
+            <code>calibration.yaml</code> (default:
+            <code>calibration.draft.yaml</code>), which is also what the
+            server reloads on restart so you can resume this session.
+            <b>Promote to calibration.yaml</b> writes to the
+            <em>source-tree</em> calibration.yaml (NOT the install-tree copy
+            colcon overwrites on every build), renaming the current file to
+            <code>calibration.yaml.old-&lt;timestamp&gt;</code> first.
           </p>
-          <button id="btn-save" class="primary" type="button">Save to draft YAML</button>
+          <table class="kv" id="waypoints-paths">
+            <tr><td>draft</td><td id="wp-path-draft">–</td></tr>
+            <tr><td>promote target</td><td id="wp-path-promote">–</td></tr>
+          </table>
+          <div class="joint-controls">
+            <button id="btn-save" class="primary" type="button">Save to draft YAML</button>
+            <button id="btn-promote" type="button">Promote to calibration.yaml</button>
+          </div>
           <p id="save-status" class="status-line"></p>
+          <p id="promote-status" class="status-line"></p>
+
+          <h3>Reload</h3>
+          <p class="muted">
+            Replace the in-memory waypoint lists with whatever the
+            chosen yaml currently contains. <b>Reload from draft</b>
+            picks up changes the auto-save mechanism wrote (e.g. a previous
+            session). <b>Reload from calibration.yaml</b> picks up edits the
+            operator made by hand to the source-tree yaml (pruning bad
+            waypoints, etc.) — useful when you've manually edited the file
+            outside the UI.
+          </p>
+          <div class="joint-controls">
+            <button id="btn-reload-draft" type="button">Reload from draft</button>
+            <button id="btn-reload-config" type="button">Reload from calibration.yaml</button>
+          </div>
+          <p id="reload-status" class="status-line"></p>
         </div>
       </div>
     </section>
 
-    <!-- ==================== Pan-tilt Jog ==================== -->
-    <section id="tab-pantilt" class="tab-panel">
-      <div class="split">
-        <div class="pane">
-          <h2>Jog to absolute (pan, tilt) in degrees</h2>
-          <div class="jog">
-            <label>pan (deg)  <input id="jog-pan" type="number" step="1" value="0"></label>
-            <label>tilt (deg) <input id="jog-tilt" type="number" step="1" value="0"></label>
-            <button id="btn-pt-move" class="primary" type="button">Move pan-tilt</button>
-          </div>
-          <h3>Quick actions</h3>
-          <div class="jog-buttons">
-            <button data-pan="0" data-tilt="0">Home (0, 0)</button>
-            <button data-pan="-60" data-tilt="-25">Corner (−60, −25)</button>
-            <button data-pan="-60" data-tilt="35">Corner (−60, +35)</button>
-            <button data-pan="60" data-tilt="-25">Corner (+60, −25)</button>
-            <button data-pan="60" data-tilt="35">Corner (+60, +35)</button>
-          </div>
-          <p id="pt-move-status" class="status-line"></p>
+    <!-- ---------- Pan-Tilt Jog tab ---------- -->
+    <section id="side-pantilt" class="side-panel-content">
+      <h2>Jog to absolute (pan, tilt) in degrees</h2>
+      <p class="muted">
+        All angles are <b>firmware degrees</b>. <b>+firmware tilt = tilt up</b>.
+        Servo zero parks 45° below level, so <b>level = firmware +45°</b>,
+        and <code>physical-tilt-above-level = firmware − 45</code>.
+      </p>
+      <div class="jog">
+        <label>pan (deg)  <input id="jog-pan" type="number" step="1" value="0"></label>
+        <label>tilt (deg) <input id="jog-tilt" type="number" step="1" value="0"></label>
+        <button id="btn-pt-move" class="primary" type="button">Move pan-tilt</button>
+      </div>
+
+      <h3>Calibration grid (from config)</h3>
+      <table class="kv" id="grid-kv">
+        <tr><td>pan</td><td id="s-grid-pan">–</td></tr>
+        <tr><td>tilt (firmware)</td><td id="s-grid-tilt">–</td></tr>
+        <tr><td>tilt (physical)</td><td id="s-grid-tilt-phys">–</td></tr>
+        <tr><td>total cells</td><td id="s-grid-n">–</td></tr>
+      </table>
+
+      <h3>Quick actions</h3>
+      <div class="jog-buttons">
+        <button data-pan="0" data-tilt="45" title="physical level (horizontal)">Level (0, +45)</button>
+        <button data-pan="0" data-tilt="0" title="servo zero; camera points 45° down">Home (0, 0)</button>
+      </div>
+      <h3>Grid corners</h3>
+      <div class="jog-buttons" id="grid-corner-buttons"></div>
+      <p id="pt-move-status" class="status-line"></p>
+      <p class="muted">
+        Jog to each grid corner to confirm the board stays in view from the
+        current xArm pose. If it falls out of view at any corner, either
+        adjust the xArm anchor in the Waypoints tab or tighten the grid in
+        <code>calibration.yaml</code>.
+      </p>
+    </section>
+
+    <!-- ---------- Calibrate tab ---------- -->
+    <section id="side-calibrate" class="side-panel-content">
+      <h2>Session</h2>
+      <p class="muted">
+        Post-collection analysis. This tab <b>never moves the robot</b> — it
+        runs <code>run_calibration.py</code> and <code>apply_to_urdf.py</code>
+        as file-only subprocesses on an existing session dir. Collection
+        itself stays a terminal command (see CLAUDE.md § Calibration).
+      </p>
+      <table class="kv">
+        <tr><td>sessions dir</td><td id="calib-sessions-dir">–</td></tr>
+      </table>
+      <div class="topic-picker">
+        <select id="calib-session-select"><option value="">(none)</option></select>
+        <input id="calib-new-session-name" type="text" placeholder="new session name">
+        <button id="calib-new-session-btn" type="button">Create</button>
+      </div>
+      <p id="calib-session-status" class="status-line"></p>
+
+      <h2>Files in session</h2>
+      <table class="kv" id="calib-files-table">
+        <tr><td colspan="2" class="muted">(pick a session above)</td></tr>
+      </table>
+
+      <h2>1 · Collect — drives the robot</h2>
+      <p class="muted">
+        Active board spec — verify against the physical print before collecting:
+        <span id="calib-board-spec">(loading…)</span>
+      </p>
+      <p class="warn">
+        <b>Collect commands move the pan-tilt and the xArm.</b> Before clicking
+        anything here: the xArm Waypoints tab must have real Phase-1 /
+        Phase-2 anchor poses (not the yaml placeholders), and the board
+        must be visible from every pose + grid corner (use the Pan-Tilt tab
+        to jog-verify). A Phase-2 sweep takes ~20 min.
+      </p>
+      <div class="joint-controls" id="calib-run-buttons-collect">
+        <button data-calib-cmd="collect_dry_run"       type="button" title="Send each xArm waypoint with no image capture and no pan-tilt motion. Reports which fail so you can fix the yaml before a real collect.">Validate waypoints (dry run)</button>
+        <button data-calib-cmd="collect_phase1"        type="button">Collect Phase 1 — level (pan=0, tilt=+45)</button>
+        <button data-calib-cmd="collect_phase1_custom" type="button" id="calib-collect-phase1-custom">Collect Phase 1 — custom</button>
+        <button data-calib-cmd="collect_phase2"        type="button">Collect Phase 2 (sweep)</button>
+        <button data-calib-cmd="collect_sanity"      type="button">Collect sanity pose</button>
+        <button data-calib-cmd="collect_both"        type="button">Collect all (1 + 2 + sanity)</button>
+      </div>
+
+      <h2>2 · Analyse — file-only, fast</h2>
+      <div class="joint-controls" id="calib-run-buttons">
+        <button data-calib-cmd="handeye" type="button">handeye</button>
+        <button data-calib-cmd="handeye_custom" type="button">handeye (custom)</button>
+        <button data-calib-cmd="chain" data-calib-flags="--fit-pan-offset" type="button">chain (+pan off)</button>
+        <button data-calib-cmd="polish" data-calib-flags="--unlock-tb-rotation" type="button">polish</button>
+        <button data-calib-cmd="validate" type="button">validate</button>
+        <button id="calib-cancel-btn" type="button" disabled>cancel</button>
+      </div>
+      <pre id="calib-log" class="calib-log">(no runs yet)</pre>
+
+      <h2>Phase gates</h2>
+      <table class="kv" id="calib-gates">
+        <tr><td colspan="3" class="muted">(run <code>handeye</code> / <code>chain</code> to populate)</td></tr>
+      </table>
+
+      <h2>Residuals</h2>
+      <div class="calib-resid-source">
+        <label><input type="radio" name="calib-resid" value="handeye" checked> handeye</label>
+        <label><input type="radio" name="calib-resid" value="chain"> chain</label>
+        <label><input type="radio" name="calib-resid" value="polish"> polish</label>
+      </div>
+      <div class="calib-resid-grid">
+        <div>
+          <p class="muted">per-sample translation error (m) — histogram</p>
+          <canvas id="calib-resid-hist" width="360" height="140"></canvas>
         </div>
-        <div class="pane">
-          <h2>Live view</h2>
-          <img id="camera-img-2" alt="waiting for camera…" class="pt-preview"/>
-          <p class="muted">
-            Jog to each corner of the pan/tilt grid to confirm the board stays
-            in view from this xArm pose. Uses the same raw/annotated toggle
-            as the Live View tab. If it falls out of view at any corner,
-            adjust the xArm waypoint in the previous tab.
-          </p>
+        <div>
+          <p class="muted">error vs sample index — scatter</p>
+          <canvas id="calib-resid-scatter" width="360" height="140"></canvas>
         </div>
       </div>
+
+      <h2>Board distribution in camera FoV</h2>
+      <p class="muted">
+        Left: one dot per captured sample, plotted at the marker's angular
+        position relative to the camera optical axis. Color = depth
+        (closer = warm). Outlined box = nominal camera FoV. Right: the
+        same samples projected onto the most recent camera frame. Each
+        sample is labeled <code>#&lt;index&gt;</code> matching its position
+        in the phase JSON. Empty regions = under-sampled — consider adding
+        waypoints that put the board there.
+      </p>
+      <div class="calib-resid-source">
+        <label><input type="radio" name="calib-cov" value="all" checked> all</label>
+        <label><input type="radio" name="calib-cov" value="phase1_handeye"> Phase 1 (level)</label>
+        <label><input type="radio" name="calib-cov" value="phase1_handeye_custom"> Phase 1 (custom)</label>
+        <label><input type="radio" name="calib-cov" value="phase2_chain"> Phase 2</label>
+      </div>
+      <div class="calib-coverage-row">
+        <div>
+          <p class="muted">angular distribution</p>
+          <canvas id="calib-coverage" width="600" height="400"></canvas>
+        </div>
+        <div>
+          <p class="muted">image-plane projection (uses live K)</p>
+          <canvas id="calib-coverage-img" width="600" height="400"></canvas>
+          <p id="calib-coverage-img-status" class="status-line muted"></p>
+        </div>
+      </div>
+      <p id="calib-coverage-status" class="status-line muted"></p>
+
+      <h2>Recovered params</h2>
+      <table class="kv" id="calib-params">
+        <tr><td colspan="2" class="muted">(run <code>chain</code> / <code>polish</code> to populate)</td></tr>
+      </table>
+
+      <h2>URDF patch</h2>
+      <div class="topic-picker">
+        <select id="calib-urdf-target"><option value="">(loading targets…)</option></select>
+        <select id="calib-urdf-results">
+          <option value="polish.json" selected>polish.json (recommended)</option>
+          <option value="chain.json">chain.json</option>
+        </select>
+        <button id="calib-urdf-diff-btn" type="button">Show diff</button>
+        <button id="calib-urdf-copy" type="button">Copy apply commands</button>
+      </div>
+      <p id="calib-urdf-status" class="status-line"></p>
+      <pre id="calib-urdf-diff" class="calib-diff">(no diff yet)</pre>
+    </section>
+
+    <!-- ---------- Prune tab ---------- -->
+    <section id="side-prune" class="side-panel-content">
+      <h2>Prune waypoints</h2>
+      <p class="muted">
+        Drop waypoints whose predicted end-point pose is too close to one
+        already kept (greedy farthest-point sampling on a two-axis SE(3)
+        metric). Click <b>Preview</b> to see the kept/dropped count; nothing
+        is written until you click <b>Apply</b> or <b>Overwrite</b>.
+        <b>Apply</b> writes a timestamped sidecar yaml (original
+        <code>calibration.yaml</code> untouched — run collection with
+        <code>-p config:=&lt;sidecar.yaml&gt;</code>).
+        <b>Overwrite</b> replaces the source-tree
+        <code>calibration.yaml</code> with the pruned set, renaming the
+        current file to
+        <code>calibration.yaml.old-&lt;timestamp&gt;</code> first (same
+        backup convention as the Waypoints tab's Promote button).
+      </p>
+
+      <div class="prune-controls">
+        <label>phase
+          <select id="prune-phase">
+            <option value="phase1_waypoints" selected>phase1_waypoints</option>
+            <option value="phase1_waypoints_custom">phase1_waypoints_custom</option>
+            <option value="phase2_grid">phase2_grid (pan × tilt)</option>
+          </select>
+        </label>
+        <label>predictor
+          <select id="prune-predictor">
+            <option value="auto" selected>auto (replay → fk)</option>
+            <option value="replay_only">replay only</option>
+            <option value="fk_only">fk only</option>
+          </select>
+        </label>
+        <label>prior run
+          <select id="prune-prior-run"><option value="">(none — fk only)</option></select>
+        </label>
+      </div>
+
+      <div class="prune-factors">
+        <label>trans_tol_m
+          <input id="prune-trans-tol" type="number" step="0.005" min="0.001" max="1.0" value="0.05">
+        </label>
+        <label>rot_tol_deg
+          <input id="prune-rot-tol" type="number" step="0.5" min="0.1" max="180" value="8">
+        </label>
+        <label>min_count
+          <input id="prune-min-count" type="number" step="1" min="1" max="100" value="8">
+        </label>
+        <label>min_rot_diversity_pairs
+          <input id="prune-min-rot-pairs" type="number" step="1" min="0" max="100" value="6">
+        </label>
+        <label>min_rot_diversity_deg
+          <input id="prune-min-rot-deg" type="number" step="1" min="0" max="180" value="28">
+        </label>
+        <label>seed_index
+          <input id="prune-seed" type="number" step="1" min="0" value="0">
+        </label>
+      </div>
+
+      <table class="kv prune-paths" id="prune-paths">
+        <tr><td>source yaml</td><td id="prune-path-source">–</td></tr>
+        <tr><td>backup pattern</td><td id="prune-path-backup">–</td></tr>
+      </table>
+
+      <div class="joint-controls">
+        <button id="prune-preview-btn" type="button">Preview</button>
+        <button id="prune-apply-btn" type="button" disabled>Apply pruned set (sidecar)</button>
+        <button id="prune-overwrite-btn" type="button" disabled>Overwrite calibration.yaml</button>
+        <button id="prune-reset-btn" type="button">Reset factors</button>
+      </div>
+      <p id="prune-status" class="status-line"></p>
+      <p id="prune-headline" class="prune-headline"></p>
+      <p id="prune-warning" class="warn" hidden></p>
+
+      <table class="kv prune-diagnostics" id="prune-diagnostics" hidden></table>
+      <table class="prune-table" id="prune-table" hidden>
+        <thead>
+          <tr>
+            <th>idx</th>
+            <th>label</th>
+            <th>kept?</th>
+            <th>predictor</th>
+            <th>nearest kept</th>
+            <th>Δtrans</th>
+            <th>Δrot</th>
+            <th>reason</th>
+            <th>force</th>
+          </tr>
+        </thead>
+        <tbody id="prune-tbody"></tbody>
+      </table>
     </section>
   </main>
 

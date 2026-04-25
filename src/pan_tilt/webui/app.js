@@ -993,7 +993,50 @@ async function calibLoadSessionDetail(name) {
       : Promise.resolve(calibRenderParams(null)),
     calibRenderResiduals(),
     calibRenderCoverage(),
+    files['validation.json']?.exists
+      ? calibFetchFile(name, 'validation.json').then(calibRenderValidate)
+      : Promise.resolve(calibRenderValidate(null)),
   ]);
+}
+
+function calibRenderValidate(j) {
+  const panel = document.getElementById('calib-validate-panel');
+  if (!panel) return;
+  if (!j) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const verdict = j.verdict || '—';
+  const pill = document.getElementById('calib-validate-verdict');
+  if (pill) {
+    pill.textContent = verdict;
+    pill.className = 'calib-verdict-pill calib-verdict-' + verdict.toLowerCase();
+  }
+  const sc = j.self_consistency || {};
+  const summary = document.getElementById('calib-validate-summary');
+  if (summary) {
+    const rmse_t = (sc.trans_rmse_m ?? 0) * 1000;
+    const rmse_r = (sc.rot_rmse_rad ?? 0) * 180 / Math.PI;
+    summary.textContent = ` n=${j.n_samples_used}/${j.n_samples_total}  ·  ` +
+                          `trans_rmse ${fmt(rmse_t, 2)} mm  ·  ` +
+                          `rot_rmse ${fmt(rmse_r, 3)}°`;
+  }
+  const tbl = document.getElementById('calib-validate-metrics');
+  if (!tbl) return;
+  const std = sc.trans_std_xyz_m || [0, 0, 0];
+  const rows = [
+    ['trans max',   fmt((sc.trans_max_m ?? 0) * 1000, 2) + ' mm'],
+    ['rot max',     fmt((sc.rot_max_rad ?? 0) * 180 / Math.PI, 3) + '°'],
+    ['trans std X', fmt(std[0] * 1000, 2) + ' mm'],
+    ['trans std Y', fmt(std[1] * 1000, 2) + ' mm'],
+    ['trans std Z', fmt(std[2] * 1000, 2) + ' mm'],
+  ];
+  const th = j.thresholds || {};
+  rows.push(['thresholds (PASS / WARN)',
+             `${fmt(th.trans_pass_mm ?? 5, 1)} mm / ${fmt(th.rot_pass_deg ?? 0.5, 2)}°  ·  ` +
+             `${fmt(th.trans_warn_mm ?? 10, 1)} mm / ${fmt(th.rot_warn_deg ?? 1, 2)}°`]);
+  tbl.innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
 }
 
 async function calibFetchFile(session, filename) {
@@ -1012,10 +1055,12 @@ const CALIB_TRACKED_FILES = [
   {name: 'phase1_handeye_custom.json', kind: 'collector'},
   {name: 'phase2_chain.json',          kind: 'collector'},
   {name: 'sanity.json',                kind: 'collector'},
+  {name: 'phase4_validation.json',     kind: 'collector'},
   {name: 'handeye.json',               kind: 'analyser'},
   {name: 'handeye_custom.json',        kind: 'analyser'},
   {name: 'chain.json',                 kind: 'analyser'},
   {name: 'polish.json',                kind: 'analyser'},
+  {name: 'validation.json',            kind: 'analyser'},
 ];
 
 // Backend session-detail returns mtimes as Unix seconds; format them for the
@@ -1166,6 +1211,12 @@ async function calibRun(cmd, flags) {
       reqBody.phase1 = phase1;
       datasetSummary = ` --phase1 ${phase1.join(' ')}`;
     }
+  } else if (cmd === 'validate') {
+    const psel = document.getElementById('validate-params-select');
+    if (psel) {
+      reqBody.params = psel.value;
+      datasetSummary = ` --params ${psel.value}`;
+    }
   }
   const banner = cmd.startsWith('collect_')
     ? '$ ros2 run pan_tilt calibrate_collect --ros-args -p phase:=' + cmd.replace('collect_', '')
@@ -1207,6 +1258,12 @@ $$('#polish-phase1-checks input[type="checkbox"]').forEach(cb => {
     calibApplyRunEnablement(CALIB.lastFiles || {});
   });
 });
+const _validateParamsSel = document.getElementById('validate-params-select');
+if (_validateParamsSel) {
+  _validateParamsSel.addEventListener('change', () => {
+    calibApplyRunEnablement(CALIB.lastFiles || {});
+  });
+}
 
 CALIB_CANCEL_BTN.addEventListener('click', async () => {
   if (!CALIB.activeRunId) return;
@@ -1705,6 +1762,11 @@ function calibDynamicPrereqs(cmd, files) {
     if (!((files['chain.json'] || {}).exists)) missing.push('chain.json');
     return missing;
   }
+  if (cmd === 'validate') {
+    const psel = $('#validate-params-select');
+    const chosen = psel ? psel.value : 'polish.json';
+    return ((files[chosen] || {}).exists) ? [] : [chosen];
+  }
   return [];
 }
 
@@ -1759,6 +1821,25 @@ function calibRenderDatasetSelectors(files) {
   if (!anyChecked) {
     const firstAvailable = checks.find(cb => !cb.disabled);
     if (firstAvailable) firstAvailable.checked = true;
+  }
+
+  // Validate params dropdown: same pattern as the chain handeye dropdown —
+  // disable missing options and show staleness inline.
+  const vparams = $('#validate-params-select');
+  if (vparams) {
+    let firstEnabled = null;
+    Array.from(vparams.options).forEach(opt => {
+      const info = files[opt.value] || {};
+      const exists = !!info.exists;
+      opt.disabled = !exists;
+      if (!opt.dataset.baseLabel) opt.dataset.baseLabel = opt.text;
+      const stamp = exists ? _calibRelTime(info.mtime) : 'missing';
+      opt.text = stamp ? `${opt.dataset.baseLabel} — ${stamp}` : opt.dataset.baseLabel;
+      if (exists && firstEnabled === null) firstEnabled = opt.value;
+    });
+    if (vparams.options[vparams.selectedIndex]?.disabled && firstEnabled) {
+      vparams.value = firstEnabled;
+    }
   }
 }
 

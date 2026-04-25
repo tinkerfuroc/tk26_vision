@@ -207,8 +207,8 @@ python -m pan_tilt.calibration.run_calibration polish \
     --phase2 phase2_chain.json --seed chain.json \
     --unlock-tb-rotation --fit-pan-offset --out .
 
-# Check all gates in one go.
-python -m pan_tilt.calibration.run_calibration validate .
+# Check all per-phase residuals against their static gates in one go.
+python -m pan_tilt.calibration.run_calibration gates .
 ```
 
 Only run polish if Phase-2 residuals show *structured* (non-random) pattern — e.g., rotation error that grows with |tilt|. If Phase-2 residuals already meet the gate, polish adds marginal value and can find worse local minima.
@@ -269,6 +269,31 @@ Restart the robot stack.
 3. Back-project test with the ChArUco still on the EE: pick an xArm pose that wasn't in the collection set, query the expected camera view of the board vs what's actually detected. Disagreement < 5 mm on-image is expected.
 4. Follow-head sanity: `ros2 run pan_tilt follow_head` and have a person walk across the camera's FoV. No systematic lag or directional bias should be visible.
 
+### 10. Phase 4 — end-to-end validation (xArm-independent)
+
+The chain/polish residuals are camera-frame metrics: they say "the FK reproduces the *training* observations". Phase 4 closes the loop in **base frame** and on **held-out** sweep poses — the regime downstream consumers (planner, grasping, follow-head) actually care about. The xArm is **not involved** in this phase: place the ChArUco board anywhere stationary in `base_link` (tripod, taped to a wall, on a table — wherever it sits in the camera's reachable FoV across the sweep), then drive the pan-tilt across N `(θ_p, θ_t)` poses and check that all views project the marker to the *same* base-frame pose under the calibrated FK chain.
+
+Optionally set explicit `validation_pan_range_deg`/`validation_tilt_range_deg` in the collector config (falls back to the convex hull of `pan_grid_deg × tilt_grid_deg` if absent). Then:
+
+```bash
+ros2 run pan_tilt calibrate_collect --ros-args \
+    -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml \
+    -p out_dir:=$PWD/calib_out -p phase:=phase4_validation
+
+python -m pan_tilt.calibration.run_calibration validate \
+    --phase4 calib_out/phase4_validation.json \
+    --params calib_out/polish.json \
+    --out calib_out
+```
+
+The collector skips `JointMove` and never reads `link_eef`, so xArm bringup isn't required. The board does need to remain motionless across the whole sweep — if it slips, every subsequent view sees a different physical target and the verdict will FAIL.
+
+Output `validation.json` reports the **self-consistency** of `T_base_marker_pred` across views: `T_base_marker_µ` is the centroid; per-view residual is the spread vs that centroid. Verdict ladder: **PASS** ≤ 5 mm / 0.5°, **WARN** ≤ 10 mm / 1°, else **FAIL** — tunable via `--trans-pass-mm`, `--rot-pass-deg`, `--trans-warn-mm`, `--rot-warn-deg`.
+
+Limitation worth knowing: self-consistency cannot detect a coherent SE(3) shift that applies to every view equally (e.g. a pure `theta_p_offset` error or a `T_A` translation error) — those move the centroid but leave the spread untouched. The chain/polish residuals already constrain those terms; phase 4 is the gate against view-dependent errors (`T_B` rotation, `theta_t_offset`, `L_pan`) that aren't pinned by the training residual alone.
+
+Reading the output: per-axis std (`trans_std_xyz_m`) localises the failure. Z-dominated → suspect `T_B` rotation or `theta_t_offset`. X-dominated → check the pan basin and `theta_p` offset. Use it before re-running polish blindly.
+
 ## Session-drift sanity
 
 `sanity.json` contains two captures of the same pose (start and end of session). If they disagree by > 2 mm / 0.2°, something drifted mid-session — thermal, servo slip, mount loosening — and the fit is suspect. Re-run.
@@ -287,6 +312,8 @@ Restart the robot stack.
 | Polish residuals worse than chain residuals | Local minimum in the joint fit; T_B rotation unlock found an alias | Re-run polish with `--fit-pan-offset` off; or trust `chain.json` and skip polish |
 | `handeye` aborts with "T_ee_marker sibling cross-check FAILED" | Either a stale `phase1_handeye.json` (you re-collected one park but not the other) or the board was re-mounted between collects — disagreement > 5 mm / 1° | Re-collect both phase-1 datasets in one sitting without touching the board / EE / xArm zero; or pass `--allow-t-ee-marker-mismatch` if you genuinely intended to remount |
 | Polish trans RMSE huge (~250 mm) and rot residual ~30° | Almost always: chain seed was in the wrong pan basin (was a problem before the two-basin warm-start; if you see this now it usually means the seed `chain.json` is from a stale run) | Re-run chain — the new run will auto-pick the correct basin |
+| Phase-4 verdict FAIL with Z-dominated `trans_std_xyz_m` | `T_B` rotation or `theta_t_offset` is off; the tilt sweep amplifies the error | Re-run polish with `--unlock-tb-rotation`, then re-validate |
+| Phase-4 spread is reasonable for some views and huge for others | The board moved mid-sweep (something nudged the tripod / fixture) | Re-collect; secure the board so nothing can shift across the sweep |
 | Envelope violation errors | A recorded xArm waypoint puts the EE inside the mast exclusion or below the floor | Re-record that waypoint in RViz; or widen `safety.z_floor_m` / `safety.mast_radius_m` if the envelope is too tight for your geometry |
 
 ## Running the synthetic regression tests

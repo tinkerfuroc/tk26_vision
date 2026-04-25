@@ -32,8 +32,13 @@ import io
 import json
 import logging
 import math
+import os
+import signal
+import sys
 import threading
 import time
+import uuid
+from datetime import datetime
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -57,11 +62,199 @@ from .calibration.aruco_detect import (
     build_detector,
     detect_pose,
 )
+from .calibration.run_calibration import GATES as _RC_GATES
 from .calibration.safety import SafetyEnvelope
+from .calibration.urdf_targets import list_targets as list_urdf_targets
 from .calibration.utils import matrix_to_pose, pose_to_matrix
+from .calibration.waypoint_predict import (
+    chain_predictors,
+    pantilt_grid_predictor,
+    replay_predictor,
+)
+from .calibration.waypoint_prune import Predicted, prune_waypoints
 
 
 log = logging.getLogger("calib_web")
+
+
+# Gate thresholds: single source of truth lives in run_calibration.GATES; here
+# we just adapt the (filename, key, threshold, label, unit) tuple into the
+# (filename, key, threshold, unit, label) shape the web UI table consumes,
+# turning the validate-CLI's terse "< 3 mm trans" into a longer human label.
+_RC_LABELS = {
+    "rms_px":            "intrinsic reprojection RMS",
+    "trans_rmse_m":      "hand-eye translation RMSE",
+    "rot_rmse_rad":      "hand-eye rotation RMSE",
+    "val_trans_rmse_m":  "chain held-out translation RMSE",
+    "val_rot_rmse_rad":  "chain held-out rotation RMSE",
+}
+CALIB_GATES = [
+    (fname, key, thresh, unit, _RC_LABELS.get(key, key))
+    for fname, key, thresh, _label, unit in _RC_GATES
+]
+
+
+class CalibrateRunner:
+    """Spawns post-collection calibration subprocesses and fans out their
+    stdout to WebSocket subscribers.
+
+    Only run_calibration subcommands and apply_to_urdf are intended to flow
+    through here; the runner is deliberately file-I/O-only so it can never
+    kick the physical robot. Collection (which owns pan-tilt + xArm) stays
+    a terminal invocation.
+    """
+
+    def __init__(self, calib_sessions_dir: Path):
+        self.sessions_dir = Path(calib_sessions_dir).expanduser().resolve()
+        # run_id -> {"proc": asyncio.subprocess.Process, "session": str, "cmd": list[str], "started": float}
+        self._active: dict[str, dict] = {}
+        self._subscribers: set[asyncio.Queue] = set()
+        self._lock = asyncio.Lock()
+
+    # ---- pub/sub -----------------------------------------------------------
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+
+    def _broadcast(self, event: dict) -> None:
+        dead: list[asyncio.Queue] = []
+        for q in self._subscribers:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                # Slow subscriber — drop this frame silently rather than stall
+                # the subprocess. The log pane will have a visible gap but
+                # the terminal exit frame is small and usually gets through.
+                pass
+            except RuntimeError:
+                dead.append(q)
+        for q in dead:
+            self._subscribers.discard(q)
+
+    # ---- session dir -------------------------------------------------------
+
+    def session_path(self, name: str) -> Path:
+        # Reject absolute paths / parent-traversal; sessions must live inside
+        # sessions_dir. `.` and `..` segments get rejected so an attacker-ish
+        # HTTP body can't pivot off the sandbox.
+        if not name or "/" in name or name in (".", "..") or name.startswith("."):
+            raise ValueError(f"invalid session name: {name!r}")
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        return (self.sessions_dir / name).resolve()
+
+    def list_sessions(self) -> list[dict]:
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        out = []
+        for entry in sorted(self.sessions_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            files = sorted(p.name for p in entry.iterdir() if p.is_file())
+            out.append({
+                "name": entry.name,
+                "path": str(entry),
+                "files": files,
+                "mtime": entry.stat().st_mtime,
+            })
+        return out
+
+    def create_session(self, name: str) -> Path:
+        path = self.session_path(name)
+        path.mkdir(parents=True, exist_ok=False)
+        return path
+
+    # ---- subprocess spawn --------------------------------------------------
+
+    async def spawn(self, session: str, argv: list[str], *, label: str) -> dict:
+        """Run an arbitrary argv in the session directory with stdout fanned
+        out to subscribers. Caller builds argv (so we can host both
+        `run_calibration` and `calibrate_collect` without special-casing).
+        """
+        session_path = self.session_path(session)
+        if not session_path.exists():
+            raise FileNotFoundError(f"session {session!r} does not exist")
+        run_id = uuid.uuid4().hex[:12]
+        async with self._lock:
+            if any(h["session"] == session for h in self._active.values()):
+                raise RuntimeError(f"another run is active on session {session!r}")
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(session_path),
+                # New process group so cancel() can signal ros2-run's
+                # grandchildren (calibrate_collect) along with the wrapper.
+                start_new_session=True,
+            )
+            self._active[run_id] = {"proc": proc, "session": session}
+        asyncio.create_task(self._pump(run_id, proc))
+        self._broadcast({
+            "type": "start", "run_id": run_id, "session": session,
+            "label": label, "argv": argv, "pid": proc.pid,
+        })
+        return {"run_id": run_id, "pid": proc.pid}
+
+    async def _pump(self, run_id: str, proc: asyncio.subprocess.Process) -> None:
+        try:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                self._broadcast({
+                    "type": "log", "run_id": run_id,
+                    "line": line.decode("utf-8", errors="replace").rstrip("\n"),
+                })
+            code = await proc.wait()
+            self._broadcast({"type": "exit", "run_id": run_id, "code": int(code)})
+        except Exception as exc:
+            self._broadcast({"type": "exit", "run_id": run_id, "code": -1, "error": str(exc)})
+        finally:
+            self._active.pop(run_id, None)
+
+    async def cancel(self, run_id: str) -> bool:
+        handle = self._active.get(run_id)
+        if handle is None:
+            return False
+        proc = handle["proc"]
+        # `ros2 run` spawns calibrate_collect as a grandchild; SIGTERM to the
+        # wrapper alone leaks the grandchild. Signal the whole process group
+        # (start_new_session=True at spawn means pgid == proc.pid).
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        return True
+
+    # ---- apply_to_urdf diff (synchronous, short-running) -------------------
+
+    async def urdf_diff(self, session: str, results_file: str, xacro_path: str) -> dict:
+        session_path = self.session_path(session)
+        results_path = session_path / results_file
+        argv = [
+            sys.executable, "-m", "pan_tilt.calibration.apply_to_urdf",
+            "--results", str(results_path),
+            "--xacro", xacro_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"apply_to_urdf exited {proc.returncode}: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+        return {"diff": stdout.decode("utf-8", errors="replace")}
 
 
 def _empty_pointcloud(frame_id: str = "base_link"):
@@ -146,6 +339,10 @@ class SharedState:
     available_image_topics: list = field(default_factory=list)
 
     safety: dict = field(default_factory=lambda: SafetyEnvelope().to_dict())
+    # Pan-tilt calibration grid (firmware degrees). Exposed to the UI so the
+    # Pan-Tilt tab can render the same corners the collector will sweep, and
+    # operators don't have to cross-reference the yaml to jog into a grid cell.
+    grid: dict = field(default_factory=lambda: {"pan_deg": [], "tilt_deg": []})
 
 
 # ---- node -------------------------------------------------------------------
@@ -158,6 +355,12 @@ class CalibWebNode(Node):
         self.declare_parameter("bind", "127.0.0.1")
         self.declare_parameter("port", 8765)
         self.declare_parameter("draft_yaml_out", "")
+        # Promote target. The runtime `config` param typically points at the
+        # install-tree copy of calibration.yaml, which colcon overwrites on
+        # every build -- promoting there silently loses operator edits at the
+        # next rebuild. Default the promote target to the source-tree yaml so
+        # it's actually persistent. Operators can override per-launch.
+        self.declare_parameter("promote_yaml_out", "")
         self.declare_parameter("image_topic", "/camera/color/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/color/camera_info")
         self.declare_parameter("pantilt_cmd_topic", "/pan_tilt_controller/cmd")
@@ -174,16 +377,36 @@ class CalibWebNode(Node):
         self.declare_parameter("arm_action_timeout_sec", 30.0)
         self.declare_parameter("pantilt_speed_raw", 120)
         self.declare_parameter("pantilt_accel_raw", 20)
+        # Calibrate tab: parent dir for session subdirs. Matches calibrate_collect's
+        # default `out_dir` so both halves point at the same sessions by default.
+        self.declare_parameter("calib_sessions_dir", "calibration_data")
 
         self.config_path: str = self.get_parameter("config").value or ""
         self.bind_host: str = self.get_parameter("bind").value
         self.bind_port: int = int(self.get_parameter("port").value)
+        self.calib_sessions_dir = Path(
+            self.get_parameter("calib_sessions_dir").value or "calibration_data"
+        ).expanduser().resolve()
+        self.calib_runner = CalibrateRunner(self.calib_sessions_dir)
 
         default_draft = ""
         if self.config_path:
             p = Path(self.config_path)
             default_draft = str(p.with_name(p.stem + ".draft.yaml"))
         self.draft_yaml_out = Path(self.get_parameter("draft_yaml_out").value or default_draft or "calibration.draft.yaml")
+
+        # Resolve the promote target. If the operator passed an explicit
+        # promote_yaml_out, honor it. Otherwise try to walk the runtime
+        # config_path back to its source-tree origin -- a typical install path
+        # looks like ".../install/pan_tilt/share/pan_tilt/config/calibration.yaml"
+        # and the matching source is ".../src/pan_tilt/config/calibration.yaml".
+        # Fall back to config_path (with a warning at promote time) only if no
+        # source-tree counterpart can be located.
+        explicit_promote = self.get_parameter("promote_yaml_out").value
+        if explicit_promote:
+            self.promote_yaml_out: Optional[Path] = Path(explicit_promote).expanduser().resolve()
+        else:
+            self.promote_yaml_out = _resolve_source_tree_yaml(self.config_path)
 
         self._board_spec, self._safety_env, self._loaded_cfg = _load_yaml_config(self.config_path)
         self._board = build_board(self._board_spec)
@@ -206,8 +429,7 @@ class CalibWebNode(Node):
 
         self.state.image_topic = self.get_parameter("image_topic").value
         self.state.camera_info_topic = self.get_parameter("camera_info_topic").value
-        import os as _os
-        self.state.ros_domain_id = _os.environ.get("ROS_DOMAIN_ID", "0 (default)")
+        self.state.ros_domain_id = os.environ.get("ROS_DOMAIN_ID", "0 (default)")
         self._image_sub = None
         self._camera_info_sub = None
         self._sensor_qos = QoSProfile(
@@ -215,12 +437,24 @@ class CalibWebNode(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
 
-        # Draft waypoint state — authored in-browser, not persisted to disk
-        # until the user explicitly hits Save.
+        # Draft waypoint state — authored in-browser, persisted to disk only
+        # when the user clicks Save. On startup we prefer whatever's in the
+        # draft YAML (if it exists) over the base config, so a reloaded or
+        # crashed session recovers the operator's in-progress lists instead
+        # of reverting to whatever was checked into git.
         self._waypoints: dict = {
             "phase1_waypoints": list(self._loaded_cfg.get("phase1_waypoints", []) or []),
+            "phase1_waypoints_custom": list(self._loaded_cfg.get("phase1_waypoints_custom", []) or []),
             "phase2_waypoints": list(self._loaded_cfg.get("phase2_waypoints", []) or []),
             "sanity_xarm_angles_rad": list(self._loaded_cfg.get("sanity_xarm_angles_rad", []) or []),
+        }
+        self._resume_from_draft()
+
+        # Expose the configured pan/tilt grid so the UI can render grid-matched
+        # jog presets and a cheat-sheet. Constant for the lifetime of the node.
+        self.state.grid = {
+            "pan_deg": list(self._loaded_cfg.get("pan_grid_deg", []) or []),
+            "tilt_deg": list(self._loaded_cfg.get("tilt_grid_deg", []) or []),
         }
 
         self._subscribe_camera(
@@ -454,8 +688,12 @@ class CalibWebNode(Node):
             rvec = cv2.Rodrigues(det.pose_optical[:3, :3])[0]
             tvec = det.pose_optical[:3, 3]
             pts, _ = cv2.projectPoints(obj, rvec, tvec, self._latest_K, self._latest_D)
-            pts = (pts.reshape(-1, 2) * scale_used).astype(int)
-            cv2.polylines(bgr, [pts], True, color, 2)
+            pts2d = pts.reshape(-1, 2) * scale_used
+            # projectPoints returns NaN/inf when the pose places corners
+            # behind the camera or at degenerate locations -- casting those
+            # to int triggers RuntimeWarning and draws garbage.
+            if np.all(np.isfinite(pts2d)):
+                cv2.polylines(bgr, [pts2d.astype(int)], True, color, 2)
         return bgr
 
     # ---- public accessors (called from FastAPI threads) ----------------------
@@ -580,34 +818,212 @@ class CalibWebNode(Node):
         with self.lock:
             self._waypoints[phase] = list(wps)
 
-    def save_waypoints(self) -> Path:
-        """Atomic rewrite of the draft YAML, preserving all non-waypoint fields.
+    def _dedupe_waypoints_inplace(self, eps_rad: float = 1e-3) -> dict:
+        """Drop near-duplicate waypoints in place across all waypoint lists.
 
-        Returns the path written. Output structure mirrors the original
-        calibration.yaml so the user can promote with a simple cp.
+        Two waypoints are duplicates if every joint angle agrees within
+        `eps_rad` (~0.06 deg, well below the xArm's joint repeatability).
+        Operates on `self._waypoints` directly so subsequent /api/waypoints
+        reads reflect the cleanup. Returns a per-phase dict of how many
+        entries were removed, so the caller can log it.
+
+        Order-preserving: the first occurrence wins; later duplicates are
+        dropped. List-of-floats and list-of-lists are both handled (the
+        sanity-pose phase is a flat float list, not a list of waypoints).
         """
+        removed: dict = {}
+        with self.lock:
+            for phase, wps in self._waypoints.items():
+                if not isinstance(wps, list) or not wps:
+                    continue
+                # Skip flat float lists (e.g. sanity_xarm_angles_rad is a
+                # single waypoint encoded as a flat list of joint angles).
+                if not isinstance(wps[0], (list, tuple)):
+                    continue
+                kept: list = []
+                n_dropped = 0
+                for w in wps:
+                    arr = np.asarray(w, dtype=float)
+                    is_dup = any(
+                        np.asarray(k).shape == arr.shape and
+                        np.allclose(np.asarray(k), arr, atol=eps_rad)
+                        for k in kept
+                    )
+                    if is_dup:
+                        n_dropped += 1
+                    else:
+                        kept.append(list(w))
+                if n_dropped:
+                    self._waypoints[phase] = kept
+                    removed[phase] = n_dropped
+        return removed
+
+    def _serialize_waypoints_yaml(self) -> str:
+        """Build the full YAML string for the current waypoint state.
+
+        Dedupes near-identical waypoints first so the on-disk yaml is the
+        canonical, deduplicated form. Operator-defined duplicates were used
+        as a self-consistency probe earlier in the calibration workflow,
+        but downstream solvers (Park-Martin) get nothing extra from them
+        and the inter-duplicate check at collection time is a better
+        signal anyway -- so save-time dedup keeps the yaml clean.
+        """
+        removed = self._dedupe_waypoints_inplace()
+        if removed:
+            self.get_logger().info(
+                f"deduped waypoints before save: {removed}"
+            )
         base = {k: v for k, v in self._loaded_cfg.items() if k != "__passthrough__"}
         with self.lock:
             for k, v in self._waypoints.items():
                 # Convert nested tuples from YAML loader to plain lists.
                 base[k] = [list(x) if isinstance(x, (list, tuple)) else x
                            for x in v] if isinstance(v, list) else v
-
         out = {"collector": base}
         passthrough = self._loaded_cfg.get("__passthrough__", {})
         if "safety_section" in passthrough:
             out["safety"] = passthrough["safety_section"]
         if "board_section" in passthrough:
             out["board"] = passthrough["board_section"]
+        return yaml.safe_dump(out, sort_keys=False)
 
-        tmp = self.draft_yaml_out.with_suffix(self.draft_yaml_out.suffix + ".tmp")
+    def _atomic_write(self, target: Path, text: str) -> None:
+        tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(yaml.safe_dump(out, sort_keys=False))
-        tmp.replace(self.draft_yaml_out)
+        tmp.write_text(text)
+        tmp.replace(target)
+
+    def save_waypoints(self) -> Path:
+        """Atomic rewrite of the draft YAML, preserving all non-waypoint fields."""
+        self._atomic_write(self.draft_yaml_out, self._serialize_waypoints_yaml())
         return self.draft_yaml_out
+
+    def save_waypoints_to_config(self) -> tuple[Path, Optional[Path]]:
+        """Promote the current waypoints to the persistent calibration.yaml.
+
+        Writes to ``self.promote_yaml_out`` (resolved at startup -- see
+        ``promote_yaml_out`` param), NOT to the runtime ``config_path`` which
+        typically lives under ``install/`` and gets clobbered on every colcon
+        build. If the target file exists, rename it to
+        ``<stem>.yaml.old-YYYYmmdd_HHMMSS`` alongside before overwriting, so
+        the previous version is always recoverable. Returns (written_path,
+        backup_path or None).
+        Raises RuntimeError if no source-tree promote target could be resolved
+        and none was passed explicitly.
+        """
+        if not self.promote_yaml_out:
+            raise RuntimeError(
+                "no promote target available -- pass -p promote_yaml_out:=<path> "
+                "(or launch with -p config:= pointing under <ws>/install/... so "
+                "the source-tree counterpart can be auto-resolved). Refusing to "
+                "write to the runtime config_path because colcon would overwrite "
+                "it on the next build."
+            )
+        target = self.promote_yaml_out
+        backup: Optional[Path] = None
+        if target.exists():
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup = target.with_name(f"{target.stem}{target.suffix}.old-{stamp}")
+            target.replace(backup)
+        self._atomic_write(target, self._serialize_waypoints_yaml())
+        return target, backup
+
+    def _resume_from_draft(self) -> None:
+        """Auto-resume from draft yaml at startup. Errors are non-fatal."""
+        try:
+            self.reload_waypoints_from_yaml(self.draft_yaml_out, log_prefix="auto-resume")
+        except FileNotFoundError:
+            return
+        except (OSError, yaml.YAMLError) as e:
+            self.get_logger().warning(
+                f"draft YAML exists at {self.draft_yaml_out} but failed to parse: {e}; "
+                "falling back to base config"
+            )
+
+    def reload_waypoints_from_yaml(self, path: Path,
+                                    log_prefix: str = "reload") -> dict:
+        """Replace in-memory waypoint lists with whatever the named yaml has.
+
+        Operator-facing reload: lets the UI swap between draft (auto-saved)
+        and the source-tree calibration.yaml (manually pruned/edited)
+        without restarting the server.
+
+        Returns a `{phase: count}` dict of what was loaded. Raises
+        FileNotFoundError / OSError / yaml.YAMLError on parse failure --
+        callers decide how loud to be.
+        """
+        data = yaml.safe_load(path.read_text()) or {}
+        coll = data.get("collector", {}) or {}
+        recovered: dict = {}
+        for k in ("phase1_waypoints", "phase1_waypoints_custom",
+                  "phase2_waypoints", "sanity_xarm_angles_rad"):
+            if k in coll:
+                v = coll[k]
+                recovered[k] = [list(x) if isinstance(x, (list, tuple)) else x
+                                for x in v] if isinstance(v, list) else v
+        counts = {k: (len(v) if isinstance(v, list) else 0)
+                  for k, v in recovered.items()}
+        if recovered:
+            with self.lock:
+                self._waypoints.update(recovered)
+            self.get_logger().info(f"{log_prefix} from {path}: {counts}")
+        else:
+            self.get_logger().info(f"{log_prefix} from {path}: no waypoint sections found")
+        return counts
 
 
 # ---- yaml loader ------------------------------------------------------------
+
+def _resolve_source_tree_yaml(config_path: str) -> Optional[Path]:
+    """Walk `config_path` from the install tree back to the colcon source tree.
+
+    A typical install path looks like
+    ``<ws>/install/pan_tilt/share/pan_tilt/config/calibration.yaml``; the
+    matching source-tree file lives at
+    ``<ws>/src/<...>/pan_tilt/config/calibration.yaml``. Returns the source
+    path if a match is found under any ``src/`` sibling of the detected
+    ``install/`` ancestor; otherwise None.
+
+    Important: do NOT call ``Path.resolve()`` on `config_path`. Under
+    ``colcon build --symlink-install`` the install file is a symlink chain
+    into ``src/``, so resolving collapses the path to the source tree and
+    erases the ``install`` segment we depend on. We instead absolutise
+    *without* following symlinks, then -- if the install path doesn't show
+    up that way either -- fall back to ``Path.resolve()`` to handle the
+    case where the operator already passed a source-tree path directly.
+    """
+    if not config_path:
+        return None
+
+    raw = Path(config_path)
+    # Make absolute without following symlinks: preserves ``install/`` if
+    # the operator launched with the canonical share-dir path.
+    p = raw if raw.is_absolute() else (Path.cwd() / raw)
+
+    parts = p.parts
+    if "install" in parts:
+        ws = Path(*parts[: parts.index("install")])
+    else:
+        # Maybe the operator passed a source-tree path directly. Re-resolve
+        # symlinks (this handles the symlink-install case too: the resolved
+        # path lands inside src/ and we just return that file when present).
+        resolved = p.resolve()
+        rparts = resolved.parts
+        if "src" not in rparts:
+            return None
+        ws = Path(*rparts[: rparts.index("src")])
+
+    src_root = ws / "src"
+    if not src_root.is_dir():
+        return None
+    rel_tail = Path("pan_tilt") / "config" / p.name
+    candidates = [c for c in src_root.rglob(str(rel_tail)) if c.is_file()]
+    # Prefer a unique match; if multiple (e.g. multiple worktrees), pick the
+    # shortest path which is typically the canonical source location.
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: len(c.parts))
+
 
 def _load_yaml_config(path: str) -> tuple[BoardSpec, SafetyEnvelope, dict]:
     """Read calibration.yaml if provided. Returns (board_spec, safety_env, collector_cfg).
@@ -685,6 +1101,29 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     @app.get("/api/state")
     def api_state():
         return node.snapshot_state()
+
+    # Build the dict_id -> DICT_* name lookup once at app-init time;
+    # dir(cv2.aruco) is hundreds of attributes and we'd otherwise scan it
+    # per-request.
+    _ARUCO_DICT_NAMES = {
+        getattr(cv2.aruco, n): n
+        for n in dir(cv2.aruco) if n.startswith("DICT_")
+    }
+
+    @app.get("/api/board")
+    def api_board():
+        """ChArUco board spec the detector is currently running with.
+        Surfaced in the UI so the operator can verify the active spec
+        matches the physical print at a glance.
+        """
+        b = node._board_spec
+        out = asdict(b)
+        out["dict"] = _ARUCO_DICT_NAMES.get(b.dict_id, f"id={b.dict_id}")
+        out["inner_corners"] = b.n_inner_corners
+        out["board_size_m"] = [b.squares_x * b.square_len_m,
+                               b.squares_y * b.square_len_m]
+        out.pop("dict_id", None)
+        return out
 
     @app.get("/api/topics/image")
     def api_image_topics():
@@ -782,14 +1221,15 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         return {"ok": True, "message": f"pan={pan_deg:+.1f} tilt={tilt_deg:+.1f} published"}
 
     # --- waypoints ----------------------------------------------------------
-    VALID_PHASES = {"phase1_waypoints", "phase2_waypoints", "sanity_xarm_angles_rad"}
+    VALID_PHASES = {"phase1_waypoints", "phase1_waypoints_custom",
+                    "phase2_waypoints", "sanity_xarm_angles_rad"}
 
     @app.get("/api/waypoints")
     def api_waypoints_all():
         return {k: node.list_waypoints(k) for k in VALID_PHASES}
 
-    # /save must be declared BEFORE /{phase} so FastAPI's first-match routing
-    # doesn't funnel it into the phase handler (which requires a body).
+    # /save and /promote must be declared BEFORE /{phase} so FastAPI's
+    # first-match routing doesn't funnel them into the phase handler.
     @app.post("/api/waypoints/save")
     async def api_waypoints_save():
         try:
@@ -797,6 +1237,100 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         except Exception as exc:
             raise HTTPException(500, f"save failed: {exc}")
         return {"ok": True, "path": str(path)}
+
+    @app.post("/api/waypoints/promote")
+    async def api_waypoints_promote():
+        """Overwrite the persistent calibration.yaml (source-tree, NOT the
+        install copy) with the current waypoints, renaming the old file to
+        <stem>.yaml.old-<timestamp> alongside. The target path is resolved
+        once at startup -- see /api/waypoints/paths.
+        """
+        try:
+            written, backup = node.save_waypoints_to_config()
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc))
+        except Exception as exc:
+            raise HTTPException(500, f"promote failed: {exc}")
+        return {
+            "ok": True,
+            "path": str(written),
+            "backup": str(backup) if backup else None,
+        }
+
+    @app.post("/api/waypoints/reload")
+    def api_waypoints_reload(req: dict):
+        """Reload waypoint lists from a chosen yaml source.
+
+        Body: `{"source": "draft" | "promote"}`. Default: "draft".
+        - "draft":   reload from `draft_yaml_out` (the auto-saved working copy)
+        - "promote": reload from `promote_yaml_out` (the source-tree
+                     calibration.yaml the operator manually prunes/edits)
+
+        Returns `{ok, source, path, counts}`. Raises 404 if the chosen
+        source isn't configured (no `--config` at startup → no promote
+        target) or doesn't exist on disk; 400 on parse failure.
+        """
+        source = (req or {}).get("source", "draft")
+        path_map = {
+            "draft":   node.draft_yaml_out,
+            "promote": node.promote_yaml_out,
+        }
+        if source not in path_map:
+            raise HTTPException(400, f"unknown source: {source!r} (use 'draft' or 'promote')")
+        path = path_map[source]
+        if path is None:
+            raise HTTPException(404, f"no {source} target configured -- "
+                                     "did you launch with -p config:=...?")
+        try:
+            counts = node.reload_waypoints_from_yaml(path,
+                                                     log_prefix=f"reload from {source}")
+        except FileNotFoundError:
+            raise HTTPException(404, f"{source} yaml not found at {path}")
+        except (OSError, yaml.YAMLError) as e:
+            raise HTTPException(400, f"parse failed: {e}")
+        return {"ok": True, "source": source, "path": str(path), "counts": counts}
+
+    @app.get("/api/waypoints/paths")
+    def api_waypoints_paths():
+        """Expose the three yaml paths the UI cares about:
+        - `config`: runtime yaml that calibrate_web loaded at startup
+        - `draft`:  where unsaved edits land (via /save)
+        - `promote`: persistent target for /promote (source-tree, never install/)
+        """
+        return {
+            "config": node.config_path or None,
+            "draft": str(node.draft_yaml_out),
+            "promote": str(node.promote_yaml_out) if node.promote_yaml_out else None,
+        }
+
+    @app.get("/api/calib/phase1_custom_park")
+    def api_phase1_custom_park_get():
+        """Operator-chosen pan/tilt for the Phase-1 custom-park dataset.
+        Lives in the loaded yaml's collector section so it round-trips
+        through save/promote like the rest of the calibration config.
+        """
+        cfg = node._loaded_cfg
+        return {
+            "pan_deg": float(cfg.get("phase1_custom_park_pan_deg", 0.0)),
+            "tilt_deg": float(cfg.get("phase1_custom_park_tilt_deg", 0.0)),
+        }
+
+    @app.post("/api/calib/phase1_custom_park")
+    def api_phase1_custom_park_set(body: dict):
+        try:
+            pan = float(body["pan_deg"])
+            tilt = float(body["tilt_deg"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, "body must be {pan_deg: float, tilt_deg: float}")
+        # Soft envelope check matching the operator-declared limits.
+        if not (-30.0 <= pan <= 30.0):
+            raise HTTPException(400, f"pan_deg out of envelope (±30): {pan}")
+        if not (0.0 <= tilt <= 45.0):
+            raise HTTPException(400, f"tilt_deg out of envelope (0..+45): {tilt}")
+        with node.lock:
+            node._loaded_cfg["phase1_custom_park_pan_deg"] = pan
+            node._loaded_cfg["phase1_custom_park_tilt_deg"] = tilt
+        return {"ok": True, "pan_deg": pan, "tilt_deg": tilt}
 
     @app.get("/api/waypoints/{phase}")
     def api_waypoints_get(phase: str):
@@ -831,6 +1365,854 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         node.set_waypoints(phase, wps)
         return {"phase": phase, "waypoints": node.list_waypoints(phase)}
 
+    # --- calibrate tab ------------------------------------------------------
+    #
+    # All endpoints here are file-I/O only -- they never move the robot. The
+    # collection step (which does move the robot) stays a terminal invocation
+    # per the design decision documented in shimmying-fluttering-koala.md.
+
+    def _parse_session_file(sess_path: Path, name: str) -> dict:
+        """Read one of the session's JSONs and surface a status summary.
+
+        Returns {exists, mtime, n_samples?, trans_rmse_m?, rot_rmse_rad?,
+        val_trans_rmse_m?, val_rot_rmse_rad?}. Missing keys are simply absent.
+        Never raises on bad JSON -- returns {exists, error} instead.
+        """
+        p = sess_path / name
+        try:
+            text = p.read_text()
+            mtime = p.stat().st_mtime
+        except (FileNotFoundError, IsADirectoryError):
+            return {"exists": False}
+        info: dict = {"exists": True, "mtime": mtime, "path": str(p)}
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            info["error"] = f"parse: {exc}"
+            return info
+        # Collector-side (raw samples list).
+        if isinstance(data, dict) and "samples" in data:
+            info["n_samples"] = len(data["samples"])
+        # Analyser-side (aggregate RMSEs).
+        for k in (
+            "trans_rmse_m", "rot_rmse_rad",
+            "val_trans_rmse_m", "val_rot_rmse_rad",
+            "train_trans_rmse_m", "train_rot_rmse_rad",
+            "n_train", "n_val", "rms_px",
+            "phase1_park_pan_rad", "phase1_park_tilt_rad",
+        ):
+            if isinstance(data, dict) and k in data:
+                info[k] = data[k]
+        return info
+
+    def _gates_from_files(files: dict[str, dict]) -> list[dict]:
+        """Compute gate pass/fail rows from an already-parsed file inventory
+        so we don't re-open + re-parse the same JSONs we just read for the
+        files-table response."""
+        out = []
+        for fname, key, thresh, unit, label in CALIB_GATES:
+            info = files.get(fname) or {}
+            common = {"file": fname, "key": key, "label": label,
+                      "unit": unit, "threshold": thresh}
+            if not info.get("exists") or key not in info:
+                out.append({**common, "status": "missing"})
+                continue
+            value = float(info[key])
+            status = "pass" if value <= thresh else "fail"
+            out.append({
+                **common, "value": value, "status": status,
+            })
+        return out
+
+    @app.get("/api/calib/sessions")
+    def api_calib_sessions():
+        return {
+            "sessions_dir": str(node.calib_runner.sessions_dir),
+            "sessions": node.calib_runner.list_sessions(),
+        }
+
+    @app.post("/api/calib/session")
+    async def api_calib_create_session(req: dict):
+        name = (req or {}).get("name", "")
+        try:
+            path = node.calib_runner.create_session(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except FileExistsError:
+            raise HTTPException(409, f"session {name!r} already exists")
+        return {"name": name, "path": str(path)}
+
+    @app.get("/api/calib/session/{name}")
+    def api_calib_session_detail(name: str):
+        try:
+            sess_path = node.calib_runner.session_path(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not sess_path.is_dir():
+            raise HTTPException(404, f"unknown session: {name}")
+        tracked = [
+            "phase1_handeye.json", "phase1_handeye_custom.json",
+            "phase2_chain.json", "sanity.json",
+            "intrinsic.json", "handeye.json", "handeye_custom.json",
+            "chain.json", "polish.json", "dry_run.json",
+        ]
+        files = {f: _parse_session_file(sess_path, f) for f in tracked}
+        return {
+            "name": name,
+            "path": str(sess_path),
+            "files": files,
+            "gates": _gates_from_files(files),
+        }
+
+    @app.get("/api/calib/session/{name}/coverage")
+    def api_calib_coverage(name: str):
+        """Per-sample marker positions across the camera FoV.
+
+        Returns angular positions (degrees off the optical axis,
+        horizontal / vertical) computed directly from the body-frame
+        translation of the marker. Lets the operator visually spot under-
+        sampled regions of the camera FoV without needing to know K (we
+        just compute atan2(y,x) and atan2(z,x) in body coords).
+
+        Body-frame convention is X forward (depth), Y left, Z up. We flip
+        Y and Z signs so the canvas reads like the camera image: +X axis
+        points right (image-X right), +Y axis points down (image-Y down).
+        """
+        try:
+            sess_path = node.calib_runner.session_path(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not sess_path.is_dir():
+            raise HTTPException(404, f"unknown session: {name}")
+
+        # Snapshot live K + frame dims once so per-sample projection and the
+        # FoV box use the same numbers.
+        with node.lock:
+            K = node._latest_K.copy() if getattr(node, "_latest_K", None) is not None else None
+            bgr = node._latest_bgr
+            img_shape = bgr.shape[:2] if bgr is not None else None
+        fov_h_deg, fov_v_deg = 80.0, 51.0
+        image_w, image_h = (None, None)
+        if K is not None and img_shape:
+            image_h, image_w = int(img_shape[0]), int(img_shape[1])
+            fov_h_deg = math.degrees(2 * math.atan(image_w / (2 * float(K[0, 0]))))
+            fov_v_deg = math.degrees(2 * math.atan(image_h / (2 * float(K[1, 1]))))
+
+        # Body (X fwd, Y left, Z up) -> optical (X right, Y down, Z fwd).
+        # Inverse of utils.R_BODY_FROM_OPTICAL; used to project samples into
+        # normalized image coordinates so the client can draw them on a flat
+        # canvas with the same K/dims the camera would use.
+        R_OPT_FROM_BODY = np.array([
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [1.0, 0.0, 0.0],
+        ])
+
+        out: list[dict] = []
+        for fname in ("phase1_handeye.json", "phase1_handeye_custom.json",
+                      "phase2_chain.json"):
+            try:
+                data = json.loads((sess_path / fname).read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            for idx, s in enumerate(data.get("samples", [])):
+                t = s.get("t_cam_marker_body", {}).get("translation")
+                if not t or len(t) != 3:
+                    continue
+                x, y, z = float(t[0]), float(t[1]), float(t[2])
+                if x <= 0:
+                    continue  # behind the camera, skip
+                # Flip Y / Z so canvas X+ is right, Y+ is down (matches image)
+                horiz_deg = math.degrees(math.atan2(-y, x))
+                vert_deg = math.degrees(math.atan2(-z, x))
+                depth_m = math.sqrt(x * x + y * y + z * z)
+                u_norm: Optional[float] = None
+                v_norm: Optional[float] = None
+                if K is not None and image_w and image_h:
+                    t_opt = R_OPT_FROM_BODY @ np.array([x, y, z])
+                    z_o = float(t_opt[2])
+                    if z_o > 0:
+                        u = float(K[0, 0]) * float(t_opt[0]) / z_o + float(K[0, 2])
+                        v = float(K[1, 1]) * float(t_opt[1]) / z_o + float(K[1, 2])
+                        if math.isfinite(u) and math.isfinite(v):
+                            u_norm = u / image_w
+                            v_norm = v / image_h
+                out.append({
+                    "phase": fname.replace(".json", ""),
+                    "index": idx,
+                    "label": s.get("label", ""),
+                    "horiz_deg": horiz_deg,
+                    "vert_deg": vert_deg,
+                    "depth_m": depth_m,
+                    "u_norm": u_norm,
+                    "v_norm": v_norm,
+                })
+        return {
+            "samples": out,
+            "fov_h_deg": fov_h_deg,
+            "fov_v_deg": fov_v_deg,
+            "image_w": image_w,
+            "image_h": image_h,
+            "have_intrinsics": K is not None and image_w is not None,
+        }
+
+    @app.get("/api/calib/session/{name}/file/{filename}")
+    def api_calib_session_file(name: str, filename: str):
+        try:
+            sess_path = node.calib_runner.session_path(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        # Only let through specific analyser files so we don't hand back
+        # arbitrary blobs (the runner's sandboxing already covers ../ etc.).
+        allowed = {"handeye.json", "handeye_custom.json",
+                   "chain.json", "polish.json",
+                   "phase1_handeye.json", "phase1_handeye_custom.json",
+                   "phase2_chain.json", "sanity.json",
+                   "intrinsic.json", "dry_run.json"}
+        if filename not in allowed:
+            raise HTTPException(404, f"unknown file: {filename}")
+        try:
+            return json.loads((sess_path / filename).read_text())
+        except FileNotFoundError:
+            raise HTTPException(404, f"{filename} not found in session")
+        except Exception as exc:
+            raise HTTPException(500, f"parse: {exc}")
+
+    # Commands accepted by the run endpoint, with the session-relative files
+    # each one REQUIRES before it can run. Keep the allowlist tight so a
+    # malformed POST can't ask us to run arbitrary argv. `collect` subcommands
+    # have empty prereq lists -- they generate files rather than consume them.
+    _CALIB_PREREQS = {
+        # analysis subcommands -> run_calibration.py
+        "handeye":         ["phase1_handeye.json"],
+        "handeye_custom":  ["phase1_handeye_custom.json"],
+        "chain":           ["phase2_chain.json", "handeye.json"],
+        "polish":          ["phase1_handeye.json", "phase2_chain.json", "chain.json"],
+        "validate":        [],
+        # collection subcommands -> calibrate_collect.py (moves the robot)
+        "collect_phase1":         [],     # canonical level park (pan=0, tilt=+45)
+        "collect_phase1_custom":  [],     # operator-chosen park, see /api/calib/phase1_custom_park
+        "collect_dry_run":        [],     # preflight: validate motion only, no image capture
+        "collect_phase2": ["phase1_handeye.json"],  # not technically required,
+                                                     # but Phase 2 without
+                                                     # Phase 1 won't produce a
+                                                     # usable calibration. Gate
+                                                     # so the operator doesn't
+                                                     # waste a 20-min sweep.
+        "collect_sanity": [],
+        "collect_both":   [],
+    }
+    _ANALYSIS_CMDS = {"handeye", "handeye_custom", "chain", "polish", "validate"}
+    # Endpoint-facing collect commands map onto `phase:=<phase>` for
+    # calibrate_collect by stripping the "collect_" prefix.
+
+    @app.post("/api/calib/run")
+    async def api_calib_run(req: dict):
+        session = (req or {}).get("session", "")
+        cmd = (req or {}).get("cmd", "")
+        extra_flags = list((req or {}).get("flags", []))
+        if cmd not in _CALIB_PREREQS:
+            raise HTTPException(400, f"unknown command: {cmd}")
+        try:
+            sess_path = node.calib_runner.session_path(session)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not sess_path.is_dir():
+            raise HTTPException(404, f"unknown session: {session}")
+
+        # Prerequisite check -- fail clean with a 400 BEFORE we spawn. Without
+        # this, the subprocess emits a Python traceback into the log pane on
+        # an out-of-order click (e.g. hitting "chain" before Phase 1 is run).
+        missing = [f for f in _CALIB_PREREQS[cmd] if not (sess_path / f).is_file()]
+        if missing:
+            raise HTTPException(
+                400,
+                f"{cmd} needs {', '.join(missing)} in the session -- "
+                "run the upstream step first"
+            )
+
+        if cmd in _ANALYSIS_CMDS:
+            # Analysis path: python -m pan_tilt.calibration.run_calibration <sub>
+            # `handeye_custom` is not a real subcommand -- it's the same handeye
+            # solver pointed at the custom-park dataset, with --out-name set so
+            # it doesn't clobber the level handeye.json.
+            sub_cmd = "handeye" if cmd == "handeye_custom" else cmd
+            cmd_args: list[str] = [sub_cmd]
+            if cmd == "handeye":
+                cmd_args.append(str(sess_path / "phase1_handeye.json"))
+                cmd_args += ["--out", str(sess_path)]
+            elif cmd == "handeye_custom":
+                cmd_args.append(str(sess_path / "phase1_handeye_custom.json"))
+                cmd_args += ["--out", str(sess_path),
+                             "--out-name", "handeye_custom.json"]
+            elif cmd == "chain":
+                cmd_args.append(str(sess_path / "phase2_chain.json"))
+                cmd_args += ["--handeye", str(sess_path / "handeye.json")]
+                cmd_args += ["--out", str(sess_path)]
+            elif cmd == "polish":
+                cmd_args.append(str(sess_path / "phase1_handeye.json"))
+                cmd_args.append(str(sess_path / "phase2_chain.json"))
+                cmd_args += ["--seed", str(sess_path / "chain.json")]
+                cmd_args += ["--out", str(sess_path)]
+            elif cmd == "validate":
+                cmd_args.append(str(sess_path))
+            # Allowlist of client flags passed through to run_calibration.
+            analysis_flags = {
+                "--fit-pan-offset", "--lock-tb-rotation", "--unlock-tb-rotation",
+                "--verbose",
+            }
+            for f in extra_flags:
+                if f not in analysis_flags:
+                    raise HTTPException(400, f"disallowed flag: {f}")
+                cmd_args.append(f)
+            argv = [sys.executable, "-u", "-m", "pan_tilt.calibration.run_calibration", *cmd_args]
+            label = f"run_calibration {cmd}"
+
+        else:
+            # Collection path: ros2 run pan_tilt calibrate_collect -- moves the
+            # robot. Requires a config yaml (the same one calib_web loaded);
+            # reject if the server wasn't launched with -p config:=...
+            if not node.config_path:
+                raise HTTPException(
+                    400,
+                    "calibrate_web was launched without -p config:=... "
+                    "calibrate_collect needs the board spec + waypoint lists "
+                    "from calibration.yaml; relaunch with the config param."
+                )
+            if extra_flags:
+                raise HTTPException(400, "collect commands accept no extra flags")
+            # Snapshot current in-memory waypoints to the draft yaml and feed
+            # *that* to calibrate_collect, so collect runs always reflect what
+            # the operator sees in the xArm Waypoints tab without forcing them
+            # to "Promote to calibration.yaml" first. The draft preserves
+            # board+safety sections via __passthrough__, so it's a complete
+            # config from calibrate_collect's POV.
+            collect_config = str(node.save_waypoints())
+            phase_arg = cmd.removeprefix("collect_")
+            argv = [
+                "ros2", "run", "pan_tilt", "calibrate_collect", "--ros-args",
+                "-p", f"config:={collect_config}",
+                "-p", f"out_dir:={sess_path}",
+                "-p", f"phase:={phase_arg}",
+            ]
+            label = f"calibrate_collect --phase {phase_arg}"
+
+        try:
+            result = await node.calib_runner.spawn(session, argv, label=label)
+        except (FileNotFoundError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc))
+        return result
+
+    @app.post("/api/calib/runs/{run_id}/cancel")
+    async def api_calib_cancel(run_id: str):
+        ok = await node.calib_runner.cancel(run_id)
+        if not ok:
+            raise HTTPException(404, f"no active run with id {run_id}")
+        return {"ok": True, "run_id": run_id}
+
+    @app.get("/api/calib/urdf_targets")
+    def api_calib_urdf_targets():
+        return {"targets": [t.to_dict() for t in list_urdf_targets()]}
+
+    @app.post("/api/calib/urdf_diff")
+    async def api_calib_urdf_diff(req: dict):
+        session = (req or {}).get("session", "")
+        xacro_path = (req or {}).get("xacro_path", "")
+        # Default to polish.json: the joint refinement is consistently a few
+        # mm tighter than chain alone on real datasets.
+        results_file = (req or {}).get("results_file", "polish.json")
+        if not xacro_path:
+            raise HTTPException(400, "xacro_path required")
+        try:
+            result = await node.calib_runner.urdf_diff(session, results_file, xacro_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc))
+        return result
+
+    @app.get("/api/calib/gates")
+    def api_calib_gates():
+        """Expose the gate thresholds so the UI stays in sync with Python."""
+        return {"gates": [
+            {"file": f, "key": k, "threshold": t, "unit": u, "label": lbl}
+            for f, k, t, u, lbl in CALIB_GATES
+        ]}
+
+    @app.get("/api/calib/commands")
+    def api_calib_commands():
+        """Expose the per-command prereq file list + whether collect is
+        available (i.e. a config yaml was passed at startup). The UI uses
+        this to disable run buttons that can't execute yet."""
+        return {
+            "prereqs": _CALIB_PREREQS,
+            "collect_enabled": bool(node.config_path),
+            "config_path": node.config_path or None,
+        }
+
+    # --- Prune (preview-then-apply) -----------------------------------------
+    #
+    # Operator-driven waypoint pruning by end-point pose similarity. The flow
+    # is intentionally two-step: Preview returns kept/dropped counts and a
+    # per-row breakdown without writing anything; Apply re-runs the same
+    # deterministic prune and writes a timestamped sidecar yaml + report.
+    # The original calibration.yaml is never modified.
+
+    PRUNE_PHASE_LABEL_PREFIX = {
+        "phase1_waypoints":         "phase1",
+        "phase1_waypoints_custom":  "phase1_custom",
+        "phase2_grid":              "phase2_grid",
+    }
+    PRUNE_DEFAULT_FACTORS = {
+        "phase1_waypoints": {
+            "trans_tol_m": 0.05, "rot_tol_deg": 8.0,
+            "min_count": 8, "min_rot_diversity_pairs": 6,
+            "min_rot_diversity_deg": 28.0, "seed_index": 0,
+        },
+        "phase1_waypoints_custom": {
+            "trans_tol_m": 0.05, "rot_tol_deg": 8.0,
+            "min_count": 8, "min_rot_diversity_pairs": 6,
+            "min_rot_diversity_deg": 28.0, "seed_index": 0,
+        },
+        "phase2_grid": {
+            "trans_tol_m": 0.04, "rot_tol_deg": 6.0,
+            "min_count": 6, "min_rot_diversity_pairs": 0,
+            "min_rot_diversity_deg": 28.0, "seed_index": 0,
+        },
+    }
+
+    def _list_prior_runs() -> list[dict]:
+        out: list[dict] = []
+        sessions = node.calib_runner.sessions_dir
+        if not sessions.exists():
+            return out
+        for run_dir in sessions.iterdir():
+            if not run_dir.is_dir():
+                continue
+            for fname in ("phase1_handeye.json", "phase1_handeye_custom.json"):
+                p = run_dir / fname
+                if not p.is_file():
+                    continue
+                try:
+                    raw = json.loads(p.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                samples = raw.get("samples", raw) if isinstance(raw, dict) else raw
+                n = len(samples) if isinstance(samples, list) else None
+                out.append({
+                    "name": f"{run_dir.name}/{fname}",
+                    "path": str(p),
+                    "mtime": p.stat().st_mtime,
+                    "n_samples": n,
+                })
+        out.sort(key=lambda r: r["mtime"], reverse=True)
+        return out
+
+    def _build_payloads(phase: str) -> tuple[list[dict], dict]:
+        prefix = PRUNE_PHASE_LABEL_PREFIX[phase]
+        if phase == "phase2_grid":
+            with node.lock:
+                pan_grid = list(node._loaded_cfg.get("pan_grid_deg", []) or [])
+                tilt_grid = list(node._loaded_cfg.get("tilt_grid_deg", []) or [])
+            payloads: list[dict] = []
+            for pi, p_deg in enumerate(pan_grid):
+                for ti, t_deg in enumerate(tilt_grid):
+                    payloads.append({
+                        "label": f"{prefix}/p{p_deg:+.1f}t{t_deg:+.1f}",
+                        "pan_deg": float(p_deg),
+                        "tilt_deg": float(t_deg),
+                        "pan_idx": pi,
+                        "tilt_idx": ti,
+                    })
+            meta = {"kind": "grid", "pan_grid_deg": pan_grid,
+                    "tilt_grid_deg": tilt_grid}
+            return payloads, meta
+
+        joints_lists = node.list_waypoints(phase)
+        payloads = [
+            {
+                "label": f"{prefix}/{i}",
+                "joints": list(angles) if isinstance(angles, (list, tuple)) else angles,
+                "yaml_index": i,
+            }
+            for i, angles in enumerate(joints_lists)
+        ]
+        return payloads, {"kind": "joint_list"}
+
+    def _build_predictor(phase: str, predictor_choice: str, prior_run_path: Optional[str]):
+        info: dict = {"requested": predictor_choice, "prior_run_path": prior_run_path}
+        predictors = []
+        if phase in ("phase1_waypoints", "phase1_waypoints_custom"):
+            if predictor_choice in ("auto", "replay_only") and prior_run_path:
+                try:
+                    predictors.append(replay_predictor(prior_run_path))
+                    info["replay"] = f"loaded {prior_run_path}"
+                except (OSError, ValueError) as exc:
+                    info["replay_error"] = str(exc)
+            if predictor_choice == "replay_only" and not predictors:
+                info["fallback"] = "replay_only requested but no prior run loaded"
+            # Phase-1 FK is intentionally absent: yourdfpy isn't in the venv
+            # and the calibration workflow always produces a prior run.
+            # Per-row failures show up in the UI as "no prediction".
+        elif phase == "phase2_grid":
+            # Phase-2 cell similarity is determined by camera pose, which is
+            # FK-only (it doesn't depend on the xArm anchor). Prior-run replay
+            # would mix anchor-dependent marker poses, so it's not used here.
+            predictors.append(pantilt_grid_predictor())
+            info["fk"] = "pantilt_grid_predictor(default_params)"
+        return chain_predictors(predictors), info
+
+    def _normalize_factors(phase: str, raw: dict) -> dict:
+        defaults = PRUNE_DEFAULT_FACTORS[phase]
+        out = dict(defaults)
+        if isinstance(raw, dict):
+            for k in defaults:
+                if k in raw and raw[k] is not None:
+                    out[k] = raw[k]
+        try:
+            return {
+                "trans_tol_m": float(out["trans_tol_m"]),
+                "rot_tol_deg": float(out["rot_tol_deg"]),
+                "min_count": int(out["min_count"]),
+                "min_rot_diversity_pairs": int(out["min_rot_diversity_pairs"]),
+                "min_rot_diversity_deg": float(out["min_rot_diversity_deg"]),
+                "seed_index": int(out["seed_index"]),
+            }
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"bad factor value: {exc}")
+
+    def _normalize_overrides(raw) -> dict[int, str]:
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise HTTPException(400, "overrides must be a {index: 'keep'|'drop'} mapping")
+        out: dict[int, str] = {}
+        for k, v in raw.items():
+            try:
+                idx = int(k)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"override key {k!r} is not an integer index")
+            if v not in ("keep", "drop"):
+                raise HTTPException(400, f"override value {v!r} must be 'keep' or 'drop'")
+            out[idx] = v
+        return out
+
+    def _run_prune(req: dict) -> tuple[dict, dict, list[dict], dict]:
+        phase = (req or {}).get("phase")
+        if phase not in PRUNE_PHASE_LABEL_PREFIX:
+            raise HTTPException(
+                404,
+                f"unknown phase: {phase!r}. valid: {sorted(PRUNE_PHASE_LABEL_PREFIX)}",
+            )
+        factors = _normalize_factors(phase, (req or {}).get("factors", {}))
+        overrides = _normalize_overrides((req or {}).get("overrides"))
+        predictor_choice = str((req or {}).get("predictor_choice", "auto"))
+        if predictor_choice not in ("auto", "replay_only", "fk_only"):
+            raise HTTPException(
+                400,
+                f"predictor_choice must be one of auto/replay_only/fk_only; "
+                f"got {predictor_choice!r}",
+            )
+        prior_run_path = (req or {}).get("prior_run_path") or None
+
+        payloads, meta = _build_payloads(phase)
+        if not payloads:
+            raise HTTPException(
+                400,
+                f"phase {phase!r} has no waypoints loaded — author them on the "
+                "Waypoints tab or pass a non-empty calibration.yaml at startup",
+            )
+        predict_fn, predictor_info = _build_predictor(
+            phase, predictor_choice, prior_run_path,
+        )
+        result = prune_waypoints(
+            payloads, predict_fn,
+            trans_tol_m=factors["trans_tol_m"],
+            rot_tol_deg=factors["rot_tol_deg"],
+            min_count=factors["min_count"],
+            min_rot_diversity_pairs=factors["min_rot_diversity_pairs"],
+            min_rot_diversity_rad=math.radians(factors["min_rot_diversity_deg"]),
+            seed_index=factors["seed_index"],
+            overrides=overrides,
+        )
+        diagnostics = dict(result.diagnostics)
+        if "replay" in predictor_info:
+            n_failed = diagnostics.get("n_predict_failed", 0)
+            if n_failed > 0 and n_failed / max(1, len(payloads)) > 0.20:
+                diagnostics["warning"] = (
+                    f"prior run looks stale: {n_failed} of {len(payloads)} "
+                    "labels not found — is this the right phase1_handeye.json?"
+                )
+        response = result.to_dict()
+        response["diagnostics"] = diagnostics
+        response["phase"] = phase
+        response["predictor_info"] = predictor_info
+        response["meta"] = meta
+        return response, factors, payloads, meta
+
+    @app.get("/api/calib/prune_inputs")
+    def api_calib_prune_inputs(phase: str):
+        if phase not in PRUNE_PHASE_LABEL_PREFIX:
+            raise HTTPException(
+                404,
+                f"unknown phase: {phase!r}. valid: {sorted(PRUNE_PHASE_LABEL_PREFIX)}",
+            )
+        if phase == "phase2_grid":
+            with node.lock:
+                pan_grid = list(node._loaded_cfg.get("pan_grid_deg", []) or [])
+                tilt_grid = list(node._loaded_cfg.get("tilt_grid_deg", []) or [])
+            n_items = len(pan_grid) * len(tilt_grid)
+        else:
+            n_items = len(node.list_waypoints(phase))
+        return {
+            "phase": phase,
+            "n_items": n_items,
+            "default_factors": PRUNE_DEFAULT_FACTORS[phase],
+            "label_prefix": PRUNE_PHASE_LABEL_PREFIX[phase],
+            "prior_runs": _list_prior_runs(),
+        }
+
+    @app.post("/api/calib/prune_preview")
+    def api_calib_prune_preview(req: dict):
+        response, _factors, _payloads, _meta = _run_prune(req)
+        response["wrote"] = None
+        return response
+
+    @app.post("/api/calib/prune_apply")
+    def api_calib_prune_apply(req: dict):
+        if not bool((req or {}).get("confirm")):
+            raise HTTPException(
+                400,
+                "apply requires confirm=true; preview first, then re-issue "
+                "with confirm=true",
+            )
+        response, factors, payloads, meta = _run_prune(req)
+        try:
+            written_paths = _write_prune_sidecar(
+                phase=response["phase"],
+                factors=factors,
+                payloads=payloads,
+                meta=meta,
+                preview=response,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc))
+        response["wrote"] = written_paths
+        return response
+
+    @app.post("/api/calib/prune_overwrite")
+    def api_calib_prune_overwrite(req: dict):
+        """Overwrite the source-tree calibration.yaml with the pruned set,
+        renaming the current file to ``<stem>.yaml.old-<YYYYmmdd_HHMMSS>``
+        first. Mirrors the existing waypoint-promote backup convention.
+        """
+        if not bool((req or {}).get("confirm")):
+            raise HTTPException(
+                400,
+                "overwrite requires confirm=true; preview first, then re-issue "
+                "with confirm=true",
+            )
+        response, factors, payloads, meta = _run_prune(req)
+        try:
+            written_paths = _overwrite_source_with_prune(
+                phase=response["phase"],
+                factors=factors,
+                payloads=payloads,
+                meta=meta,
+                preview=response,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc))
+        response["wrote"] = written_paths
+        return response
+
+    def _build_pruned_collector(
+        *, phase: str, payloads: list[dict], preview: dict, src_collector: dict,
+    ) -> dict:
+        """Apply the pruned-set surgery to a copy of the source collector
+        dict. Returns the modified dict — caller is responsible for writing
+        it. Shared by the sidecar Apply and the in-place Overwrite paths.
+        """
+        if phase == "phase2_grid":
+            kept_pairs = [
+                [float(payloads[i]["pan_deg"]), float(payloads[i]["tilt_deg"])]
+                for i in preview["kept_indices"]
+            ]
+            return {**src_collector, "phase2_grid_pairs": kept_pairs}
+        existing = list(src_collector.get(phase, []) or [])
+        kept_yaml = [
+            list(existing[i])
+            for i in sorted(preview["kept_indices"])
+            if 0 <= i < len(existing)
+        ]
+        return {**src_collector, phase: kept_yaml}
+
+    def _read_source_yaml() -> tuple[dict, dict]:
+        """Load + sanity-check the source-tree calibration.yaml.
+
+        Returns ``(full_data, collector_dict)``. Raises RuntimeError on any
+        failure, with the same message style the existing flows use."""
+        if not node.promote_yaml_out:
+            raise RuntimeError(
+                "no source-tree calibration.yaml could be resolved — pass "
+                "-p promote_yaml_out:=<path> at startup so calib_web knows "
+                "where the canonical yaml lives."
+            )
+        try:
+            src_text = node.promote_yaml_out.read_text()
+            src_data = yaml.safe_load(src_text) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise RuntimeError(
+                f"could not read source yaml {node.promote_yaml_out}: {exc}"
+            )
+        coll = src_data.get("collector")
+        if not isinstance(coll, dict):
+            raise RuntimeError(
+                f"source yaml {node.promote_yaml_out} has no 'collector' section"
+            )
+        return src_data, coll
+
+    def _write_prune_sidecar(
+        *, phase: str, factors: dict, payloads: list[dict],
+        meta: dict, preview: dict,
+    ) -> dict:
+        """Write ``calibration.pruned.<phase>.<ts>.yaml`` plus a
+        ``prune_report.<phase>.<ts>.json`` next to the source-tree
+        calibration.yaml. Sidecar = copy of the source with only the pruned
+        section replaced. Phase-1 phases get their joint-list filtered;
+        Phase-2 grid pruning emits ``phase2_grid_pairs`` that ``run_phase2``
+        consumes in preference to the rectangular grid.
+        """
+        src_data, src_coll = _read_source_yaml()
+        target_dir = node.promote_yaml_out.parent
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        sidecar = target_dir / f"calibration.pruned.{phase}.{ts}.yaml"
+        report = target_dir / f"prune_report.{phase}.{ts}.json"
+
+        n = 1
+        while sidecar.exists() or report.exists():
+            sidecar = target_dir / f"calibration.pruned.{phase}.{ts}.{n}.yaml"
+            report = target_dir / f"prune_report.{phase}.{ts}.{n}.json"
+            n += 1
+
+        coll = _build_pruned_collector(
+            phase=phase, payloads=payloads, preview=preview, src_collector=src_coll,
+        )
+        out = {"collector": coll}
+        if "safety" in src_data:
+            out["safety"] = src_data["safety"]
+        if "board" in src_data:
+            out["board"] = src_data["board"]
+
+        header = (
+            f"# Generated by calib_web prune-apply on {ts}.\n"
+            f"# Source: {node.promote_yaml_out}\n"
+            f"# Phase: {phase}\n"
+            f"# Factors: {json.dumps(factors)}\n"
+            f"# Result: {preview['headline']}\n"
+            f"# Predictor: {json.dumps(preview.get('predictor_info', {}))}\n"
+        )
+        sidecar_text = header + yaml.safe_dump(out, sort_keys=False)
+        node._atomic_write(sidecar, sidecar_text)
+
+        report_payload = _build_prune_report_payload(
+            phase=phase, ts=ts, factors=factors, preview=preview,
+            extra={"sidecar_yaml": str(sidecar)},
+        )
+        node._atomic_write(report, json.dumps(report_payload, indent=2))
+        return {"sidecar_yaml": str(sidecar), "report_json": str(report)}
+
+    def _overwrite_source_with_prune(
+        *, phase: str, factors: dict, payloads: list[dict],
+        meta: dict, preview: dict,
+    ) -> dict:
+        """Overwrite ``node.promote_yaml_out`` with the pruned set.
+
+        Renames the existing file to ``<stem>.yaml.old-<ts>`` first so the
+        previous version is always recoverable — same convention as
+        ``CalibWebNode.save_waypoints_to_config``. Also drops a
+        ``prune_report.<phase>.<ts>.json`` next to it for audit.
+        """
+        src_data, src_coll = _read_source_yaml()
+        target = node.promote_yaml_out
+        target_dir = target.parent
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        report = target_dir / f"prune_report.{phase}.{ts}.json"
+
+        # Disambiguate the report filename if a sub-second collision lands
+        # on an existing file (matches the sidecar convention).
+        n = 1
+        while report.exists():
+            report = target_dir / f"prune_report.{phase}.{ts}.{n}.json"
+            n += 1
+
+        coll = _build_pruned_collector(
+            phase=phase, payloads=payloads, preview=preview, src_collector=src_coll,
+        )
+        out = {"collector": coll}
+        if "safety" in src_data:
+            out["safety"] = src_data["safety"]
+        if "board" in src_data:
+            out["board"] = src_data["board"]
+
+        header = (
+            f"# Overwritten by calib_web prune-overwrite on {ts}.\n"
+            f"# Phase: {phase}\n"
+            f"# Factors: {json.dumps(factors)}\n"
+            f"# Result: {preview['headline']}\n"
+            f"# Predictor: {json.dumps(preview.get('predictor_info', {}))}\n"
+            f"# Previous version backed up to "
+            f"{target.stem}{target.suffix}.old-<ts> in this directory.\n"
+        )
+        new_text = header + yaml.safe_dump(out, sort_keys=False)
+
+        backup: Optional[Path] = None
+        if target.exists():
+            backup = target.with_name(f"{target.stem}{target.suffix}.old-{ts}")
+            # If two overwrites land in the same second, fall back to a
+            # numbered suffix so we never clobber a backup.
+            n = 1
+            while backup.exists():
+                backup = target.with_name(
+                    f"{target.stem}{target.suffix}.old-{ts}.{n}"
+                )
+                n += 1
+            target.replace(backup)
+        node._atomic_write(target, new_text)
+
+        report_payload = _build_prune_report_payload(
+            phase=phase, ts=ts, factors=factors, preview=preview,
+            extra={
+                "overwrote_yaml": str(target),
+                "backup_yaml": str(backup) if backup else None,
+            },
+        )
+        node._atomic_write(report, json.dumps(report_payload, indent=2))
+        return {
+            "wrote_yaml": str(target),
+            "backup_yaml": str(backup) if backup else None,
+            "report_json": str(report),
+        }
+
+    def _build_prune_report_payload(
+        *, phase: str, ts: str, factors: dict, preview: dict, extra: dict,
+    ) -> dict:
+        return {
+            "phase": phase,
+            "ts": ts,
+            "factors": factors,
+            "headline": preview["headline"],
+            "predictor_info": preview.get("predictor_info", {}),
+            "diagnostics": preview.get("diagnostics", {}),
+            "kept_indices": preview["kept_indices"],
+            "dropped_indices": preview["dropped_indices"],
+            "items": preview["items"],
+            "source_yaml": str(node.promote_yaml_out),
+            **extra,
+        }
+
     # --- WebSocket (10 Hz state push) ---------------------------------------
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket):
@@ -844,6 +2226,22 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             return
         except Exception as exc:
             log.warning("websocket error: %s", exc)
+
+    # --- WebSocket (calibration subprocess log fanout) ----------------------
+    @app.websocket("/ws/calib-log")
+    async def ws_calib_log(ws: WebSocket):
+        await ws.accept()
+        q = node.calib_runner.subscribe()
+        try:
+            while True:
+                event = await q.get()
+                await ws.send_text(json.dumps(event))
+        except WebSocketDisconnect:
+            return
+        except Exception as exc:
+            log.warning("calib-log websocket error: %s", exc)
+        finally:
+            node.calib_runner.unsubscribe(q)
 
     return app
 
@@ -872,12 +2270,11 @@ def main():
     # throughput-critical path — a downscaled preview at modest Hz is fine.
     # Users who really need SHM (e.g. to cohost with a high-rate consumer)
     # can pre-set FASTDDS_BUILTIN_TRANSPORTS themselves.
-    import os as _os
-    _os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
+    os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
     # The workspace shm.xml profile pins SHM as the preferred transport and
     # overrides FASTDDS_BUILTIN_TRANSPORTS; ignore it for this node so we
     # don't re-enter the SHM stall path.
-    _os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+    os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
 
     rclpy.init()
     node = CalibWebNode()

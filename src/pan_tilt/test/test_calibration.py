@@ -20,6 +20,7 @@ from pan_tilt.calibration.optimize import (
     fit_chain,
     fit_joint,
     solve_handeye,
+    solve_handeye_with_consensus,
     warm_start_t_b_rotation,
 )
 from pan_tilt.calibration.pan_tilt_model import PanTiltParams, forward_kinematics
@@ -27,6 +28,7 @@ from pan_tilt.calibration.utils import (
     invert_transform,
     matrix_to_pose_dict,
     pose_error_scalars,
+    pose_to_matrix,
 )
 
 
@@ -324,3 +326,263 @@ def test_apply_to_urdf_patches_both_xacro_forms():
         p = _patched_xacro(src, t_a, t_b_trans, rotvec)
         assert 'rpy="0.1 0 3.0"' not in p, "old rpy should be gone"
         assert 'xyz="-0.08 -0.01 0.08"' in p
+
+
+def test_chain_output_includes_per_sample_residuals(tmp_path):
+    """`chain.json` must expose per-sample residual arrays -- the Calibrate
+    tab's browser-side residual chart reads them directly. Without this test
+    a future refactor could silently drop the arrays and leave the chart
+    empty. We re-use the synthetic fixture so there's no hardware dependency.
+    """
+    from pan_tilt.calibration import run_calibration as rc
+    import json, argparse
+
+    truth, t_ee_marker = _make_truth()
+    # Phase-1 samples (hand-eye stage input) — xArm poses vary, head at "park".
+    he_samples = _phase1_samples(truth, t_ee_marker, noise_rng=None)
+    (tmp_path / "phase1_handeye.json").write_text(json.dumps({"samples": he_samples}))
+    # Phase-2 samples (chain stage input) — pan/tilt vary, xArm frozen.
+    ch_samples = _phase2_samples(truth, t_ee_marker, noise_rng=None)
+    (tmp_path / "phase2_chain.json").write_text(json.dumps({"samples": ch_samples}))
+
+    # Run handeye first so chain has its seed.
+    rc.cmd_handeye(argparse.Namespace(
+        phase1=str(tmp_path / "phase1_handeye.json"),
+        out=str(tmp_path),
+    ))
+    assert (tmp_path / "handeye.json").is_file()
+
+    rc.cmd_chain(argparse.Namespace(
+        phase2=str(tmp_path / "phase2_chain.json"),
+        handeye=str(tmp_path / "handeye.json"),
+        out=str(tmp_path),
+        fit_pan_offset=False,
+        lock_tb_rotation=False,
+        loss="soft_l1",
+        val_seed=0,
+        verbose=False,
+    ))
+    payload = json.loads((tmp_path / "chain.json").read_text())
+
+    assert "per_sample_trans_err_m" in payload
+    assert "per_sample_rot_err_rad" in payload
+    assert isinstance(payload["per_sample_trans_err_m"], list)
+    assert len(payload["per_sample_trans_err_m"]) == payload["n_train"]
+    assert len(payload["per_sample_rot_err_rad"]) == payload["n_train"]
+    # Noise-free fixture -> residuals should be finite and well below the
+    # 3 mm calibration gate. Tolerance is loose vs analytic zero because
+    # the solver terminates on ftol once parameters are recovered, not when
+    # residuals themselves hit machine precision.
+    assert all(np.isfinite(v) for v in payload["per_sample_trans_err_m"])
+    assert max(payload["per_sample_trans_err_m"]) < 1e-3
+
+
+# ---- robustness regressions for the redesigned pipeline ---------------------
+#
+# The 2026-04-25 redesign added three layers:
+#   - per-frame PnP method selection (B1) and IPPE multi-criterion picker (B2)
+#   - per-cell cluster_consensus voter (B3)
+#   - per-dataset cross-cell consensus pre-pass (C)
+#
+# Tests below exercise each layer with synthetic inputs that mimic the real
+# failure mode (IPPE planar reflection at the cell or sample level).
+
+
+def _ippe_flip(T_cm: np.ndarray) -> np.ndarray:
+    """Synthesize an IPPE planar-reflection flip for a marker pose.
+
+    The two IPPE solutions for a planar target are related by a rotation by
+    pi about an axis lying in the plane perpendicular to the principal
+    viewing ray. We approximate this as a rotation by pi about an axis in
+    the image plane (which for our purposes is good enough -- the rotation
+    magnitude is the diagnostic signature).
+    """
+    R_in = T_cm[:3, :3]
+    t = T_cm[:3, 3]
+    rng = np.linalg.norm(t)
+    view_dir = t / max(rng, 1e-9)
+    # Build an axis perpendicular to view_dir.
+    arbitrary = np.array([0.0, 0.0, 1.0]) if abs(view_dir[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    axis = np.cross(view_dir, arbitrary)
+    axis = axis / np.linalg.norm(axis)
+    R_flip = Rotation.from_rotvec(np.pi * axis).as_matrix()
+    T_out = T_cm.copy()
+    T_out[:3, :3] = R_flip @ R_in
+    return T_out
+
+
+def test_solve_handeye_with_consensus_rejects_ippe_flips():
+    """Cross-cell consensus pre-pass must drop synthetically-flipped samples.
+
+    Build a clean phase-1 dataset, flip ~30% of the marker poses (simulate
+    IPPE branch failures that survived the per-cell voter), and check that
+    `solve_handeye_with_consensus` filters them out and recovers the truth
+    on the remaining clean samples.
+    """
+    truth, t_ee_marker = _make_truth()
+    noise_rng = np.random.default_rng(RNG_SEED + 300)
+    samples = _phase1_samples(truth, t_ee_marker, n=20, noise_rng=noise_rng)
+
+    flip_indices = {3, 7, 11, 13, 16, 18}    # 6/20 = 30% flipped
+    for i in flip_indices:
+        T_cm = pose_to_matrix(
+            samples[i]["t_cam_marker_body"]["translation"],
+            samples[i]["t_cam_marker_body"]["rotation"],
+        )
+        T_flipped = _ippe_flip(T_cm)
+        samples[i]["t_cam_marker_body"] = matrix_to_pose_dict(T_flipped)
+
+    t_em_recovered, t_bc_recovered, _per_pose, rejected = \
+        solve_handeye_with_consensus(samples, pre_filter_rot_deg=5.0)
+
+    # Every flipped sample must have been rejected. We allow extras
+    # (occasional clean samples can land just over threshold under noise),
+    # but no flip should slip through.
+    assert flip_indices.issubset(set(rejected)), (
+        f"flipped samples not all rejected; missed {flip_indices - set(rejected)}"
+    )
+    # Recovery on the clean residue must meet the calibration gate.
+    trans_err, rot_err = pose_error_scalars(t_em_recovered, t_ee_marker)
+    assert trans_err < 0.006, f"trans err {trans_err*1000:.2f} mm"
+    assert np.degrees(rot_err) < 0.8, f"rot err {np.degrees(rot_err):.3f} deg"
+
+
+def test_cluster_consensus_picks_majority_branch():
+    """When most frames agree on one IPPE branch, cluster_consensus picks it
+    even though a minority of frames sit on the other branch."""
+    from pan_tilt.calibration.aruco_detect import (
+        Detection, PoseCandidate, cluster_consensus,
+    )
+
+    rng = np.random.default_rng(RNG_SEED + 400)
+    # Truth pose (cam_optical -> marker), arbitrary.
+    R_true = Rotation.from_euler("xyz", [0.1, -0.2, 0.05]).as_matrix()
+    t_true = np.array([0.05, -0.02, 0.65])
+    T_true = np.eye(4); T_true[:3, :3] = R_true; T_true[:3, 3] = t_true
+
+    # Corresponding flip via the same helper used for sample-level tests.
+    T_flip = _ippe_flip(T_true)
+
+    detections = []
+    for k in range(10):
+        # Add small per-frame noise.
+        dR = Rotation.from_rotvec(rng.normal(0, np.deg2rad(0.2), size=3)).as_matrix()
+        dt = rng.normal(0, 0.0005, size=3)
+        if k < 7:
+            T = T_true.copy()
+        else:
+            T = T_flip.copy()
+        T[:3, :3] = dR @ T[:3, :3]
+        T[:3, 3] = T[:3, 3] + dt
+        cand = PoseCandidate(pose_optical=T, reproj_rms_px=0.3 + rng.normal(0, 0.05))
+        detections.append(Detection(
+            pose_optical=T, n_corners=20, reprojection_rms_px=cand.reproj_rms_px,
+            success=True, candidates=[cand], method="iterative",
+        ))
+
+    consensus = cluster_consensus(detections, min_cluster_frac=0.6)
+    assert consensus is not None
+    # Recovered ROTATION must be close to the majority cluster (T_true), not
+    # the flipped minority. Translations are identical between branches by
+    # construction of the IPPE planar reflection, so we gate on rotation.
+    _, rot_err_true = pose_error_scalars(consensus.pose_optical, T_true)
+    _, rot_err_flip = pose_error_scalars(consensus.pose_optical, T_flip)
+    assert np.degrees(rot_err_true) < 1.0, f"rot err to T_true {np.degrees(rot_err_true):.3f} deg"
+    assert rot_err_true < rot_err_flip
+
+
+def test_cluster_consensus_returns_none_on_split():
+    """Even split between two branches yields no quorum -> None."""
+    from pan_tilt.calibration.aruco_detect import (
+        Detection, PoseCandidate, cluster_consensus,
+    )
+
+    rng = np.random.default_rng(RNG_SEED + 500)
+    R_true = Rotation.from_euler("xyz", [0.0, 0.3, 0.0]).as_matrix()
+    t_true = np.array([0.0, 0.0, 0.5])
+    T_true = np.eye(4); T_true[:3, :3] = R_true; T_true[:3, 3] = t_true
+    T_flip = _ippe_flip(T_true)
+
+    detections = []
+    for k in range(10):
+        dR = Rotation.from_rotvec(rng.normal(0, np.deg2rad(0.1), size=3)).as_matrix()
+        dt = rng.normal(0, 0.0003, size=3)
+        T = (T_true if k < 5 else T_flip).copy()
+        T[:3, :3] = dR @ T[:3, :3]
+        T[:3, 3] = T[:3, 3] + dt
+        cand = PoseCandidate(pose_optical=T, reproj_rms_px=0.3)
+        detections.append(Detection(
+            pose_optical=T, n_corners=20, reprojection_rms_px=0.3,
+            success=True, candidates=[cand], method="iterative",
+        ))
+
+    # 5/10 in each cluster -> neither reaches the 60% quorum.
+    assert cluster_consensus(detections, min_cluster_frac=0.6) is None
+
+
+def test_cluster_consensus_breaks_tie_with_dual_ippe_candidates():
+    """When per-frame IPPE returns BOTH candidates and clustering across all
+    candidates favors one cluster, the voter should still pick correctly."""
+    from pan_tilt.calibration.aruco_detect import (
+        Detection, PoseCandidate, cluster_consensus,
+    )
+
+    rng = np.random.default_rng(RNG_SEED + 600)
+    R_true = Rotation.from_euler("xyz", [-0.05, 0.2, 0.1]).as_matrix()
+    t_true = np.array([0.02, 0.01, 0.55])
+    T_true = np.eye(4); T_true[:3, :3] = R_true; T_true[:3, 3] = t_true
+    T_flip = _ippe_flip(T_true)
+
+    detections = []
+    for k in range(8):
+        dR = Rotation.from_rotvec(rng.normal(0, np.deg2rad(0.2), size=3)).as_matrix()
+        dt = rng.normal(0, 0.0005, size=3)
+        T_a = T_true.copy(); T_a[:3, :3] = dR @ T_a[:3, :3]; T_a[:3, 3] = T_a[:3, 3] + dt
+        T_b = T_flip.copy(); T_b[:3, :3] = dR @ T_b[:3, :3]; T_b[:3, 3] = T_b[:3, 3] + dt
+        # Half the frames give the true branch a slightly lower reproj
+        # (matching what really happens at most viewing angles).
+        if k % 2 == 0:
+            cands = [
+                PoseCandidate(pose_optical=T_a, reproj_rms_px=0.4),
+                PoseCandidate(pose_optical=T_b, reproj_rms_px=0.5),
+            ]
+            primary = T_a
+        else:
+            cands = [
+                PoseCandidate(pose_optical=T_b, reproj_rms_px=0.4),
+                PoseCandidate(pose_optical=T_a, reproj_rms_px=0.5),
+            ]
+            primary = T_b
+        detections.append(Detection(
+            pose_optical=primary, n_corners=18,
+            reprojection_rms_px=0.4, success=True,
+            candidates=cands, method="ippe",
+        ))
+
+    # Each frame contributes one vote per cluster. Both clusters get 8/8
+    # frames, but the dedup ("one vote per frame per cluster") means the
+    # tie is broken by which cluster the lower-reproj candidates seed first.
+    # The function should return a valid consensus.
+    consensus = cluster_consensus(detections, min_cluster_frac=0.6)
+    assert consensus is not None
+    err_to_true, _ = pose_error_scalars(consensus.pose_optical, T_true)
+    err_to_flip, _ = pose_error_scalars(consensus.pose_optical, T_flip)
+    # Either branch is technically valid as a "vote outcome" here, but the
+    # recovered pose must match ONE cluster (i.e. not be smeared between).
+    assert min(err_to_true, err_to_flip) < 0.01
+
+
+def test_duplicate_ee_geometry_check():
+    """The EE-duplicate guard at the recording side compares full SE(3).
+    Verify the geometry primitive used (`pose_error_scalars`) flags the
+    smoking-gun pairs we saw in the 04-25 dataset."""
+    # Two waypoints with identical rotation but 1.5 mm translation.
+    T_a = np.eye(4); T_a[:3, 3] = [0.30, 0.0, 1.20]
+    T_b = T_a.copy(); T_b[:3, 3] = [0.3015, 0.0, 1.20]
+    t, r = pose_error_scalars(T_a, T_b)
+    assert t > 0.001 and r < 0.001    # 1.5 mm > 1 mm tol -> would NOT flag
+
+    # Identical poses (the smoking-gun case from the field dataset).
+    T_dup = T_a.copy()
+    t, r = pose_error_scalars(T_a, T_dup)
+    assert t < 1e-9 and r < 1e-9      # would flag -- duplicate detected

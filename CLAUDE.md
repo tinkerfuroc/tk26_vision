@@ -76,7 +76,7 @@ src/tk26_vision/src/
 ├── object_detection_generalist/   # Pretrained YOLO + YOLO-World (default fallback) or Gemini 2.5 Flash (enable_vlm) + FastSAM mask, tk26 srv
 ├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
 ├── tk_vision_specialized/         # SpotOnShelf action + waving detector
-├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head
+├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head (closed-loop absolute targeting in a pan-tilt-rooted frame; feedback-gated settle; sticky ID + EMA)
 ├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
 └── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay)
 ```
@@ -101,9 +101,9 @@ Key ROS2 parameters:
 - `object_detection_new`: `service_name`, `model_path`, camera topics, `sort_mode`
 - `pan_tilt/controller`: `device`, startup/feedback timing, limits, invert/trim, default speed/accel
 - `pan_tilt/state_publisher`: `state_topic`, `joint_state_topic`, joint names, stale timeout
-- `pan_tilt/follow_head`: `yolo_model`, `command_topic`, `state_topic`, `home_pan_deg`, `home_tilt_deg`
+- `pan_tilt/follow_head`: full param surface in `src/pan_tilt/config/pan_tilt.yaml`. Highlights: `yolo_model`, `command_topic`/`state_topic`, `home_pan_deg`/`home_tilt_deg`, `pan_deadband_deg`/`tilt_deadband_deg`, `min_command_change_deg` (chatter suppression), `min_detection_interval_sec` (YOLO cap), `max_settle_timeout_sec` + `steady_{pan,tilt}_eps_deg` + `steady_velocity_eps_deg_per_sec` + `steady_sample_count` (feedback-gated settle), `ema_alpha` + `target_ttl_sec` + `reassoc_dist_m` (smoothing + identity lock), `command_speed_raw_{small,large}` + `small_error_deg` + `command_accel_raw` (motion profile). Defaults are biased for **responsiveness over smoothness** — turn `ema_alpha` down and `steady_*_eps_deg` tighter if you want calmer motion.
 - `kimi_api/*`: `llm_model`, `detection_service`, `log_prompts`
-- `vision_logging_enabled` (default `true`) + `vision_log_folder` (default `'vision_log'`) on the five bbox/seg/centroid-producing nodes: `yolo_seg_{node,default_node}`, `generalist_node`, `person_track_node`, `waving_person_server`, `follow_head`. Each run creates `vision_log/<YYYYmmdd_HHMMSS>/` relative to CWD and drops `orig_*.jpg` + `overlay_*.jpg` + `req_*.json` per call (tracker: only on lost/reclaim transitions; follow_head: at its existing 1 Hz tick). Pass `-p vision_logging_enabled:=false` to opt out.
+- `vision_logging_enabled` (default `true` everywhere except `follow_head`, which defaults to `false` in its yaml because the ~30-40 ms synchronous disk IO at 10 Hz detection stalls the action loop) + `vision_log_folder` (default `'vision_log'`) on the five bbox/seg/centroid-producing nodes: `yolo_seg_{node,default_node}`, `generalist_node`, `person_track_node`, `waving_person_server`, `follow_head`. Each run creates `vision_log/<YYYYmmdd_HHMMSS>/` relative to CWD and drops `orig_*.jpg` + `overlay_*.jpg` + `req_*.json` per call (tracker: only on lost/reclaim transitions; follow_head: at its detection tick when re-enabled for debugging). Pass `-p vision_logging_enabled:=<bool>` to override.
 
 ## Third-party drivers
 

@@ -4,6 +4,11 @@ log/
 .vscode/
 **/*.pt
 
+vision_log/
+.ros/
+log/
+
+
 scripts/tests/logs/
 
 # Scratch outputs from calibration CLI / tests.

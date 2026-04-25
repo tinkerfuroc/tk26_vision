@@ -42,7 +42,9 @@ import time
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
+from sensor_msgs.msg import Image
 from std_msgs.msg import Header
 
 from tinker_vision_msgs_26.msg import Object
@@ -77,6 +79,33 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # can run concurrently in the race path. Ultralytics models are not
         # thread-safe; serialize segmentation calls.
         self._sam_lock = threading.Lock()
+
+        # Latest raw orbbec depth Image (native camera resolution). The
+        # parent class only subscribes to the registered PointCloud2, so to
+        # answer `return_depth_image=True` for orbbec at raw size we keep a
+        # separate sub on the camera's depth-Image topic. No sync with the
+        # rgb/pc pair — we just hand back whatever arrived most recently.
+        self._orbbec_depth_image_lock = threading.Lock()
+        self._latest_orbbec_depth_image: Image | None = None
+        if 'orbbec' in self.camera_types:
+            depth_image_topic = (
+                self.get_parameter('orbbec_depth_image_topic').value
+            )
+            qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self._orbbec_depth_image_sub = self.create_subscription(
+                Image,
+                depth_image_topic,
+                self._orbbec_depth_image_callback,
+                qos_profile=qos,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+            self.get_logger().info(
+                f'Subscribed to orbbec depth Image on {depth_image_topic}'
+            )
 
         # YOLO-World is the default open-vocab fallback. It loads even when
         # `enable_vlm=True` so flipping the flag at runtime via param events
@@ -135,6 +164,17 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # boost via -p world_conf_threshold:=0.10 if you see false positives.
         self.declare_parameter('world_conf_threshold', 0.05)
         self.declare_parameter('world_iou_threshold', 0.5)
+        # Orbbec depth Image to surface in the response. Two viable choices:
+        #   - /camera/depth_to_color/image_raw — depth registered to color,
+        #     so size MATCHES rgb_image and segments. Requires the camera
+        #     launched with `enable_d2c_viewer:=true`.
+        #   - /camera/depth/image_raw — raw depth-sensor resolution
+        #     (e.g. 640x576 on Femto Bolt). Won't match rgb (1280x720) or
+        #     segments. Use only if the caller does its own alignment.
+        # Default to the d2c topic so segments fit by construction.
+        self.declare_parameter(
+            'orbbec_depth_image_topic', '/camera/depth_to_color/image_raw'
+        )
 
     def _load_parameters(self):
         super()._load_parameters()
@@ -283,14 +323,42 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             )
 
         if request.return_rgb_image:
+            # Raw camera message at native resolution — no resize/processing.
             response.rgb_image = rec_msg[0]
-        if request.return_depth_image and camera == 'realsense':
-            # Only realsense carries a depth Image; orbbec uses PointCloud2
-            # which does not fit the sensor_msgs/Image field.
-            response.depth_image = rec_msg[1]
+        if request.return_depth_image:
+            # Raw depth Image at native resolution — no resize/processing.
+            # Realsense: pulled from the synced rgb+depth pair.
+            # Orbbec: synced sub is PointCloud2, so we use the most recent
+            # message from the separate raw-depth-Image sub instead.
+            if camera == 'realsense':
+                response.depth_image = rec_msg[1]
+            else:
+                with self._orbbec_depth_image_lock:
+                    latest = self._latest_orbbec_depth_image
+                if latest is not None:
+                    response.depth_image = copy.deepcopy(latest)
+                else:
+                    self.get_logger().warn(
+                        'return_depth_image=True for orbbec but no depth '
+                        'Image received yet on '
+                        f'{self.get_parameter("orbbec_depth_image_topic").value}'
+                    )
         if request.return_segments and segments:
+            # Segments are produced at rgb_img.shape[:2] by both pipelines:
+            # YOLO crops to (h, w) in `_detect_objects`; FastSAM resizes via
+            # INTER_NEAREST in `sam_mask.segment`. Verify here so any future
+            # pipeline regression that emits off-size masks fails loudly
+            # rather than handing the caller mis-shaped buffers.
+            rgb_h, rgb_w = rgb_img.shape[:2]
+            for i, seg in enumerate(segments):
+                if seg.shape[:2] != (rgb_h, rgb_w):
+                    self.get_logger().error(
+                        f'segment[{i}] shape {seg.shape[:2]} != '
+                        f'rgb {(rgb_h, rgb_w)}; pipeline bug'
+                    )
+            self._warn_if_depth_mismatch(rgb_h, rgb_w, response, camera)
             response.segments = [
-                self.bridge.cv2_to_imgmsg(seg, encoding='mono8')
+                self.bridge.cv2_to_imgmsg(seg, encoding='8UC1')
                 for seg in segments
             ]
 
@@ -639,6 +707,34 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             )
 
     # --- helpers ---------------------------------------------------------
+
+    def _orbbec_depth_image_callback(self, msg: Image) -> None:
+        with self._orbbec_depth_image_lock:
+            self._latest_orbbec_depth_image = msg
+
+    def _warn_if_depth_mismatch(self, rgb_h: int, rgb_w: int,
+                                 response, camera: str) -> None:
+        """Log once per call if the depth Image dims differ from rgb/segments.
+
+        Sizes are pulled directly from the just-attached `response.depth_image`
+        message header — no decode required. Realsense aligned-depth and
+        orbbec depth_to_color match rgb by construction; raw orbbec depth
+        does not. We only warn (not error) because the caller may genuinely
+        want raw sensor-resolution depth.
+        """
+        depth = getattr(response, 'depth_image', None)
+        if depth is None or depth.height == 0 or depth.width == 0:
+            return
+        if (depth.height, depth.width) != (rgb_h, rgb_w):
+            self.get_logger().warn(
+                f'{camera} depth_image is {(depth.height, depth.width)} '
+                f'but rgb_image and segments are {(rgb_h, rgb_w)}; '
+                'segments will not overlay depth pixel-for-pixel. '
+                'For orbbec, launch the camera with '
+                'enable_d2c_viewer:=true and use '
+                '/camera/depth_to_color/image_raw, or override '
+                'orbbec_depth_image_topic.'
+            )
 
     def _select_camera(self, camera_req: str) -> str:
         if 'realsense' in (camera_req or ''):

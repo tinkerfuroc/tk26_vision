@@ -201,38 +201,31 @@ The solver writes `chain.json` (and optionally `polish.json`) with the fitted pa
 - `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` — the **authoritative** URDF, a `<xacro:macro name="pan_tilt_macro">` that `tracer_mini_manipulator.urdf.xacro` (loaded by the main robot bringup, e.g. `grasp_bringup`) instantiates with `parent=base_link`. Link name is `camera_link` here. **Patch this one** — it's what downstream TF consumers actually see.
 - `src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro` — the standalone form used by `ros2 launch pan_tilt pan_tilt.launch.py` for dev bringup without the full robot stack. Link name is `head_camera_link` (renamed to dodge the xArm's own `link_eef → camera_link` edge when the xArm macro is also instantiated). Patch this too so RViz-based dev stays representative.
 
-`apply_to_urdf.py` auto-detects which form it's given and patches the right slots:
-
-```bash
-# Patch the macro form (live robot)
-python -m pan_tilt.calibration.apply_to_urdf \
-    --results chain.json \
-    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro
-
-# Patch the standalone form (dev bringup)
-python -m pan_tilt.calibration.apply_to_urdf \
-    --results chain.json \
-    --xacro src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro
-```
-
-Each invocation prints (but does not apply) a diff. What gets updated:
+`apply_to_urdf.py` auto-detects which form it's given and patches the right slots. What gets updated:
 
 - **Standalone form:** `pan_joint` origin `xyz` → fitted `t_a` (rpy preserved); `camera_mount_joint` origin `xyz` → fitted `t_b_trans`, `rpy` → fitted `t_b_rotvec` (converted to XYZ Euler). If `t_b_rotvec` is zero (e.g. you're patching from `chain.json`, which froze T_B rotation), the existing `rpy` is preserved rather than zeroed.
 - **Macro form:** `attach_xyz:='...'` default in the macro params → fitted `t_a` (the `attach_rpy` default is preserved — T_A rotation is not fitted); `camera_mount_joint` origin `xyz`/`rpy` same as above.
 
-**The URDFs are never auto-modified.** Sanity-check the diff — the new values should be within a cm and a few degrees of the current URDF — then apply manually, one file at a time:
+**Primary path: apply via the calib_web UI.** In the Calibrate tab, **URDF patch** panel:
+
+1. Pick the target from the dropdown — both targets are listed; the macro form is marked *(authoritative)*.
+2. Click **Show diff** and sanity-check it (new values within a cm and a few degrees of the existing URDF).
+3. Click **Apply patch**. The server writes a timestamped `.old-<YYYYmmdd_HHMMSS>` backup next to the xacro, swaps the patched file into place atomically, and shows the exact `colcon` command to rebuild that package — copy-and-run it from the workspace root.
+4. Repeat for the other target so RViz and the live robot stay in lockstep.
+
+**Fallback (headless / scripted runs):** invoke the patcher from a shell. Each invocation prints a diff to stdout; pass `--out` to write the patched file.
 
 ```bash
+# Macro form (live robot)
 python -m pan_tilt.calibration.apply_to_urdf \
     --results chain.json \
     --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro \
     --out /tmp/patched.urdf.xacro
-
 diff src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro /tmp/patched.urdf.xacro
 cp /tmp/patched.urdf.xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro
 ```
 
-Rebuild both packages:
+Then rebuild both packages:
 ```bash
 colcon build --packages-select tinker_urdf  # tk25_basic side
 ./src/tk26_vision/scripts/build.sh --packages-select pan_tilt  # tk26_vision side

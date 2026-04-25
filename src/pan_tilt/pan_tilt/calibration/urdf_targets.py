@@ -34,6 +34,8 @@ class UrdfTarget:
     exists: bool
     form: str          # "macro" or "standalone" -- documents the xacro shape
     build_package: str # which colcon package to rebuild after applying the patch
+    build_command: str # exact shell command the operator should run
+    workspace_hint: str # cwd hint for the rebuild (which workspace root)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -54,14 +56,17 @@ def _share(pkg: str) -> Optional[Path]:
         return None
 
 
-def _target(label: str, pkg: str, rel: str, form: str, build_package: str) -> UrdfTarget:
+def _target(label: str, pkg: str, rel: str, form: str,
+            build_package: str, build_command: str, workspace_hint: str) -> UrdfTarget:
     share = _share(pkg)
     if share is None:
         return UrdfTarget(label=label, path=f"<{pkg} not installed>",
-                          exists=False, form=form, build_package=build_package)
+                          exists=False, form=form, build_package=build_package,
+                          build_command=build_command, workspace_hint=workspace_hint)
     path = share / rel
     return UrdfTarget(label=label, path=str(path), exists=path.is_file(),
-                      form=form, build_package=build_package)
+                      form=form, build_package=build_package,
+                      build_command=build_command, workspace_hint=workspace_hint)
 
 
 def list_targets() -> list[UrdfTarget]:
@@ -69,6 +74,11 @@ def list_targets() -> list[UrdfTarget]:
 
     Both should be patched so dev and production stay in lockstep; we surface
     both and let the operator apply whichever is relevant.
+
+    Build commands differ by package: `tinker_urdf` is a pure ament_cmake
+    URDF package and uses plain `colcon build`; `pan_tilt` lives in the tk26
+    venv-backed tree and needs the wrapper at `scripts/build.sh` so the
+    install-tree shebangs see the venv (see `src/tk26_vision/CLAUDE.md`).
     """
     return [
         _target(
@@ -77,6 +87,8 @@ def list_targets() -> list[UrdfTarget]:
             rel="src/pan_tilt.urdf.xacro",
             form="macro",
             build_package="tinker_urdf",
+            build_command="colcon build --packages-select tinker_urdf",
+            workspace_hint="run from the main workspace root (e.g. ~/tk25_ws)",
         ),
         _target(
             label="tk26_vision standalone (dev bringup)",
@@ -84,5 +96,7 @@ def list_targets() -> list[UrdfTarget]:
             rel="urdf/pan_tilt.urdf.xacro",
             form="standalone",
             build_package="pan_tilt",
+            build_command="./src/tk26_vision/scripts/build.sh --packages-select pan_tilt",
+            workspace_hint="run from the main workspace root (e.g. ~/tk25_ws)",
         ),
     ]

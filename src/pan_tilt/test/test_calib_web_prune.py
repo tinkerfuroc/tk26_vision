@@ -35,6 +35,14 @@ class _StubCalibRunner:
         self.sessions_dir = sessions_dir
 
 
+class _StubState:
+    """Stand-in for CalibWebNode.state — only `grid` is touched by the
+    prune sync path under test."""
+
+    def __init__(self):
+        self.grid = {"pan_deg": [], "tilt_deg": []}
+
+
 class _StubCalibNode:
     """Minimal duck-typed CalibWebNode for the prune tests.
 
@@ -48,6 +56,9 @@ class _StubCalibNode:
         self.lock = threading.Lock()
         self._loaded_cfg = loaded_cfg
         self._waypoints = waypoints
+        self.state = _StubState()
+        with self.lock:
+            self._refresh_state_grid_locked()
 
     def list_waypoints(self, phase: str) -> list:
         return list(self._waypoints.get(phase, []))
@@ -58,6 +69,39 @@ class _StubCalibNode:
         tmp.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(text)
         tmp.replace(target)
+
+    def _refresh_state_grid_locked(self) -> None:
+        self.state.grid = {
+            "pan_deg": list(self._loaded_cfg.get("pan_grid_deg", []) or []),
+            "tilt_deg": list(self._loaded_cfg.get("tilt_grid_deg", []) or []),
+        }
+
+    # Mirrors CalibWebNode.reload_waypoints_from_yaml for the prune tests.
+    # The endpoint calls this after a successful overwrite, and the test
+    # asserts that `state.grid` and `_loaded_cfg` track the on-disk yaml.
+    def reload_waypoints_from_yaml(self, path: Path,
+                                   log_prefix: str = "reload") -> dict:
+        data = yaml.safe_load(Path(path).read_text()) or {}
+        coll = data.get("collector", {}) or {}
+        recovered: dict = {}
+        for k in ("phase1_waypoints", "phase1_waypoints_custom",
+                  "phase2_waypoints", "sanity_xarm_angles_rad"):
+            if k in coll:
+                v = coll[k]
+                recovered[k] = list(v) if isinstance(v, list) else v
+        grid_updates: dict = {}
+        for k in ("pan_grid_deg", "tilt_grid_deg", "phase2_grid_pairs"):
+            if k in coll:
+                v = coll[k]
+                grid_updates[k] = list(v) if isinstance(v, list) else v
+        with self.lock:
+            if recovered:
+                self._waypoints.update(recovered)
+            if grid_updates:
+                self._loaded_cfg.update(grid_updates)
+                self._refresh_state_grid_locked()
+        return {k: (len(v) if isinstance(v, list) else 0)
+                for k, v in recovered.items()}
 
 
 @pytest.fixture
@@ -381,6 +425,41 @@ def test_overwrite_phase2_grid_emits_grid_pairs(fake_robot):
     sd = yaml.safe_load(target.read_text())
     assert "phase2_grid_pairs" in sd["collector"]
     assert len(sd["collector"]["phase2_grid_pairs"]) == len(data["kept_indices"])
+
+
+def test_overwrite_syncs_in_memory_grid(fake_robot):
+    """After prune-overwrite the source yaml, the Pan-Tilt Jog tab reads
+    `state.grid` (driven by `_loaded_cfg`). Verify the endpoint pulls the
+    new yaml back into both so the tab tracks the overwrite without an
+    extra Reload click. Regression: previously `state.grid` was set once
+    at startup and never refreshed.
+    """
+    node = fake_robot["node"]
+    # Simulate an operator yaml edit landing on disk before the prune call:
+    # tightening the tilt grid to a different set of values. The original
+    # `_loaded_cfg` (set at stub init) still holds the old tilt list.
+    src_data = yaml.safe_load(fake_robot["config_path"].read_text())
+    src_data["collector"]["tilt_grid_deg"] = [10.0, 20.0, 40.0]
+    fake_robot["config_path"].write_text(yaml.safe_dump(src_data, sort_keys=False))
+    assert node._loaded_cfg["tilt_grid_deg"] == [15.0, 30.0, 45.0]
+    assert node.state.grid["tilt_deg"] == [15.0, 30.0, 45.0]
+
+    body = {
+        "phase": "phase2_grid",
+        "factors": {"trans_tol_m": 1.0, "rot_tol_deg": 60.0,
+                    "min_count": 2, "min_rot_diversity_pairs": 0},
+        "predictor_choice": "fk_only",
+        "confirm": True,
+    }
+    r = fake_robot["client"].post("/api/calib/prune_overwrite", json=body)
+    assert r.status_code == 200, r.text
+
+    # `_loaded_cfg` and `state.grid` now reflect the on-disk tilt edit AND
+    # the new pruned-pair override the prune flow added.
+    assert node._loaded_cfg["tilt_grid_deg"] == [10.0, 20.0, 40.0]
+    assert node.state.grid["tilt_deg"] == [10.0, 20.0, 40.0]
+    assert "phase2_grid_pairs" in node._loaded_cfg
+    assert isinstance(node._loaded_cfg["phase2_grid_pairs"], list)
 
 
 def test_preview_surfaces_predict_failures(fake_robot):

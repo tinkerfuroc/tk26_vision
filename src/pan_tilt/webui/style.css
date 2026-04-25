@@ -358,6 +358,27 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .calib-diff .diff-rem { color: var(--err); }
 .calib-diff .diff-hunk { color: var(--accent); }
 
+.rebuild-prompt {
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+.rebuild-prompt p { margin: 4px 0; }
+.rebuild-prompt pre {
+  background: var(--bg-muted, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+
 .prune-controls,
 .prune-factors {
   display: flex;

@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import FindExecutable
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -9,8 +10,9 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     config = LaunchConfiguration('config')
     device = LaunchConfiguration('device')
+    launch_rsp = LaunchConfiguration('launch_robot_state_publisher')
     urdf_path = PathJoinSubstitution(
-        [FindPackageShare('pan_tilt'), 'urdf', 'pan_tilt.urdf.xacro'],
+        [FindPackageShare('tinker_urdf'), 'src', 'pan_tilt_standalone.urdf.xacro'],
     )
     robot_description = Command([FindExecutable(name='xacro'), ' ', urdf_path])
 
@@ -41,6 +43,15 @@ def generate_launch_description():
                 ),
             ),
             DeclareLaunchArgument('device', default_value='/dev/ttyUSB0'),
+            DeclareLaunchArgument(
+                'launch_robot_state_publisher',
+                default_value='true',
+                description=(
+                    'Set to false when another launch already owns '
+                    '/robot_description (e.g. mobile_bringup grasp_bringup, '
+                    'which publishes the merged mobile_manipulator URDF).'
+                ),
+            ),
             Node(
                 package='pan_tilt',
                 executable='controller',

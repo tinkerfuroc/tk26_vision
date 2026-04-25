@@ -311,3 +311,173 @@ def request_seat(
             client.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+_CHOICE_SYSTEM_PROMPT = (
+    'You are helping a robot place a new guest on an empty seat. The '
+    'image has N numbered yellow-and-black circles drawn on top of '
+    'horizontal surfaces that are depth-verified to be near seat height. '
+    'Circles are numbered 1..N. Some numbered spots may be occupied or '
+    'may not actually be seats — you must filter those out.\n'
+    '\n'
+    'Return a JSON object with exactly one key `choice`:\n'
+    '- choice = <k> where 1 <= k <= N, picking the best empty seat.\n'
+    '- choice = 0 if none of the numbered spots is a valid empty seat.\n'
+    '\n'
+    'Rules:\n'
+    '- A spot is OCCUPIED if a person visibly sits on or very near it, '
+    'or a substantial object rests directly on the cushion (laptop, '
+    'bag, folded clothes). Objects on a coffee table, the floor, or '
+    'other nearby furniture do NOT occupy the seat.\n'
+    '- Do not choose a spot that is clearly not a seat (table top, '
+    'counter, shelf, floor, countertop) even if it is horizontal.\n'
+    '- If multiple spots are empty, prefer the cushion closest to any '
+    'existing guest unless the user provided a name — then prefer a '
+    'cushion next to that named person.\n'
+    '- Answer with only the JSON, no commentary.'
+)
+
+
+_CHOICE_RESPONSE_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'choice': {'type': 'integer'},
+    },
+    'required': ['choice'],
+    'additionalProperties': False,
+}
+
+
+def request_seat_choice(
+    annotated_bgr: np.ndarray,
+    n_candidates: int,
+    names: Sequence[str],
+    features: Sequence[str],
+    *,
+    model: str,
+    max_retries: int = 3,
+    timeout_s: float = 20.0,
+    logger=None,
+) -> tuple[int, float]:
+    """Ask Gemini to pick a numbered candidate from a SoM-annotated image.
+
+    Returns ``(choice, elapsed_s)`` where ``choice`` is an int in
+    ``[0, n_candidates]`` — 0 means no valid empty seat. On repeated parse
+    failures or network errors, returns ``(0, elapsed_s)``.
+
+    Raises ``VlmSeatError`` only on configuration problems (e.g. missing
+    API key) the caller should propagate as `status=1`.
+    """
+
+    load_env()
+    try:
+        api_key = require_api_key()
+    except RuntimeError as exc:
+        raise VlmSeatError(str(exc)) from exc
+
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url=base_url())
+    t0 = time.perf_counter()
+    try:
+        data_url = _encode_data_url(annotated_bgr)
+        text_prompt = _build_text_prompt(names, features)
+        text_prompt += (
+            f' Pick one of the {n_candidates} numbered circles drawn on '
+            'the image, or 0 if none is a valid empty seat.'
+        )
+
+        messages = [
+            {'role': 'system', 'content': _CHOICE_SYSTEM_PROMPT},
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'image_url', 'image_url': {'url': data_url}},
+                    {'type': 'text', 'text': text_prompt},
+                ],
+            },
+        ]
+
+        response_format_strict = {
+            'type': 'json_schema',
+            'json_schema': {
+                'name': 'seat_choice',
+                'strict': True,
+                'schema': _CHOICE_RESPONSE_SCHEMA,
+            },
+        }
+        response_format_loose = {'type': 'json_object'}
+        use_strict = True
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_retries + 1):
+            response_format = (
+                response_format_strict if use_strict else response_format_loose
+            )
+            try:
+                completion = client.with_options(timeout=timeout_s).chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    response_format=response_format,
+                    temperature=0.3,
+                )
+                raw = completion.choices[0].message.content or ''
+                parsed = json.loads(raw)
+                choice_raw = parsed.get('choice')
+                try:
+                    choice = int(choice_raw)
+                except (TypeError, ValueError):
+                    raise ValueError(f'choice is not an int: {choice_raw!r}')
+                if choice < 0 or choice > n_candidates:
+                    # Clamp out-of-range picks to the "none" sentinel rather
+                    # than silently acting on an index that doesn't exist.
+                    if logger is not None:
+                        logger.warning(
+                            f'VLM returned choice={choice} outside '
+                            f'[0, {n_candidates}]; clamping to 0.'
+                        )
+                    choice = 0
+                if logger is not None:
+                    logger.info(
+                        f'VLM seat-choice returned {choice} / {n_candidates} '
+                        f'(attempt {attempt}/{max_retries}).'
+                    )
+                return choice, time.perf_counter() - t0
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+                last_error = exc
+                if logger is not None:
+                    logger.warning(
+                        f'VLM seat-choice JSON parse failed '
+                        f'(attempt {attempt}/{max_retries}): {exc}'
+                    )
+            except Exception as exc:  # noqa: BLE001
+                exc_text = str(exc).lower()
+                if use_strict and (
+                    'json_schema' in exc_text
+                    or 'response_format' in exc_text
+                    or 'schema' in exc_text
+                ):
+                    if logger is not None:
+                        logger.warning(
+                            'VLM route rejected json_schema; falling back to '
+                            f'json_object ({exc}).'
+                        )
+                    use_strict = False
+                last_error = exc
+                if logger is not None:
+                    logger.warning(
+                        f'VLM seat-choice call failed '
+                        f'(attempt {attempt}/{max_retries}): {exc}'
+                    )
+
+        if logger is not None:
+            logger.error(
+                f'VLM seat-choice exhausted {max_retries} retries; '
+                f'last error: {last_error}'
+            )
+        return 0, time.perf_counter() - t0
+    finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass

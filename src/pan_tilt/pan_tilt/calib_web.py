@@ -1525,6 +1525,17 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         ):
             if isinstance(data, dict) and k in data:
                 info[k] = data[k]
+        # Phase-4 validation.json: surface verdict + self-consistency rmse so
+        # the file-status table can show the verdict pill at-a-glance.
+        if isinstance(data, dict) and data.get("phase") == "validation":
+            info["verdict"] = data.get("verdict")
+            sc = data.get("self_consistency") or {}
+            if "trans_rmse_m" in sc:
+                info["trans_rmse_m"] = sc["trans_rmse_m"]
+            if "rot_rmse_rad" in sc:
+                info["rot_rmse_rad"] = sc["rot_rmse_rad"]
+            if "n_samples_used" in data:
+                info["n_samples"] = data["n_samples_used"]
         return info
 
     def _gates_from_files(files: dict[str, dict]) -> list[dict]:
@@ -1574,9 +1585,9 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             raise HTTPException(404, f"unknown session: {name}")
         tracked = [
             "phase1_handeye.json", "phase1_handeye_custom.json",
-            "phase2_chain.json", "sanity.json",
+            "phase2_chain.json", "sanity.json", "phase4_validation.json",
             "intrinsic.json", "handeye.json", "handeye_custom.json",
-            "chain.json", "polish.json", "dry_run.json",
+            "chain.json", "polish.json", "validation.json", "dry_run.json",
         ]
         files = {f: _parse_session_file(sess_path, f) for f in tracked}
         return {
@@ -1687,9 +1698,10 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         # Only let through specific analyser files so we don't hand back
         # arbitrary blobs (the runner's sandboxing already covers ../ etc.).
         allowed = {"handeye.json", "handeye_custom.json",
-                   "chain.json", "polish.json",
+                   "chain.json", "polish.json", "validation.json",
                    "phase1_handeye.json", "phase1_handeye_custom.json",
                    "phase2_chain.json", "sanity.json",
+                   "phase4_validation.json",
                    "intrinsic.json", "dry_run.json"}
         if filename not in allowed:
             raise HTTPException(404, f"unknown file: {filename}")
@@ -1711,6 +1723,10 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     _CHAIN_HANDEYE_ALLOWLIST = {"handeye.json", "handeye_custom.json"}
     _POLISH_PHASE1_ALLOWLIST = {"phase1_handeye.json", "phase1_handeye_custom.json"}
     _POLISH_SEED_ALLOWLIST = {"chain.json"}
+    # Validate (Phase 4) accepts polish.json or chain.json as the params
+    # under test. Phase 4 is xArm-independent (board is fixed in base_link),
+    # so no handeye file is involved.
+    _VALIDATE_PARAMS_ALLOWLIST = {"polish.json", "chain.json"}
 
     _CALIB_PREREQS = {
         # analysis subcommands -> run_calibration.py
@@ -1722,7 +1738,9 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         "chain":           ["phase2_chain.json"],
         # Polish accepts per-request phase1 list + seed, validated below.
         "polish":          ["phase2_chain.json"],
-        "validate":        [],
+        # Validate (Phase 4) needs the collected validation samples; the
+        # params choice is checked per-request below.
+        "validate":        ["phase4_validation.json"],
         # collection subcommands -> calibrate_collect.py (moves the robot)
         "collect_phase1":         [],     # canonical level park (pan=0, tilt=+45)
         "collect_phase1_custom":  [],     # operator-chosen park, see /api/calib/phase1_custom_park
@@ -1735,6 +1753,9 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
                                                      # waste a 20-min sweep.
         "collect_sanity": [],
         "collect_both":   [],
+        # Phase 4 collection: drives pan-tilt across a sweep with arm held
+        # static. No file prereqs (it generates phase4_validation.json).
+        "collect_phase4_validation": [],
     }
     _ANALYSIS_CMDS = {"handeye", "handeye_custom", "chain", "polish", "validate"}
     # Endpoint-facing collect commands map onto `phase:=<phase>` for
@@ -1834,7 +1855,22 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
                 cmd_args += ["--seed", str(sess_path / seed_choice)]
                 cmd_args += ["--out", str(sess_path)]
             elif cmd == "validate":
-                cmd_args.append(str(sess_path))
+                params_choice = (req or {}).get("params") or "polish.json"
+                if params_choice not in _VALIDATE_PARAMS_ALLOWLIST:
+                    raise HTTPException(
+                        400,
+                        f"validate: params must be one of "
+                        f"{sorted(_VALIDATE_PARAMS_ALLOWLIST)}, got {params_choice!r}"
+                    )
+                if not (sess_path / params_choice).is_file():
+                    raise HTTPException(
+                        400,
+                        f"validate: {params_choice} not found in session — "
+                        f"run polish (or chain) first"
+                    )
+                cmd_args += ["--phase4", str(sess_path / "phase4_validation.json"),
+                             "--params", str(sess_path / params_choice),
+                             "--out", str(sess_path)]
             # Allowlist of client flags passed through to run_calibration.
             analysis_flags = {
                 "--fit-pan-offset", "--lock-tb-rotation", "--unlock-tb-rotation",

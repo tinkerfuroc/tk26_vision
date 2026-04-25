@@ -850,3 +850,137 @@ def test_duplicate_ee_geometry_check():
     T_dup = T_a.copy()
     t, r = pose_error_scalars(T_a, T_dup)
     assert t < 1e-9 and r < 1e-9      # would flag -- duplicate detected
+
+
+# ---- Phase 4 end-to-end validation -----------------------------------------
+#
+# Phase 4 is xArm-independent: the ChArUco board is fixed somewhere in
+# `base_link` (tripod, fixture, taped to a wall) and the pan-tilt sweeps
+# views of it. Synthesis below mirrors that — `T_base_marker` is a single
+# fixed transform; per-view `t_cam_marker_body = inv(FK(theta_p, theta_t))
+# @ T_base_marker` and samples have no `t_base_ee` field.
+
+def _phase4_samples(truth, T_base_marker, n=20, noise_rng=None,
+                    trans_noise_std=0.001, rot_noise_std_deg=0.05):
+    """Synthesize phase-4 samples for a board fixed in base_link."""
+    rng = np.random.default_rng(RNG_SEED + 4242)
+    pan_min, pan_max = np.deg2rad(-30.0), np.deg2rad(30.0)
+    tilt_min, tilt_max = np.deg2rad(15.0), np.deg2rad(45.0)
+    samples = []
+    for _ in range(n):
+        theta_p = float(rng.uniform(pan_min, pan_max))
+        theta_t = float(rng.uniform(tilt_min, tilt_max))
+        T_base_cam = forward_kinematics(theta_p, theta_t, truth)
+        T_cam_base = invert_transform(T_base_cam)
+        T_cm = T_cam_base @ T_base_marker
+        if noise_rng is not None:
+            dR = Rotation.from_rotvec(noise_rng.normal(
+                0, np.deg2rad(rot_noise_std_deg), size=3)).as_matrix()
+            dt = noise_rng.normal(0, trans_noise_std, size=3)
+            T_cm[:3, :3] = dR @ T_cm[:3, :3]
+            T_cm[:3, 3] = T_cm[:3, 3] + dt
+        samples.append({
+            "theta_pan_rad": theta_p,
+            "theta_tilt_rad": theta_t,
+            "t_cam_marker_body": matrix_to_pose_dict(T_cm),
+            "image_stamp_ns": 0,
+            "state_stamp_ns": 0,
+            "detection_quality": 24,
+        })
+    return samples
+
+
+def _validate_args(tmp_path, phase4_path, params_path,
+                   trans_pass_mm=5.0, rot_pass_deg=0.5,
+                   trans_warn_mm=10.0, rot_warn_deg=1.0):
+    import argparse
+    return argparse.Namespace(
+        phase4=str(phase4_path),
+        params=str(params_path),
+        out=str(tmp_path),
+        out_name="validation.json",
+        trans_pass_mm=trans_pass_mm,
+        rot_pass_deg=rot_pass_deg,
+        trans_warn_mm=trans_warn_mm,
+        rot_warn_deg=rot_warn_deg,
+    )
+
+
+def _params_blob(params):
+    """Synthesize a polish.json-shaped {"params": {...}} payload.
+
+    `t_ee_marker_*` fields are unused by `cmd_validate` (phase 4 doesn't
+    involve T_ee_marker) but the schema requires them, so we fill in zeros."""
+    return {
+        "params": {
+            "t_a": params.t_a.tolist(),
+            "t_b_trans": params.t_b_trans.tolist(),
+            "t_b_rotvec": params.t_b_rotvec.tolist(),
+            "t_ee_marker_rotvec": [0.0, 0.0, 0.0],
+            "t_ee_marker_trans": [0.0, 0.0, 0.0],
+            "theta_t_offset_rad": float(params.theta_t_offset),
+            "theta_p_offset_rad": float(params.theta_p_offset),
+            "l_pan": float(params.l_pan),
+        }
+    }
+
+
+def test_validate_round_trip(tmp_path):
+    """Phase-4 validate should report PASS when the params match truth and
+    FAIL/WARN when they're meaningfully wrong. The board lives in base_link;
+    no xArm or T_ee_marker is involved."""
+    from pan_tilt.calibration import run_calibration as rc
+    import json
+
+    truth, _ = _make_truth()
+    # Pick a fixed board pose in base_link that's plausibly visible across
+    # the sweep range used by _phase4_samples.
+    T_base_marker = np.eye(4)
+    T_base_marker[:3, :3] = Rotation.from_euler("xyz", [0.0, 0.4, 0.0]).as_matrix()
+    T_base_marker[:3, 3] = np.array([0.45, 0.0, 1.05])
+
+    noise_rng = np.random.default_rng(RNG_SEED + 5678)
+    samples = _phase4_samples(truth, T_base_marker, n=20, noise_rng=noise_rng)
+
+    phase4_path = tmp_path / "phase4_validation.json"
+    phase4_path.write_text(json.dumps({
+        "phase": "phase4_validation",
+        "samples": samples,
+    }))
+
+    polish_path = tmp_path / "polish.json"
+    polish_path.write_text(json.dumps(_params_blob(truth)))
+
+    # 1. Truth params → PASS.
+    rc.cmd_validate(_validate_args(tmp_path, phase4_path, polish_path))
+    out = json.loads((tmp_path / "validation.json").read_text())
+    assert out["verdict"] == "PASS", out
+    sc = out["self_consistency"]
+    # Spread is bounded by injected noise (1 mm / 0.05°) propagated through
+    # the FK; expect both metrics well inside the PASS gate.
+    assert sc["trans_rmse_m"] < 0.003, sc
+    assert np.degrees(sc["rot_rmse_rad"]) < 0.3, sc
+    # Per-axis std populated.
+    assert max(sc["trans_std_xyz_m"]) > 1e-5
+    # Per-sample list shape mirrors n_samples_used.
+    assert len(out["per_sample"]) == out["n_samples_used"]
+    # No truth_anchored side; payload should not carry that key at all.
+    assert "truth_anchored" not in out
+
+    # 2. Perturb theta_t_offset by 3°. Note: a θ_p_offset error is a constant
+    # SE(3) shift across views and cancels in the centroid — self-consistency
+    # cannot detect it. θ_t_offset interacts with the L_pan translation (R_y
+    # is sandwiched by trans(L·ẑ) in FK), so per-view error depends on θ_p
+    # and the spread inflates. 3° is well above the noise floor.
+    bad = PanTiltParams(
+        t_a=truth.t_a.copy(), t_b_trans=truth.t_b_trans.copy(),
+        t_b_rotvec=truth.t_b_rotvec.copy(),
+        theta_t_offset=truth.theta_t_offset + np.deg2rad(3.0),
+        theta_p_offset=truth.theta_p_offset,
+        l_pan=truth.l_pan,
+    )
+    polish_path.write_text(json.dumps(_params_blob(bad)))
+    rc.cmd_validate(_validate_args(tmp_path, phase4_path, polish_path))
+    bad_out = json.loads((tmp_path / "validation.json").read_text())
+    assert bad_out["verdict"] in ("WARN", "FAIL"), bad_out
+    assert np.degrees(bad_out["self_consistency"]["rot_rmse_rad"]) > 0.5, bad_out

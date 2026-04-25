@@ -17,9 +17,16 @@ Subcommands:
     polish     <phase1.json> <phase2.json> <--seed chain.json> <--out results/>
         Optional Phase-3 joint refinement. Emits `polish.json`.
 
-    validate   <results_dir>
-        Load whatever is in results/ and print a pass/fail summary against
-        the plan's gates. Also writes `residuals.png` if matplotlib is available.
+    validate   --phase4 phase4.json --params polish.json --out results/
+        Phase-4 end-to-end check (xArm-independent, board fixed in
+        base_link). Compose `T_base_marker_pred` for each held-out
+        (pan, tilt) view through the FK chain under test and report the
+        spread vs the centroid. Writes `validation.json` with a
+        PASS/WARN/FAIL verdict against 5 mm / 0.5° (PASS) and 10 mm / 1° (WARN).
+
+    gates      <results_dir>
+        Legacy: print PASS/FAIL summary for each per-phase residual against
+        the static plan gates. Superseded by `validate` for end-to-end checks.
 
 Each subcommand is pure-Python / no ROS — safe to run after-the-fact on saved data.
 """
@@ -590,7 +597,8 @@ def cmd_polish(args):
     print(f"Wrote {out_path}")
 
 
-def cmd_validate(args):
+def cmd_gates(args):
+    """Print PASS/FAIL summary for each phase result against the static GATES."""
     results_dir = Path(args.results_dir)
     for fname, key, thresh, label, unit in GATES:
         p = results_dir / fname
@@ -605,6 +613,132 @@ def cmd_validate(args):
         flag = "  OK  " if ok else " FAIL "
         disp = val * 1000 if unit == "mm" else (np.degrees(val) if unit == "deg" else val)
         print(f"  [{flag}] {fname}:{key} = {disp:.3f} {unit}  ({label})")
+
+
+def cmd_validate(args):
+    """Phase-4 end-to-end validation.
+
+    The ChArUco board was held stationary in `base_link` (mounted to a
+    tripod / wall / fixture — anywhere fixed, not on the EE) while the
+    pan-tilt swept N (pan, tilt) views. Compose `T_base_marker_pred_i =
+    forward_kinematics(theta_p_i, theta_t_i, params) @ T_cam_marker_i` for
+    each view; if the calibration is correct, all views project the marker
+    to the same base-frame pose. Spread across views = end-to-end error.
+    No xArm or T_ee_marker assumption is involved.
+    """
+    phase4 = json.loads(Path(args.phase4).read_text())
+    samples = phase4.get("samples", [])
+    n_total = len(samples)
+    if n_total < 3:
+        raise SystemExit(
+            f"validate: need >=3 samples in phase4_validation, got {n_total}"
+        )
+
+    params_blob = json.loads(Path(args.params).read_text())
+    params = _params_from_dict(params_blob["params"])
+
+    # Compose per-sample base-frame marker predictions through the FK chain
+    # under test. `t_cam_marker_body` is already in body coords (post
+    # optical_to_body conversion at collect time), so no extra rotation here.
+    pred_T: list[np.ndarray] = []
+    pan_arr: list[float] = []
+    tilt_arr: list[float] = []
+    for s in samples:
+        theta_p = float(s["theta_pan_rad"])
+        theta_t = float(s["theta_tilt_rad"])
+        t_cam_marker = pose_to_matrix(
+            s["t_cam_marker_body"]["translation"],
+            s["t_cam_marker_body"]["rotation"],
+        )
+        t_base_cam = forward_kinematics(theta_p, theta_t, params)
+        pred_T.append(t_base_cam @ t_cam_marker)
+        pan_arr.append(theta_p)
+        tilt_arr.append(theta_t)
+
+    # Self-consistency centroid. Translation is arithmetic mean; rotation is
+    # the chordal mean over the per-sample rotation matrices (same primitive
+    # the chain solver uses elsewhere). The choice doesn't matter much when
+    # views agree closely (the regime that gates PASS); it just keeps the
+    # residual definition well-posed when they don't.
+    trans_arr = np.array([T[:3, 3] for T in pred_T])
+    rot_arr = np.array([T[:3, :3] for T in pred_T])
+    centroid_trans = trans_arr.mean(axis=0)
+    centroid_rot = Rotation.from_matrix(rot_arr).mean().as_matrix()
+    centroid_T = np.eye(4)
+    centroid_T[:3, :3] = centroid_rot
+    centroid_T[:3, 3] = centroid_trans
+
+    trans_errs = np.zeros(n_total)
+    rot_errs = np.zeros(n_total)
+    for i, T in enumerate(pred_T):
+        te, re = pose_error_scalars(T, centroid_T)
+        trans_errs[i] = te
+        rot_errs[i] = re
+
+    trans_rmse_self = float(np.sqrt(np.mean(trans_errs ** 2)))
+    rot_rmse_self = float(np.sqrt(np.mean(rot_errs ** 2)))
+    trans_max_self = float(np.max(trans_errs))
+    rot_max_self = float(np.max(rot_errs))
+    # Per-axis std on translation: an operator can read "Z dominates" → look
+    # at T_B Y rotation / theta_t_offset, "X dominates" → look at theta_p.
+    trans_std_xyz = trans_arr.std(axis=0).tolist()
+
+    # Verdict on self-consistency: spread of T_base_marker_pred across views.
+    trans_pass = args.trans_pass_mm * 1e-3
+    rot_pass = np.deg2rad(args.rot_pass_deg)
+    trans_warn = args.trans_warn_mm * 1e-3
+    rot_warn = np.deg2rad(args.rot_warn_deg)
+    if trans_rmse_self <= trans_pass and rot_rmse_self <= rot_pass:
+        verdict = "PASS"
+    elif trans_rmse_self <= trans_warn and rot_rmse_self <= rot_warn:
+        verdict = "WARN"
+    else:
+        verdict = "FAIL"
+
+    out_path = Path(args.out) / args.out_name
+    payload = {
+        "phase": "validation",
+        "params_source": str(args.params),
+        "phase4_source": str(args.phase4),
+        "n_samples_total": n_total,
+        "n_samples_used": n_total,
+        "self_consistency": {
+            "trans_rmse_m": trans_rmse_self,
+            "rot_rmse_rad": rot_rmse_self,
+            "trans_max_m": trans_max_self,
+            "rot_max_rad": rot_max_self,
+            "trans_std_xyz_m": trans_std_xyz,
+            "centroid": matrix_to_pose_dict(centroid_T),
+        },
+        "per_sample": [
+            {
+                "i": i,
+                "pan_rad": pan_arr[i],
+                "tilt_rad": tilt_arr[i],
+                "trans_err_m": float(trans_errs[i]),
+                "rot_err_rad": float(rot_errs[i]),
+                "T_base_marker_pred": matrix_to_pose_dict(pred_T[i]),
+            }
+            for i in range(n_total)
+        ],
+        "verdict": verdict,
+        "thresholds": {
+            "trans_pass_mm": args.trans_pass_mm,
+            "rot_pass_deg": args.rot_pass_deg,
+            "trans_warn_mm": args.trans_warn_mm,
+            "rot_warn_deg": args.rot_warn_deg,
+        },
+    }
+    _save_json(out_path, payload)
+
+    print(
+        f"VALIDATE: {verdict}  n={n_total}  "
+        f"trans_rmse={trans_rmse_self*1000:.2f}mm "
+        f"rot_rmse={np.degrees(rot_rmse_self):.3f}deg  "
+        f"trans_max={trans_max_self*1000:.2f}mm "
+        f"rot_max={np.degrees(rot_max_self):.3f}deg"
+    )
+    print(f"Wrote {out_path}")
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -737,8 +871,26 @@ def main(argv=None):
                     help="Disable the iterative MAD-sigma rejection. --exclude-indices still applies.")
     pp.set_defaults(func=cmd_polish)
 
-    pv = sub.add_parser("validate", help="Check results against plan gates.")
-    pv.add_argument("results_dir")
+    pg = sub.add_parser("gates", help="Print PASS/FAIL summary for static phase gates.")
+    pg.add_argument("results_dir")
+    pg.set_defaults(func=cmd_gates)
+
+    pv = sub.add_parser(
+        "validate",
+        help="Phase 4: end-to-end pan-tilt sweep against a stationary "
+             "in-base_link board (xArm-independent).",
+    )
+    pv.add_argument("--phase4", required=True,
+                    help="phase4_validation.json (board fixed in base_link).")
+    pv.add_argument("--params", required=True,
+                    help="polish.json (preferred) or chain.json — params under test.")
+    pv.add_argument("--out", default="results",
+                    help="Session dir; writes <out>/<out-name>.")
+    pv.add_argument("--out-name", default="validation.json")
+    pv.add_argument("--trans-pass-mm", type=float, default=5.0)
+    pv.add_argument("--rot-pass-deg", type=float, default=0.5)
+    pv.add_argument("--trans-warn-mm", type=float, default=10.0)
+    pv.add_argument("--rot-warn-deg", type=float, default=1.0)
     pv.set_defaults(func=cmd_validate)
 
     args = parser.parse_args(argv)

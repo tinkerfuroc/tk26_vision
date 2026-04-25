@@ -222,8 +222,19 @@ The old monolithic `pan_tilt/ctrl` path is gone on purpose.
   `pan_tilt` package does not subscribe to it.
 - Runtime TF comes from `/joint_states` plus `robot_state_publisher`, not from
   the serial driver.
-- `config/specs.json` is retained only as reference data; runtime geometry now
-  lives in `src/pan_tilt/urdf/pan_tilt.urdf.xacro`.
+- `config/specs.json` is retained only as reference data; runtime geometry
+  now lives in `tk25_basic/tinker_urdf` as a `pan_tilt_macro`
+  (`src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro`) plus a
+  standalone wrapper (`pan_tilt_standalone.urdf.xacro`). The macro is
+  reused by `tracer_mini_manipulator.urdf.xacro` with `parent="base_link"`
+  so the combined `mobile_manipulator` URDF loaded by MoveIt (via
+  `grasp_bringup`) contains `pan_joint` + `tilt_joint` — this kills the
+  `move_group` "Joint 'pan_joint' not found in model 'mobile_manipulator'"
+  log spam. When running `pan_tilt.launch.py` alongside `grasp_bringup`,
+  pass `launch_robot_state_publisher:=false` so only the xArm RSP owns
+  `/robot_description`. The geometry was placed in `tinker_urdf` (not
+  `pan_tilt`) to keep dependencies flowing `tk26_vision → tk25_basic`
+  only — `tinker_urdf` must not depend on `pan_tilt`.
 
 See `scripts/tests/README.md` for env vars and skip conditions. Logs in `scripts/tests/logs/`.
 

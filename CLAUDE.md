@@ -130,6 +130,88 @@ Integration smoke suite at `scripts/tests/`, four tiers each gated by the previo
 | T3 | `t3_interaction.sh` | cross-node: feature_matching↔yolo, spot_on_shelf↔yolo, controller↔state_publisher↔follow_head TF | T2 + servo |
 | T4 | `t4_hardware.sh {servo_motion\|servo_tracking\|shelf_scene\|person\|all}` | hardware-in-the-loop, staged scenes | operator |
 
+## Pan-tilt / head camera extrinsic calibration
+
+Two-phase solver with xArm FK as the ground-truth anchor and a ChArUco board on the EE as the observation target.
+
+**Hardware note.** The camera is mounted at roughly 90° to the tilt arm — at firmware `tilt = 45°` (arm pointing straight up) the optical axis is horizontal; at firmware `tilt = 0°` (servo-zero set via `T:502`) it points ~45° down. This means T_B has a **large non-identity rotation** (~π/2 about X in tilt_link coordinates), not a small mount-tolerance correction. The calibration handles this by warm-starting T_B from the Phase-1 reference pose rather than from the URDF's stale rpy.
+
+Parameters fit:
+
+| Block | DOF | Init | Phase-2 fit? | Notes |
+|---|---|---|---|---|
+| T_A trans (base_link→pan axis) | 3 | URDF xyz | yes | rotation locked identity |
+| T_B trans (tilt_end→camera_link body) | 3 | from warm-start | yes | |
+| T_B rotation (rotvec) | 3 | from warm-start | **no** (Phase-2) / yes (polish) | Y-component is degenerate with θ_t_offset; unlock only in joint polish where Phase-1 data breaks the degeneracy |
+| T_ee_marker | 6 | identity | Phase-1 only | Phase-1 hand-eye then frozen |
+| θ_t_offset | 1 | −π/4 | yes | absorbs servo-zero-set noise |
+
+Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13–14.
+
+### Procedure
+
+1. **Generate the board.** `python -m pan_tilt.calibration.charuco_generate --out ~/calib/charuco_5x7` → PDF + PNG + JSON spec. Print on A4 matte at 100% scale, mount on 3 mm aluminum composite, re-measure square size with calipers. (Default 5×7 40 mm squares = 200×280 mm on A4; shrink to `--square-len 0.035 --marker-len 0.026` if your printer can't handle 5 mm edge margins.)
+2. **Fill config.** Edit `src/pan_tilt/config/calibration.yaml` — replace the placeholder xArm joint waypoints with 12–15 hand-eye poses (Phase 1) and 2–3 grid-anchor poses (Phase 2). Pre-validate each in RViz with the full URDF loaded. The node enforces a software Z-floor + mast exclusion cylinder but does no general collision checking.
+3. **Collect.**
+   ```bash
+   ros2 run pan_tilt calibrate_collect --ros-args \
+     -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml \
+     -p out_dir:=$PWD/calib_out -p phase:=both
+   ```
+   Produces `phase1_handeye.json`, `phase2_chain.json`, `sanity.json`.
+4. **(Optional) Calibrate intrinsics.** If reprojection RMSE > 0.5 px during Phase 1, collect ~20 ChArUco shots and run `python -m pan_tilt.calibration.run_calibration intrinsic <images_dir> --out calib_out`.
+5. **Solve.**
+   ```bash
+   python -m pan_tilt.calibration.run_calibration handeye calib_out/phase1_handeye.json --out calib_out
+   python -m pan_tilt.calibration.run_calibration chain  calib_out/phase2_chain.json --handeye calib_out/handeye.json --fit-pan-offset --out calib_out
+   python -m pan_tilt.calibration.run_calibration validate calib_out
+   ```
+   The chain step warm-starts T_B from the Phase-1 `Z₀`, which handles the ~90° (about Y) mount rotation automatically. T_B rotation is **locked by default** through the chain fit to avoid the `T_B(Y) ↔ θ_t_offset` degeneracy; pass `--unlock-tb-rotation` only for debugging or comparison runs. The chain solver auto-tries **two warm-start basins** (`θ_p_offset ∈ {0, π}`) and saves the lower-rot-RMSE result — fixes the silent wrong-basin failure on hardware whose pan firmware sign is opposite the FK assumption (symptom: locked-T_B chain rot RMSE stuck at ~20°). The chosen basin is printed alongside residuals. To run chain against the custom-park solve instead of the canonical one, swap `--handeye calib_out/handeye_custom.json`.
+
+   Optional polish (unlocks T_B rotation; auto-rejects MAD-sigma outliers like handeye does):
+   ```bash
+   python -m pan_tilt.calibration.run_calibration polish \
+     --phase1 calib_out/phase1_handeye.json \
+     --phase2 calib_out/phase2_chain.json \
+     --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
+   ```
+   Pass multiple `--phase1` files to concatenate datasets collected at different park poses — the extra EE-rotation diversity helps the joint fit, and is the recommended polish input when both `phase1_handeye.json` and `phase1_handeye_custom.json` exist:
+   ```bash
+   python -m pan_tilt.calibration.run_calibration polish \
+     --phase1 calib_out/phase1_handeye.json calib_out/phase1_handeye_custom.json \
+     --phase2 calib_out/phase2_chain.json \
+     --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
+   ```
+   Polish flags:
+   - `--phase1 PATH [PATH ...]` (required) — one or more phase-1 sample JSONs concatenated in argument order. `--exclude-indices` indexes into this concatenated array (phase1 first, then phase2).
+   - `--phase2 PATH` (required).
+   - `--exclude-indices N [N ...]` — drop manually-known-bad samples up front. Use this to propagate handeye's `rejected_sample_indices` across phases.
+   - `--reject-sigma` (default 3.0), `--max-reject-frac` (default 0.10) — control the iterative MAD-sigma rejection loop.
+   - `--no-reject` — skip auto rejection entirely; manual `--exclude-indices` still applies.
+6. **Emit URDF diff.** The patcher auto-detects both xacro layouts: the `tk25_basic` macro form at `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` (the authoritative URDF the main robot bringup loads — patches `attach_xyz` default + `camera_mount_joint` origin) and the `tk26_vision` standalone form at `src/pan_tilt/urdf/pan_tilt.urdf.xacro` (used by `pan_tilt.launch.py` for dev bringup). Run `python -m pan_tilt.calibration.apply_to_urdf --results calib_out/chain.json --xacro <path>` against **both** so RViz and the live robot stay consistent, and apply the diffs manually once reviewed.
+
+### Phase gates
+
+- Intrinsic RMSE < 0.5 px
+- Hand-eye trans RMSE < 3 mm, rot RMSE < 0.5°
+- Chain held-out trans RMSE < 3 mm, rot RMSE < 0.4°
+- Sanity-pose bracket (start vs end) < 2 mm / 0.2°
+
+> **Don't move the board between phase-1 collects.** `T_ee_marker` is the rigid pose of the marker on the EE flange — both `handeye.json` (canonical 45°) and `handeye_custom.json` (operator-chosen park) describe the *same* physical board, so the two solves must agree. The handeye solver cross-checks them and refuses to write if they disagree by more than 5 mm / 1°. Recovery: re-collect *both* phase-1 datasets in one sitting without touching the board, the EE, or the xArm zero. If you intentionally remounted the board (e.g. swapping marker prints for evaluation), pass `--allow-t-ee-marker-mismatch` on the handeye CLI to bypass the gate.
+
+### Robustness measures baked in
+
+- Per-axis backlash mitigation (overshoot-return per cell)
+- Servo settle check (feedback_ok + |cur − tgt| < 0.3° held 0.5 s)
+- MAD outlier rejection over 10-frame average per cell
+- Image-vs-state timestamp skew gate (≤ 20 ms)
+- SE(3) log residual (proper manifold metric) with `soft_l1` loss
+- 80/20 train/val split at the chain phase
+
+### Synthetic-data regression test
+
+`pytest src/pan_tilt/test/test_calibration.py` fabricates samples from a known ground-truth, runs every solver, and asserts recovery. Run this before touching `optimize.py` or `pan_tilt_model.py`.
+
 ## Pan-tilt refactor notes
 
 The old monolithic `pan_tilt/ctrl` path is gone on purpose.

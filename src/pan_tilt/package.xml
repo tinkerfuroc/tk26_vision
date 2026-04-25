@@ -16,9 +16,12 @@
   <depend>ament_index_python</depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>
+  <depend>tf2_ros</depend>
+  <depend>geometry_msgs</depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>vision_util</exec_depend>
+  <exec_depend>tinker_arm_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

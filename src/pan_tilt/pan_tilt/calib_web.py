@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import io
 import json
 import logging
@@ -256,6 +257,101 @@ class CalibrateRunner:
             )
         return {"diff": stdout.decode("utf-8", errors="replace")}
 
+    # ---- apply_to_urdf write (atomic in-place patch with backup) -----------
+
+    async def urdf_apply(self, session: str, results_file: str, xacro_path: str) -> dict:
+        """Patch ``xacro_path`` from ``<session>/<results_file>`` and replace
+        in place. Writes a timestamped backup unless the patch is a no-op.
+
+        ``xacro_path`` must match one of the entries in ``list_urdf_targets()``.
+        That allowlist is the only thing standing between an HTTP body and
+        an arbitrary file write, so the check is mandatory here even though
+        ``urdf_diff`` (read-only) doesn't need it.
+        """
+        target = next(
+            (t for t in list_urdf_targets() if t.path == xacro_path),
+            None,
+        )
+        if target is None:
+            raise ValueError(
+                f"xacro_path {xacro_path!r} is not on the URDF target allowlist"
+            )
+        if not target.exists:
+            raise FileNotFoundError(
+                f"target xacro {xacro_path!r} not present in this overlay "
+                f"(package {target.build_package} not built?)"
+            )
+
+        session_path = self.session_path(session)
+        results_path = session_path / results_file
+        if not results_path.is_file():
+            raise FileNotFoundError(
+                f"results file {results_file!r} not found in session {session!r}"
+            )
+
+        xacro = Path(xacro_path)
+        # Sit the temp file next to the target so os.replace() is atomic
+        # (same filesystem) and a crash leaves a debuggable artifact rather
+        # than a half-written xacro.
+        run_id = uuid.uuid4().hex[:8]
+        tmp_path = xacro.with_name(xacro.name + f".tmp-{run_id}")
+
+        argv = [
+            sys.executable, "-m", "pan_tilt.calibration.apply_to_urdf",
+            "--results", str(results_path),
+            "--xacro", str(xacro),
+            "--out", str(tmp_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"apply_to_urdf exited {proc.returncode}: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+        if not tmp_path.is_file():
+            raise RuntimeError(
+                f"apply_to_urdf produced no output at {tmp_path}; "
+                f"stdout was: {stdout.decode('utf-8', errors='replace').strip()}"
+            )
+
+        original_bytes = xacro.read_bytes()
+        patched_bytes = tmp_path.read_bytes()
+        if original_bytes == patched_bytes:
+            tmp_path.unlink(missing_ok=True)
+            return {
+                "applied": False,
+                "reason": "no change — xacro already matches calibration",
+                "build_package": target.build_package,
+                "build_command": target.build_command,
+                "workspace_hint": target.workspace_hint,
+            }
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = xacro.with_name(xacro.name + f".old-{ts}")
+        backup_path.write_bytes(original_bytes)
+        os.replace(tmp_path, xacro)
+
+        diff_lines = list(difflib.unified_diff(
+            original_bytes.decode("utf-8", errors="replace").splitlines(keepends=True),
+            patched_bytes.decode("utf-8", errors="replace").splitlines(keepends=True),
+            fromfile=str(xacro),
+            tofile=str(xacro) + " (calibrated)",
+        ))
+        return {
+            "applied": True,
+            "backup_path": str(backup_path),
+            "build_package": target.build_package,
+            "build_command": target.build_command,
+            "workspace_hint": target.workspace_hint,
+            "diff_preview": "".join(diff_lines[:24]),
+        }
+
 
 def _empty_pointcloud(frame_id: str = "base_link"):
     """Zero-point but well-formed PointCloud2 used when no live depth cloud is available.
@@ -451,11 +547,10 @@ class CalibWebNode(Node):
         self._resume_from_draft()
 
         # Expose the configured pan/tilt grid so the UI can render grid-matched
-        # jog presets and a cheat-sheet. Constant for the lifetime of the node.
-        self.state.grid = {
-            "pan_deg": list(self._loaded_cfg.get("pan_grid_deg", []) or []),
-            "tilt_deg": list(self._loaded_cfg.get("tilt_grid_deg", []) or []),
-        }
+        # jog presets and a cheat-sheet. Refreshed on each yaml reload so the
+        # Pan-Tilt Jog tab tracks operator yaml edits + prune-overwrite output.
+        with self.lock:
+            self._refresh_state_grid_locked()
 
         self._subscribe_camera(
             self.state.image_topic, self.state.camera_info_topic,
@@ -946,7 +1041,10 @@ class CalibWebNode(Node):
 
         Operator-facing reload: lets the UI swap between draft (auto-saved)
         and the source-tree calibration.yaml (manually pruned/edited)
-        without restarting the server.
+        without restarting the server. Also refreshes the pan/tilt scan
+        grid (`pan_grid_deg`/`tilt_grid_deg`/`phase2_grid_pairs`) so the
+        Pan-Tilt Jog tab tracks the live yaml — without this the tab shows
+        whatever was on disk at server startup, even after operator edits.
 
         Returns a `{phase: count}` dict of what was loaded. Raises
         FileNotFoundError / OSError / yaml.YAMLError on parse failure --
@@ -963,13 +1061,37 @@ class CalibWebNode(Node):
                                 for x in v] if isinstance(v, list) else v
         counts = {k: (len(v) if isinstance(v, list) else 0)
                   for k, v in recovered.items()}
-        if recovered:
+
+        # Phase-2 sweep config: rectangular grid + optional pruned-pair
+        # override. Pulled through into `_loaded_cfg` so the Jog tab + the
+        # next `_serialize_waypoints_yaml` see the operator's edits.
+        grid_updates: dict = {}
+        for k in ("pan_grid_deg", "tilt_grid_deg", "phase2_grid_pairs"):
+            if k in coll:
+                v = coll[k]
+                grid_updates[k] = list(v) if isinstance(v, list) else v
+
+        if recovered or grid_updates:
             with self.lock:
-                self._waypoints.update(recovered)
+                if recovered:
+                    self._waypoints.update(recovered)
+                if grid_updates:
+                    self._loaded_cfg.update(grid_updates)
+                    self._refresh_state_grid_locked()
             self.get_logger().info(f"{log_prefix} from {path}: {counts}")
         else:
             self.get_logger().info(f"{log_prefix} from {path}: no waypoint sections found")
         return counts
+
+    def _refresh_state_grid_locked(self) -> None:
+        """Republish the pan/tilt scan grid from `_loaded_cfg` into
+        `state.grid` (the Pan-Tilt Jog tab's data source).
+        Caller must hold `self.lock`.
+        """
+        self.state.grid = {
+            "pan_deg": list(self._loaded_cfg.get("pan_grid_deg", []) or []),
+            "tilt_deg": list(self._loaded_cfg.get("tilt_grid_deg", []) or []),
+        }
 
 
 # ---- yaml loader ------------------------------------------------------------
@@ -1582,12 +1704,24 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     # each one REQUIRES before it can run. Keep the allowlist tight so a
     # malformed POST can't ask us to run arbitrary argv. `collect` subcommands
     # have empty prereq lists -- they generate files rather than consume them.
+    # Which session-relative basenames each command will accept as the
+    # operator-chosen input file. Keep these tight — `api_calib_run` pipes
+    # whatever the front-end sends straight into a subprocess argv, so any
+    # client-supplied filename has to be checked against these allowlists.
+    _CHAIN_HANDEYE_ALLOWLIST = {"handeye.json", "handeye_custom.json"}
+    _POLISH_PHASE1_ALLOWLIST = {"phase1_handeye.json", "phase1_handeye_custom.json"}
+    _POLISH_SEED_ALLOWLIST = {"chain.json"}
+
     _CALIB_PREREQS = {
         # analysis subcommands -> run_calibration.py
         "handeye":         ["phase1_handeye.json"],
         "handeye_custom":  ["phase1_handeye_custom.json"],
-        "chain":           ["phase2_chain.json", "handeye.json"],
-        "polish":          ["phase1_handeye.json", "phase2_chain.json", "chain.json"],
+        # Chain accepts a per-request handeye file (default handeye.json), so the
+        # static prereq carries only what's always required; the chosen handeye
+        # file is checked per-request below.
+        "chain":           ["phase2_chain.json"],
+        # Polish accepts per-request phase1 list + seed, validated below.
+        "polish":          ["phase2_chain.json"],
         "validate":        [],
         # collection subcommands -> calibrate_collect.py (moves the robot)
         "collect_phase1":         [],     # canonical level park (pan=0, tilt=+45)
@@ -1646,13 +1780,58 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
                 cmd_args += ["--out", str(sess_path),
                              "--out-name", "handeye_custom.json"]
             elif cmd == "chain":
+                handeye_choice = (req or {}).get("handeye") or "handeye.json"
+                if handeye_choice not in _CHAIN_HANDEYE_ALLOWLIST:
+                    raise HTTPException(
+                        400,
+                        f"chain: handeye must be one of "
+                        f"{sorted(_CHAIN_HANDEYE_ALLOWLIST)}, got {handeye_choice!r}"
+                    )
+                if not (sess_path / handeye_choice).is_file():
+                    raise HTTPException(
+                        400,
+                        f"chain: {handeye_choice} not found in session — "
+                        f"run handeye first"
+                    )
                 cmd_args.append(str(sess_path / "phase2_chain.json"))
-                cmd_args += ["--handeye", str(sess_path / "handeye.json")]
+                cmd_args += ["--handeye", str(sess_path / handeye_choice)]
                 cmd_args += ["--out", str(sess_path)]
             elif cmd == "polish":
-                cmd_args.append(str(sess_path / "phase1_handeye.json"))
-                cmd_args.append(str(sess_path / "phase2_chain.json"))
-                cmd_args += ["--seed", str(sess_path / "chain.json")]
+                phase1_choice = (req or {}).get("phase1") or ["phase1_handeye.json"]
+                if not isinstance(phase1_choice, list) or not phase1_choice:
+                    raise HTTPException(
+                        400, "polish: phase1 must be a non-empty list of basenames"
+                    )
+                bad_phase1 = [f for f in phase1_choice if f not in _POLISH_PHASE1_ALLOWLIST]
+                if bad_phase1:
+                    raise HTTPException(
+                        400,
+                        f"polish: phase1 entries must be in "
+                        f"{sorted(_POLISH_PHASE1_ALLOWLIST)}, got {bad_phase1}"
+                    )
+                missing_phase1 = [f for f in phase1_choice if not (sess_path / f).is_file()]
+                if missing_phase1:
+                    raise HTTPException(
+                        400,
+                        f"polish: phase1 file(s) not found in session: {missing_phase1}"
+                    )
+                seed_choice = (req or {}).get("seed") or "chain.json"
+                if seed_choice not in _POLISH_SEED_ALLOWLIST:
+                    raise HTTPException(
+                        400,
+                        f"polish: seed must be one of "
+                        f"{sorted(_POLISH_SEED_ALLOWLIST)}, got {seed_choice!r}"
+                    )
+                if not (sess_path / seed_choice).is_file():
+                    raise HTTPException(
+                        400,
+                        f"polish: {seed_choice} not found in session — "
+                        f"run chain first"
+                    )
+                cmd_args += ["--phase1",
+                             *[str(sess_path / f) for f in phase1_choice]]
+                cmd_args += ["--phase2", str(sess_path / "phase2_chain.json")]
+                cmd_args += ["--seed", str(sess_path / seed_choice)]
                 cmd_args += ["--out", str(sess_path)]
             elif cmd == "validate":
                 cmd_args.append(str(sess_path))
@@ -1729,6 +1908,25 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             raise HTTPException(404, str(exc))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc))
+        return result
+
+    @app.post("/api/calib/urdf_apply")
+    async def api_calib_urdf_apply(req: dict):
+        session = (req or {}).get("session", "")
+        xacro_path = (req or {}).get("xacro_path", "")
+        results_file = (req or {}).get("results_file", "polish.json")
+        if not xacro_path:
+            raise HTTPException(400, "xacro_path required")
+        try:
+            result = await node.calib_runner.urdf_apply(session, results_file, xacro_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except PermissionError as exc:
+            raise HTTPException(500, f"cannot write xacro: {exc}")
         except RuntimeError as exc:
             raise HTTPException(500, str(exc))
         return result
@@ -2025,6 +2223,17 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             )
         except RuntimeError as exc:
             raise HTTPException(400, str(exc))
+        # The source yaml on disk is now the new truth; pull it back into
+        # `_loaded_cfg` + `state.grid` so the Pan-Tilt Jog tab reflects the
+        # pruned grid without an extra "Reload from calibration.yaml" click.
+        # Best-effort -- the file write succeeded so don't fail the request
+        # if the reload trips on a transient parse issue.
+        reload_fn = getattr(node, "reload_waypoints_from_yaml", None)
+        if callable(reload_fn) and node.promote_yaml_out is not None:
+            try:
+                reload_fn(node.promote_yaml_out, log_prefix="prune-overwrite")
+            except (FileNotFoundError, OSError, yaml.YAMLError) as exc:
+                log.warning("prune-overwrite reload failed: %s", exc)
         response["wrote"] = written_paths
         return response
 

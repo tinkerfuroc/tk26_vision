@@ -328,6 +328,270 @@ def test_apply_to_urdf_patches_both_xacro_forms():
         assert 'xyz="-0.08 -0.01 0.08"' in p
 
 
+def test_polish_rejects_corrupted_sample(tmp_path):
+    """Polish must drop outliers like handeye does. We synthesize a clean
+    phase1+phase2 dataset, then deliberately rotate one phase1 sample's marker
+    pose by 30 deg. With auto rejection on (default) the corrupted index must
+    appear in `rejected_indices_auto` and the joint RMSE must stay near the
+    noise floor; with `--no-reject` (and no manual exclude) the same fit blows
+    up. This is the regression guard for the 0426_newset failure mode where
+    `phase1/12` slipped through and drove polish to 17.9 mm trans / 5.65 deg.
+    """
+    from pan_tilt.calibration import run_calibration as rc
+    import json, argparse
+
+    truth, t_ee_marker = _make_truth()
+    noise_rng = np.random.default_rng(RNG_SEED + 700)
+    phase1 = _phase1_samples(truth, t_ee_marker, n=18, noise_rng=noise_rng)
+    phase2 = _phase2_samples(truth, t_ee_marker, noise_rng=noise_rng)
+
+    # Corrupt phase1[3]'s marker rotation by 30 deg about a random axis. This
+    # mimics an EE-pose timing skew or a misdetected board orientation.
+    bad_local = 3
+    T_cm = pose_to_matrix(
+        phase1[bad_local]["t_cam_marker_body"]["translation"],
+        phase1[bad_local]["t_cam_marker_body"]["rotation"],
+    )
+    bad_axis = np.array([0.3, 0.7, 0.6]); bad_axis /= np.linalg.norm(bad_axis)
+    R_bad = Rotation.from_rotvec(np.deg2rad(30.0) * bad_axis).as_matrix()
+    T_cm[:3, :3] = R_bad @ T_cm[:3, :3]
+    phase1[bad_local]["t_cam_marker_body"] = matrix_to_pose_dict(T_cm)
+    bad_global = bad_local  # phase1 occupies the first len(phase1) slots
+
+    # Write phase1, phase2 files. We don't need a real chain.json — write
+    # the truth params directly into a seed JSON that polish can read.
+    (tmp_path / "phase1.json").write_text(json.dumps({"samples": phase1}))
+    (tmp_path / "phase2.json").write_text(json.dumps({"samples": phase2}))
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(json.dumps({
+        "params": {
+            "t_a": truth.t_a.tolist(),
+            "t_b_trans": truth.t_b_trans.tolist(),
+            "t_b_rotvec": truth.t_b_rotvec.tolist(),
+            "t_ee_marker_rotvec": Rotation.from_matrix(t_ee_marker[:3, :3]).as_rotvec().tolist(),
+            "t_ee_marker_trans": t_ee_marker[:3, 3].tolist(),
+            "theta_t_offset_rad": float(truth.theta_t_offset),
+            "theta_p_offset_rad": float(truth.theta_p_offset),
+            "l_pan": float(truth.l_pan),
+        }
+    }))
+
+    def _polish_args(out_dir, *, no_reject=False, exclude_indices=()):
+        return argparse.Namespace(
+            phase1=[str(tmp_path / "phase1.json")],
+            phase2=str(tmp_path / "phase2.json"),
+            seed=str(seed_path),
+            out=str(out_dir),
+            unlock_tb_rotation=False,
+            fit_pan_offset=True,
+            loss="soft_l1",
+            exclude_indices=list(exclude_indices),
+            reject_sigma=3.0,
+            max_reject_frac=0.10,
+            no_reject=no_reject,
+        )
+
+    # Default run: auto MAD rejection should catch the corrupted sample.
+    out_auto = tmp_path / "auto"
+    rc.cmd_polish(_polish_args(out_auto))
+    payload_auto = json.loads((out_auto / "polish.json").read_text())
+    auto_indices = [r["index"] for r in payload_auto["rejected_indices_auto"]]
+    assert bad_global in auto_indices, (
+        f"corrupted sample #{bad_global} not auto-rejected; got {auto_indices}"
+    )
+    # On clean residue the joint fit must hit the calibration gate (3 mm/0.4°).
+    assert payload_auto["trans_rmse_m"] < 0.003, (
+        f"polish trans RMSE {payload_auto['trans_rmse_m']*1000:.2f} mm > 3 mm "
+        f"after auto rejection — outlier still poisoning the fit"
+    )
+    assert np.degrees(payload_auto["rot_rmse_rad"]) < 0.4
+
+    # Manual exclude path: same outcome without the MAD loop running.
+    out_manual = tmp_path / "manual"
+    rc.cmd_polish(_polish_args(out_manual, no_reject=True, exclude_indices=[bad_global]))
+    payload_manual = json.loads((out_manual / "polish.json").read_text())
+    assert payload_manual["rejected_indices_manual"] == [bad_global]
+    assert payload_manual["rejected_indices_auto"] == []
+    assert payload_manual["trans_rmse_m"] < 0.003
+
+    # No-reject + no manual exclude: outlier is left in -> fit must be noticeably
+    # worse than the gate, proving rejection is what saves the result. The
+    # corruption is rotation-only, so the trans RMSE may stay near the noise
+    # floor; the rot residual is what reliably blows up.
+    out_none = tmp_path / "none"
+    rc.cmd_polish(_polish_args(out_none, no_reject=True))
+    payload_none = json.loads((out_none / "polish.json").read_text())
+    assert (
+        payload_none["trans_rmse_m"] > 0.003
+        or np.degrees(payload_none["rot_rmse_rad"]) > 0.4
+    ), (
+        "no-reject baseline didn't blow up — corruption may be too small to "
+        "exercise the regression"
+    )
+
+
+def test_handeye_t_ee_marker_cross_check(tmp_path):
+    """If `handeye_custom.json` would be written with a T_ee_marker that disagrees
+    with the existing canonical `handeye.json` by more than 5 mm / 1°, the
+    handeye solver must refuse — that's the operator's loud signal that one of
+    the phase-1 files is stale or the board was re-mounted between collects.
+    Override flag bypasses the check.
+
+    This is the regression guard for the 0426_newset incident where a stale
+    canonical `phase1_handeye.json` quietly poisoned the entire downstream
+    pipeline (chain ~13 mm / 21°, polish ~248 mm / 32°)."""
+    from pan_tilt.calibration import run_calibration as rc
+    import json, argparse, pytest
+
+    truth, t_ee_marker_a = _make_truth()
+
+    # Second batch fabricated with a different marker pose (rotated 30°
+    # around X, translated 10 cm) to mimic the operator re-mounting the board.
+    Rb = Rotation.from_euler("xyz", [0.5, 0.0, 0.0]).as_matrix()
+    t_ee_marker_b = np.eye(4)
+    t_ee_marker_b[:3, :3] = Rb
+    t_ee_marker_b[:3, 3] = t_ee_marker_a[:3, 3] + np.array([0.10, 0.0, 0.0])
+
+    # Generate two clean phase-1 batches that describe two different
+    # T_ee_markers — the disagreement is genuine, not solver noise.
+    phase1_a = _phase1_samples(truth, t_ee_marker_a, n=14, noise_rng=None)
+    phase1_b = _phase1_samples(truth, t_ee_marker_b, n=14, noise_rng=None)
+    pa = tmp_path / "phase1_handeye.json"
+    pb = tmp_path / "phase1_handeye_custom.json"
+    pa.write_text(json.dumps({"samples": phase1_a}))
+    pb.write_text(json.dumps({"samples": phase1_b}))
+
+    def _handeye_args(phase1, out_name=None, allow=False):
+        return argparse.Namespace(
+            phase1=str(phase1),
+            out=str(tmp_path),
+            out_name=out_name,
+            no_quality_gate=False,
+            quality_min_corners=10,
+            quality_max_reproj_px=1.5,
+            no_reject=False,
+            reject_sigma=3.0,
+            max_reject_frac=0.25,
+            prefilter_rot_deg=5.0,
+            allow_t_ee_marker_mismatch=allow,
+        )
+
+    # Step 1: write the canonical handeye.
+    rc.cmd_handeye(_handeye_args(pa))
+    canonical = tmp_path / "handeye.json"
+    assert canonical.is_file()
+    canonical_bytes_before = canonical.read_bytes()
+
+    # Step 2: try to write handeye_custom from the second batch — must abort.
+    custom = tmp_path / "handeye_custom.json"
+    assert not custom.is_file()
+    with pytest.raises(SystemExit) as excinfo:
+        rc.cmd_handeye(_handeye_args(pb, out_name="handeye_custom.json"))
+    assert excinfo.value.code != 0
+    assert not custom.is_file(), "cross-check should refuse to write the file"
+    # Canonical file must be untouched.
+    assert canonical.read_bytes() == canonical_bytes_before
+
+    # Step 3: with the override flag, the file is written.
+    rc.cmd_handeye(_handeye_args(pb, out_name="handeye_custom.json", allow=True))
+    assert custom.is_file()
+    saved = json.loads(custom.read_text())
+    saved_em_trans = np.asarray(saved["t_ee_marker"]["translation"])
+    # Saved should reflect the second batch's truth (within solver noise).
+    assert np.linalg.norm(saved_em_trans - t_ee_marker_b[:3, 3]) < 0.005
+
+
+def test_polish_merges_multiple_phase1(tmp_path):
+    """Polish must concatenate multiple phase-1 datasets when --phase1 receives
+    more than one path. Merging two phase-1 batches collected at different park
+    poses is the operator-facing reason this exists: the extra EE-rotation
+    diversity helps break the T_B(Y) ↔ θ_t_offset degeneracy when polish runs
+    with --unlock-tb-rotation. We synthesize two batches and verify both that
+    polish reads them and that an outlier dropped into the *second* batch is
+    still caught by the auto-rejection loop (i.e. concatenation indices are
+    threaded through correctly)."""
+    from pan_tilt.calibration import run_calibration as rc
+    import json, argparse
+
+    truth, t_ee_marker = _make_truth()
+    noise_rng = np.random.default_rng(RNG_SEED + 750)
+    # Two phase-1 batches with different RNG seeds → different EE poses.
+    phase1_a = _phase1_samples(truth, t_ee_marker, n=12, noise_rng=noise_rng)
+    rng_b = np.random.default_rng(RNG_SEED + 9000)
+    phase1_b = []
+    for _ in range(10):
+        T_be = _random_ee_pose(rng_b)
+        phase1_b.append(_sample(0.0, 0.0, T_be, truth, t_ee_marker, noise_rng))
+    phase2 = _phase2_samples(truth, t_ee_marker, noise_rng=noise_rng)
+
+    # Corrupt one sample in batch B with a 30° rotation. Index in the
+    # concatenated array = len(phase1_a) + 4 (since A precedes B in the
+    # --phase1 argument order).
+    bad_in_b = 4
+    T_cm = pose_to_matrix(
+        phase1_b[bad_in_b]["t_cam_marker_body"]["translation"],
+        phase1_b[bad_in_b]["t_cam_marker_body"]["rotation"],
+    )
+    bad_axis = np.array([0.6, 0.5, 0.6]); bad_axis /= np.linalg.norm(bad_axis)
+    R_bad = Rotation.from_rotvec(np.deg2rad(30.0) * bad_axis).as_matrix()
+    T_cm[:3, :3] = R_bad @ T_cm[:3, :3]
+    phase1_b[bad_in_b]["t_cam_marker_body"] = matrix_to_pose_dict(T_cm)
+    bad_global = len(phase1_a) + bad_in_b
+
+    pa = tmp_path / "phase1_a.json"
+    pb = tmp_path / "phase1_b.json"
+    p2 = tmp_path / "phase2.json"
+    pa.write_text(json.dumps({"samples": phase1_a}))
+    pb.write_text(json.dumps({"samples": phase1_b}))
+    p2.write_text(json.dumps({"samples": phase2}))
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(json.dumps({
+        "params": {
+            "t_a": truth.t_a.tolist(),
+            "t_b_trans": truth.t_b_trans.tolist(),
+            "t_b_rotvec": truth.t_b_rotvec.tolist(),
+            "t_ee_marker_rotvec": Rotation.from_matrix(t_ee_marker[:3, :3]).as_rotvec().tolist(),
+            "t_ee_marker_trans": t_ee_marker[:3, 3].tolist(),
+            "theta_t_offset_rad": float(truth.theta_t_offset),
+            "theta_p_offset_rad": float(truth.theta_p_offset),
+            "l_pan": float(truth.l_pan),
+        }
+    }))
+
+    out = tmp_path / "out"
+    rc.cmd_polish(argparse.Namespace(
+        phase1=[str(pa), str(pb)],
+        phase2=str(p2),
+        seed=str(seed_path),
+        out=str(out),
+        unlock_tb_rotation=False,
+        fit_pan_offset=True,
+        loss="soft_l1",
+        exclude_indices=[],
+        reject_sigma=3.0,
+        max_reject_frac=0.10,
+        no_reject=False,
+    ))
+    payload = json.loads((out / "polish.json").read_text())
+
+    # Both phase-1 paths must be recorded so polish.json is self-describing.
+    assert payload["phase1_sources"] == [str(pa), str(pb)]
+    # Total sample count = sum of all inputs.
+    assert payload["n_samples_total"] == len(phase1_a) + len(phase1_b) + len(phase2)
+    # Auto rejection must catch the corrupted index, which is in batch B's
+    # range of the concatenated array.
+    auto_indices = [r["index"] for r in payload["rejected_indices_auto"]]
+    assert bad_global in auto_indices, (
+        f"corrupted sample at concat-index {bad_global} not auto-rejected; "
+        f"got {auto_indices}"
+    )
+    # Joint fit on the clean residue must hit the calibration gate.
+    assert payload["trans_rmse_m"] < 0.003, (
+        f"polish trans RMSE {payload['trans_rmse_m']*1000:.2f} mm > 3 mm"
+    )
+    assert np.degrees(payload["rot_rmse_rad"]) < 0.4
+
+
 def test_chain_output_includes_per_sample_residuals(tmp_path):
     """`chain.json` must expose per-sample residual arrays -- the Calibrate
     tab's browser-side residual chart reads them directly. Without this test
@@ -357,7 +621,7 @@ def test_chain_output_includes_per_sample_residuals(tmp_path):
         handeye=str(tmp_path / "handeye.json"),
         out=str(tmp_path),
         fit_pan_offset=False,
-        lock_tb_rotation=False,
+        unlock_tb_rotation=False,
         loss="soft_l1",
         val_seed=0,
         verbose=False,

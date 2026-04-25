@@ -3,22 +3,70 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
-// ---- tabs -------------------------------------------------------------------
+// ---- side-panel tabs --------------------------------------------------------
 
-function activateTab(name) {
-  $$('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
-  $$('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+function activateSideTab(name) {
+  $$('.side-tab').forEach(b => b.classList.toggle('active', b.dataset.sideTab === name));
+  $$('.side-panel-content').forEach(p => p.classList.toggle('active', p.id === 'side-' + name));
 }
-$$('.tab').forEach(b => b.addEventListener('click', () => activateTab(b.dataset.tab)));
+$$('.side-tab').forEach(b => b.addEventListener('click', () => activateSideTab(b.dataset.sideTab)));
+
+// ---- resizable camera thumbnail --------------------------------------------
+// Camera floats upper-left; controls wrap around it. A small handle in the
+// camera's bottom-right corner lets the user drag to resize. Width persisted.
+const CAM_HANDLE = $('#cam-resize');
+const CAM_KEY = 'pt-calib-cam-width';
+const MIN_CAM = 240, MAX_CAM = 720;
+
+function clampCamWidth(px) {
+  const maxAllowed = Math.min(MAX_CAM, window.innerWidth * 0.4);
+  return Math.max(MIN_CAM, Math.min(maxAllowed, px));
+}
+function setCamWidth(px) {
+  const w = clampCamWidth(px);
+  document.documentElement.style.setProperty('--cam-w', w + 'px');
+  return w;
+}
+(function initCamWidth() {
+  const stored = parseInt(localStorage.getItem(CAM_KEY) || '', 10);
+  setCamWidth(Number.isFinite(stored) ? stored : Math.min(480, window.innerWidth * 0.25));
+})();
+if (CAM_HANDLE) {
+  let dragging = false, startX = 0, startW = 0;
+  CAM_HANDLE.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--cam-w'), 10) || 480;
+    CAM_HANDLE.classList.add('dragging');
+    try { CAM_HANDLE.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  CAM_HANDLE.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    setCamWidth(startW + (e.clientX - startX));
+  });
+  const endDrag = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    CAM_HANDLE.classList.remove('dragging');
+    try { CAM_HANDLE.releasePointerCapture(e.pointerId); } catch (_) {}
+    const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--cam-w'), 10);
+    if (Number.isFinite(cur)) localStorage.setItem(CAM_KEY, String(cur));
+  };
+  CAM_HANDLE.addEventListener('pointerup', endDrag);
+  CAM_HANDLE.addEventListener('pointercancel', endDrag);
+}
+window.addEventListener('resize', () => {
+  const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--cam-w'), 10);
+  if (Number.isFinite(cur)) setCamWidth(cur);
+});
 
 // ---- camera refresh (MJPEG-ish polling) -------------------------------------
-// Re-fetch /api/frame.jpg with cache-busting at ~3 Hz. Two <img> targets
-// keep the Live View + Pan-tilt tabs in sync.
+// Re-fetch /api/frame.jpg with cache-busting at ~3 Hz.
 // `view-mode` radios toggle between the annotated (detection overlay) stream
 // and the raw camera feed — useful when overlay encoding fails (e.g. missing
 // camera_info) or when debugging why frames are black.
 const IMG_MAIN = $('#camera-img');
-const IMG_ALT  = $('#camera-img-2');
 const LIVE_FRAME = document.querySelector('.live-frame');
 
 let rawMode = false;
@@ -32,9 +80,7 @@ function currentFrameUrl() {
 }
 
 function refreshFrame() {
-  const url = currentFrameUrl();
-  if (IMG_MAIN) IMG_MAIN.src = url;
-  if (IMG_ALT)  IMG_ALT.src  = url;
+  if (IMG_MAIN) IMG_MAIN.src = currentFrameUrl();
 }
 setInterval(refreshFrame, 330);
 
@@ -93,30 +139,40 @@ if (BTN_RESUB) {
 // ---- WebSocket state --------------------------------------------------------
 
 const INDICATOR = $('#conn-indicator');
-let ws = null;
 let lastState = null;
 
-function wsConnect() {
+// Auto-reconnecting WebSocket helper. Both the state-push (/ws) and the
+// calibrate log fanout (/ws/calib-log) use this; only the message handler and
+// optional indicator update differ.
+function connectWS(path, {onMessage, onOpen, onClose, retryMs = 1500}) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws');
-  ws.onopen = () => {
+  const ws = new WebSocket(proto + '//' + location.host + path);
+  ws.onopen = () => onOpen && onOpen(ws);
+  ws.onclose = () => {
+    onClose && onClose();
+    setTimeout(() => connectWS(path, {onMessage, onOpen, onClose, retryMs}), retryMs);
+  };
+  ws.onerror = () => {/* onclose fires after */};
+  ws.onmessage = (ev) => onMessage(ev, ws);
+  return ws;
+}
+
+connectWS('/ws', {
+  onOpen: () => {
     INDICATOR.textContent = 'WS: live';
     INDICATOR.classList.remove('dropped');
     INDICATOR.classList.add('connected');
-  };
-  ws.onclose = () => {
+  },
+  onClose: () => {
     INDICATOR.textContent = 'WS: dropped — retrying';
     INDICATOR.classList.remove('connected');
     INDICATOR.classList.add('dropped');
-    setTimeout(wsConnect, 1500);
-  };
-  ws.onerror = () => {/* onclose will fire */};
-  ws.onmessage = (ev) => {
-    try { lastState = JSON.parse(ev.data); } catch (e) { return; }
+  },
+  onMessage: (ev) => {
+    try { lastState = JSON.parse(ev.data); } catch (_) { return; }
     renderState(lastState);
-  };
-}
-wsConnect();
+  },
+});
 
 // ---- state rendering --------------------------------------------------------
 
@@ -193,6 +249,60 @@ function renderState(s) {
     ss.textContent = 'waiting for TF…';
     ss.className = 'status-line warn';
   }
+
+  // --- Pan-Tilt tab grid cheat-sheet + corner presets ----------------------
+  renderGridFromState(s.grid);
+}
+
+let _gridSignature = null;
+function renderGridFromState(grid) {
+  if (!grid) return;
+  const pan = grid.pan_deg || [];
+  const tilt = grid.tilt_deg || [];
+  const sig = pan.join(',') + '|' + tilt.join(',');
+  if (sig === _gridSignature) return;        // only redraw when config changes
+  _gridSignature = sig;
+  const fmt = arr => arr.map(x => Number(x).toFixed(0)).join(', ');
+  const panKv = $('#s-grid-pan');
+  const tiltKv = $('#s-grid-tilt');
+  const tiltPhysKv = $('#s-grid-tilt-phys');
+  const nKv = $('#s-grid-n');
+  if (panKv) panKv.textContent = pan.length ? `[${fmt(pan)}]°  (span ±${Math.max(...pan.map(Math.abs)).toFixed(0)}°)` : '—';
+  if (tiltKv) tiltKv.textContent = tilt.length ? `[${fmt(tilt)}]°` : '—';
+  if (tiltPhysKv) tiltPhysKv.textContent = tilt.length
+    ? `[${fmt(tilt.map(t => t - 45))}]°  (±${(Math.max(...tilt) - Math.min(...tilt)) / 2}° around level, + = up)`
+    : '—';
+  if (nKv) nKv.textContent = (pan.length * tilt.length) + ` (${pan.length} pan × ${tilt.length} tilt)`;
+  renderGridCornerButtons(pan, tilt);
+}
+
+function renderGridCornerButtons(pan, tilt) {
+  const root = $('#grid-corner-buttons');
+  if (!root) return;
+  root.innerHTML = '';
+  if (!pan.length || !tilt.length) return;
+  const pMin = Math.min(...pan), pMax = Math.max(...pan);
+  const tMin = Math.min(...tilt), tMax = Math.max(...tilt);
+  const tMid = tilt[Math.floor(tilt.length / 2)];
+  const pMid = pan[Math.floor(pan.length / 2)];
+  const corners = [
+    [pMin, tMin, '⌜'], [pMax, tMin, '⌝'],
+    [pMin, tMax, '⌞'], [pMax, tMax, '⌟'],
+    [pMid, tMid, '⊙'],
+  ];
+  for (const [p, t, gly] of corners) {
+    const b = document.createElement('button');
+    b.textContent = `${gly} (${p}, ${t})`;
+    b.title = `Physical tilt ${t - 45}° from level (+ = up)`;
+    b.dataset.pan = String(p);
+    b.dataset.tilt = String(t);
+    b.addEventListener('click', () => {
+      $('#jog-pan').value = p;
+      $('#jog-tilt').value = t;
+      ptMove(p, t);
+    });
+    root.appendChild(b);
+  }
 }
 
 function evaluateSafetyEnvelope(T, env, line) {
@@ -215,13 +325,13 @@ function evaluateSafetyEnvelope(T, env, line) {
 
 // ---- joint editor -----------------------------------------------------------
 
-const N_JOINTS = 6;
+const N_JOINTS = 7;
 const JOINT_INPUTS_EL = $('#joint-inputs');
 const jointInputs = [];
 for (let i = 0; i < N_JOINTS; i++) {
   const row = document.createElement('div');
   row.className = 'joint-row';
-  row.innerHTML = `<label>J${i + 1}</label><input type="number" step="0.01" value="0">`;
+  row.innerHTML = `<label>J${i}</label><input type="number" step="0.01" value="0">`;
   JOINT_INPUTS_EL.appendChild(row);
   jointInputs.push(row.querySelector('input'));
 }
@@ -400,13 +510,34 @@ $('#btn-cart-move').addEventListener('click', async () => {
 // ---- waypoint lists ---------------------------------------------------------
 
 const PHASES = [
-  { key: 'phase1_waypoints', label: 'Phase 1 — hand-eye (at pan=0,tilt=0)' },
-  { key: 'phase2_waypoints', label: 'Phase 2 — anchor poses for grid sweep' },
-  { key: 'sanity_xarm_angles_rad', label: 'Sanity pose (single)' },
+  {
+    key: 'phase1_waypoints',
+    label: 'Phase 1 — hand-eye (LEVEL, tilt=+45)',
+    hint: 'Head parks at (pan=0, tilt=+45 firmware) = physically level. Record 12–15 distinct xArm EE poses; aim for ≥60° orientation change between consecutive poses. Compact configs (wrist near base) minimise gravity sag. Gate: trans RMSE < 3 mm, rot RMSE < 0.5°.',
+  },
+  {
+    key: 'phase1_waypoints_custom',
+    label: 'Phase 1 — hand-eye (CUSTOM)',
+    customParkControls: true,
+    hint: 'OPTIONAL second hand-eye dataset. Pick park (pan, tilt) below to match your robot geometry, then add xArm poses that keep the marker in the camera FoV at that head pose. Pan range ±30°, tilt range 0..+45° firmware (where +45 = level, 0 = 45° down). Solving hand-eye on this set independently and comparing T_ee_marker vs the LEVEL solve is a powerful cross-check — they must agree to ~mm/°.',
+  },
+  {
+    key: 'phase2_waypoints',
+    label: 'Phase 2 — pan-tilt sweep anchors',
+    hint: 'xArm frozen at each anchor, pan-tilt sweeps all 25 grid cells. Need 2–3 anchors with the board visible across every cell. Vary xArm Z by ≥10 cm between anchors so T_B_trans and T_ee_marker are disambiguated. Gate: held-out trans RMSE < 3 mm, rot RMSE < 0.4°.',
+  },
+  {
+    key: 'sanity_xarm_angles_rad',
+    label: 'Sanity pose (single)',
+    hint: 'Recorded at session start and session end. Any repeatable pose works. If the start→end bracket disagrees by > 2 mm / 0.2°, something drifted (thermal, servo re-home, mount loosened) → flag the run.',
+  },
 ];
 
 const WP_ROOT = $('#waypoint-lists');
-let wpState = { phase1_waypoints: [], phase2_waypoints: [], sanity_xarm_angles_rad: [] };
+let wpState = {
+  phase1_waypoints: [], phase1_waypoints_custom: [],
+  phase2_waypoints: [], sanity_xarm_angles_rad: [],
+};
 
 function renderWaypoints() {
   WP_ROOT.innerHTML = '';
@@ -421,6 +552,17 @@ function renderWaypoints() {
     add.addEventListener('click', () => addWaypoint(phase.key));
     header.appendChild(add);
     group.appendChild(header);
+
+    if (phase.hint) {
+      const hint = document.createElement('p');
+      hint.className = 'muted wp-hint';
+      hint.textContent = phase.hint;
+      group.appendChild(hint);
+    }
+
+    if (phase.customParkControls) {
+      group.appendChild(_buildCustomParkControls());
+    }
 
     const list = document.createElement('div');
     list.className = 'wp-list';
@@ -531,6 +673,173 @@ $('#btn-save').addEventListener('click', async () => {
   }
 });
 
+async function loadBoardSpec() {
+  try {
+    const r = await fetch('/api/board');
+    if (!r.ok) return;
+    const b = await r.json();
+    const set = (id, v) => { const el = $('#' + id); if (el) el.textContent = v; };
+    set('s-board-grid',    `${b.squares_x} × ${b.squares_y} squares`);
+    set('s-board-square',  `${(b.square_len_m * 1000).toFixed(1)} mm`);
+    set('s-board-marker',  `${(b.marker_len_m * 1000).toFixed(1)} mm`);
+    set('s-board-dict',    b.dict);
+    set('s-board-corners', String(b.inner_corners));
+    set('s-board-size',    `${(b.board_size_m[0] * 1000).toFixed(0)} × ${(b.board_size_m[1] * 1000).toFixed(0)} mm`);
+    // Compact one-line summary for the Calibrate tab.
+    const calibLine = $('#calib-board-spec');
+    if (calibLine) {
+      calibLine.textContent =
+        `${b.squares_x}×${b.squares_y} ${b.dict}, ` +
+        `square=${(b.square_len_m * 1000).toFixed(1)}mm, ` +
+        `marker=${(b.marker_len_m * 1000).toFixed(1)}mm, ` +
+        `physical=${(b.board_size_m[0] * 1000).toFixed(0)}×${(b.board_size_m[1] * 1000).toFixed(0)}mm`;
+    }
+  } catch (e) { /* server not up yet */ }
+}
+loadBoardSpec();
+
+// ---- Phase-1 custom park controls -------------------------------------------
+
+let _phase1CustomPark = { pan_deg: 0, tilt_deg: 0 };
+
+async function _fetchPhase1CustomPark() {
+  try {
+    const r = await fetch('/api/calib/phase1_custom_park');
+    if (!r.ok) return;
+    _phase1CustomPark = await r.json();
+    _updateCustomParkUI();
+  } catch (e) { /* ignore */ }
+}
+
+async function _pushPhase1CustomPark(pan_deg, tilt_deg) {
+  const r = await fetch('/api/calib/phase1_custom_park', {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({ pan_deg, tilt_deg }),
+  });
+  if (r.ok) {
+    _phase1CustomPark = { pan_deg, tilt_deg };
+    _updateCustomParkUI();
+  }
+  return r.ok;
+}
+
+function _updateCustomParkUI() {
+  const btn = $('#calib-collect-phase1-custom');
+  if (btn) {
+    btn.textContent = `Collect Phase 1 — custom (pan=${_phase1CustomPark.pan_deg.toFixed(1)}°, tilt=${_phase1CustomPark.tilt_deg.toFixed(1)}°)`;
+  }
+  const pi = document.getElementById('phase1-custom-pan');
+  const ti = document.getElementById('phase1-custom-tilt');
+  if (pi && document.activeElement !== pi) pi.value = _phase1CustomPark.pan_deg;
+  if (ti && document.activeElement !== ti) ti.value = _phase1CustomPark.tilt_deg;
+}
+
+function _buildCustomParkControls() {
+  const wrap = document.createElement('div');
+  wrap.className = 'wp-custom-park';
+  wrap.innerHTML = `
+    <label>Park pan: <input id="phase1-custom-pan" type="number" step="0.5" min="-30" max="30" value="${_phase1CustomPark.pan_deg}"> °</label>
+    <label>Park tilt: <input id="phase1-custom-tilt" type="number" step="0.5" min="0" max="45" value="${_phase1CustomPark.tilt_deg}"> °</label>
+    <button id="phase1-custom-park-save" type="button">Save park</button>
+    <span id="phase1-custom-park-status" class="status-line muted"></span>
+  `;
+  // Bind after attach
+  setTimeout(() => {
+    const save = document.getElementById('phase1-custom-park-save');
+    const status = document.getElementById('phase1-custom-park-status');
+    if (save) save.addEventListener('click', async () => {
+      const pan = parseFloat(document.getElementById('phase1-custom-pan').value);
+      const tilt = parseFloat(document.getElementById('phase1-custom-tilt').value);
+      if (Number.isNaN(pan) || Number.isNaN(tilt)) {
+        status.textContent = 'invalid number'; status.className = 'status-line err'; return;
+      }
+      const ok = await _pushPhase1CustomPark(pan, tilt);
+      status.textContent = ok ? `saved: pan=${pan}°, tilt=${tilt}°` : 'save failed';
+      status.className = ok ? 'status-line ok' : 'status-line err';
+    });
+  }, 0);
+  return wrap;
+}
+_fetchPhase1CustomPark();
+
+async function loadWaypointPaths() {
+  try {
+    const r = await fetch('/api/waypoints/paths');
+    if (!r.ok) return;
+    const body = await r.json();
+    const setCell = (id, v) => { const el = $('#' + id); if (el) el.textContent = v || '(unresolved)'; };
+    setCell('wp-path-draft', body.draft);
+    setCell('wp-path-promote', body.promote);
+  } catch (e) { /* tab may not be in DOM yet */ }
+}
+loadWaypointPaths();
+
+const BTN_PROMOTE = $('#btn-promote');
+if (BTN_PROMOTE) BTN_PROMOTE.addEventListener('click', async () => {
+  const status = $('#promote-status');
+  const promoteTarget = $('#wp-path-promote')?.textContent || 'calibration.yaml';
+  if (!confirm(`Overwrite ${promoteTarget} with the current waypoints?\n\nThe existing file will be renamed to <stem>.yaml.old-<timestamp> first.`)) {
+    return;
+  }
+  status.textContent = 'promoting…';
+  status.className = 'status-line warn';
+  try {
+    const r = await fetch('/api/waypoints/promote', { method: 'POST' });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      status.textContent = 'wrote ' + body.path + (body.backup ? '  (backup: ' + body.backup + ')' : '  (no prior file existed)');
+      status.className = 'status-line ok';
+    } else {
+      status.textContent = 'FAIL: ' + (body.detail || JSON.stringify(body));
+      status.className = 'status-line err';
+    }
+  } catch (e) {
+    status.textContent = 'ERROR: ' + e;
+    status.className = 'status-line err';
+  }
+});
+
+async function _reloadWaypointsFromSource(source, confirmMsg) {
+  const status = $('#reload-status');
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  status.textContent = `reloading from ${source}…`;
+  status.className = 'status-line warn';
+  try {
+    const r = await fetch('/api/waypoints/reload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source }),
+    });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      const counts = Object.entries(body.counts || {})
+        .map(([k, v]) => `${k}=${v}`).join(', ') || '(no waypoint sections)';
+      status.textContent = `loaded from ${body.path}  (${counts})`;
+      status.className = 'status-line ok';
+      await fetchWaypoints();
+    } else {
+      status.textContent = 'FAIL: ' + (body.detail || JSON.stringify(body));
+      status.className = 'status-line err';
+    }
+  } catch (e) {
+    status.textContent = 'ERROR: ' + e;
+    status.className = 'status-line err';
+  }
+}
+
+const BTN_RELOAD_DRAFT = $('#btn-reload-draft');
+if (BTN_RELOAD_DRAFT) BTN_RELOAD_DRAFT.addEventListener('click', () =>
+  _reloadWaypointsFromSource('draft',
+    'Replace in-memory waypoints with the contents of the draft yaml? '
+    + 'Any unsaved edits will be lost.'));
+
+const BTN_RELOAD_CONFIG = $('#btn-reload-config');
+if (BTN_RELOAD_CONFIG) BTN_RELOAD_CONFIG.addEventListener('click', () =>
+  _reloadWaypointsFromSource('promote',
+    'Replace in-memory waypoints with the contents of the source-tree '
+    + 'calibration.yaml? Any unsaved edits will be lost.'));
+
 // ---- pan-tilt jog -----------------------------------------------------------
 
 async function ptMove(panDeg, tiltDeg) {
@@ -566,3 +875,1066 @@ $$('.jog-buttons button').forEach(b => {
     ptMove(p, t);
   });
 });
+
+// ============================================================================
+// Calibrate tab
+// ============================================================================
+//
+// Drives the post-collection CLI stack (`run_calibration.py` +
+// `apply_to_urdf.py`) through the server-side CalibrateRunner. Everything
+// here is file-I/O; nothing in this block ever moves the robot.
+
+const CALIB = {
+  currentSession: null,
+  sessionsDir: null,
+  urdfTargets: [],
+  activeRunId: null,
+  residualSource: 'handeye',
+  // filename -> parsed JSON, scoped to the currently selected session.
+  // Cleared on session change so we never accumulate cross-session data.
+  fileCache: {},
+  prereqs: {},        // cmd -> required session-relative filenames
+  collectEnabled: true,
+};
+
+const CALIB_LOG = $('#calib-log');
+const CALIB_SESSION_SELECT = $('#calib-session-select');
+const CALIB_SESSION_STATUS = $('#calib-session-status');
+const CALIB_CANCEL_BTN = $('#calib-cancel-btn');
+
+// ---- session discovery -----------------------------------------------------
+
+async function calibLoadSessions() {
+  try {
+    const r = await fetch('/api/calib/sessions');
+    const body = await r.json();
+    CALIB.sessionsDir = body.sessions_dir;
+    const sdirEl = $('#calib-sessions-dir');
+    if (sdirEl) sdirEl.textContent = body.sessions_dir || '—';
+    const prev = CALIB_SESSION_SELECT.value;
+    const opts = ['<option value="">(none)</option>']
+      .concat((body.sessions || []).map(s => `<option value="${s.name}">${s.name}  (${s.files.length} files)</option>`));
+    CALIB_SESSION_SELECT.innerHTML = opts.join('');
+    const names = (body.sessions || []).map(s => s.name);
+    if (prev && names.includes(prev)) {
+      CALIB_SESSION_SELECT.value = prev;
+    } else if (names.length > 0) {
+      CALIB_SESSION_SELECT.value = names[names.length - 1];
+    }
+    if (CALIB_SESSION_SELECT.value) {
+      CALIB.currentSession = CALIB_SESSION_SELECT.value;
+      await calibLoadSessionDetail(CALIB.currentSession);
+    }
+  } catch (e) {
+    CALIB_SESSION_STATUS.textContent = 'ERROR listing sessions: ' + e;
+    CALIB_SESSION_STATUS.className = 'status-line err';
+  }
+}
+
+CALIB_SESSION_SELECT.addEventListener('change', async () => {
+  const next = CALIB_SESSION_SELECT.value || null;
+  if (next === CALIB.currentSession) return;
+  CALIB.currentSession = next;
+  CALIB.fileCache = {};
+  if (CALIB.currentSession) {
+    await calibLoadSessionDetail(CALIB.currentSession);
+  } else {
+    calibRenderFiles(null); calibRenderGates([]); calibRenderParams(null); calibRenderResiduals();
+  }
+});
+
+$('#calib-new-session-btn').addEventListener('click', async () => {
+  const name = $('#calib-new-session-name').value.trim();
+  if (!name) {
+    CALIB_SESSION_STATUS.textContent = 'enter a name first';
+    CALIB_SESSION_STATUS.className = 'status-line warn';
+    return;
+  }
+  try {
+    const r = await fetch('/api/calib/session', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({name}),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
+    CALIB_SESSION_STATUS.textContent = 'created ' + body.path;
+    CALIB_SESSION_STATUS.className = 'status-line ok';
+    $('#calib-new-session-name').value = '';
+    await calibLoadSessions();
+    CALIB_SESSION_SELECT.value = name;
+    CALIB_SESSION_SELECT.dispatchEvent(new Event('change'));
+  } catch (e) {
+    CALIB_SESSION_STATUS.textContent = 'FAIL: ' + e.message;
+    CALIB_SESSION_STATUS.className = 'status-line err';
+  }
+});
+
+// ---- session detail --------------------------------------------------------
+
+async function calibLoadSessionDetail(name) {
+  const r = await fetch('/api/calib/session/' + encodeURIComponent(name));
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
+  const files = body.files || {};
+  calibRenderFiles(files);
+  calibRenderGates(body.gates || []);
+  calibApplyRunEnablement(files);
+  // polish.json takes precedence over chain.json when both are present.
+  const paramsSource = ['polish.json', 'chain.json'].find(f => files[f]?.exists) || null;
+  // Run params fetch + residuals + coverage in parallel; they're independent.
+  await Promise.all([
+    paramsSource
+      ? calibFetchFile(name, paramsSource).then(j => calibRenderParams({file: paramsSource, data: j}))
+      : Promise.resolve(calibRenderParams(null)),
+    calibRenderResiduals(),
+    calibRenderCoverage(),
+  ]);
+}
+
+async function calibFetchFile(session, filename) {
+  if (CALIB.fileCache[filename]) return CALIB.fileCache[filename];
+  const r = await fetch(`/api/calib/session/${encodeURIComponent(session)}/file/${filename}`);
+  if (!r.ok) return null;
+  const body = await r.json();
+  CALIB.fileCache[filename] = body;
+  return body;
+}
+
+// ---- files table -----------------------------------------------------------
+
+const CALIB_TRACKED_FILES = [
+  {name: 'phase1_handeye.json', kind: 'collector'},
+  {name: 'phase2_chain.json',   kind: 'collector'},
+  {name: 'sanity.json',         kind: 'collector'},
+  {name: 'handeye.json',        kind: 'analyser'},
+  {name: 'chain.json',          kind: 'analyser'},
+  {name: 'polish.json',         kind: 'analyser'},
+];
+
+function calibRenderFiles(files) {
+  const root = $('#calib-files-table');
+  if (!files) {
+    root.innerHTML = '<tr><td colspan="2" class="muted">(pick a session above)</td></tr>';
+    return;
+  }
+  const rows = CALIB_TRACKED_FILES.map(({name, kind}) => {
+    const info = files[name] || {};
+    let rhs;
+    if (!info.exists) {
+      rhs = '<span class="muted">not yet</span>';
+    } else {
+      const parts = [];
+      if ('n_samples' in info) parts.push(info.n_samples + ' samples');
+      if ('trans_rmse_m' in info) parts.push(fmt(info.trans_rmse_m * 1000, 2) + ' mm');
+      if ('rot_rmse_rad' in info) parts.push(fmt(info.rot_rmse_rad * 180 / Math.PI, 3) + '°');
+      if ('val_trans_rmse_m' in info) parts.push('val ' + fmt(info.val_trans_rmse_m * 1000, 2) + ' mm');
+      if ('val_rot_rmse_rad' in info) parts.push('val ' + fmt(info.val_rot_rmse_rad * 180 / Math.PI, 3) + '°');
+      if (info.mtime) parts.push(new Date(info.mtime * 1000).toLocaleTimeString());
+      rhs = '<span style="color:var(--ok)">✓</span>  ' + parts.join('  ·  ');
+    }
+    return `<tr><td>${name}</td><td>${rhs}</td></tr>`;
+  });
+  root.innerHTML = rows.join('');
+}
+
+// ---- gates table -----------------------------------------------------------
+
+// Format a numeric gate value/threshold by its declared unit. Server reports
+// SI internally (m, rad) so we apply the *1000 / rad->deg conversion here.
+function gateFmt(value, unit, decimals = 3) {
+  if (unit === 'mm') return fmt(value * 1000, decimals) + ' mm';
+  if (unit === 'deg') return fmt(value * 180 / Math.PI, decimals) + '°';
+  return fmt(value, decimals) + ' ' + unit;
+}
+
+function calibRenderGates(gates) {
+  const root = $('#calib-gates');
+  if (!gates || gates.length === 0) {
+    root.innerHTML = '<tr><td colspan="3" class="muted">(run handeye / chain to populate)</td></tr>';
+    return;
+  }
+  const rows = gates.map(g => {
+    const value = ('value' in g) ? gateFmt(g.value, g.unit, 3) : '—';
+    const thresh = '< ' + gateFmt(g.threshold, g.unit, 2);
+    const statusClass = 'gate-' + g.status;
+    const statusText = g.status.toUpperCase();
+    return `<tr><td>${g.label}</td><td>${value} (${thresh})</td><td class="${statusClass}">${statusText}</td></tr>`;
+  });
+  root.innerHTML = rows.join('');
+}
+
+// ---- params table ----------------------------------------------------------
+
+function calibRenderParams(info) {
+  const root = $('#calib-params');
+  if (!info) {
+    root.innerHTML = '<tr><td colspan="2" class="muted">(run chain / polish to populate)</td></tr>';
+    return;
+  }
+  const p = info.data.params || {};
+  const tra = v => (v === undefined ? '—' : `[${v.map(x => Number(x).toFixed(4)).join(', ')}]`);
+  const rows = [
+    ['source', info.file],
+    ['T_A translation', tra(p.t_a)],
+    ['T_B translation', tra(p.t_b_trans)],
+    ['T_B rotvec (rad)', tra(p.t_b_rotvec)],
+    ['T_ee_marker trans', tra(p.t_ee_marker_trans)],
+    ['T_ee_marker rotvec (rad)', tra(p.t_ee_marker_rotvec)],
+    ['θ_t_offset', p.theta_t_offset_deg !== undefined ? `${p.theta_t_offset_deg.toFixed(3)}°` : '—'],
+    ['θ_p_offset', p.theta_p_offset_deg !== undefined ? `${p.theta_p_offset_deg.toFixed(3)}°` : '—'],
+    ['L_pan', p.l_pan !== undefined ? `${p.l_pan.toFixed(4)} m` : '—'],
+  ];
+  root.innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+}
+
+// ---- run subprocess --------------------------------------------------------
+
+const CALIB_LOG_MAX_LINES = 2000;
+function calibLogAppend(text, className) {
+  if (!CALIB_LOG) return;
+  if (CALIB_LOG.textContent === '(no runs yet)') CALIB_LOG.textContent = '';
+  const span = document.createElement('span');
+  if (className) span.className = className;
+  span.textContent = text + '\n';
+  CALIB_LOG.appendChild(span);
+  // Bound the DOM size so a 20-min Phase-2 sweep doesn't drown the browser.
+  while (CALIB_LOG.childElementCount > CALIB_LOG_MAX_LINES) {
+    CALIB_LOG.removeChild(CALIB_LOG.firstChild);
+  }
+  CALIB_LOG.scrollTop = CALIB_LOG.scrollHeight;
+}
+
+async function calibRun(cmd, flags) {
+  if (!CALIB.currentSession) {
+    CALIB_SESSION_STATUS.textContent = 'pick a session first';
+    CALIB_SESSION_STATUS.className = 'status-line warn';
+    return;
+  }
+  // Collection commands move the physical robot -- require an explicit confirm
+  // so a stray click doesn't kick off a 20-minute sweep.
+  if (cmd.startsWith('collect_')) {
+    const human = {
+      collect_phase1:        'Phase 1 LEVEL (pan=0, tilt=+45 — head horizontal, uses phase1_waypoints)',
+      collect_phase1_custom: `Phase 1 CUSTOM (pan=${_phase1CustomPark.pan_deg}°, tilt=${_phase1CustomPark.tilt_deg}°, uses phase1_waypoints_custom)`,
+      collect_dry_run:       'Dry-run waypoint validation (NO image capture, NO pan-tilt motion). Sends each xArm waypoint via JointMove and reports which ones fail. Cheap; safe to run before a full collect.',
+      collect_phase2:        'Phase 2 (pan-tilt grid sweep at each xArm anchor)',
+      collect_sanity:        'sanity pose (single pose)',
+      collect_both:          'the full run (Phase 1 + Phase 2 + sanity; ~20-30 min)',
+    }[cmd] || cmd;
+    const yes = confirm(
+      'This will MOVE THE ROBOT.\n\n' +
+      'Running: ' + human + '\n' +
+      'Session: ' + CALIB.currentSession + '\n\n' +
+      'Cancelable at any point from the Cancel button. OK to proceed?'
+    );
+    if (!yes) return;
+  }
+  CALIB_LOG.textContent = '';
+  const banner = cmd.startsWith('collect_')
+    ? '$ ros2 run pan_tilt calibrate_collect --ros-args -p phase:=' + cmd.replace('collect_', '')
+    : '$ python -m pan_tilt.calibration.run_calibration ' + cmd + ' ' + flags.join(' ');
+  calibLogAppend(banner, 'log-start');
+  try {
+    const r = await fetch('/api/calib/run', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({session: CALIB.currentSession, cmd, flags}),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
+    CALIB.activeRunId = body.run_id;
+    CALIB_CANCEL_BTN.disabled = false;
+  } catch (e) {
+    calibLogAppend('ERROR: ' + e.message, 'log-exit-err');
+  }
+}
+
+$$('#calib-run-buttons button[data-calib-cmd], #calib-run-buttons-collect button[data-calib-cmd]').forEach(b => {
+  b.addEventListener('click', () => {
+    const cmd = b.dataset.calibCmd;
+    const flags = (b.dataset.calibFlags || '').split(/\s+/).filter(Boolean);
+    calibRun(cmd, flags);
+  });
+});
+
+CALIB_CANCEL_BTN.addEventListener('click', async () => {
+  if (!CALIB.activeRunId) return;
+  try {
+    await fetch(`/api/calib/runs/${CALIB.activeRunId}/cancel`, {method: 'POST'});
+  } catch (e) { calibLogAppend('cancel ERROR: ' + e, 'log-exit-err'); }
+});
+
+// ---- /ws/calib-log --------------------------------------------------------
+
+function calibLogConnect() {
+  connectWS('/ws/calib-log', {
+    onMessage: (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === 'log') {
+        calibLogAppend(msg.line);
+      } else if (msg.type === 'exit') {
+        const cls = msg.code === 0 ? 'log-exit-ok' : 'log-exit-err';
+        calibLogAppend(`[ exited ${msg.code} ]`, cls);
+        CALIB_CANCEL_BTN.disabled = true;
+        CALIB.activeRunId = null;
+        if (CALIB.currentSession) {
+          CALIB.fileCache = {};  // session detail will repopulate
+          calibLoadSessionDetail(CALIB.currentSession).catch(console.warn);
+        }
+      } else if (msg.type === 'start') {
+        calibLogAppend(`[ started pid=${msg.pid} ]`, 'log-start');
+      }
+    },
+  });
+}
+
+// ---- residual charts (vanilla canvas) --------------------------------------
+
+$$('input[name="calib-resid"]').forEach(r => r.addEventListener('change', () => {
+  CALIB.residualSource = document.querySelector('input[name="calib-resid"]:checked').value;
+  calibRenderResiduals();
+}));
+
+$$('input[name="calib-cov"]').forEach(r => r.addEventListener('change', () => {
+  calibRenderCoverage();
+}));
+
+async function calibRenderResiduals() {
+  const histCanvas = $('#calib-resid-hist');
+  const scatterCanvas = $('#calib-resid-scatter');
+  if (!histCanvas || !scatterCanvas) return;
+  _clearCanvas(histCanvas); _clearCanvas(scatterCanvas);
+  if (!CALIB.currentSession) return;
+  const fileMap = {handeye: 'handeye.json', chain: 'chain.json', polish: 'polish.json'};
+  const filename = fileMap[CALIB.residualSource];
+  const j = await calibFetchFile(CALIB.currentSession, filename);
+  if (!j) return;
+  const trans = j.per_sample_trans_err_m || [];
+  if (trans.length === 0) {
+    _ctxNote(histCanvas, '(no per-sample data)');
+    _ctxNote(scatterCanvas, '(no per-sample data)');
+    return;
+  }
+  _drawHistogram(histCanvas, trans.map(x => x * 1000), 'mm');
+  _drawScatter(scatterCanvas, trans.map(x => x * 1000), 'mm');
+}
+
+async function calibRenderCoverage() {
+  const c = $('#calib-coverage');
+  const status = $('#calib-coverage-status');
+  if (!c) return;
+  _clearCanvas(c);
+  if (!CALIB.currentSession) {
+    if (status) status.textContent = '';
+    return;
+  }
+  let body;
+  try {
+    const r = await fetch(`/api/calib/session/${encodeURIComponent(CALIB.currentSession)}/coverage`);
+    if (!r.ok) { _ctxNote(c, '(no coverage data)'); return; }
+    body = await r.json();
+  } catch (e) { _ctxNote(c, '(fetch failed)'); return; }
+
+  const allSamples = body.samples || [];
+  const filterRadio = document.querySelector('input[name="calib-cov"]:checked');
+  const filter = filterRadio ? filterRadio.value : 'all';
+  const samples = (filter === 'all')
+    ? allSamples
+    : allSamples.filter(s => s.phase === filter);
+  if (samples.length === 0) {
+    const phaseLabel = ({
+      all: '',
+      phase1_handeye: 'Phase 1 (level)',
+      phase1_handeye_custom: 'Phase 1 (custom)',
+      phase2_chain: 'Phase 2',
+    })[filter] || filter;
+    _ctxNote(c, allSamples.length === 0
+      ? '(no samples in this session yet — run Phase 1/2 collect)'
+      : `(no samples for ${phaseLabel} — collect or switch to a populated set)`);
+    if (status) status.textContent = '';
+    return;
+  }
+
+  const ctx = c.getContext('2d');
+  const pad = 32;
+  const W = c.width - 2 * pad, H = c.height - 2 * pad;
+
+  // Plot range: max of FoV box or sample extents (so off-axis samples are visible).
+  const fovH = body.fov_h_deg / 2, fovV = body.fov_v_deg / 2;
+  const sampleH = Math.max(...samples.map(s => Math.abs(s.horiz_deg)));
+  const sampleV = Math.max(...samples.map(s => Math.abs(s.vert_deg)));
+  const rangeH = Math.max(fovH, sampleH) * 1.1;
+  const rangeV = Math.max(fovV, sampleV) * 1.1;
+
+  const x2px = (deg) => pad + W * (deg + rangeH) / (2 * rangeH);
+  const y2px = (deg) => pad + H * (deg + rangeV) / (2 * rangeV);
+
+  // Background grid + axes
+  ctx.strokeStyle = '#2c3140';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x2px(0), pad); ctx.lineTo(x2px(0), pad + H);
+  ctx.moveTo(pad, y2px(0)); ctx.lineTo(pad + W, y2px(0));
+  ctx.stroke();
+
+  // FoV box
+  ctx.strokeStyle = '#5fd37f';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 3]);
+  ctx.strokeRect(x2px(-fovH), y2px(-fovV), x2px(fovH) - x2px(-fovH), y2px(fovV) - y2px(-fovV));
+  ctx.setLineDash([]);
+
+  // Depth color scale across all samples
+  const depths = samples.map(s => s.depth_m);
+  const dMin = Math.min(...depths), dMax = Math.max(...depths);
+  const dSpan = (dMax - dMin) || 1;
+  const colorAt = (d) => {
+    // Warm (close) -> cool (far): red -> blue
+    const t = (d - dMin) / dSpan;
+    const r = Math.round(255 * (1 - t));
+    const b = Math.round(255 * t);
+    return `rgba(${r}, 80, ${b}, 0.85)`;
+  };
+
+  // Phase shape: phase1 = filled circle, phase2 = open triangle
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  samples.forEach((s, i) => {
+    const x = x2px(s.horiz_deg), y = y2px(s.vert_deg);
+    const col = colorAt(s.depth_m);
+    ctx.fillStyle = col;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    if (s.phase === 'phase2_chain') {
+      ctx.moveTo(x, y - 3.5); ctx.lineTo(x + 3, y + 3); ctx.lineTo(x - 3, y + 3); ctx.closePath();
+      ctx.stroke();
+    } else {
+      ctx.arc(x, y, 3.5, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    // Always-on index label so it lines up with the projected image panel.
+    // Fall back to array position if the backend payload didn't include it
+    // (older calib_web running, etc).
+    const idx = (s.index !== undefined && s.index !== null) ? s.index : i;
+    ctx.fillStyle = col;
+    ctx.fillText(`#${idx}`, x + 5, y - 4);
+  });
+
+  // Axis labels
+  ctx.fillStyle = '#8a93a6'; ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`horiz angle (deg)  →  +${rangeH.toFixed(0)}`, pad + W, pad + H + 14);
+  ctx.fillText(`-${rangeH.toFixed(0)}`, pad, pad + H + 14);
+  ctx.textAlign = 'left';
+  ctx.fillText(`vert -${rangeV.toFixed(0)}`, 2, pad + 8);
+  ctx.fillText(`vert +${rangeV.toFixed(0)}`, 2, pad + H);
+  ctx.textAlign = 'left';
+  ctx.fillText(`FoV ${body.fov_h_deg.toFixed(0)}° × ${body.fov_v_deg.toFixed(0)}°`,
+               pad, pad - 4);
+  ctx.textAlign = 'right';
+  ctx.fillText(`● phase1   △ phase2   depth ${dMin.toFixed(2)}-${dMax.toFixed(2)} m`,
+               pad + W, pad - 4);
+  if (status) {
+    const n1 = samples.filter(s => s.phase === 'phase1_handeye').length;
+    const n2 = samples.length - n1;
+    status.textContent = `${samples.length} samples (${n1} phase1, ${n2} phase2)`;
+  }
+  calibRenderCoverageProjection(body, samples, dMin, dMax);
+}
+
+function calibRenderCoverageProjection(body, samples, dMin, dMax) {
+  const c = document.getElementById('calib-coverage-img');
+  const status = document.getElementById('calib-coverage-img-status');
+  if (!c) return;
+  _clearCanvas(c);
+
+  if (!body.have_intrinsics || !body.image_w || !body.image_h) {
+    _ctxNote(c, '(no camera intrinsics yet — start the camera so K is published)');
+    if (status) status.textContent = '';
+    return;
+  }
+
+  const ctx = c.getContext('2d');
+  const imgW = body.image_w, imgH = body.image_h;
+  // Letterbox the image rectangle into the canvas while keeping aspect ratio.
+  const pad = 6;
+  const availW = c.width - 2 * pad, availH = c.height - 2 * pad;
+  const scale = Math.min(availW / imgW, availH / imgH);
+  const drawW = imgW * scale, drawH = imgH * scale;
+  const x0 = pad + (availW - drawW) / 2;
+  const y0 = pad + (availH - drawH) / 2;
+
+  // Monocolor background = simulated image plane.
+  ctx.fillStyle = '#1b1f2a';
+  ctx.fillRect(x0, y0, drawW, drawH);
+  ctx.strokeStyle = '#2c3140';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x0 + 0.5, y0 + 0.5, drawW - 1, drawH - 1);
+
+  // Same depth ramp as the angular plot.
+  const dSpan = (dMax - dMin) || 1;
+  const colorAt = (d) => {
+    const t = (d - dMin) / dSpan;
+    const r = Math.round(255 * (1 - t));
+    const b = Math.round(255 * t);
+    return `rgba(${r}, 80, ${b}, 0.95)`;
+  };
+
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  let nProjected = 0, nOff = 0;
+  samples.forEach((s, i) => {
+    if (s.u_norm == null || s.v_norm == null) return;
+    const u = s.u_norm, v = s.v_norm;
+    const onImage = (u >= 0 && u <= 1 && v >= 0 && v <= 1);
+    if (onImage) nProjected++; else nOff++;
+    // Clamp slightly outside so off-image points still render at the edge.
+    const cu = Math.max(-0.05, Math.min(1.05, u));
+    const cv = Math.max(-0.05, Math.min(1.05, v));
+    const x = x0 + cu * drawW;
+    const y = y0 + cv * drawH;
+    const col = colorAt(s.depth_m);
+    ctx.fillStyle = col; ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    if (s.phase === 'phase2_chain') {
+      ctx.moveTo(x, y - 5); ctx.lineTo(x + 4.5, y + 4); ctx.lineTo(x - 4.5, y + 4); ctx.closePath();
+      ctx.stroke();
+    } else {
+      ctx.arc(x, y, 4.5, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    const idx = (s.index !== undefined && s.index !== null) ? s.index : i;
+    ctx.fillStyle = col;
+    ctx.fillText(`#${idx}`, x + 6, y - 5);
+  });
+
+  // Caption: image dims + on/off counts.
+  ctx.fillStyle = '#8a93a6';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`image ${imgW}×${imgH}`, x0, y0 - 2);
+  ctx.textAlign = 'right';
+  ctx.fillText(`on-image ${nProjected}   off ${nOff}`, x0 + drawW, y0 - 2);
+
+  if (status) status.textContent = '';
+}
+
+function _clearCanvas(c) {
+  const ctx = c.getContext('2d'); ctx.clearRect(0, 0, c.width, c.height);
+}
+function _ctxNote(c, text) {
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#8a93a6';
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(text, c.width / 2, c.height / 2);
+}
+function _drawHistogram(c, values, unit) {
+  const ctx = c.getContext('2d');
+  const pad = 24;
+  const W = c.width - 2 * pad, H = c.height - 2 * pad;
+  const nBins = 20;
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const span = hi - lo || 1;
+  const bins = Array(nBins).fill(0);
+  values.forEach(v => {
+    const i = Math.min(nBins - 1, Math.floor((v - lo) / span * nBins));
+    bins[i]++;
+  });
+  const maxBin = Math.max(...bins);
+  // Axes
+  ctx.strokeStyle = '#2c3140'; ctx.beginPath();
+  ctx.moveTo(pad, pad); ctx.lineTo(pad, pad + H); ctx.lineTo(pad + W, pad + H); ctx.stroke();
+  // Bars
+  const bw = W / nBins;
+  ctx.fillStyle = '#4da3ff';
+  bins.forEach((n, i) => {
+    const h = maxBin > 0 ? (n / maxBin) * H : 0;
+    ctx.fillRect(pad + i * bw + 1, pad + H - h, bw - 2, h);
+  });
+  // Labels
+  ctx.fillStyle = '#8a93a6'; ctx.font = '10px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(`${lo.toFixed(2)} ${unit}`, pad, pad + H + 12);
+  ctx.textAlign = 'right';
+  ctx.fillText(`${hi.toFixed(2)} ${unit}`, pad + W, pad + H + 12);
+  ctx.textAlign = 'left';
+  ctx.fillText(`N=${values.length}  max=${maxBin}`, pad, pad - 4);
+}
+function _drawScatter(c, values, unit) {
+  const ctx = c.getContext('2d');
+  const pad = 24;
+  const W = c.width - 2 * pad, H = c.height - 2 * pad;
+  const lo = 0, hi = Math.max(...values) * 1.05 || 1;
+  // Axes
+  ctx.strokeStyle = '#2c3140'; ctx.beginPath();
+  ctx.moveTo(pad, pad); ctx.lineTo(pad, pad + H); ctx.lineTo(pad + W, pad + H); ctx.stroke();
+  // Points
+  ctx.fillStyle = '#5fd37f';
+  const n = values.length;
+  values.forEach((v, i) => {
+    const x = pad + (n > 1 ? (i / (n - 1)) * W : W / 2);
+    const y = pad + H - (v - lo) / (hi - lo) * H;
+    ctx.beginPath(); ctx.arc(x, y, 2.5, 0, 2 * Math.PI); ctx.fill();
+  });
+  // Labels
+  ctx.fillStyle = '#8a93a6'; ctx.font = '10px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(`0 ${unit}`, 2, pad + H + 12);
+  ctx.fillText(`sample 0`, pad, pad + H + 12);
+  ctx.textAlign = 'right';
+  ctx.fillText(`${hi.toFixed(2)} ${unit}`, pad + W, pad - 4);
+  ctx.fillText(`sample ${n - 1}`, pad + W, pad + H + 12);
+}
+
+// ---- URDF diff -------------------------------------------------------------
+
+async function calibLoadUrdfTargets() {
+  try {
+    const r = await fetch('/api/calib/urdf_targets');
+    const body = await r.json();
+    CALIB.urdfTargets = body.targets || [];
+    const sel = $('#calib-urdf-target');
+    sel.innerHTML = CALIB.urdfTargets
+      .map(t => `<option value="${t.path}" ${t.exists ? '' : 'disabled'}>${t.label}${t.exists ? '' : '  (not installed)'}</option>`)
+      .join('');
+  } catch (e) {
+    $('#calib-urdf-status').textContent = 'ERROR loading URDF targets: ' + e;
+    $('#calib-urdf-status').className = 'status-line err';
+  }
+}
+
+$('#calib-urdf-diff-btn').addEventListener('click', async () => {
+  if (!CALIB.currentSession) {
+    $('#calib-urdf-status').textContent = 'pick a session first';
+    $('#calib-urdf-status').className = 'status-line warn';
+    return;
+  }
+  const xacroPath = $('#calib-urdf-target').value;
+  const resultsFile = $('#calib-urdf-results').value;
+  const statusEl = $('#calib-urdf-status');
+  const diffEl = $('#calib-urdf-diff');
+  statusEl.textContent = 'generating…';
+  statusEl.className = 'status-line warn';
+  try {
+    const r = await fetch('/api/calib/urdf_diff', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({session: CALIB.currentSession, xacro_path: xacroPath, results_file: resultsFile}),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
+    const diff = body.diff || '(no changes)';
+    diffEl.innerHTML = _colorizeDiff(diff);
+    const changed = diff.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length;
+    statusEl.textContent = `diff: ${changed} changed lines`;
+    statusEl.className = 'status-line ok';
+  } catch (e) {
+    statusEl.textContent = 'FAIL: ' + e.message;
+    statusEl.className = 'status-line err';
+    diffEl.textContent = '';
+  }
+});
+
+function _colorizeDiff(diff) {
+  return diff.split('\n').map(line => {
+    const esc = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    if (line.startsWith('+++') || line.startsWith('---')) return `<span class="diff-hunk">${esc}</span>`;
+    if (line.startsWith('@@')) return `<span class="diff-hunk">${esc}</span>`;
+    if (line.startsWith('+')) return `<span class="diff-add">${esc}</span>`;
+    if (line.startsWith('-')) return `<span class="diff-rem">${esc}</span>`;
+    return esc;
+  }).join('\n');
+}
+
+$('#calib-urdf-copy').addEventListener('click', async () => {
+  const xacroPath = $('#calib-urdf-target').value;
+  const target = CALIB.urdfTargets.find(t => t.path === xacroPath);
+  const pkg = target?.build_package || 'pan_tilt';
+  const resultsFile = $('#calib-urdf-results').value || 'polish.json';
+  const sessionPath = CALIB.currentSession ? `<session>/${resultsFile}` : `<path/to/${resultsFile}>`;
+  const cmds = [
+    '# Review the diff above, then (from the workspace root):',
+    `#   edit ${xacroPath} by hand OR use apply_to_urdf.py --out <path> and mv.`,
+    `python -m pan_tilt.calibration.apply_to_urdf --results ${sessionPath} --xacro ${xacroPath} --out ${xacroPath}.patched`,
+    `mv ${xacroPath}.patched ${xacroPath}`,
+    `./src/tk26_vision/scripts/build.sh --packages-select ${pkg}`,
+    `source install/setup.bash`,
+  ].join('\n');
+  try {
+    await navigator.clipboard.writeText(cmds);
+    $('#calib-urdf-status').textContent = 'apply commands copied to clipboard';
+    $('#calib-urdf-status').className = 'status-line ok';
+  } catch (e) {
+    $('#calib-urdf-status').textContent = 'clipboard failed: ' + e;
+    $('#calib-urdf-status').className = 'status-line err';
+  }
+});
+
+// ---- run-button enablement (prereq check + collect-availability) ----------
+
+async function calibLoadCommands() {
+  try {
+    const r = await fetch('/api/calib/commands');
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || 'commands fetch failed');
+    CALIB.prereqs = body.prereqs || {};
+    CALIB.collectEnabled = !!body.collect_enabled;
+  } catch (e) {
+    console.warn('could not load calib commands:', e);
+  }
+  calibApplyRunEnablement({});
+}
+
+function calibApplyRunEnablement(files) {
+  const btns = $$('#calib-run-buttons button[data-calib-cmd], #calib-run-buttons-collect button[data-calib-cmd]');
+  btns.forEach(b => {
+    const cmd = b.dataset.calibCmd;
+    if (!cmd) return;
+    if (cmd.startsWith('collect_') && !CALIB.collectEnabled) {
+      b.disabled = true;
+      b.title = 'calibrate_web was launched without -p config:=... ; collect is unavailable';
+      return;
+    }
+    const prereqs = CALIB.prereqs[cmd] || [];
+    const missing = prereqs.filter(f => !((files[f] || {}).exists));
+    if (missing.length > 0) {
+      b.disabled = true;
+      b.title = 'needs ' + missing.join(', ') + ' in the session first';
+    } else {
+      b.disabled = false;
+      b.title = '';
+    }
+  });
+}
+
+// ---- prune (preview-then-apply) -------------------------------------------
+//
+// Operator-driven waypoint pruning. Preview returns a kept/dropped headline
+// and a per-waypoint table without touching disk; Apply re-runs the same
+// deterministic prune (with whatever overrides the operator toggled) and
+// writes a sidecar yaml. The Apply button stays disabled until a Preview
+// has succeeded so the operator always sees the count first.
+
+const PRUNE = {
+  lastPayload: null,         // last request body sent to /preview
+  lastResponse: null,        // last response body
+  overrides: {},             // {idx: 'keep'|'drop'} per session
+  defaultsByPhase: {},       // populated lazily from /api/calib/prune_inputs
+};
+
+function pruneCurrentFactors() {
+  return {
+    trans_tol_m: parseFloat($('#prune-trans-tol').value),
+    rot_tol_deg: parseFloat($('#prune-rot-tol').value),
+    min_count: parseInt($('#prune-min-count').value, 10),
+    min_rot_diversity_pairs: parseInt($('#prune-min-rot-pairs').value, 10),
+    min_rot_diversity_deg: parseFloat($('#prune-min-rot-deg').value),
+    seed_index: parseInt($('#prune-seed').value, 10),
+  };
+}
+
+function prunePopulateFactors(factors) {
+  $('#prune-trans-tol').value = factors.trans_tol_m;
+  $('#prune-rot-tol').value = factors.rot_tol_deg;
+  $('#prune-min-count').value = factors.min_count;
+  $('#prune-min-rot-pairs').value = factors.min_rot_diversity_pairs;
+  $('#prune-min-rot-deg').value = factors.min_rot_diversity_deg;
+  $('#prune-seed').value = factors.seed_index;
+}
+
+async function pruneLoadInputs() {
+  const phase = $('#prune-phase').value;
+  try {
+    const r = await fetch(`/api/calib/prune_inputs?phase=${encodeURIComponent(phase)}`);
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    PRUNE.defaultsByPhase[phase] = data.default_factors;
+    prunePopulateFactors(data.default_factors);
+
+    // Prior-run picker.
+    const sel = $('#prune-prior-run');
+    sel.innerHTML = '<option value="">(none — fk only)</option>';
+    for (const run of data.prior_runs) {
+      const opt = document.createElement('option');
+      opt.value = run.path;
+      opt.textContent = `${run.name} (${run.n_samples ?? '?'} samples)`;
+      sel.appendChild(opt);
+    }
+    if (data.prior_runs.length > 0) sel.value = data.prior_runs[0].path;
+
+    $('#prune-status').textContent = `loaded ${data.n_items} items for phase=${phase}`;
+    // Reset apply/overwrite state on phase change.
+    PRUNE.lastResponse = null;
+    PRUNE.overrides = {};
+    $('#prune-apply-btn').disabled = true;
+    $('#prune-overwrite-btn').disabled = true;
+    $('#prune-table').hidden = true;
+    $('#prune-tbody').innerHTML = '';
+    $('#prune-headline').textContent = '';
+    $('#prune-warning').hidden = true;
+    $('#prune-diagnostics').hidden = true;
+  } catch (e) {
+    $('#prune-status').textContent = `failed to load inputs: ${e}`;
+  }
+}
+
+// Resolve the source-tree promote target so the Prune tab shows the
+// operator exactly which file Overwrite would replace and what the backup
+// will be named. Reuses /api/waypoints/paths from the existing waypoint
+// flow — single source of truth.
+async function pruneLoadPaths() {
+  const src = $('#prune-path-source');
+  const bak = $('#prune-path-backup');
+  if (!src || !bak) return;
+  try {
+    const r = await fetch('/api/waypoints/paths');
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    if (data.promote) {
+      src.textContent = data.promote;
+      bak.textContent = data.promote.replace(/\.yaml$/, '.yaml.old-<YYYYmmdd_HHMMSS>');
+      PRUNE.promoteTarget = data.promote;
+    } else {
+      src.textContent = '(none — Overwrite disabled)';
+      bak.textContent = '–';
+      PRUNE.promoteTarget = null;
+    }
+  } catch (e) {
+    src.textContent = `failed: ${e}`;
+    bak.textContent = '–';
+    PRUNE.promoteTarget = null;
+  }
+}
+
+function pruneBuildPayload(extra) {
+  return {
+    phase: $('#prune-phase').value,
+    factors: pruneCurrentFactors(),
+    predictor_choice: $('#prune-predictor').value,
+    prior_run_path: $('#prune-prior-run').value || null,
+    overrides: { ...PRUNE.overrides },
+    ...extra,
+  };
+}
+
+async function prunePreview() {
+  const body = pruneBuildPayload();
+  $('#prune-status').textContent = 'previewing…';
+  try {
+    const r = await fetch('/api/calib/prune_preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    PRUNE.lastPayload = body;
+    PRUNE.lastResponse = data;
+    $('#prune-status').textContent = 'preview ready — Apply (sidecar) or Overwrite (replace source yaml)';
+    $('#prune-headline').textContent = data.headline || '';
+    $('#prune-apply-btn').disabled = false;
+    $('#prune-overwrite-btn').disabled = !PRUNE.promoteTarget;
+    pruneRenderDiagnostics(data);
+    pruneRenderTable(data);
+  } catch (e) {
+    PRUNE.lastResponse = null;
+    $('#prune-status').textContent = `preview failed: ${e}`;
+    $('#prune-apply-btn').disabled = true;
+    $('#prune-overwrite-btn').disabled = true;
+  }
+}
+
+async function pruneApply() {
+  if (!PRUNE.lastResponse) {
+    $('#prune-status').textContent = 'click Preview first';
+    return;
+  }
+  const headline = PRUNE.lastResponse.headline || '(no headline)';
+  if (!confirm(`Write sidecar yaml?\n\n${headline}\n\n` +
+               `Original calibration.yaml is untouched.`)) {
+    return;
+  }
+  const body = pruneBuildPayload({ confirm: true });
+  $('#prune-status').textContent = 'applying…';
+  try {
+    const r = await fetch('/api/calib/prune_apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    PRUNE.lastResponse = data;
+    pruneRenderDiagnostics(data);
+    pruneRenderTable(data);
+    if (data.wrote && data.wrote.sidecar_yaml) {
+      $('#prune-status').textContent =
+        `wrote ${data.wrote.sidecar_yaml} (${headline})`;
+    } else {
+      $('#prune-status').textContent = `apply succeeded: ${headline}`;
+    }
+    // Disable both write buttons after a successful write to prevent double-apply.
+    $('#prune-apply-btn').disabled = true;
+    $('#prune-overwrite-btn').disabled = true;
+  } catch (e) {
+    $('#prune-status').textContent = `apply failed: ${e}`;
+  }
+}
+
+async function pruneOverwrite() {
+  if (!PRUNE.lastResponse) {
+    $('#prune-status').textContent = 'click Preview first';
+    return;
+  }
+  if (!PRUNE.promoteTarget) {
+    $('#prune-status').textContent =
+      'no source-tree calibration.yaml resolved — Overwrite unavailable';
+    return;
+  }
+  const headline = PRUNE.lastResponse.headline || '(no headline)';
+  const target = PRUNE.promoteTarget;
+  if (!confirm(
+    `Replace ${target} with the pruned set?\n\n${headline}\n\n` +
+    `Current file will be renamed to <stem>.yaml.old-<timestamp> ` +
+    `in the same directory before the new yaml is written.`,
+  )) {
+    return;
+  }
+  const body = pruneBuildPayload({ confirm: true });
+  $('#prune-status').textContent = 'overwriting…';
+  try {
+    const r = await fetch('/api/calib/prune_overwrite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    PRUNE.lastResponse = data;
+    pruneRenderDiagnostics(data);
+    pruneRenderTable(data);
+    const w = data.wrote || {};
+    if (w.wrote_yaml) {
+      const bak = w.backup_yaml ? ` · backup ${w.backup_yaml}` : '';
+      $('#prune-status').textContent = `wrote ${w.wrote_yaml}${bak} (${headline})`;
+    } else {
+      $('#prune-status').textContent = `overwrite succeeded: ${headline}`;
+    }
+    $('#prune-apply-btn').disabled = true;
+    $('#prune-overwrite-btn').disabled = true;
+  } catch (e) {
+    $('#prune-status').textContent = `overwrite failed: ${e}`;
+  }
+}
+
+function pruneRenderDiagnostics(data) {
+  const tbl = $('#prune-diagnostics');
+  tbl.innerHTML = '';
+  tbl.hidden = false;
+  const diag = data.diagnostics || {};
+  const rows = [
+    ['kept', `${data.kept_indices.length} of ${data.items.length}`],
+    ['rotation-diverse pairs in kept', diag.rot_diverse_pairs_in_kept ?? '–'],
+    ['rescued for rotation diversity', diag.n_rescued_for_rot_diversity ?? 0],
+    ['predict failed', diag.n_predict_failed ?? 0],
+    ['forced keep / drop', `${diag.n_forced_keep ?? 0} / ${diag.n_forced_drop ?? 0}`],
+    ['predictor sources', JSON.stringify(diag.predictor_sources ?? {})],
+  ];
+  for (const [k, v] of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${k}</td><td>${v}</td>`;
+    tbl.appendChild(tr);
+  }
+  const warn = $('#prune-warning');
+  if (diag.warning) {
+    warn.textContent = diag.warning;
+    warn.hidden = false;
+  } else {
+    warn.hidden = true;
+  }
+}
+
+function pruneRenderTable(data) {
+  const tbody = $('#prune-tbody');
+  tbody.innerHTML = '';
+  for (const it of data.items) {
+    const tr = document.createElement('tr');
+    tr.classList.add(it.kept ? 'prune-kept' : 'prune-dropped');
+    if (it.forced_keep) tr.classList.add('prune-forced-keep');
+    if (it.forced_drop) tr.classList.add('prune-forced-drop');
+
+    const trans = it.nearest_trans_m == null ? '–' : `${(it.nearest_trans_m * 1000).toFixed(1)} mm`;
+    const rot = it.nearest_rot_deg == null ? '–' : `${it.nearest_rot_deg.toFixed(2)} °`;
+    const reason = it.kept ? '' : (it.drop_reason || 'dropped');
+    tr.innerHTML = `
+      <td>${it.index}</td>
+      <td><code>${it.label}</code></td>
+      <td>${it.kept ? '✔' : '✗'}</td>
+      <td>${it.predictor_source ?? ''}</td>
+      <td>${it.nearest_kept_label ?? ''}</td>
+      <td>${trans}</td>
+      <td>${rot}</td>
+      <td>${reason}</td>
+      <td>
+        <select data-prune-override="${it.index}">
+          <option value="">auto</option>
+          <option value="keep">force keep</option>
+          <option value="drop">force drop</option>
+        </select>
+      </td>
+    `;
+    const sel = tr.querySelector('select');
+    sel.value = PRUNE.overrides[it.index] || '';
+    sel.addEventListener('change', () => {
+      if (sel.value) {
+        PRUNE.overrides[it.index] = sel.value;
+      } else {
+        delete PRUNE.overrides[it.index];
+      }
+      // After any override edit, force a re-Preview so the write buttons
+      // reflect the new override.
+      $('#prune-apply-btn').disabled = true;
+      $('#prune-overwrite-btn').disabled = true;
+      $('#prune-status').textContent = 'overrides changed — click Preview to refresh';
+    });
+    tbody.appendChild(tr);
+  }
+  $('#prune-table').hidden = false;
+}
+
+function pruneResetFactors() {
+  const phase = $('#prune-phase').value;
+  const defaults = PRUNE.defaultsByPhase[phase];
+  if (!defaults) {
+    pruneLoadInputs();
+    return;
+  }
+  prunePopulateFactors(defaults);
+  PRUNE.overrides = {};
+  $('#prune-status').textContent = 'factors reset';
+  $('#prune-apply-btn').disabled = true;
+  $('#prune-overwrite-btn').disabled = true;
+}
+
+if ($('#prune-phase')) {
+  $('#prune-phase').addEventListener('change', pruneLoadInputs);
+  $('#prune-preview-btn').addEventListener('click', prunePreview);
+  $('#prune-apply-btn').addEventListener('click', pruneApply);
+  $('#prune-overwrite-btn').addEventListener('click', pruneOverwrite);
+  $('#prune-reset-btn').addEventListener('click', pruneResetFactors);
+  // Initial load — populates the prior-run picker and the default factors.
+  pruneLoadInputs().catch(e => console.warn('prune-init:', e));
+  pruneLoadPaths().catch(e => console.warn('prune-paths:', e));
+}
+
+// ---- boot ------------------------------------------------------------------
+
+// Three independent fetches + the WS connect can all start in parallel; the
+// commands fetch just needs to land before the session-detail render fires
+// `calibApplyRunEnablement`. Loading sessions internally awaits commands
+// where needed via the next render tick (commands fill into CALIB.prereqs
+// asynchronously; if sessions render first the buttons stay disabled until
+// commands lands, then a final calibApplyRunEnablement re-runs).
+Promise.all([calibLoadCommands(), calibLoadSessions(), calibLoadUrdfTargets()])
+  .catch(e => console.warn('calibrate-tab boot:', e));
+calibLogConnect();

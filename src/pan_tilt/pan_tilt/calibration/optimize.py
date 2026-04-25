@@ -164,26 +164,33 @@ def fit_chain(
 def warm_start_t_b_rotation(
     template: PanTiltParams,
     t_base_cam_ref: np.ndarray,
+    park_pan_rad: float = 0.0,
+    park_tilt_rad: float = 0.0,
 ) -> PanTiltParams:
-    """Back-solve T_B from the Phase-1 reference pose `Z_0 = T_base_cam(0, 0)`.
+    """Back-solve T_B from the Phase-1 reference pose `Z_park = T_base_cam(park)`.
 
-    From the FK identity at (theta_p=0, theta_t=0):
-        Z_0 = translate(t_a) @ R_z(-theta_p_off) @ translate(L_pan z)
-              @ R_y(theta_t_off) @ T_B
-    we solve T_B and copy it into a fresh `PanTiltParams` block. This pulls a
-    (potentially large, e.g. 90 deg) T_B rotation into the init so the chain
-    optimizer starts inside the right convergence basin.
+    The reference pose Z_park was captured with the pan-tilt held at
+    (park_pan_rad, park_tilt_rad) FIRMWARE radians during Phase 1 data
+    collection -- NOT necessarily firmware zero. The FK identity we invert is
+
+        Z_park = translate(t_a)
+                 @ R_z(-(theta_p_off + park_pan))
+                 @ translate(L_pan z)
+                 @ R_y(theta_t_off + park_tilt)
+                 @ T_B
+
+    Defaults (0, 0) preserve legacy callers that parked at servo-zero.
+    This pulls a (potentially large, e.g. 90 deg) T_B rotation into the init
+    so the chain optimizer starts inside the right convergence basin.
     """
-    from scipy.spatial.transform import Rotation
-
     T_a = np.eye(4)
     T_a[:3, 3] = template.t_a
     R_pan0 = np.eye(4)
-    R_pan0[:3, :3] = Rotation.from_euler('z', -template.theta_p_offset).as_matrix()
+    R_pan0[:3, :3] = Rotation.from_euler('z', -(template.theta_p_offset + park_pan_rad)).as_matrix()
     T_lp = np.eye(4)
     T_lp[:3, 3] = [0, 0, template.l_pan]
     R_tilt0 = np.eye(4)
-    R_tilt0[:3, :3] = Rotation.from_euler('y', template.theta_t_offset).as_matrix()
+    R_tilt0[:3, :3] = Rotation.from_euler('y', template.theta_t_offset + park_tilt_rad).as_matrix()
 
     pre = T_a @ R_pan0 @ T_lp @ R_tilt0
     T_b = invert_transform(pre) @ t_base_cam_ref
@@ -290,7 +297,103 @@ def solve_handeye(samples: list):
     if len(samples) < 3:
         raise ValueError(f"solve_handeye needs >=3 samples, got {len(samples)}")
 
-    # Build pairs (i, j) with i < j. For N=15 that's 105 pairs — plenty.
+    return _park_martin_solve(samples)
+
+
+def solve_handeye_with_consensus(
+    samples: list,
+    *,
+    pre_filter_rot_deg: float = 5.0,
+    min_samples: int = 8,
+    ransac_iters: int = 50,
+    ransac_subset_size: int = 5,
+    ransac_seed: Optional[int] = 0,
+) -> tuple[np.ndarray, np.ndarray, list, list[int]]:
+    """Two-stage hand-eye solve: RANSAC pre-pass to find inliers, then Park-Martin refinement.
+
+    Stage 1 (RANSAC)
+        - For `ransac_iters` trials, pick a random subset of `ransac_subset_size`
+          samples, run Park-Martin on the subset, and count inliers across
+          ALL samples (a sample is an inlier if its implied T_ee_marker
+          rotation matches the trial's T_ee_marker within `pre_filter_rot_deg`).
+        - The trial with the most inliers wins. Robust to up to ~50%
+          IPPE-flip contamination because, with reasonable subset size and
+          enough trials, at least one trial samples an all-clean subset.
+
+    Stage 2 (final solve)
+        - Park-Martin on the inliers. Returns final
+          (t_em, t_bc, per_pose, rejected_indices).
+
+    A handful of samples surviving stage 1 may still get the iterative
+    MAD-sigma refinement applied by `cmd_handeye`; this function only does
+    the absolute-threshold RANSAC pre-filter.
+    """
+    if len(samples) < max(3, min_samples // 2):
+        raise ValueError(f"need >=3 samples, got {len(samples)}")
+
+    rot_thresh = np.deg2rad(pre_filter_rot_deg)
+    N = len(samples)
+
+    # Pre-extract matrices (cheap, but we do this many times in RANSAC).
+    T_be_list, T_cm_list = [], []
+    for s in samples:
+        _, _, T_be, T_cm = sample_to_matrices(s)
+        T_be_list.append(T_be)
+        T_cm_list.append(T_cm)
+
+    rng = np.random.default_rng(ransac_seed)
+    subset_size = max(3, min(ransac_subset_size, N))
+    best_inliers: list[int] = []
+    best_t_em = best_t_bc = None
+
+    for _ in range(ransac_iters):
+        idx = rng.choice(N, size=subset_size, replace=False)
+        subset = [samples[i] for i in idx]
+        try:
+            t_em_trial, t_bc_trial, _ = _park_martin_solve(subset)
+        except ValueError:
+            # Subset didn't have enough rotational diversity; skip.
+            continue
+
+        # Score: inliers across ALL samples for this trial.
+        inliers = []
+        for k in range(N):
+            T_em_k = invert_transform(T_be_list[k]) @ t_bc_trial @ T_cm_list[k]
+            _, r = pose_error_scalars(T_em_k, t_em_trial)
+            if r < rot_thresh:
+                inliers.append(k)
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            best_t_em = t_em_trial
+            best_t_bc = t_bc_trial
+
+    rejected = sorted(set(range(N)) - set(best_inliers))
+    if best_t_em is None or len(best_inliers) < 3:
+        # RANSAC didn't find any consistent subset -- fall back to plain
+        # Park-Martin on the full set, no rejections. The downstream
+        # MAD-sigma loop will at least try to clean up.
+        t_em, t_bc, per_pose = _park_martin_solve(samples)
+        return t_em, t_bc, per_pose, []
+
+    # Final refinement on the inlier set.
+    kept = [samples[i] for i in best_inliers]
+    if len(kept) >= 3:
+        try:
+            t_em, t_bc, per_pose = _park_martin_solve(kept)
+            return t_em, t_bc, per_pose, rejected
+        except ValueError:
+            pass
+    # Fall back to the RANSAC trial's solution.
+    per_pose = []
+    for s in kept:
+        _, _, T_be, T_cm = sample_to_matrices(s)
+        T_em_k = invert_transform(T_be) @ best_t_bc @ T_cm
+        per_pose.append(pose_error_scalars(best_t_em, T_em_k))
+    return best_t_em, best_t_bc, per_pose, rejected
+
+
+def _park_martin_solve(samples: list):
+    """Inner Park-Martin solve. Pure linear AX=XB, no outlier handling."""
     N = len(samples)
     A_list, B_list = [], []
     for i in range(N):
@@ -299,9 +402,8 @@ def solve_handeye(samples: list):
         T_mci = invert_transform(T_cmi)
         for j in range(i + 1, N):
             _, _, T_bej, T_cmj = sample_to_matrices(samples[j])
-            A = T_bej @ T_ebi           # relative EE motion in base
-            B = T_cmj @ T_mci           # relative marker motion in cam
-            # Prune near-zero-rotation pairs; they add no rotational constraint.
+            A = T_bej @ T_ebi
+            B = T_cmj @ T_mci
             if float(np.linalg.norm(Rotation.from_matrix(A[:3, :3]).as_rotvec())) < 0.08:
                 continue
             A_list.append(A)
@@ -317,7 +419,6 @@ def solve_handeye(samples: list):
     t_base_cam_ref[:3, :3] = R_x
     t_base_cam_ref[:3, 3] = t_x
 
-    # Recover T_ee_marker per sample from the closure and average on SE(3).
     candidates = []
     for s in samples:
         _, _, T_be, T_cm = sample_to_matrices(s)

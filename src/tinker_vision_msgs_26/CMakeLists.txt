@@ -37,6 +37,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetTorque.srv"
   "srv/SetZero.srv"
   "srv/SeatRecommendation.srv"
+  "srv/SeatRecommendBbox.srv"
   "action/Categorize.action"
   "action/FollowHeadAction.action"
   "action/HumanFollowing.action"

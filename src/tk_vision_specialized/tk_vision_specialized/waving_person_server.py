@@ -17,6 +17,10 @@ from rclpy.executors import MultiThreadedExecutor
 import tf2_ros
 import tf2_geometry_msgs
 
+# Shared logger
+from vision_util.vision_logging import VisionLogger
+from vision_util.weights_cache import resolve_weights
+
 def get_array_from_points(points: PointCloud2, cam_K: np.array) -> tuple[np.array, np.array]:
     h, w = 720, 1280
     arr = np.frombuffer(points.data, dtype='<f4')
@@ -48,7 +52,9 @@ class DetectWavingPersonsNode(Node):
         self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
 
         self.bridge = CvBridge()
-        self.yolo = YOLO('yolov8s.pt')
+        self.declare_parameter('model_path', 'yolov8s.pt')
+        model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        self.yolo = YOLO(str(resolve_weights(model_path)))
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
         self.pose = self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
@@ -64,6 +70,14 @@ class DetectWavingPersonsNode(Node):
 
         self.declare_parameter('show_window', True)
         self.show_window = self.get_parameter('show_window').get_parameter_value().bool_value
+
+        self.declare_parameter('vision_logging_enabled', True)
+        self.declare_parameter('vision_log_folder', 'vision_log')
+        self._vision_logger = VisionLogger(
+            self,
+            self.get_parameter('vision_logging_enabled').get_parameter_value().bool_value,
+            self.get_parameter('vision_log_folder').get_parameter_value().string_value,
+        )
 
         self._frame_queue = None
         self._display_thread = None
@@ -155,9 +169,6 @@ class DetectWavingPersonsNode(Node):
         self.get_logger().info(f"left_hand_above_elbow: {left_hand_above_elbow}")
         self.get_logger().info(f"left_elbow_above_shoulder: {left_elbow_above_shoulder}")
 
-        # save person_roi to file
-        cv2.imwrite('person_roi' + str(time.time()) + '.png', person_roi)
-
         is_waving_gesture = (right_hand_above_shoulder or left_hand_above_shoulder or
                              (right_hand_above_elbow and right_elbow_above_shoulder) or
                              (left_hand_above_elbow and left_elbow_above_shoulder))
@@ -166,6 +177,7 @@ class DetectWavingPersonsNode(Node):
 
 
     def detect_waving_callback(self, request, response):
+        _t0 = time.perf_counter()
         self.get_logger().info('Detect waving request received. Detecting persons now...')
         with self.lock:
             if self.rgb_image is None or self.depth_points is None or self.camera_k is None:
@@ -257,6 +269,32 @@ class DetectWavingPersonsNode(Node):
                 self._frame_queue.put_nowait(annotated)
             except queue.Full:
                 pass
+
+        if self._vision_logger.enabled:
+            detections = []
+            for (x1, y1, x2, y2, _lm), pt in zip(
+                waving_annotations, waving_persons_centroids
+            ):
+                mask = np.zeros(rgb_image.shape[:2], dtype=bool)
+                mask[y1:y2, x1:x2] = True
+                detections.append({
+                    'bbox': [x1, y1, x2, y2],
+                    'mask': mask,
+                    'cls_name': 'waving_person',
+                    'conf': 1.0,
+                    'centroid': [(x1 + x2) // 2, (y1 + y2) // 2],
+                    'centroid_3d': [float(pt.point.x), float(pt.point.y), float(pt.point.z)],
+                })
+            self._vision_logger.write(
+                rgb_image, detections,
+                request_ctx={
+                    'target_frame': request.target_frame,
+                    'threshold_meters': float(request.threshold_meters),
+                },
+                branch='detect_waving',
+                extras={'n_person_candidates': person_candidates},
+                timings={'detect_waving': time.perf_counter() - _t0},
+            )
 
         if request.target_frame and waving_persons_centroids:
             if request.target_frame != header.frame_id:

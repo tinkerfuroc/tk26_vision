@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>object_detection_generalist</name>
+  <version>0.1.0</version>
+  <description>
+    Open-vocabulary object detection service. Runs a clean pretrained YOLO
+    segmentation model; when the requested prompt is not in the YOLO class
+    list (or the caller opts in) falls back to Gemini-2.5-Pro for bounding
+    boxes + FastSAM for masks. Delegates camera sync + 3D centroid logic to
+    the YOLOSegmentationNode base class in object_detection_new.
+  </description>
+  <maintainer email="cindy.w0135@gmail.com">cindy</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>ament_index_python</depend>
+  <depend>tinker_vision_msgs_26</depend>
+  <exec_depend>object_detection_new</exec_depend>
+  <exec_depend>kimi_api</exec_depend>
+  <exec_depend>vision_util</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

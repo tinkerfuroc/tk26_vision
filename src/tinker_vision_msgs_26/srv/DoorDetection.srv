@@ -1,0 +1,8 @@
+# currently only 'orbbec' is supported
+string camera
+
+---
+
+int32 status
+string error_msg
+int32 is_open

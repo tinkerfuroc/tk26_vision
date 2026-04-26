@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'door_detection = vision_util.door_detection:main',
             'get_point_cloud = vision_util.get_point_cloud:main',
+            'get_image = vision_util.get_image:main',
         ],
     },
 )

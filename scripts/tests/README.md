@@ -9,25 +9,25 @@ Logs are captured to `./logs/` (per-node, per-case). Inspect on any failure.
 
 | Prereq | Required by | How to set up |
 |---|---|---|
-| Workspace built via `build.sh` | all | `./src/tk26_vision/scripts/build.sh` |
-| Venv exists at `src/tk26_vision/.venv-vision-main` | all | see `src/tk26_vision/README.md` |
-| `/home/tinker/tk25_ws/.env` with real `OPENROUTER_API_KEY` | T2.7–T2.9, T3.1 | `cp src/tk26_vision/src/kimi_api/.env.example .env && $EDITOR .env` |
+| Workspace built via `build.sh` | all | `./scripts/build.sh` |
+| Venv exists at `.venv-vision-main` or the original checkout's shared venv | all | see `README.md` |
+| `$WS_ROOT/.env` with real `OPENROUTER_API_KEY` | T2.7–T2.9, T3.1 | `cp src/kimi_api/.env.example .env && $EDITOR .env` |
 | Orbbec camera running | T2–T4 | `ros2 launch orbbec_camera femto_bolt.launch.py enable_colored_point_cloud:=true depth_registration:=true` |
 | RealSense camera running | T2.2, T2.6 | `ros2 launch realsense2_camera rs_launch.py camera_name:=xarm_camera align_depth.enable:=true` |
-| Servo at `/dev/ttyUSB1` (0777 perms) | T1.5 positive, T2.10, T3.3, T4.1–T4.2 | plug in pan-tilt; `chmod 777` if needed |
+| Servo at `/dev/ttyUSB0` or exported `SERVO_DEVICE` | T1.5 positive, T2.10, T3.3, T4.1–T4.2 | plug in pan-tilt; note the scripts still default to `/dev/ttyUSB1`, so export `SERVO_DEVICE=/dev/ttyUSB0` on current hardware |
 | Physical shelf scene | T4.3 | 2–3 objects at two heights |
 | Operator in frame | T4.4 | someone walks into orbbec view |
 
 ## Running
 
 ```bash
-cd /home/tinker/tk25_ws
-./src/tk26_vision/scripts/tests/t0_static.sh       # <30 s, no cameras
-./src/tk26_vision/scripts/tests/t1_startup.sh      # ~2 min, no cameras
+cd /path/to/tk26_vision
+./scripts/tests/t0_static.sh       # <30 s, no cameras
+./scripts/tests/t1_startup.sh      # ~2 min, no cameras
 # Launch cameras in separate terminals first
-./src/tk26_vision/scripts/tests/t2_live.sh         # ~3 min
-./src/tk26_vision/scripts/tests/t3_interaction.sh  # ~1 min
-./src/tk26_vision/scripts/tests/t4_hardware.sh [servo_motion|servo_tracking|shelf_scene|person|all]
+./scripts/tests/t2_live.sh         # ~3 min
+./scripts/tests/t3_interaction.sh  # ~1 min
+./scripts/tests/t4_hardware.sh [servo_motion|servo_tracking|shelf_scene|person|all]
 ```
 
 All scripts source the venv + ROS setup internally. You don't need to pre-source.
@@ -36,11 +36,11 @@ All scripts source the venv + ROS setup internally. You don't need to pre-source
 
 | Var | Default | Purpose |
 |---|---|---|
-| `WS_ROOT` | `$HOME/tk25_ws` | workspace root |
+| `WS_ROOT` | repo root | workspace root |
 | `ROS_SETUP` | `/opt/ros/humble/setup.bash` | ROS setup file |
 | `ENV_FILE` | `$WS_ROOT/.env` | dotenv file with `OPENROUTER_API_KEY` |
-| `LOG_DIR` | `$WS_ROOT/src/tk26_vision/scripts/tests/logs` | where per-node logs go |
-| `SERVO_DEVICE` | `/dev/ttyUSB1` | pan-tilt serial device |
+| `LOG_DIR` | `$WS_ROOT/scripts/tests/logs` | where per-node logs go |
+| `SERVO_DEVICE` | `/dev/ttyUSB1` | pan-tilt serial device; stale default from before the clean pan-tilt refactor, override to `/dev/ttyUSB0` on current hardware |
 
 ## Exit codes
 
@@ -60,12 +60,18 @@ Per-node stdout/stderr is tee'd to `logs/<tag>.log`. The failure line prints a s
 
 | Symptom | Cause |
 |---|---|
-| `ModuleNotFoundError` in a log | shebang not fixed — run `./src/tk26_vision/scripts/fix_venv_shebangs.sh` |
+| `ModuleNotFoundError` in a log | shebang not fixed — run `./scripts/fix_venv_shebangs.sh` |
 | `OPENROUTER_API_KEY is not set` | edit `$ENV_FILE` with a real key |
-| `SerialException` in `ctrl` log | wrong `SERVO_DEVICE` or no servo plugged in |
+| `SerialException` in the pan-tilt controller log | wrong `SERVO_DEVICE` or no servo plugged in |
 | `/camera/color/image_raw not at 5 Hz` (T2 precheck) | orbbec launch not running |
 | YOLO weights download hangs T1.1 | run once manually to let ultralytics cache the model |
 
+Pan-tilt specific note:
+
+- The test harness now talks to `/pan_tilt_controller/cmd` with
+  `PanTiltCommand`. If you still see notes about `pan_tilt/ctrl`,
+  `/pan_tilt_ctrl`, or `PanTiltCtrl`, those notes predate the clean refactor.
+
 ## Reverting the test suite
 
-`rm -rf src/tk26_vision/scripts/tests/` — no other artifacts. Doesn't touch package sources, tk23, or the venv.
+`rm -rf scripts/tests/` — no other artifacts. Doesn't touch package sources, tk23, or the venv.

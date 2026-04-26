@@ -1,0 +1,9 @@
+string prompt
+sensor_msgs/Image image
+
+---
+
+int32 status
+string error_msg
+Object[] objects
+sensor_msgs/Image[] segments

@@ -1,0 +1,873 @@
+"""Generalist object detection service.
+
+Subclasses `YOLOSegmentationNode` from `object_detection_new` and overrides
+the service registration + callback. Open-vocab path uses YOLO-World and/or
+Gemini 2.5 Flash, both feeding into FastSAM for masks; 3D centroids and
+sorting are inherited unchanged from the parent class.
+
+Branching (after camera/prompt validation):
+
+  * ``request.force_vlm_sam=True``  → VLM + FastSAM only (operator override;
+    bypasses YOLO-World regardless of node config).
+  * ``prompt`` is a YOLO class       → run pretrained YOLO. If non-empty, done;
+                                       otherwise fall through to the open-vocab path.
+  * ``request.use_vlm_sam_fallback=True``
+                                     → race YOLO-World and VLM concurrently.
+                                       If YOLO-World returns objects first,
+                                       cancel the VLM call: an abandon-event
+                                       guarantees FastSAM + downstream work
+                                       are skipped (no zombie GPU/SAM-lock
+                                       tail), and we also close the OpenAI
+                                       client cross-thread as a best-effort
+                                       attempt to interrupt the in-flight
+                                       HTTP. Worst-case the VLM thread still
+                                       blocks in recv() until vlm_timeout_s,
+                                       then exits cleanly. Otherwise wait
+                                       for VLM.
+  * Auto-fallback (``allow_auto_fallback=True``, no per-request flags)
+                                     → single fallback chosen by ``enable_vlm``:
+                                       YOLO-World if False (default), VLM if True.
+
+Camera synchronization, intrinsics handling, image → 3D point projection,
+3D centroid computation, and sort-mode logic are all reused unchanged from
+the parent class. No duplication.
+"""
+
+from __future__ import annotations
+
+import copy
+import threading
+import time
+
+import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+from sensor_msgs.msg import Image
+from std_msgs.msg import Header
+
+from tinker_vision_msgs_26.msg import Object
+from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist
+
+from object_detection_new.object_seg_yolo import YOLOSegmentationNode
+from vision_util.weights_cache import resolve_weights
+
+from .sam_mask import FastSAMPredictor
+from .vlm_bbox import VlmBboxError, request_bboxes
+from .world_bbox import WorldDetector, WorldDetectorError
+
+
+class GeneralistDetectionNode(YOLOSegmentationNode):
+    """YOLO + VLM/SAM fallback object detection server."""
+
+    def __init__(self, node_name='generalist_detection_node',
+                 parameter_overrides=None):
+        super().__init__(
+            node_name=node_name,
+            parameter_overrides=parameter_overrides or [],
+        )
+        # Parent __init__ finished — device, YOLO model, camera subscribers,
+        # TF, locks, and the generalist service are all up. Construct the
+        # FastSAM predictor once so weights & CUDA context amortize.
+        self._sam = FastSAMPredictor(
+            weights_path=str(resolve_weights(self.fastsam_weights)),
+            device=self.device,
+            logger=self.get_logger(),
+        )
+        # FastSAM is shared between the YOLO-World and VLM pipelines, which
+        # can run concurrently in the race path. Ultralytics models are not
+        # thread-safe; serialize segmentation calls.
+        self._sam_lock = threading.Lock()
+
+        # Latest raw orbbec depth Image (native camera resolution). The
+        # parent class only subscribes to the registered PointCloud2, so to
+        # answer `return_depth_image=True` for orbbec at raw size we keep a
+        # separate sub on the camera's depth-Image topic. No sync with the
+        # rgb/pc pair — we just hand back whatever arrived most recently.
+        self._orbbec_depth_image_lock = threading.Lock()
+        self._latest_orbbec_depth_image: Image | None = None
+        if 'orbbec' in self.camera_types:
+            depth_image_topic = (
+                self.get_parameter('orbbec_depth_image_topic').value
+            )
+            qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self._orbbec_depth_image_sub = self.create_subscription(
+                Image,
+                depth_image_topic,
+                self._orbbec_depth_image_callback,
+                qos_profile=qos,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+            self.get_logger().info(
+                f'Subscribed to orbbec depth Image on {depth_image_topic}'
+            )
+
+        # YOLO-World is the default open-vocab fallback. It loads even when
+        # `enable_vlm=True` so flipping the flag at runtime via param events
+        # doesn't require a node restart. If load fails (missing weights /
+        # ultralytics), keep the node usable: log loudly and fall through to
+        # the VLM path on out-of-vocab prompts (which will surface its own
+        # error if the API key is missing too).
+        self._world: WorldDetector | None = None
+        try:
+            self._world = WorldDetector(
+                weights_path=str(resolve_weights(self.world_weights)),
+                device=self.device,
+                conf_threshold=self.world_conf_threshold,
+                iou_threshold=self.world_iou_threshold,
+                logger=self.get_logger(),
+            )
+            # Pay CUDA kernel-compile + CLIP text-head allocation cost
+            # (~1.7s on RTX 5070 Ti) up front. Without this, the *first*
+            # user call observes the cost — and in race mode it contends
+            # with the VLM thread for the GIL during JPEG encode + openai
+            # client construction, slowing both legs.
+            self._world.warmup()
+        except WorldDetectorError as exc:
+            self.get_logger().error(
+                f'YOLO-World unavailable ({exc}); fallback path will skip '
+                'straight to VLM+SAM (if enabled).'
+            )
+
+        self.get_logger().info(
+            f'Generalist detection node ready: enable_vlm={self.enable_vlm}, '
+            f'world_weights={self.world_weights}, vlm_model={self.vlm_model}, '
+            f'fastsam_weights={self.fastsam_weights}, '
+            f'allow_auto_fallback={self.allow_auto_fallback}'
+        )
+
+    # --- parameter wiring -------------------------------------------------
+
+    def _declare_parameters(self):
+        super()._declare_parameters()
+        self.declare_parameter('allow_auto_fallback', True)
+        # Selects the fallback model used on the *auto* path (no per-request
+        # flags). When True, auto-fallback uses Gemini (VLM) + FastSAM; when
+        # False (default), it uses local YOLO-World + FastSAM. Per-request
+        # flags override this:
+        #   - force_vlm_sam=True  → VLM only, regardless of enable_vlm.
+        #   - use_vlm_sam_fallback=True → race YOLO-World vs VLM concurrently.
+        self.declare_parameter('enable_vlm', False)
+        self.declare_parameter('vlm_model', 'google/gemini-2.5-flash')
+        self.declare_parameter('vlm_timeout_s', 20.0)
+        self.declare_parameter('vlm_max_retries', 3)
+        self.declare_parameter('fastsam_weights', 'FastSAM-s.pt')
+        # YOLO-World weights. yolov8s-worldv2.pt is the smallest v2 variant
+        # (~25 MB, auto-downloaded). Bigger v2 variants: m / l / x.
+        self.declare_parameter('world_weights', 'yolov8s-worldv2.pt')
+        # YOLO-World tends to need a low conf threshold for novel classes;
+        # boost via -p world_conf_threshold:=0.10 if you see false positives.
+        self.declare_parameter('world_conf_threshold', 0.05)
+        self.declare_parameter('world_iou_threshold', 0.5)
+        # Orbbec depth Image to surface in the response. Two viable choices:
+        #   - /camera/depth_to_color/image_raw — depth registered to color,
+        #     so size MATCHES rgb_image and segments. Requires the camera
+        #     launched with `enable_d2c_viewer:=true`.
+        #   - /camera/depth/image_raw — raw depth-sensor resolution
+        #     (e.g. 640x576 on Femto Bolt). Won't match rgb (1280x720) or
+        #     segments. Use only if the caller does its own alignment.
+        # Default to the d2c topic so segments fit by construction.
+        self.declare_parameter(
+            'orbbec_depth_image_topic', '/camera/depth_to_color/image_raw'
+        )
+
+    def _load_parameters(self):
+        super()._load_parameters()
+        self.allow_auto_fallback = (
+            self.get_parameter('allow_auto_fallback').value
+        )
+        self.enable_vlm = bool(self.get_parameter('enable_vlm').value)
+        self.vlm_model = self.get_parameter('vlm_model').value
+        self.vlm_timeout_s = float(self.get_parameter('vlm_timeout_s').value)
+        self.vlm_max_retries = int(self.get_parameter('vlm_max_retries').value)
+        self.fastsam_weights = self.get_parameter('fastsam_weights').value
+        self.world_weights = self.get_parameter('world_weights').value
+        self.world_conf_threshold = float(
+            self.get_parameter('world_conf_threshold').value
+        )
+        self.world_iou_threshold = float(
+            self.get_parameter('world_iou_threshold').value
+        )
+
+    # --- service advertisement -------------------------------------------
+
+    def _init_service(self):
+        """Advertise the redesigned ObjectDetection service."""
+        service_name = self.get_parameter('service_name').value
+        self.detection_srv = self.create_service(
+            ObjectDetectionGeneralist,
+            service_name,
+            self._generalist_service_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
+        self.get_logger().info(
+            f'Generalist detection service created: {service_name}'
+        )
+
+    # --- service callback ------------------------------------------------
+
+    def _generalist_service_callback(
+        self,
+        request: ObjectDetectionGeneralist.Request,
+        response: ObjectDetectionGeneralist.Response,
+    ) -> ObjectDetectionGeneralist.Response:
+        _t0 = time.perf_counter()
+        response.header = Header(stamp=self.get_clock().now().to_msg())
+        response.status = 1
+        response.person_id = 0
+        response.objects = []
+        response.detection_source = 'none'
+
+        camera = self._select_camera(request.camera)
+
+        rec_msg = self._wait_for_recent_frame(camera)
+        if rec_msg is None:
+            response.error_msg = f'No {camera} camera data within sync threshold'
+            return response
+
+        intrinsic = self._get_intrinsic(camera)
+        if intrinsic is None:
+            response.error_msg = f'No {camera} camera intrinsics available'
+            return response
+
+        try:
+            if camera == 'realsense':
+                rgb_img, points, valid_mask, header = self._process_realsense_data(
+                    rec_msg[0], rec_msg[1], intrinsic
+                )
+            else:
+                rgb_img, points, valid_mask, header = self._process_orbbec_data(
+                    rec_msg[0], rec_msg[1], intrinsic
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'Error processing {camera} data: {exc}')
+            response.error_msg = f'camera data processing error: {exc}'
+            return response
+
+        response.header = header
+
+        sort_mode = self._select_sort_mode(request)
+        prompt = (request.prompt or '').strip()
+        if not prompt:
+            response.error_msg = 'prompt is empty'
+            return response
+
+        ctx = dict(
+            rgb_img=rgb_img, points=points, valid_mask=valid_mask,
+            prompt=prompt, camera=camera, header=header,
+            sort_mode=sort_mode, return_segments=request.return_segments,
+        )
+
+        yolo_known = prompt in set(self.model.names.values())
+
+        # --- branching ----------------------------------------------------
+        if request.force_vlm_sam:
+            # Operator override: VLM + SAM only (semantics unchanged from the
+            # original generalist behavior; ignores enable_vlm).
+            self.get_logger().info(
+                f'force_vlm_sam set; running VLM+SAM only for "{prompt}"'
+            )
+            result = self._vlm_pipeline(**ctx)
+        elif yolo_known:
+            result = self._yolo_pipeline(**ctx)
+            if not result['objects']:
+                if request.use_vlm_sam_fallback:
+                    self.get_logger().info(
+                        f'YOLO empty for "{prompt}"; racing YOLO-World vs VLM'
+                    )
+                    result = self._race_world_vlm(**ctx)
+                elif self.allow_auto_fallback:
+                    fb = 'vlm_sam' if self.enable_vlm else 'yolo_world'
+                    self.get_logger().info(
+                        f'YOLO empty for "{prompt}"; auto-fallback to {fb}'
+                    )
+                    result = (
+                        self._vlm_pipeline(**ctx) if self.enable_vlm
+                        else self._world_pipeline(**ctx)
+                    )
+                # else: keep the empty YOLO result as authoritative.
+        elif request.use_vlm_sam_fallback:
+            self.get_logger().info(
+                f'OOV prompt "{prompt}"; racing YOLO-World vs VLM'
+            )
+            result = self._race_world_vlm(**ctx)
+        elif self.allow_auto_fallback:
+            fb = 'vlm_sam' if self.enable_vlm else 'yolo_world'
+            self.get_logger().info(
+                f'OOV prompt "{prompt}"; auto-fallback to {fb}'
+            )
+            result = (
+                self._vlm_pipeline(**ctx) if self.enable_vlm
+                else self._world_pipeline(**ctx)
+            )
+        else:
+            response.error_msg = (
+                f'class "{prompt}" not in YOLO names and fallback disabled'
+            )
+            return response
+
+        # --- response assembly --------------------------------------------
+        objects = result['objects']
+        segments = result['segments']
+        response.objects = objects
+        response.detection_source = result['source'] if objects else 'none'
+        response.status = 0 if objects else 1
+        if not objects:
+            response.error_msg = result.get('error') or (
+                f'no matches for "{prompt}" via {result["source"]}'
+            )
+
+        if request.return_rgb_image:
+            # Raw camera message at native resolution — no resize/processing.
+            response.rgb_image = rec_msg[0]
+        if request.return_depth_image:
+            # Raw depth Image at native resolution — no resize/processing.
+            # Realsense: pulled from the synced rgb+depth pair.
+            # Orbbec: synced sub is PointCloud2, so we use the most recent
+            # message from the separate raw-depth-Image sub instead.
+            if camera == 'realsense':
+                response.depth_image = rec_msg[1]
+            else:
+                with self._orbbec_depth_image_lock:
+                    latest = self._latest_orbbec_depth_image
+                if latest is not None:
+                    response.depth_image = copy.deepcopy(latest)
+                else:
+                    self.get_logger().warn(
+                        'return_depth_image=True for orbbec but no depth '
+                        'Image received yet on '
+                        f'{self.get_parameter("orbbec_depth_image_topic").value}'
+                    )
+        if request.return_segments and segments:
+            # Segments are produced at rgb_img.shape[:2] by both pipelines:
+            # YOLO crops to (h, w) in `_detect_objects`; FastSAM resizes via
+            # INTER_NEAREST in `sam_mask.segment`. Verify here so any future
+            # pipeline regression that emits off-size masks fails loudly
+            # rather than handing the caller mis-shaped buffers.
+            rgb_h, rgb_w = rgb_img.shape[:2]
+            for i, seg in enumerate(segments):
+                if seg.shape[:2] != (rgb_h, rgb_w):
+                    self.get_logger().error(
+                        f'segment[{i}] shape {seg.shape[:2]} != '
+                        f'rgb {(rgb_h, rgb_w)}; pipeline bug'
+                    )
+            self._warn_if_depth_mismatch(rgb_h, rgb_w, response, camera)
+            response.segments = [
+                self.bridge.cv2_to_imgmsg(seg, encoding='8UC1')
+                for seg in segments
+            ]
+
+        if self._vision_logger.enabled:
+            self._log_debug(
+                _t0, request, prompt, rgb_img, result,
+            )
+
+        return response
+
+    # --- pipeline helpers -------------------------------------------------
+
+    @staticmethod
+    def _empty_result(source: str, error: str | None = None,
+                      world_elapsed: float = 0.0,
+                      vlm_elapsed: float = 0.0,
+                      sam_elapsed: float = 0.0) -> dict:
+        return {
+            'source': source,
+            'objects': [], 'segments': [],
+            'bboxes': [], 'masks': [], 'confs': [],
+            'world_elapsed': world_elapsed,
+            'vlm_elapsed': vlm_elapsed,
+            'sam_elapsed': sam_elapsed,
+            'error': error,
+        }
+
+    def _yolo_pipeline(self, *, rgb_img, points, valid_mask, prompt,
+                       camera, header, sort_mode, return_segments) -> dict:
+        """Run pretrained YOLO via the parent's `_detect_objects`."""
+        yolo_objects_msg, yolo_segments = self._detect_objects(
+            rgb_img, points, prompt, valid_mask, header, camera,
+            request_segments=return_segments, sort_mode=sort_mode,
+        )
+        result = self._empty_result('yolo')
+        result['objects'] = list(yolo_objects_msg.objects)
+        result['segments'] = list(yolo_segments)
+        return result
+
+    def _world_pipeline(self, *, rgb_img, points, valid_mask, prompt,
+                        camera, header, sort_mode, return_segments) -> dict:
+        """Run YOLO-World + FastSAM. Returns a result dict (never raises)."""
+        if self._world is None:
+            return self._empty_result(
+                'yolo_world', error='YOLO-World unavailable at node init'
+            )
+        try:
+            bboxes, confs, world_elapsed = self._world.detect(rgb_img, prompt)
+        except Exception as exc:  # noqa: BLE001 — model errors stay non-fatal
+            self.get_logger().error(f'YOLO-World inference failed: {exc}')
+            return self._empty_result(
+                'yolo_world', error=f'YOLO-World inference: {exc}'
+            )
+
+        if not bboxes:
+            return self._empty_result(
+                'yolo_world', world_elapsed=world_elapsed,
+            )
+
+        with self._sam_lock:
+            masks, sam_elapsed = self._sam.segment(rgb_img, bboxes)
+        objects, segments = self._build_fallback_objects(
+            prompt, bboxes, masks, points, valid_mask, camera,
+            return_segments=return_segments, confs=confs,
+        )
+        if objects:
+            objects, segments = self._sort_objects_and_segments(
+                objects, segments, sort_mode,
+                camera=camera, source_frame=header.frame_id, header=header,
+            )
+        return {
+            'source': 'yolo_world',
+            'objects': objects, 'segments': segments,
+            'bboxes': bboxes, 'masks': masks, 'confs': confs,
+            'world_elapsed': world_elapsed, 'vlm_elapsed': 0.0,
+            'sam_elapsed': sam_elapsed,
+            'error': None,
+        }
+
+    def _vlm_pipeline(self, *, rgb_img, points, valid_mask, prompt,
+                      camera, header, sort_mode, return_segments,
+                      abandon_event=None, client_holder=None) -> dict:
+        """Run VLM + FastSAM. Returns a result dict (never raises).
+
+        If ``abandon_event`` is set at any post-HTTP checkpoint (immediately
+        after `request_bboxes` returns, or before/after FastSAM), the
+        pipeline returns an "abandoned" empty result without touching SAM
+        or downstream centroid/sort work. This is what makes the abandoned
+        VLM thread cheap: even if the HTTP call had to run to completion
+        (no `client.close()` was issued), the thread still skips the GPU
+        work and exits.
+        """
+        try:
+            bboxes, vlm_elapsed = request_bboxes(
+                rgb_img, prompt,
+                model=self.vlm_model,
+                max_retries=self.vlm_max_retries,
+                timeout_s=self.vlm_timeout_s,
+                logger=self.get_logger(),
+                abandon_event=abandon_event,
+                client_holder=client_holder,
+            )
+        except VlmBboxError as exc:
+            return self._empty_result(
+                'vlm_sam', error=f'VLM unavailable: {exc}'
+            )
+        except Exception as exc:  # noqa: BLE001 — keep race partner alive
+            self.get_logger().error(f'VLM call failed: {exc}')
+            return self._empty_result('vlm_sam', error=f'VLM error: {exc}')
+
+        if abandon_event is not None and abandon_event.is_set():
+            # Race winner already returned. Skip FastSAM + downstream work.
+            return self._empty_result(
+                'vlm_sam', vlm_elapsed=vlm_elapsed, error='abandoned',
+            )
+
+        if not bboxes:
+            return self._empty_result(
+                'vlm_sam', vlm_elapsed=vlm_elapsed,
+            )
+
+        with self._sam_lock:
+            # Re-check after acquiring the lock — caller may have abandoned
+            # while we were queued behind another SAM call.
+            if abandon_event is not None and abandon_event.is_set():
+                return self._empty_result(
+                    'vlm_sam', vlm_elapsed=vlm_elapsed, error='abandoned',
+                )
+            masks, sam_elapsed = self._sam.segment(rgb_img, bboxes)
+        objects, segments = self._build_fallback_objects(
+            prompt, bboxes, masks, points, valid_mask, camera,
+            return_segments=return_segments,
+        )
+        if objects:
+            objects, segments = self._sort_objects_and_segments(
+                objects, segments, sort_mode,
+                camera=camera, source_frame=header.frame_id, header=header,
+            )
+        return {
+            'source': 'vlm_sam',
+            'objects': objects, 'segments': segments,
+            'bboxes': bboxes, 'masks': masks, 'confs': [],
+            'world_elapsed': 0.0, 'vlm_elapsed': vlm_elapsed,
+            'sam_elapsed': sam_elapsed,
+            'error': None,
+        }
+
+    def _race_world_vlm(self, **ctx) -> dict:
+        """Race YOLO-World vs VLM. Prefer YOLO-World if it returns objects.
+
+        Both pipelines run as daemon threads. If YOLO-World wins we cancel
+        the VLM leg via two mechanisms, only one of which is fully reliable:
+
+          1. **abandon_event (reliable).** Set before returning. The VLM
+             worker checks it (a) at every retry boundary inside
+             `request_bboxes`, (b) immediately after `request_bboxes`
+             returns in `_vlm_pipeline`, and (c) right before acquiring
+             `self._sam_lock`. So FastSAM, centroid math, and TF lookups
+             are guaranteed to be skipped. The thread exits cleanly without
+             touching any ROS state on its way out.
+          2. **client.close() (best-effort).** Also issued. On the sync
+             OpenAI/httpx stack a cross-thread close does NOT reliably
+             interrupt a blocking socket read — the worker may stay parked
+             in `recv()` until its `vlm_timeout_s` fires. We still call
+             close() because some platforms / connection states (e.g. the
+             request hasn't entered recv yet, or the transport pool gets
+             reaped) DO unblock; it's free insurance.
+
+        Worst-case termination latency for an abandoned VLM thread is
+        therefore one in-flight HTTP attempt (≤ `vlm_timeout_s`, default
+        20 s). Best-case (between retries / pre-call / post-HTTP) is
+        milliseconds. In all cases, no GPU/SAM work runs after abandon, so
+        the next race's `self._sam_lock` acquire is not blocked by a
+        zombie tail.
+        """
+        results: dict[str, dict | None] = {'world': None, 'vlm': None}
+        done_world = threading.Event()
+        done_vlm = threading.Event()
+
+        # Cancellation channel for the VLM leg. The holder dict is filled
+        # in by `request_bboxes` once it has an OpenAI client constructed,
+        # so we can close it cross-thread.
+        abandon_vlm = threading.Event()
+        vlm_client_holder: dict = {}
+
+        def _world_worker():
+            try:
+                results['world'] = self._world_pipeline(**ctx)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                results['world'] = self._empty_result(
+                    'yolo_world', error=f'world worker crashed: {exc}'
+                )
+            finally:
+                done_world.set()
+
+        def _vlm_worker():
+            try:
+                results['vlm'] = self._vlm_pipeline(
+                    **ctx,
+                    abandon_event=abandon_vlm,
+                    client_holder=vlm_client_holder,
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                results['vlm'] = self._empty_result(
+                    'vlm_sam', error=f'vlm worker crashed: {exc}'
+                )
+            finally:
+                done_vlm.set()
+
+        threading.Thread(
+            target=_world_worker, daemon=True, name='gen_world_race'
+        ).start()
+        threading.Thread(
+            target=_vlm_worker, daemon=True, name='gen_vlm_race'
+        ).start()
+
+        # Wait for YOLO-World; bound by VLM timeout so a stuck local pass
+        # can't hang the whole call past the VLM ceiling.
+        world_wait = max(5.0, float(self.vlm_timeout_s))
+        if not done_world.wait(timeout=world_wait):
+            results['world'] = self._empty_result(
+                'yolo_world',
+                error=f'YOLO-World did not finish within {world_wait:.1f}s',
+            )
+        world_res = results['world'] or self._empty_result('yolo_world')
+
+        if world_res.get('objects'):
+            self.get_logger().info(
+                f'YOLO-World won race: {len(world_res["objects"])} '
+                f'object(s) in {world_res.get("world_elapsed", 0.0) * 1000:.0f} '
+                'ms (+ SAM); cancelling VLM call'
+            )
+            self._cancel_vlm(abandon_vlm, vlm_client_holder)
+            return world_res
+
+        self.get_logger().info(
+            f'YOLO-World produced no objects '
+            f'({world_res.get("error") or "empty"}); waiting for VLM'
+        )
+        # VLM has its own internal retries with vlm_timeout_s each; allow a
+        # small grace margin on top of the upper bound.
+        vlm_wait = float(self.vlm_timeout_s) * float(
+            max(1, self.vlm_max_retries)
+        ) + 5.0
+        if not done_vlm.wait(timeout=vlm_wait):
+            # Don't leave the VLM thread running indefinitely past our wait
+            # ceiling — cancel it on our way out.
+            self._cancel_vlm(abandon_vlm, vlm_client_holder)
+            results['vlm'] = self._empty_result(
+                'vlm_sam',
+                error=f'VLM did not finish within {vlm_wait:.1f}s',
+            )
+        vlm_res = results['vlm'] or self._empty_result('vlm_sam')
+
+        if vlm_res.get('objects'):
+            return vlm_res
+
+        # Both empty/failed. Surface a combined error so the caller can see
+        # which leg failed.
+        if world_res.get('error') and vlm_res.get('error'):
+            combined = self._empty_result(
+                'none',
+                error=(
+                    f'world: {world_res["error"]}; vlm: {vlm_res["error"]}'
+                ),
+                world_elapsed=world_res.get('world_elapsed', 0.0),
+                vlm_elapsed=vlm_res.get('vlm_elapsed', 0.0),
+            )
+            return combined
+        # Otherwise the more recently executed (VLM) result is the cleaner
+        # "no detections" answer to surface.
+        return vlm_res if not vlm_res.get('error') else world_res
+
+    def _cancel_vlm(self, abandon_event, client_holder):
+        """Cancel an in-flight VLM call: set the event and close the client.
+
+        Called from the service-callback thread when YOLO-World wins or
+        when the VLM wait ceiling expires. Safe to call even before the
+        VLM worker has constructed its client (holder will be empty) — the
+        event alone will short-circuit the worker at the next checkpoint.
+        """
+        abandon_event.set()
+        client = client_holder.get('client')
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().debug(
+                f'Closing VLM client during cancel raised {type(exc).__name__}: '
+                f'{exc} (safe to ignore)'
+            )
+
+    def _log_debug(self, _t0, request, prompt, rgb_img, result):
+        """Write per-call debug artifacts based on the winning pipeline."""
+        used_source = result['source'] if result['objects'] else 'none'
+        request_ctx = {
+            'service': 'generalist_ObjectDetection',
+            'prompt': prompt,
+            'camera': request.camera,
+            'target_frame': request.target_frame,
+            'sort_closest': bool(request.sort_closest),
+            'sort_highest': bool(request.sort_highest),
+            'force_vlm_sam': bool(request.force_vlm_sam),
+            'use_vlm_sam_fallback': bool(request.use_vlm_sam_fallback),
+            'enable_vlm': bool(self.enable_vlm),
+            'detection_source': used_source,
+        }
+        if used_source == 'yolo':
+            self._write_debug_artifacts(
+                self._last_rgb_img,
+                self._last_detection_info,
+                request_ctx=request_ctx,
+                branch='yolo',
+                timings={'yolo': time.perf_counter() - _t0},
+            )
+        elif used_source in ('vlm_sam', 'yolo_world'):
+            bboxes = result['bboxes']
+            masks = result['masks']
+            confs = result['confs']
+            detections = []
+            for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
+                if mask is None or mask.sum() == 0:
+                    continue
+                detections.append({
+                    'bbox': bbox,
+                    'mask': mask,
+                    'cls_name': prompt,
+                    'conf': confs[i] if i < len(confs) else 1.0,
+                })
+            timings = {'sam': result['sam_elapsed']}
+            if used_source == 'vlm_sam':
+                timings['vlm'] = result['vlm_elapsed']
+            else:
+                timings['yolo_world'] = result['world_elapsed']
+            self._write_debug_artifacts(
+                rgb_img,
+                detections,
+                request_ctx=request_ctx,
+                branch=used_source,
+                vlm_raw=(
+                    [list(bbox) for bbox in bboxes]
+                    if used_source == 'vlm_sam' else None
+                ),
+                timings=timings,
+            )
+
+    # --- helpers ---------------------------------------------------------
+
+    def _orbbec_depth_image_callback(self, msg: Image) -> None:
+        with self._orbbec_depth_image_lock:
+            self._latest_orbbec_depth_image = msg
+
+    def _warn_if_depth_mismatch(self, rgb_h: int, rgb_w: int,
+                                 response, camera: str) -> None:
+        """Log once per call if the depth Image dims differ from rgb/segments.
+
+        Sizes are pulled directly from the just-attached `response.depth_image`
+        message header — no decode required. Realsense aligned-depth and
+        orbbec depth_to_color match rgb by construction; raw orbbec depth
+        does not. We only warn (not error) because the caller may genuinely
+        want raw sensor-resolution depth.
+        """
+        depth = getattr(response, 'depth_image', None)
+        if depth is None or depth.height == 0 or depth.width == 0:
+            return
+        if (depth.height, depth.width) != (rgb_h, rgb_w):
+            self.get_logger().warn(
+                f'{camera} depth_image is {(depth.height, depth.width)} '
+                f'but rgb_image and segments are {(rgb_h, rgb_w)}; '
+                'segments will not overlay depth pixel-for-pixel. '
+                'For orbbec, launch the camera with '
+                'enable_d2c_viewer:=true and use '
+                '/camera/depth_to_color/image_raw, or override '
+                'orbbec_depth_image_topic.'
+            )
+
+    def _select_camera(self, camera_req: str) -> str:
+        if 'realsense' in (camera_req or ''):
+            return 'realsense'
+        if 'orbbec' in (camera_req or ''):
+            return 'orbbec'
+        self.get_logger().warn(
+            f'Unknown camera "{camera_req}", defaulting to orbbec'
+        )
+        return 'orbbec'
+
+    def _wait_for_recent_frame(self, camera: str):
+        call_time = self.get_clock().now()
+        for _ in range(self.sync_wait_time_limit):
+            with self.lock_msg:
+                recent_time = self.recent_publish_time[camera]
+                rec_msg_ref = self.recent_sync_msg.get(camera)
+            if recent_time is None or (
+                (call_time - recent_time).nanoseconds / 1e9
+                > self.img_sync_thres
+            ):
+                time.sleep(0.1)
+                continue
+            with self.lock_msg:
+                return copy.deepcopy(self.recent_sync_msg.get(camera))
+        return None
+
+    def _get_intrinsic(self, camera: str):
+        with self.lock_info:
+            return copy.deepcopy(self.camera_intrinsic.get(camera))
+
+    @staticmethod
+    def _select_sort_mode(request) -> str:
+        if request.sort_closest:
+            return 'closest'
+        if request.sort_highest:
+            return 'highest'
+        return 'none'
+
+    def _build_fallback_objects(
+        self,
+        prompt: str,
+        bboxes,
+        masks,
+        points,
+        valid_mask,
+        camera: str,
+        return_segments: bool,
+        confs: list[float] | None = None,
+    ):
+        """Convert (bbox, mask) pairs into Object[] via parent centroid logic.
+
+        Used by both fallback paths (YOLO-World and VLM+SAM). YOLO-World
+        supplies real per-box confidences via ``confs``; Gemini does not, so
+        VLM-path callers leave ``confs=None`` and every object reports
+        conf=1.0. Callers that want to filter on confidence should branch on
+        the response's ``detection_source`` (`'yolo'` and `'yolo_world'`
+        carry real scores; `'vlm_sam'` does not).
+        """
+        import numpy as np
+
+        objects: list[Object] = []
+        segments: list = []
+        for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
+            if mask is None or mask.sum() == 0:
+                continue
+            centroid = self._calculate_centroid(
+                points, mask, valid_mask, bbox, camera
+            )
+            if centroid is None:
+                continue
+            obj = Object()
+            obj.conf = float(confs[i]) if confs and i < len(confs) else 1.0
+            obj.cls = prompt
+            obj.centroid = centroid
+            obj.id = 0
+            obj.object_id = -1
+            obj.similarity = 0.0
+            obj.being_pointed = 0
+            objects.append(obj)
+            if return_segments:
+                segments.append(mask.astype(np.uint8) * 255)
+        return objects, segments
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = GeneralistDetectionNode(
+        node_name='generalist_detection_node',
+        parameter_overrides=[
+            Parameter('service_name',
+                      Parameter.Type.STRING,
+                      'object_detection_generalist'),
+            # Clean COCO baseline; callers that want the custom-trained
+            # competition model should use /object_detection_yolo instead.
+            Parameter('model_path',
+                      Parameter.Type.STRING,
+                      'yolo11m-seg.pt'),
+        ],
+    )
+    # MultiThreadedExecutor — required, not optional.
+    #
+    # The service callback now blocks (potentially for many seconds) while
+    # waiting on the race threads via threading.Event. Each ROS callback
+    # group (service, realsense sync, orbbec sync, camera_info x2, TF
+    # listener) needs its own executor thread to keep camera streams and
+    # TF lookups alive while the service is mid-race. Default thread count
+    # = multiprocessing.cpu_count() which is fine on the dev host (>=8 on
+    # the target workstation), but we pin a floor of 8 so embedded
+    # deployments don't starve.
+    #
+    # The race-thread workers spawned inside the callback are plain
+    # threading.Thread (daemon=True) and do NOT consume executor threads;
+    # they only touch (a) pure-Python/GPU model APIs (YOLO-World, FastSAM,
+    # OpenAI HTTP) and (b) thread-safe rclpy facilities (logger,
+    # tf2_ros.Buffer reads). FastSAM is shared between race legs and is
+    # serialized by self._sam_lock.
+    import multiprocessing
+    num_threads = max(8, multiprocessing.cpu_count())
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=num_threads)
+    executor.add_node(node)
+    node.get_logger().info(
+        f'Spinning generalist node with MultiThreadedExecutor '
+        f'(num_threads={num_threads})'
+    )
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

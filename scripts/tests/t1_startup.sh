@@ -74,24 +74,24 @@ t1_check T1.3 service /door_detection_srv vision_util door_detection
 section "T1.4 — get_point_cloud advertises /get_point_cloud_service"
 t1_check T1.4 service /get_point_cloud_service vision_util get_point_cloud
 
-section "T1.5 — pan_tilt/ctrl positive + negative cases"
+section "T1.5 — pan_tilt low-level stack positive + negative cases"
 # Positive: real device
 if [ -c "$SERVO_DEVICE" ]; then
-    start_node T1.5_pos pan_tilt ctrl --ros-args -p "device:=$SERVO_DEVICE"
+    start_launch T1.5_pos pan_tilt pan_tilt.launch.py "device:=$SERVO_DEVICE"
     sleep 3
     if kill -0 "${NODE_PIDS[-1]}" 2>/dev/null; then
         # Check TF chain appears
-        if timeout 5 ros2 run tf2_ros tf2_echo base_link camera_link >"$LOG_DIR/t1.5_tf.log" 2>&1 &
+        if timeout 5 ros2 run tf2_ros tf2_echo base_link head_camera_link >"$LOG_DIR/t1.5_tf.log" 2>&1 &
         then
             tf_pid=$!; sleep 3; kill "$tf_pid" 2>/dev/null || true; wait "$tf_pid" 2>/dev/null || true
         fi
         if grep -qE 'Translation|At time' "$LOG_DIR/t1.5_tf.log"; then
-            pass "T1.5 positive: ctrl alive on $SERVO_DEVICE, TF base_link→camera_link resolves"
+            pass "T1.5 positive: stack alive on $SERVO_DEVICE, TF base_link→head_camera_link resolves"
         else
             fail "T1.5 positive" "TF chain not published (see $LOG_DIR/t1.5_tf.log)"
         fi
     else
-        fail "T1.5 positive" "ctrl died within 3 s on $SERVO_DEVICE (log: $LAST_LOG)"
+        fail "T1.5 positive" "stack died within 3 s on $SERVO_DEVICE (log: $LAST_LOG)"
     fi
     stop_all_nodes
 else
@@ -99,7 +99,7 @@ else
 fi
 
 # Negative: unplugged path
-start_node T1.5_neg pan_tilt ctrl --ros-args -p device:=/dev/ttyUSB_nonexistent
+start_node T1.5_neg pan_tilt controller --ros-args -p device:=/dev/ttyUSB_nonexistent
 sleep 3
 if grep -qE 'SerialException|could not open port' "$LAST_LOG"; then
     pass "T1.5 negative: clean SerialException on missing device"
@@ -181,5 +181,31 @@ t1_check T1.10 action /spot_on_shelf tk_vision_specialized spot_on_shelf_server
 section "T1.11 — person_track_server advertises /track_person action"
 # enable_reid:=False keeps startup under 5 s on cold load
 t1_check T1.11 action /track_person vision_track person_track_server --ros-args -p enable_reid:=false
+
+section "T1.12 — generalist_node: no-key + with-key both advertise"
+# Unlike kimi_api, the generalist checks the key lazily on the VLM branch —
+# it MUST advertise cleanly even without a key so out-of-vocab fallback fails
+# gracefully at call time instead of killing the node at startup.
+start_node T1.12_nokey object_detection_generalist generalist_node
+if wait_for_service /object_detection_generalist 20; then
+    pass "T1.12 no-key: service advertised (key is checked lazily)"
+    # Sanity: log must not contain a traceback in the first seconds
+    if grep -qE 'Traceback' "$LAST_LOG"; then
+        fail "T1.12 no-key traceback" "$(tail -5 "$LAST_LOG" | tr '\n' '|')"
+    fi
+else
+    fail "T1.12 no-key" "service not advertised"
+fi
+stop_all_nodes
+
+OPENROUTER_API_KEY=smoke start_node T1.12_withkey object_detection_generalist generalist_node
+if wait_for_service /object_detection_generalist 20; then
+    pass "T1.12 with-key: service advertised"
+else
+    fail "T1.12 with-key" "service not advertised"
+fi
+stop_all_nodes
+# Negative-path VLM call (out-of-vocab + fallback under no key → OPENROUTER_API_KEY
+# error) requires live cameras to get past the recent-frame wait, so it lives in T2.
 
 summary

@@ -1,0 +1,13 @@
+# Recommend where a new guest should sit. Returns the human-readable
+# sentence (same semantics as SeatRecommendation.srv) plus the 2D
+# bounding box and 3D centroid of the recommended empty seat.
+string camera
+string[] names
+string[] features
+string target_frame
+---
+int32 status
+string error_msg
+string recommendation
+tinker_vision_msgs_26/BoundingBox bbox
+geometry_msgs/PointStamped centroid

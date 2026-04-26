@@ -1,0 +1,8 @@
+# camera in ['realsense', 'orbbec']
+string camera
+bool depth
+---
+int32 status
+string error_msg
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image

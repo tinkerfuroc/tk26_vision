@@ -28,7 +28,7 @@ from openai import OpenAI
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
-from tinker_vision_msgs.srv import FeatureExtraction, SeatRecommendation
+from tinker_vision_msgs_26.srv import FeatureExtraction, SeatRecommendation
 
 from ._env import base_url, default_model, load_env, require_api_key
 

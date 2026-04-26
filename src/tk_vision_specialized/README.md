@@ -48,7 +48,6 @@ ros2 service call /detect_waving_persons tinker_vision_msgs_26/srv/DetectWaving 
 ### Known issues (filed for follow-up, not fixed during migration)
 
 - `waving_person_server.py:99` — `right_elbow.y <= right_shoulder.y + int(img_h + 0.1)` almost certainly meant `img_h * 0.1` (mirroring line 100). The right-arm branch is effectively always true.
-- `waving_person_server.py:118` — writes `person_roi<ts>.png` to CWD on every call; unbounded disk fill. Gate behind a debug flag and route to `vision_log_folder`.
 
 ## check_waving_inference
 
@@ -63,6 +62,6 @@ Flags: `--runs`, `--interval`, `--image-topic`, `--model`, `--output-root`, `--n
 
 ## Dependencies
 
-ROS (via `package.xml`): `rclpy`, `geometry_msgs`, `std_msgs`, `sensor_msgs`, `tinker_vision_msgs`, `tinker_vision_msgs_26`, `tf2_ros`, `tf2_geometry_msgs`, `cv_bridge`, `message_filters`.
+ROS (via `package.xml`): `rclpy`, `geometry_msgs`, `std_msgs`, `sensor_msgs`, `tinker_vision_msgs_26`, `tf2_ros`, `tf2_geometry_msgs`, `cv_bridge`, `message_filters`.
 
 Python (via `requirements.txt`, pip-installed): `ultralytics>=8.0.0`, `mediapipe>=0.10.0`, `opencv-python>=4.5.0`, `numpy>=1.21.0`.

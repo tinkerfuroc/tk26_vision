@@ -6,13 +6,23 @@
 #            start_node, stop_all_nodes, wait_for_service, wait_for_action,
 #            wait_for_topic_hz, assert_log_grep, assert_log_nogrep
 
-WS_ROOT="${WS_ROOT:-$HOME/tk25_ws}"
-VENV="$WS_ROOT/src/tk26_vision/.venv-vision-main"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+FALLBACK_VENV="$(cd "$REPO_ROOT/../.." && pwd)/src/tk26_vision/.venv-vision-main"
+
+WS_ROOT="${WS_ROOT:-$REPO_ROOT}"
+VENV="${VENV:-$WS_ROOT/.venv-vision-main}"
+if [ ! -f "$VENV/bin/activate" ] && [ -f "$FALLBACK_VENV/bin/activate" ]; then
+    VENV="$FALLBACK_VENV"
+fi
 ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
-LOG_DIR="${LOG_DIR:-$WS_ROOT/src/tk26_vision/scripts/tests/logs}"
+LOG_DIR="${LOG_DIR:-$WS_ROOT/scripts/tests/logs}"
 ENV_FILE="${ENV_FILE:-$WS_ROOT/.env}"
+ROS_LOG_DIR="${ROS_LOG_DIR:-$WS_ROOT/.ros/log}"
+ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
 
 mkdir -p "$LOG_DIR"
+mkdir -p "$ROS_LOG_DIR"
 
 PASS_N=0; FAIL_N=0; SKIP_N=0
 FAILURES=()
@@ -41,6 +51,8 @@ source_envs() {
     [ -f "$WS_ROOT/install/setup.bash" ] && source "$WS_ROOT/install/setup.bash"
     set -u
     export ROS2_PTH_WARNED=1
+    export ROS_LOG_DIR
+    export ROS_LOCALHOST_ONLY
 }
 
 have_api_key() {
@@ -58,6 +70,22 @@ start_node() {
     local log="$LOG_DIR/$tag.log"
     : >"$log"
     setsid ros2 run "$pkg" "$entry" "$@" >>"$log" 2>&1 &
+    local pid=$!
+    sleep 0.1
+    local pgid
+    pgid=$(ps -o pgid= "$pid" 2>/dev/null | tr -d ' ' || echo "$pid")
+    NODE_PIDS+=("$pid")
+    NODE_PGIDS+=("$pgid")
+    LAST_LOG="$log"
+}
+
+# start_launch <tag> <pkg> <launch_file> [launch args...]
+start_launch() {
+    local tag="$1" pkg="$2" launch_file="$3"
+    shift 3
+    local log="$LOG_DIR/$tag.log"
+    : >"$log"
+    setsid ros2 launch "$pkg" "$launch_file" "$@" >>"$log" 2>&1 &
     local pid=$!
     sleep 0.1
     local pgid

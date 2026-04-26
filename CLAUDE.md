@@ -43,15 +43,18 @@ Optional: `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `LLM_M
 source install/setup.bash
 
 # Object detection
-ros2 run object_detection_new yolo_seg_node          # /object_detection_yolo (custom yolo11m-seg)
-ros2 run object_detection_new yolo_seg_default_node  # /object_detection (pretrained yolo11n-seg)
+ros2 run object_detection_new yolo_seg_node                 # /object_detection_yolo (specialist, excludes 'person')
+ros2 run object_detection_new yolo_seg_default_node         # /object_detection (pretrained COCO, backward-compat)
+ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + YOLO-World/FastSAM fallback; flip to Gemini via -p enable_vlm:=true)
 
 # Tracking / shelves
 ros2 run vision_track person_track_server            # action /track_person
 ros2 run tk_vision_specialized spot_on_shelf_server  # action /spot_on_shelf
 
-# Pan-tilt (servo on /dev/ttyUSB0; override via -p device:=…)
-ros2 run pan_tilt ctrl                               # serial driver + TF
+# Pan-tilt (servo on /dev/ttyUSB0; see src/pan_tilt/README.md)
+ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
+ros2 run pan_tilt controller --ros-args -p device:=/dev/ttyUSB0
+ros2 run pan_tilt state_publisher
 ros2 run pan_tilt follow_head                        # /follow_head_action + /follow_head_service
 
 # LLM-backed (kimi_api)
@@ -68,18 +71,24 @@ ros2 run vision_util get_point_cloud                 # /get_point_cloud_service
 
 ```
 src/tk26_vision/src/
-├── tinker_vision_msgs_26/    # action/TrackPerson, action/SpotOnShelf
-├── object_detection_new/     # YOLO-seg: yolo_seg_node + yolo_seg_default_node (same class, different params)
-├── vision_track/             # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
-├── tk_vision_specialized/    # SpotOnShelf action server
-├── pan_tilt/                 # ctrl (serial + TF) + follow_head (YOLO@1Hz w/ blur gate)
-├── kimi_api/                 # OpenRouter LLM services; _env.py centralizes key loading
-└── vision_util/              # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay)
+├── tinker_vision_msgs_26/         # canonical vision interfaces — all msgs/srvs/actions live here (absorbed tk23's tinker_vision_msgs)
+├── object_detection_new/          # YOLO-seg: specialist (yolo_seg_node, excludes 'person') + default (yolo_seg_default_node, pretrained COCO)
+├── object_detection_generalist/   # Pretrained YOLO + YOLO-World (default fallback) or Gemini 2.5 Flash (enable_vlm) + FastSAM mask, tk26 srv
+├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
+├── tk_vision_specialized/         # SpotOnShelf action + waving detector
+├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head (closed-loop absolute targeting in a pan-tilt-rooted frame; feedback-gated settle; sticky ID + EMA)
+├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
+└── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay)
 ```
 
 **Notes:**
-- `kimi_api` calls `object_detection` (generalist) via the `detection_service` ROS param — retargetable without rebuilding.
-- All migrated nodes import from `tinker_vision_msgs` (tk23's package), not `tinker_vision_msgs_26`. Intentional — `tk25_decision/messages.py` also imports from it. Consolidation deferred.
+- Three object-detection services now coexist. Canonical targets going forward:
+  - `/object_detection_yolo` (specialist, custom-trained model, `excluded_classes=['person']`) — arena/competition items.
+  - `/object_detection_generalist` (new, `tinker_vision_msgs_26/srv/ObjectDetectionGeneralist` with boolean flags) — the recommended target for open-vocabulary / non-arena callers (person detection, seat-rec helpers, any class YOLO doesn't recognize).
+  - `/object_detection` (pretrained COCO, `tinker_vision_msgs_26/srv/ObjectDetection` — the legacy string-flag schema, kept under its original name) — back-compat for tk25_decision BT nodes that still hard-code this name. Prefer the generalist for new code.
+- The specialist (`yolo_seg_node`) now silently drops the `'person'` class regardless of what the (future) custom model emits. To detect people, use the generalist or the default node.
+- `kimi_api` calls `object_detection_generalist` via the `detection_service` ROS param — retargetable without rebuilding.
+- **All vision interfaces live in `tinker_vision_msgs_26`.** The legacy `tinker_vision_msgs` package (tk23) has been retired and the whole `src/tk23_vision/` tree is `COLCON_IGNORE`d. The two srv names (`ObjectDetection` = legacy string-flag schema, `ObjectDetectionGeneralist` = new boolean-flag schema) coexist in the same package so both specialist and generalist servers can be served without name collisions.
 - Cameras: RealSense = aligned depth-to-color Image + pinhole intrinsics (ROS convention: x=fwd, y=left, z=up); Orbbec = PointCloud2 reprojected to image grid (standard ROS convention from the cloud).
 
 ## Models
@@ -90,9 +99,11 @@ YOLO `.pt` files pre-bundled under `object_detection_new/models/` / `vision_trac
 
 Key ROS2 parameters:
 - `object_detection_new`: `service_name`, `model_path`, camera topics, `sort_mode`
-- `pan_tilt/ctrl`: `device`, `specs_path`
-- `pan_tilt/follow_head`: `yolo_model`
+- `pan_tilt/controller`: `device`, startup/feedback timing, limits, invert/trim, default speed/accel
+- `pan_tilt/state_publisher`: `state_topic`, `joint_state_topic`, joint names, stale timeout
+- `pan_tilt/follow_head`: full param surface in `src/pan_tilt/config/pan_tilt.yaml`. Highlights: `yolo_model`, `command_topic`/`state_topic`, `home_pan_deg`/`home_tilt_deg`, `pan_deadband_deg`/`tilt_deadband_deg`, `min_command_change_deg` (chatter suppression), `min_detection_interval_sec` (YOLO cap), `max_settle_timeout_sec` + `steady_{pan,tilt}_eps_deg` + `steady_velocity_eps_deg_per_sec` + `steady_sample_count` (feedback-gated settle), `ema_alpha` + `target_ttl_sec` + `reassoc_dist_m` (smoothing + identity lock), `command_speed_raw_{small,large}` + `small_error_deg` + `command_accel_raw` (motion profile). Defaults are biased for **responsiveness over smoothness** — turn `ema_alpha` down and `steady_*_eps_deg` tighter if you want calmer motion.
 - `kimi_api/*`: `llm_model`, `detection_service`, `log_prompts`
+- `vision_logging_enabled` (default `true` everywhere except `follow_head`, which defaults to `false` in its yaml because the ~30-40 ms synchronous disk IO at 10 Hz detection stalls the action loop) + `vision_log_folder` (default `'vision_log'`) on the five bbox/seg/centroid-producing nodes: `yolo_seg_{node,default_node}`, `generalist_node`, `person_track_node`, `waving_person_server`, `follow_head`. Each run creates `vision_log/<YYYYmmdd_HHMMSS>/` relative to CWD and drops `orig_*.jpg` + `overlay_*.jpg` + `req_*.json` per call (tracker: only on lost/reclaim transitions; follow_head: at its detection tick when re-enabled for debugging). Pass `-p vision_logging_enabled:=<bool>` to override.
 
 ## Third-party drivers
 
@@ -116,8 +127,115 @@ Integration smoke suite at `scripts/tests/`, four tiers each gated by the previo
 | T0 | `t0_static.sh` | shebangs, venv deps, ROS interfaces, entry-point imports, `.env` sanity | venv only |
 | T1 | `t1_startup.sh` | all 11 nodes start + advertise + SIGTERM clean; pan_tilt serial pos/neg; kimi_api key pos/neg | venv + (opt) servo |
 | T2 | `t2_live.sh` | one call per node with live cameras (empty scene OK) | orbbec + realsense running |
-| T3 | `t3_interaction.sh` | cross-node: feature_matching↔yolo, spot_on_shelf↔yolo, ctrl↔follow_head TF | T2 + servo |
+| T3 | `t3_interaction.sh` | cross-node: feature_matching↔yolo, spot_on_shelf↔yolo, controller↔state_publisher↔follow_head TF | T2 + servo |
 | T4 | `t4_hardware.sh {servo_motion\|servo_tracking\|shelf_scene\|person\|all}` | hardware-in-the-loop, staged scenes | operator |
+
+## Pan-tilt / head camera extrinsic calibration
+
+Two-phase solver with xArm FK as the ground-truth anchor and a ChArUco board on the EE as the observation target.
+
+**Hardware note.** The camera is mounted at roughly 90° to the tilt arm — at firmware `tilt = 45°` (arm pointing straight up) the optical axis is horizontal; at firmware `tilt = 0°` (servo-zero set via `T:502`) it points ~45° down. This means T_B has a **large non-identity rotation** (~π/2 about X in tilt_link coordinates), not a small mount-tolerance correction. The calibration handles this by warm-starting T_B from the Phase-1 reference pose rather than from the URDF's stale rpy.
+
+Parameters fit:
+
+| Block | DOF | Init | Phase-2 fit? | Notes |
+|---|---|---|---|---|
+| T_A trans (base_link→pan axis) | 3 | URDF xyz | yes | rotation locked identity |
+| T_B trans (tilt_end→camera_link body) | 3 | from warm-start | yes | |
+| T_B rotation (rotvec) | 3 | from warm-start | **no** (Phase-2) / yes (polish) | Y-component is degenerate with θ_t_offset; unlock only in joint polish where Phase-1 data breaks the degeneracy |
+| T_ee_marker | 6 | identity | Phase-1 only | Phase-1 hand-eye then frozen |
+| θ_t_offset | 1 | −π/4 | yes | absorbs servo-zero-set noise |
+
+Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13–14.
+
+### Procedure
+
+1. **Generate the board.** `python -m pan_tilt.calibration.charuco_generate --out ~/calib/charuco_5x7` → PDF + PNG + JSON spec. Print on A4 matte at 100% scale, mount on 3 mm aluminum composite, re-measure square size with calipers. (Default 5×7 40 mm squares = 200×280 mm on A4; shrink to `--square-len 0.035 --marker-len 0.026` if your printer can't handle 5 mm edge margins.)
+2. **Fill config.** Edit `src/pan_tilt/config/calibration.yaml` — replace the placeholder xArm joint waypoints with 12–15 hand-eye poses (Phase 1) and 2–3 grid-anchor poses (Phase 2). Pre-validate each in RViz with the full URDF loaded. The node enforces a software Z-floor + mast exclusion cylinder but does no general collision checking.
+3. **Collect.**
+   ```bash
+   ros2 run pan_tilt calibrate_collect --ros-args \
+     -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml \
+     -p out_dir:=$PWD/calib_out -p phase:=both
+   ```
+   Produces `phase1_handeye.json`, `phase2_chain.json`, `sanity.json`.
+4. **(Optional) Calibrate intrinsics.** If reprojection RMSE > 0.5 px during Phase 1, collect ~20 ChArUco shots and run `python -m pan_tilt.calibration.run_calibration intrinsic <images_dir> --out calib_out`.
+5. **Solve.**
+   ```bash
+   python -m pan_tilt.calibration.run_calibration handeye calib_out/phase1_handeye.json --out calib_out
+   python -m pan_tilt.calibration.run_calibration chain  calib_out/phase2_chain.json --handeye calib_out/handeye.json --fit-pan-offset --out calib_out
+   python -m pan_tilt.calibration.run_calibration validate calib_out
+   ```
+   The chain step warm-starts T_B from the Phase-1 `Z₀`, which handles the ~90° (about Y) mount rotation automatically. T_B rotation is **locked by default** through the chain fit to avoid the `T_B(Y) ↔ θ_t_offset` degeneracy; pass `--unlock-tb-rotation` only for debugging or comparison runs. The chain solver auto-tries **two warm-start basins** (`θ_p_offset ∈ {0, π}`) and saves the lower-rot-RMSE result — fixes the silent wrong-basin failure on hardware whose pan firmware sign is opposite the FK assumption (symptom: locked-T_B chain rot RMSE stuck at ~20°). The chosen basin is printed alongside residuals. To run chain against the custom-park solve instead of the canonical one, swap `--handeye calib_out/handeye_custom.json`.
+
+   Optional polish (unlocks T_B rotation; auto-rejects MAD-sigma outliers like handeye does):
+   ```bash
+   python -m pan_tilt.calibration.run_calibration polish \
+     --phase1 calib_out/phase1_handeye.json \
+     --phase2 calib_out/phase2_chain.json \
+     --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
+   ```
+   Pass multiple `--phase1` files to concatenate datasets collected at different park poses — the extra EE-rotation diversity helps the joint fit, and is the recommended polish input when both `phase1_handeye.json` and `phase1_handeye_custom.json` exist:
+   ```bash
+   python -m pan_tilt.calibration.run_calibration polish \
+     --phase1 calib_out/phase1_handeye.json calib_out/phase1_handeye_custom.json \
+     --phase2 calib_out/phase2_chain.json \
+     --seed calib_out/chain.json --unlock-tb-rotation --out calib_out
+   ```
+   Polish flags:
+   - `--phase1 PATH [PATH ...]` (required) — one or more phase-1 sample JSONs concatenated in argument order. `--exclude-indices` indexes into this concatenated array (phase1 first, then phase2).
+   - `--phase2 PATH` (required).
+   - `--exclude-indices N [N ...]` — drop manually-known-bad samples up front. Use this to propagate handeye's `rejected_sample_indices` across phases.
+   - `--reject-sigma` (default 3.0), `--max-reject-frac` (default 0.10) — control the iterative MAD-sigma rejection loop.
+   - `--no-reject` — skip auto rejection entirely; manual `--exclude-indices` still applies.
+6. **Emit URDF diff.** The patcher auto-detects both xacro layouts: the `tk25_basic` macro form at `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` (the authoritative URDF the main robot bringup loads — patches `attach_xyz` default + `camera_mount_joint` origin) and the `tk26_vision` standalone form at `src/pan_tilt/urdf/pan_tilt.urdf.xacro` (used by `pan_tilt.launch.py` for dev bringup). Run `python -m pan_tilt.calibration.apply_to_urdf --results calib_out/chain.json --xacro <path>` against **both** so RViz and the live robot stay consistent, and apply the diffs manually once reviewed.
+
+### Phase gates
+
+- Intrinsic RMSE < 0.5 px
+- Hand-eye trans RMSE < 3 mm, rot RMSE < 0.5°
+- Chain held-out trans RMSE < 3 mm, rot RMSE < 0.4°
+- Sanity-pose bracket (start vs end) < 2 mm / 0.2°
+- **Phase 4 end-to-end** (recommended after polish, before `apply_to_urdf`): self-consistency trans RMSE < 5 mm / rot RMSE < 0.5° (PASS), 10 mm / 1° (WARN). xArm-independent: place a ChArUco board anywhere stationary in `base_link` (tripod, fixture, taped to a wall), sweep the pan-tilt over N held-out `(θ_p, θ_t)`, and check that the base-frame marker pose is consistent across views. `python -m pan_tilt.calibration.run_calibration validate --phase4 phase4_validation.json --params polish.json --out <session>` — see `src/pan_tilt/pan_tilt/calibration/readme.md § Phase 4`.
+
+> **Don't move the board between phase-1 collects.** `T_ee_marker` is the rigid pose of the marker on the EE flange — both `handeye.json` (canonical 45°) and `handeye_custom.json` (operator-chosen park) describe the *same* physical board, so the two solves must agree. The handeye solver cross-checks them and refuses to write if they disagree by more than 5 mm / 1°. Recovery: re-collect *both* phase-1 datasets in one sitting without touching the board, the EE, or the xArm zero. If you intentionally remounted the board (e.g. swapping marker prints for evaluation), pass `--allow-t-ee-marker-mismatch` on the handeye CLI to bypass the gate.
+
+### Robustness measures baked in
+
+- Per-axis backlash mitigation (overshoot-return per cell)
+- Servo settle check (feedback_ok + |cur − tgt| < 0.3° held 0.5 s)
+- MAD outlier rejection over 10-frame average per cell
+- Image-vs-state timestamp skew gate (≤ 20 ms)
+- SE(3) log residual (proper manifold metric) with `soft_l1` loss
+- 80/20 train/val split at the chain phase
+
+### Synthetic-data regression test
+
+`pytest src/pan_tilt/test/test_calibration.py` fabricates samples from a known ground-truth, runs every solver, and asserts recovery. Run this before touching `optimize.py` or `pan_tilt_model.py`.
+
+## Pan-tilt refactor notes
+
+The old monolithic `pan_tilt/ctrl` path is gone on purpose.
+
+- `ros2 run pan_tilt ctrl` no longer exists.
+- `/pan_tilt_ctrl` and `/pan_tilt_ctrl_modify` are not used by current runtime nodes.
+- `PanTiltCtrl` still exists as an interface artifact, but the current
+  `pan_tilt` package does not subscribe to it.
+- Runtime TF comes from `/joint_states` plus `robot_state_publisher`, not from
+  the serial driver.
+- `config/specs.json` is retained only as reference data; runtime geometry
+  now lives in `tk25_basic/tinker_urdf` as a `pan_tilt_macro`
+  (`src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro`) plus a
+  standalone wrapper (`pan_tilt_standalone.urdf.xacro`). The macro is
+  reused by `tracer_mini_manipulator.urdf.xacro` with `parent="base_link"`
+  so the combined `mobile_manipulator` URDF loaded by MoveIt (via
+  `grasp_bringup`) contains `pan_joint` + `tilt_joint` — this kills the
+  `move_group` "Joint 'pan_joint' not found in model 'mobile_manipulator'"
+  log spam. When running `pan_tilt.launch.py` alongside `grasp_bringup`,
+  pass `launch_robot_state_publisher:=false` so only the xArm RSP owns
+  `/robot_description`. The geometry was placed in `tinker_urdf` (not
+  `pan_tilt`) to keep dependencies flowing `tk26_vision → tk25_basic`
+  only — `tinker_urdf` must not depend on `pan_tilt`.
 
 See `scripts/tests/README.md` for env vars and skip conditions. Logs in `scripts/tests/logs/`.
 
@@ -128,3 +246,12 @@ See `scripts/tests/README.md` for env vars and skip conditions. Logs in `scripts
 - kimi_api loads `.env` via `load_dotenv()` from CWD upward at startup. Negative "no key" tests must move `.env` aside.
 
 Per-run results and operator-in-the-loop matrix in [`DEV_NOTES.md`](./DEV_NOTES.md).
+
+## Known follow-ups
+
+Actionable work that remains open. Full context, rationale, and prioritization in [`DEV_NOTES.md § Follow-ups`](./DEV_NOTES.md#follow-ups--ordered-roughly-by-impact). Items 1–5 and 9 from the previous follow-up list were addressed in the 2026-04-22 "Follow-up wave" session — see that DEV_NOTES entry.
+
+1. **Specialist model training.** The custom-trained competition YOLO does not exist yet — `yolo_seg_node` currently serves pretrained `yolo11m-seg.pt`. `excluded_classes=['person']` is belt-and-suspenders for the future retrain.
+2. **VLM latency** (5–10 s/call on Gemini 2.5 Flash) is the dominant cost when `enable_vlm=True`. Default fallback is now YOLO-World (~150–400 ms/call locally) — only flip `enable_vlm` on if YOLO-World can't recognise the target class.
+3. **Triple-subscription of camera streams** when specialist + default + generalist all run together. Not urgent, but worth factoring the input half of `YOLOSegmentationNode` into a shared node if we keep the three-service split.
+4. **`BtNode_TrackPerson` / `BtNode_ScanForWavingPerson` / `BtNode_FindPointedLuggage` rearchitect** — these BT nodes were migrated to the tk26 generalist srv mechanically in Wave 2.1, but their *semantics* depend on tk23-only response fields the tk26 detection nodes never populate (`result.person_id`, `Object.being_pointed`). The full catalog of broken nodes, live-task blast radius, and recommended fix per node lives alongside the code in [`src/tk25_decision/CLAUDE.md § Known issues & broken nodes`](../../src/tk25_decision/CLAUDE.md#known-issues--broken-nodes).

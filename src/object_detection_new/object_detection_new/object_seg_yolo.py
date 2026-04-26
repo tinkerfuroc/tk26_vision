@@ -16,8 +16,8 @@ import time
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from std_msgs.msg import Header
 import geometry_msgs.msg
-from tinker_vision_msgs.msg import Object, Objects
-from tinker_vision_msgs.srv import ObjectDetection
+from tinker_vision_msgs_26.msg import Object, Objects
+from tinker_vision_msgs_26.srv import ObjectDetection
 
 # TF2 for coordinate transformations
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
@@ -29,6 +29,10 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 # Computer vision
 from ultralytics import YOLO
 from cv_bridge import CvBridge
+
+# Shared logger
+from vision_util.vision_logging import VisionLogger
+from vision_util.weights_cache import resolve_weights
 
 
 class YOLOSegmentationNode(Node):
@@ -109,14 +113,31 @@ class YOLOSegmentationNode(Node):
         self.declare_parameter('max_depth', 10.0)  # meters
         self.declare_parameter('min_depth', -10.0)   # meters
         self.declare_parameter('sync_wait_time_limit', 5) # how many 0.1 seconds to wait
-        self.declare_parameter('img_sync_thres', 0.00)
+        # Max age (seconds) of the most recent synced frame pair before we refuse
+        # detection. 0 means "reject anything older than now", which fails even
+        # a healthy 30 Hz camera because recent_publish_time is stamped at the
+        # sync callback and is always >0 ms behind wall clock. Budget matches
+        # 2x the ApproximateTimeSynchronizer slop of 0.1s.
+        self.declare_parameter('img_sync_thres', 0.20)
 
-        # vision log folder
-        self.declare_parameter('vision_log_folder', f'tmp/vision_log{time.strftime("%Y%m%d_%H%M%S", time.localtime())}')
+        # Base folder for per-call artifacts; a run-timestamped subdir is
+        # created lazily on first write. Resolves relative to CWD when not
+        # absolute.
+        self.declare_parameter('vision_log_folder', 'vision_log')
+
+        # Per-call artifact dump (req_{ts}.json, orig_{ts}.jpg, overlay_{ts}.jpg).
+        # Default-on so every production call leaves an audit trail; pass
+        # `-p vision_logging_enabled:=false` to opt out.
+        self.declare_parameter('vision_logging_enabled', True)
         
         # Sorting mode: 'none', 'closest', 'highest'
         self.declare_parameter('sort_mode', 'none')
-        
+
+        # Class names to drop before the target-class filter, regardless of prompt.
+        # Default empty; specialist entry point overrides to ['person'] so a
+        # custom-trained competition model never emits people.
+        self.declare_parameter('excluded_classes', [''])
+
         self.get_logger().info('Parameters declared successfully')
 
     def _load_parameters(self):
@@ -145,6 +166,13 @@ class YOLOSegmentationNode(Node):
         self.vision_log_folder = self.get_parameter('vision_log_folder').value
         self.get_logger().info(f'Vision log folder: {self.vision_log_folder}')
 
+        self.vision_logging_enabled = self.get_parameter('vision_logging_enabled').value
+        self.get_logger().info(f'Vision logging enabled: {self.vision_logging_enabled}')
+
+        self._vision_logger = VisionLogger(
+            self, self.vision_logging_enabled, self.vision_log_folder
+        )
+
         self.sort_mode = self.get_parameter('sort_mode').value
         self.get_logger().info(f'Default sort mode: {self.sort_mode}')
 
@@ -154,53 +182,18 @@ class YOLOSegmentationNode(Node):
         self.img_sync_thres = self.get_parameter('img_sync_thres').value
         self.get_logger().info(f'Image sync threshold: {self.img_sync_thres} seconds')
 
-        if not os.path.exists(self.vision_log_folder):
-            os.makedirs(self.vision_log_folder)
-            self.get_logger().info(f'Created vision log folder: {self.vision_log_folder}')
+        raw_excluded = self.get_parameter('excluded_classes').value or []
+        self.excluded_classes = {c for c in raw_excluded if c}
+        if self.excluded_classes:
+            self.get_logger().info(f'Excluded classes: {sorted(self.excluded_classes)}')
+
 
     def _init_model(self):
         """Initialize YOLO model."""
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.get_logger().info(f'Using device: {self.device}')
         try:
-            model_file = Path(self.model_path)
-            found = False
-
-            # If not absolute path, search for it
-            if not model_file.is_absolute():
-                # Try to find in installed share directory first
-                try:
-                    from ament_index_python.packages import get_package_share_directory
-                    share_dir = Path(get_package_share_directory('object_detection_new'))
-                    self.get_logger().info(f'Package share directory: {share_dir}')
-                    share_model = 'models/' + self.model_path
-                    file_path = os.path.join(share_dir, share_model)
-                    self.get_logger().info(f'Checking share directory: {file_path}')
-                    if os.path.exists(file_path):
-                        model_file = file_path
-                        found = True
-                        self.get_logger().info('Found model in share directory')
-                except Exception as e:
-                    self.get_logger().warn(f'Could not check share directory: {e}')
-
-                # Try to find in package source directory
-                if not found:
-                    pkg_dir = Path(__file__).parent.parent
-                    src_model = pkg_dir / 'models' / self.model_path
-                    self.get_logger().info(f'Checking source directory: {src_model}')
-                    if os.path.exists(src_model):
-                        model_file = src_model
-                        found = True
-                        self.get_logger().info('Found model in source directory')
-            else:
-                found = os.path.exists(model_file)
-
-            if not found:
-                self.get_logger().warn(
-                    f'Model not found, will try to download {self.model_path}'
-                )
-                model_file = Path(self.model_path)
-
+            model_file = resolve_weights(self.model_path)
             self.model = YOLO(str(model_file))
             self.model.to(self.device)
             self.get_logger().info(f'YOLO model loaded from {model_file}')
@@ -380,10 +373,13 @@ class YOLOSegmentationNode(Node):
         h, w = 720, 1280
         K = np.array(intrinsic.k).reshape((3, 3))
 
-        # Parse point cloud
+        # Parse point cloud. Derive floats/point from point_step so both the 4-float
+        # xyz layout (Femto Bolt default) and the 5-float xyzrgb layout
+        # (enable_colored_point_cloud:=true) work — point_step is bytes/point, /4 = floats/point.
+        floats_per_point = pc_msg.point_step // 4
         arr = np.frombuffer(pc_msg.data, dtype='<f4')
-        N = len(arr) // 5  # x, y, z, rgb (padding to 5 floats)
-        points = arr.reshape((N, 5))[:, [0, 1, 2]]
+        N = len(arr) // floats_per_point
+        points = arr.reshape((N, floats_per_point))[:, [0, 1, 2]]
 
         # Project to image coordinates
         points_homo = points / np.repeat(points[:, 2:3], 3, axis=1)
@@ -708,7 +704,10 @@ class YOLOSegmentationNode(Node):
                         f'Skipping {cls_name}: invalid depth'
                     )
                     continue
-                
+
+                if cls_name in self.excluded_classes:
+                    continue
+
                 if cls_name != target_cls:
                     continue
                 
@@ -764,6 +763,12 @@ class YOLOSegmentationNode(Node):
         if self.visualization:
             self._visualize_all_detections(rgb_img, detection_info)
             self._visualize_all_detections(rgb_img, detection_info_all, displaying_all=True)
+
+        # Stash for the service callback to write debug artifacts if desired.
+        # Copied so later tick of the same node can't mutate them mid-write.
+        self._last_detection_info = list(detection_info)
+        self._last_detection_info_all = list(detection_info_all)
+        self._last_rgb_img = rgb_img.copy()
 
         objects_msg.status = 0 if len(objects_msg.objects) > 0 else 1
 
@@ -909,11 +914,22 @@ class YOLOSegmentationNode(Node):
         cv2.imwrite(filename, vis_img)
         self.get_logger().info(f'Saved visualization to {filename}')
 
+    def _write_debug_artifacts(self, rgb_img, detections, request_ctx,
+                               branch='yolo', vlm_raw=None, timings=None):
+        """Dispatch to the shared VisionLogger; preserved as a compat wrapper
+        so subclasses (generalist_node) can keep their existing call sites."""
+        extras = {'vlm_raw': vlm_raw} if vlm_raw is not None else None
+        self._vision_logger.write(
+            rgb_img, detections, request_ctx=request_ctx,
+            branch=branch, extras=extras, timings=timings,
+        )
+
     def _detection_service_callback(
             self, request: ObjectDetection.Request,
             response: ObjectDetection.Response
     ) -> ObjectDetection.Response:
         """Handle detection service requests."""
+        _t0 = time.perf_counter()
         self.get_logger().info('Detection service request received')
 
         # Determine which camera to use
@@ -1042,6 +1058,23 @@ class YOLOSegmentationNode(Node):
                 ]
             else:
                 response.segments = []
+
+            if self._vision_logger.enabled:
+                self._write_debug_artifacts(
+                    self._last_rgb_img,
+                    self._last_detection_info,
+                    request_ctx={
+                        'service': 'tk23_ObjectDetection',
+                        'prompt': request.prompt,
+                        'camera': request.camera,
+                        'flags': request.flags,
+                        'target_frame': request.target_frame,
+                        'sort_mode': sort_mode,
+                        'n_all_detections': len(self._last_detection_info_all),
+                    },
+                    branch='yolo',
+                    timings={'yolo': time.perf_counter() - _t0},
+                )
 
         except Exception as e:
             self.get_logger().error(f'Detection failed: {e}')

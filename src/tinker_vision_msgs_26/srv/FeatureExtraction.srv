@@ -1,0 +1,5 @@
+string camera
+---
+int32 status
+string error_msg
+string feature

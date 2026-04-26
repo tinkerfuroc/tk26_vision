@@ -24,7 +24,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'yolo_seg_node = object_detection_new.object_seg_yolo:main',
+            'yolo_seg_node = object_detection_new.object_seg_yolo_specialist:main',
             'yolo_seg_default_node = object_detection_new.object_seg_yolo_default:main',
         ],
     },

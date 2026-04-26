@@ -1,0 +1,7 @@
+string camera
+string[] names
+string[] features
+---
+int32 status
+string error_msg
+string recommendation

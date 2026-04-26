@@ -1,0 +1,19 @@
+# camera in ['realsense', 'orbbec']
+string camera
+# 'person, bottle'
+string prompt
+string flags
+string target_frame
+string category
+
+---
+
+std_msgs/Header header
+int32 status
+string error_msg
+int32 person_id
+Object[] objects
+
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image
+sensor_msgs/Image[] segments

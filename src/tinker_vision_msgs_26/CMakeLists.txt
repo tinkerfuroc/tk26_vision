@@ -12,11 +12,37 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 
-# Generate action files
+# Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/BoundingBox.msg"
+  "msg/Face.msg"
+  "msg/FaceResult.msg"
+  "msg/PanTiltCommand.msg"
+  "msg/Object.msg"
+  "msg/Objects.msg"
+  "msg/PanTiltCtrl.msg"
+  "msg/PanTiltState.msg"
+  "srv/DetectWaving.srv"
+  "srv/DoorDetection.srv"
+  "srv/FaceRegister.srv"
+  "srv/FeatureExtraction.srv"
+  "srv/FeatureMatching.srv"
+  "srv/FollowHead.srv"
+  "srv/GetImage.srv"
+  "srv/GetPointCloud.srv"
+  "srv/ObjectDetection.srv"
+  "srv/ObjectDetectionGeneralist.srv"
+  "srv/ObjectDetectionImage.srv"
+  "srv/PointDirection.srv"
+  "srv/SetTorque.srv"
+  "srv/SetZero.srv"
+  "srv/SeatRecommendation.srv"
+  "srv/SeatRecommendBbox.srv"
+  "action/Categorize.action"
+  "action/FollowHeadAction.action"
+  "action/HumanFollowing.action"
   "action/SpotOnShelf.action"
   "action/TrackPerson.action"
-  "srv/DetectWaving.srv"
   DEPENDENCIES geometry_msgs std_msgs sensor_msgs
 )
 

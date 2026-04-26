@@ -23,6 +23,7 @@ setup(
             'feature_recognition = kimi_api.feature_recognition:main',
             'feature_matching = kimi_api.feature_matching:main',
             'grocery_categorize = kimi_api.grocery_categorize:main',
+            'seat_recommend_bbox = kimi_api.seat_recommend_bbox:main',
         ],
     },
 )

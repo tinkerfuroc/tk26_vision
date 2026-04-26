@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pan_tilt">
+  <!--
+    Link names are scoped to the head camera so this URDF can coexist with the
+    main robot URDF loaded by mobile_bringup (xarm_description already defines
+    `camera_link` under `link_eef`). `base_link` stays shared by design - the
+    pan axis is expressed in the robot's base_link frame.
+  -->
+  <link name="base_link"/>
+  <link name="pan_link"/>
+  <link name="tilt_link"/>
+  <link name="head_camera_link"/>
+
+  <joint name="pan_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="pan_link"/>
+    <origin xyz="-0.275369 -0.013443 1.545923" rpy="0.019631607 0.033441848 0.052035773"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-3.141592653589793" upper="3.141592653589793" effort="1.0" velocity="10.0"/>
+  </joint>
+
+  <joint name="tilt_joint" type="revolute">
+    <parent link="pan_link"/>
+    <child link="tilt_link"/>
+    <origin xyz="0 0 0.135" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.523598775598299" upper="1.570796326794897" effort="1.0" velocity="10.0"/>
+  </joint>
+
+  <joint name="camera_mount_joint" type="fixed">
+    <parent link="tilt_link"/>
+    <child link="head_camera_link"/>
+    <origin xyz="-0.0724 -0.009 0.075" rpy="0.107098723 -0.004162789 3.062236662"/>
+  </joint>
+</robot>

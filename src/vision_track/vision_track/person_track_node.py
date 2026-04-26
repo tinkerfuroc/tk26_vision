@@ -44,6 +44,10 @@ from cv_bridge import CvBridge
 # Import YOLOTracker
 from vision_track.track_yolo import YOLOTracker, TrackerState, TrackingResult
 
+# Shared logger
+from vision_util.vision_logging import VisionLogger
+from vision_util.weights_cache import resolve_weights
+
 
 class PersonTrackNode(Node):
     """
@@ -67,6 +71,15 @@ class PersonTrackNode(Node):
         self.tracker: YOLOTracker = None
         self.tracking_active = False
         self.goal_handle = None
+
+        # Track-state cache for lost/reclaim logging (last successful frame)
+        self._last_tracked_rgb = None
+        self._last_tracked_detection = None
+        self._was_lost = False
+
+        self._vision_logger = VisionLogger(
+            self, self.vision_logging_enabled, self.vision_log_folder,
+        )
         self.target_point_pub = None
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -75,6 +88,9 @@ class PersonTrackNode(Node):
         self.lock_msg = threading.Lock()
         self.lock_info = threading.Lock()
         self.lock_tracker = threading.Lock()
+        # Guards tracking_active + goal_handle so goal_callback can atomically
+        # test-and-set without two concurrent ACCEPTs under MultiThreadedExecutor.
+        self.lock_lifecycle = threading.Lock()
         
         # Camera data storage
         self.camera_intrinsic: CameraInfo = None
@@ -122,6 +138,11 @@ class PersonTrackNode(Node):
         self.declare_parameter('lost_timeout', 300.0)  # seconds before declaring failure
         self.declare_parameter('target_point_topic', '/target_points')  # default PointStamped pub topic
 
+        # Vision logging (default-on). Tracker logs only on lost/reclaim
+        # transitions — no per-frame artifacts during steady-state tracking.
+        self.declare_parameter('vision_logging_enabled', True)
+        self.declare_parameter('vision_log_folder', 'vision_log')
+
         self.get_logger().info('Parameters declared')
 
     def _load_parameters(self):
@@ -142,6 +163,9 @@ class PersonTrackNode(Node):
         self.tracking_rate = self.get_parameter('tracking_rate').value
         self.lost_timeout = self.get_parameter('lost_timeout').value
         self.default_target_point_topic = self.get_parameter('target_point_topic').value
+
+        self.vision_logging_enabled = self.get_parameter('vision_logging_enabled').value
+        self.vision_log_folder = self.get_parameter('vision_log_folder').value
         
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Enable ReID: {self.enable_reid}')
@@ -156,8 +180,7 @@ class PersonTrackNode(Node):
         self.get_logger().info('Initializing YOLO Tracker...')
         
         try:
-            # Find model path
-            model_file = self._find_model_path(self.model_path)
+            model_file = resolve_weights(self.model_path)
             # Allow loss duration to be governed by time, not fixed frames.
             # Use whichever is larger: explicit max_frames_lost or rate * lost_timeout.
             max_frames_allowed = (
@@ -200,116 +223,6 @@ class PersonTrackNode(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to initialize tracker: {e}')
             raise
-
-    def _find_model_path(self, model_path: str) -> Path:
-        """Find the model file path."""
-        model_file = Path(model_path)
-        preferred_order = [
-            'yolo11x-seg.pt',
-            'yolo11l-seg.pt',
-            'yolo11m-seg.pt',
-            'yolo11s-seg.pt',
-            'yolo11n-seg.pt',
-        ]
-        
-        if model_file.is_absolute() and model_file.exists():
-            return model_file
-        
-        # Try package share directory (in models subfolder)
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            share_dir = Path(get_package_share_directory('vision_track'))
-            model_dirs = [share_dir / 'models', share_dir]
-            for d in model_dirs:
-                share_model = d / model_path
-                if share_model.exists():
-                    self.get_logger().info(f'Found model in share: {share_model}')
-                    return share_model
-            
-            # If requested model missing, pick the best available in share/models
-            for d in model_dirs:
-                if not d.exists():
-                    continue
-                for candidate in preferred_order:
-                    candidate_path = d / candidate
-                    if candidate_path.exists():
-                        self.get_logger().warn(
-                            f"Requested model '{model_path}' not found; using available model '{candidate_path.name}'"
-                        )
-                        return candidate_path
-        except Exception as e:
-            self.get_logger().warn(f'Could not check share directory: {e}')
-        
-        # Try source directory - package root (where setup.py is)
-        pkg_dir = Path(__file__).parent.parent
-        src_model = pkg_dir / model_path
-        if src_model.exists():
-            self.get_logger().info(f'Found model in source directory: {src_model}')
-            return src_model
-        
-        # Try source models subdirectory
-        src_model = pkg_dir / 'models' / model_path
-        if src_model.exists():
-            self.get_logger().info(f'Found model in source/models: {src_model}')
-            return src_model
-        
-        # Try object_detection_new package (has yolo11m-seg.pt)
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            od_share_dir = Path(get_package_share_directory('object_detection_new'))
-            od_model = od_share_dir / 'models' / model_path
-            if od_model.exists():
-                self.get_logger().info(f'Found model in object_detection_new: {od_model}')
-                return od_model
-            # Try alternative model (yolo11m-seg.pt instead of yolo11n-seg.pt)
-            alt_model = 'yolo11m-seg.pt'
-            od_model = od_share_dir / 'models' / alt_model
-            if od_model.exists():
-                self.get_logger().info(f'Using alternative model from object_detection_new: {od_model}')
-                return od_model
-        except Exception:
-            pass
-        
-        # Try HuggingFace download as a final fallback
-        downloaded = self._download_model_from_hf(model_path)
-        if downloaded is not None and downloaded.exists():
-            return downloaded
-        
-        # Return as-is (YOLO will try to download if needed)
-        self.get_logger().warn(f'Model not found locally and download failed, will try YOLO auto-download: {model_path}')
-        return Path(model_path)
-
-    def _download_model_from_hf(self, model_name: str) -> Path:
-        """
-        Attempt to download the requested model from HuggingFace.
-        
-        Returns:
-            Path to the downloaded file, or None if download not possible.
-        """
-        try:
-            from huggingface_hub import hf_hub_download
-        except Exception as exc:
-            self.get_logger().warn(f'HuggingFace download unavailable ({exc}); skipping download attempt.')
-            return None
-        
-        # Map common model names to the ultralytics repo filenames
-        repo_id = "ultralytics/YOLO11"
-        filename = model_name
-        # Ensure output directory exists
-        cache_dir = Path.home() / ".cache" / "vision_track" / "models"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            downloaded_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                cache_dir=cache_dir
-            )
-            self.get_logger().info(f"Downloaded model from HuggingFace: {downloaded_path}")
-            return Path(downloaded_path)
-        except Exception as exc:
-            self.get_logger().warn(f"Failed to download model '{model_name}' from HuggingFace: {exc}")
-            return None
 
     def _init_subscribers(self):
         """Initialize camera subscribers with synchronization."""
@@ -560,12 +473,17 @@ class PersonTrackNode(Node):
         if not has_data or not has_intrinsic:
             self.get_logger().warn('No camera data available, rejecting goal')
             return GoalResponse.REJECT
-        
-        # Check if already tracking
-        if self.tracking_active:
-            self.get_logger().warn('Already tracking, rejecting new goal')
-            return GoalResponse.REJECT
-        
+
+        # Atomic test-and-set: reserve the tracking slot here so a second
+        # concurrent goal_callback sees tracking_active=True and rejects.
+        # _execute_callback / _cleanup_tracking release the slot under the
+        # same lock.
+        with self.lock_lifecycle:
+            if self.tracking_active:
+                self.get_logger().warn('Already tracking, rejecting new goal')
+                return GoalResponse.REJECT
+            self.tracking_active = True
+
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, goal_handle):
@@ -583,8 +501,10 @@ class PersonTrackNode(Node):
         3. Handles target loss and cancellation
         """
         self.get_logger().info('Executing track_person action')
-        self.tracking_active = True
-        self.goal_handle = goal_handle
+        # tracking_active was already set True under lock_lifecycle in
+        # _goal_callback; we just record the goal handle here.
+        with self.lock_lifecycle:
+            self.goal_handle = goal_handle
 
         params = {
             "return_rgb_img": goal_handle.request.return_rgb_img,
@@ -791,6 +711,28 @@ class PersonTrackNode(Node):
 
         goal_handle.publish_feedback(feedback)
 
+        # Cache the latest good frame for the lost-transition dump, and emit
+        # a 'reclaimed' artifact if we're just coming back from a lost state.
+        self._last_tracked_rgb = rgb_img.copy()
+        self._last_tracked_detection = {
+            'bbox': list(track_result.bbox) if track_result.bbox is not None else None,
+            'mask': track_result.mask,
+            'cls_name': 'person',
+            'conf': float(getattr(track_result, 'confidence', 0.0) or 0.0),
+            'centroid': [
+                float(position.x), float(position.y), float(position.z)
+            ] if position is not None else None,
+            'track_id': int(track_result.track_id),
+        }
+        if self._was_lost and self._vision_logger.enabled:
+            self._vision_logger.write(
+                rgb_img, [self._last_tracked_detection],
+                request_ctx={'target_frame': params.get('target_frame')},
+                branch='person_track',
+                extras={'event': 'reclaimed'},
+            )
+        self._was_lost = False
+
     def _handle_lost_frame(
         self,
         last_seen_time: float,
@@ -802,6 +744,26 @@ class PersonTrackNode(Node):
         result,
     ) -> bool:
         time_since_seen = time.time() - last_seen_time
+
+        # First tick after a TRACKING → LOST transition: dump the last-good
+        # frame and the current (failed) frame. Subsequent lost ticks don't
+        # log, so a long occlusion produces exactly two artifacts.
+        if (not self._was_lost) and self._vision_logger.enabled:
+            if self._last_tracked_rgb is not None and self._last_tracked_detection is not None:
+                self._vision_logger.write(
+                    self._last_tracked_rgb, [self._last_tracked_detection],
+                    request_ctx={'target_frame': params.get('target_frame')},
+                    branch='person_track',
+                    extras={'event': 'lost', 'time_since_seen_s': float(time_since_seen)},
+                )
+            self._vision_logger.write(
+                rgb_img, None,
+                request_ctx={'target_frame': params.get('target_frame')},
+                branch='person_track',
+                extras={'event': 'lost_current', 'time_since_seen_s': float(time_since_seen)},
+            )
+        self._was_lost = True
+
         feedback.target_lost = True
         feedback.target_track_id = self.tracker.original_track_id if self.tracker.original_track_id else -1
         feedback.target_position = PointStamped()
@@ -833,8 +795,13 @@ class PersonTrackNode(Node):
 
     def _cleanup_tracking(self):
         """Clean up tracking state."""
-        self.tracking_active = False
-        self.goal_handle = None
+        with self.lock_lifecycle:
+            self.tracking_active = False
+            self.goal_handle = None
+
+        self._last_tracked_rgb = None
+        self._last_tracked_detection = None
+        self._was_lost = False
 
         if self.target_point_pub is not None:
             self.destroy_publisher(self.target_point_pub)

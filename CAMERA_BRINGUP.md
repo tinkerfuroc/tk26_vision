@@ -25,12 +25,23 @@ ros2 launch realsense2_camera rs_launch.py \
     align_depth.enable:=true \
     config_file:=/home/tinker/tk25_ws/src/tk26_vision/config/realsense_qos.yaml
 
-# terminal 2 — Orbbec Femto Bolt
+# terminal 2 — Orbbec Femto Bolt (wrapper sets FASTRTPS_DEFAULT_PROFILES_FILE
+# to config/fastdds_shm.xml and forwards the tuned overrides; extra
+# key:=value args after the script name pass through to ros2 launch)
+./src/tk26_vision/scripts/launch_orbbec_shm.sh
+```
+
+The Orbbec wrapper is equivalent to:
+
+```bash
+export FASTRTPS_DEFAULT_PROFILES_FILE=/home/tinker/tk25_ws/src/tk26_vision/config/fastdds_shm.xml
 ros2 launch orbbec_camera femto_bolt.launch.py \
     depth_registration:=true \
     enable_ir:=false \
     enable_frame_sync:=false
 ```
+
+(the RealSense side doesn't have a wrapper yet — still launch it as shown above).
 
 Expected rates on `/camera/xarm_camera/color/image_raw`, `/camera/color/image_raw`, and their `depth` siblings: **~30 Hz with σ ≤ 5 ms**. Verify with `ros2 topic hz`.
 
@@ -139,7 +150,7 @@ UDP `InErrors` delta over the 60 s window: 487, down from >20 k in the same inte
 
 ## Follow-ups (not required for the fix)
 
-- **Wrapper launch file** under `src/tk26_vision/launch/cameras_bringup.launch.py` that sets the env var and composes both camera launches with the overrides. Would let teammates run one command.
+- **Wrapper launch file** under `src/tk26_vision/launch/cameras_bringup.launch.py` that sets the env var and composes both camera launches with the overrides. Would let teammates run one command. Partial: `scripts/launch_orbbec_shm.sh` already wraps the Orbbec side; RealSense still needs the same treatment before both cameras can come up under a single launch.
 - **CycloneDDS** (`apt install ros-humble-rmw-cyclonedds-cpp`, `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`) — handles large messages without the XML profile. Not installed on this box.
 
 ## References

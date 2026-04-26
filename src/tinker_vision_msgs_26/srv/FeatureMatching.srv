@@ -1,0 +1,10 @@
+string camera
+string[] features
+float32 max_distance
+string target_frame
+
+---
+
+int32 status
+string error_msg
+geometry_msgs/PointStamped[] centroids

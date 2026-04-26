@@ -1,8 +1,16 @@
 # tinker_vision_msgs_26
 
-ROS 2 interface package for tk26 vision. Actions and services only — no messages. Consumers (and any producer outside this package) should `<depend>tinker_vision_msgs_26</depend>` rather than putting `.action`/`.srv` files next to code.
+Canonical ROS 2 interface package for tk26 vision. Holds **all** messages, services, and actions used by the vision stack. Consumers (and any producer outside this package) should `<depend>tinker_vision_msgs_26</depend>` rather than putting `.action`/`.srv` files next to code.
+
+As of the tk23→tk26 migration, the tk23 `tinker_vision_msgs` package has been retired and `src/tk23_vision/` is fully `COLCON_IGNORE`d. Every type previously defined there now lives here.
 
 ## Interfaces
+
+### Messages
+
+`BoundingBox`, `Face`, `FaceResult`, `Object`, `Objects`, `PanTiltCommand`,
+`PanTiltState`, `PanTiltCtrl` (legacy interface only; current `pan_tilt`
+runtime nodes do not subscribe to it).
 
 ### Actions
 
@@ -10,12 +18,42 @@ ROS 2 interface package for tk26 vision. Actions and services only — no messag
 |---|---|---|
 | `action/SpotOnShelf.action` | `tk_vision_specialized/spot_on_shelf_server` | Shelf slot categorization — maps detected items to (layer, horizontal-grid). |
 | `action/TrackPerson.action` | `vision_track/person_track_server` | Person tracking with ReID (Orbbec). |
+| `action/Categorize.action` | `kimi_api/grocery_categorize` | Grocery categorization action. |
+| `action/FollowHeadAction.action` | `pan_tilt/follow_head` | Pan-tilt head following. |
+| `action/HumanFollowing.action` | (legacy) | Retained from tk23 for back-compat. |
 
 ### Services
 
+Two `ObjectDetection`-shaped services coexist in this package, deliberately named to disambiguate:
+
 | File | Server | Purpose |
 |---|---|---|
-| `srv/DetectWaving.srv` | `tk_vision_specialized/waving_person_server` | Return all currently-waving persons as PointStamped centroids. |
+| `srv/ObjectDetection.srv` | `object_detection_new/yolo_seg_node` (specialist) + `yolo_seg_default_node` (pretrained COCO) | Legacy string-flag schema inherited from tk23. Kept for back-compat with tk25_decision BTs that hard-code `/object_detection`. |
+| `srv/ObjectDetectionGeneralist.srv` | `object_detection_generalist/generalist_node` | Clean YOLO + optional VLM+SAM open-vocabulary detection with typed boolean flags. |
+
+Additional services: `DetectWaving`, `DoorDetection`, `FaceRegister`,
+`FeatureExtraction`, `FeatureMatching`, `FollowHead`, `GetImage`,
+`GetPointCloud`, `ObjectDetectionImage`, `PointDirection`, `SeatRecommendation`,
+`SetTorque`, `SetZero`.
+
+### Pan-tilt low-level interfaces
+
+| File | Purpose |
+|---|---|
+| `msg/PanTiltCommand.msg` | Native pan-tilt command API. Uses radians and a `mode` field for absolute vs relative commands. |
+| `msg/PanTiltState.msg` | Native pan-tilt state feedback. Publishes radians plus connection / feedback health flags. |
+| `srv/SetTorque.srv` | Enable or disable pan-tilt torque from ROS. |
+| `srv/SetZero.srv` | Persist the current hardware pose as pan / tilt zero, matching the firmware workflow in `src/pan_tilt/about_pantilt.md`. |
+
+#### Generalist vs. legacy `ObjectDetection` — field mapping
+
+| Legacy `ObjectDetection.srv` | Generalist `ObjectDetectionGeneralist.srv` | Notes |
+|---|---|---|
+| `string flags` (substring-parsed: `'sort_closest'`, `'sort_highest'`, `'sort_none'`, `'request_image'`, `'request_segments'`) | `bool sort_closest`, `bool sort_highest`, `bool return_rgb_image`, `bool return_depth_image`, `bool return_segments` | Typed booleans — no string parsing. |
+| `string category` | *(dropped)* | Unused. |
+| — | `bool force_vlm_sam`, `bool use_vlm_sam_fallback` | Generalist-only: opt in/out of the VLM+SAM path. |
+| — | `string detection_source` (response) | `'yolo'` / `'vlm_sam'` / `'none'` — which branch answered. |
+| `Object[] objects` | `Object[] objects` | Both reference the `Object.msg` in this package. |
 
 ## Build dependencies
 
@@ -30,21 +68,6 @@ Declared in `package.xml` / `CMakeLists.txt`: `geometry_msgs`, `std_msgs`, `sens
 5. Append `build/tinker_vision_msgs_26/rosidl_generator_py` to `.vscode/settings.json` `python.analysis.extraPaths` (already listed — no change needed as of this README).
 
 ## Shape reference
-
-### `DetectWaving.srv`
-
-```
-float32 threshold_meters     # z-distance cutoff in metres; ≤0 = no limit
-string  target_frame         # TF target frame for output points (empty = raw camera frame)
----
-int32   status               # 0=found, 1=none, -1=error
-string  error_msg
-geometry_msgs/PointStamped[] waving_persons   # sorted closest-first on z
-
-sensor_msgs/Image  rgb_image     # reserved; current server does not populate
-sensor_msgs/Image  depth_image   # reserved; current server does not populate
-sensor_msgs/Image[] segments     # reserved; current server does not populate
-```
 
 ### `SpotOnShelf.action`
 
@@ -96,7 +119,3 @@ tracking rate (independent of BT tick cadence), but **only** when the target
 is not lost and the TF transform to `target_frame` succeeded. This gating
 means `tk26_nav/tracking_server`'s own LOST timer engages cleanly when the
 stream goes silent.
-
-## Legacy note
-
-Several types still come from the tk23 package `tinker_vision_msgs` (e.g. `ObjectDetection.srv`, `PanTiltCtrl.msg`). Those have not been ported to tk26 yet — consumers import from both packages for now.

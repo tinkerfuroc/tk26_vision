@@ -32,6 +32,7 @@ from cv_bridge import CvBridge
 
 # Shared logger
 from vision_util.vision_logging import VisionLogger
+from vision_util.mask_utils import largest_connected_component
 from vision_util.weights_cache import resolve_weights
 
 
@@ -685,6 +686,10 @@ class YOLOSegmentationNode(Node):
                 mask = masks[i].data.cpu().numpy().squeeze()
                 mask = mask[:h, :w]  # Crop to original size
                 mask = (mask > 0.5).astype(bool)
+                # Drop disconnected fragments — keep only the largest CC.
+                # Stabilises the depth-median centroid and guarantees the
+                # returned segment is a single closed region.
+                mask = largest_connected_component(mask)
 
                 detection_info_all.append({
                     'bbox': (x1, y1, x2, y2),
@@ -789,8 +794,13 @@ class YOLOSegmentationNode(Node):
         roi_mask = mask[y1:y2, x1:x2]
         roi_valid = valid_mask[y1:y2, x1:x2]
         if np.sum(roi_mask) == 0:
-            self.get_logger().warn('No valid mask pixels in ROI for centroid calculation!')
-            roi_mask = np.ones_like(roi_mask)
+            # Empty mask in the bbox interior — used to silently fall back to
+            # bbox-centroid via np.ones_like, which produced a wrong centroid
+            # for occluded/missing instances. Surface and skip instead.
+            self.get_logger().warn(
+                f'empty mask in bbox={bbox}; skipping centroid'
+            )
+            return None
         roi_points = points[y1:y2, x1:x2]
 
         # Combine masks using multiplication (works for both bool and float masks)
@@ -1077,11 +1087,31 @@ class YOLOSegmentationNode(Node):
                 )
 
         except Exception as e:
-            self.get_logger().error(f'Detection failed: {e}')
+            self.get_logger().exception(f'Detection failed: {e}')
             response.header = Header(stamp=self.get_clock().now().to_msg())
             response.status = 1
             response.objects = []
             response.person_id = 0
+            # Failure-case audit trail: rgb_img is in scope here (raise came
+            # from _detect_objects, after _process_*_data succeeded).
+            # Pre-rgb early returns above (no camera msg / no intrinsics /
+            # camera-data parse error) intentionally don't log — there is
+            # no image to render.
+            if self._vision_logger.enabled:
+                self._vision_logger.write(
+                    rgb_img, [],
+                    request_ctx={
+                        'service': 'tk23_ObjectDetection',
+                        'prompt': request.prompt,
+                        'camera': request.camera,
+                        'flags': request.flags,
+                        'target_frame': request.target_frame,
+                        'sort_mode': sort_mode,
+                        'error': str(e),
+                    },
+                    branch='error',
+                    timings={'yolo': time.perf_counter() - _t0},
+                )
 
         return response
 

@@ -1,26 +1,15 @@
-"""LLM-backed person re-identification by description matching.
+"""LLM-backed person re-identification by image-vs-image matching.
 
-Ports tk23 `kimi_api/feature_matching.py`. Calls `object_detection` (the
-generalist YOLO service), crops each detected person, then asks an OpenRouter
-vision model to assign each caller-supplied description to one of the cropped
-images. Returns a PointStamped per matched description.
-
-Changes from tk23:
-- API key/base URL/model from environment.
-- `detection_service` ROS param lets the operator retarget between
-  `object_detection` (default-YOLO generalist) and `object_detection_yolo`
-  (custom-trained variant).
-- Temporary JPEGs written via `tempfile.NamedTemporaryFile`.
+Calls `object_detection_generalist` (the generalist YOLO/VLM service) to
+crop each detected person in the current scene, then asks a vision LLM to
+match each caller-supplied REFERENCE image (the comparison image captured
+during feature extraction) to one of the candidate crops. The text feature
+description is supplied as a tiebreaker hint only.
 """
 
 import ast
-import base64
-import os
-import tempfile
 import time
 
-import cv2
-import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped
@@ -31,24 +20,7 @@ from tinker_vision_msgs_26.srv import FeatureMatching
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
 from ._env import base_url, default_model, load_env, require_api_key
-
-
-def bbox_from_mask(mask):
-    nonzero = np.nonzero(mask)
-    x1, y1, x2, y2 = np.min(nonzero[0]), np.min(nonzero[1]), np.max(nonzero[0]), np.max(nonzero[1])
-    return x1, y1, x2, y2
-
-
-def _encode_to_data_url(img) -> str:
-    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        cv2.imwrite(tmp_path, img)
-        with open(tmp_path, 'rb') as f:
-            data = f.read()
-    finally:
-        os.unlink(tmp_path)
-    return f'data:image/jpg;base64,{base64.b64encode(data).decode("utf-8")}'
+from ._image_utils import bbox_from_mask, encode_to_data_url
 
 
 class FeatureMatchingService(Node):
@@ -92,8 +64,12 @@ class FeatureMatchingService(Node):
         request: FeatureMatching.Request,
         response: FeatureMatching.Response,
     ):
-        assert 0 < len(request.features) <= 26, 'Too few (or too many) features to match.'
-        self.get_logger().info('Request received.')
+        n_refs = len(request.comparison_images)
+        assert 0 < n_refs <= 26, 'Too few (or too many) references to match.'
+        assert len(request.features) == n_refs, (
+            f'features ({len(request.features)}) and comparison_images ({n_refs}) length mismatch.'
+        )
+        self.get_logger().info(f'Request received with {n_refs} references.')
 
         start_time = time.time_ns()
 
@@ -116,12 +92,11 @@ class FeatureMatchingService(Node):
         await detection_future
         detection_res = detection_future.result()
 
-        if detection_res.status != 0:
-            self.get_logger().warn('Detection service failed.')
+        if detection_res is None or detection_res.status != 0:
+            err = detection_res.error_msg if detection_res is not None else 'no response'
+            self.get_logger().warn(f'Detection service failed: {err}')
             response.status = 1
-            response.error_msg = (
-                f'Detection failed (status {detection_res.status}): {detection_res.error_msg}.'
-            )
+            response.error_msg = f'Detection failed: {err}.'
             response.centroids = []
             return response
 
@@ -153,40 +128,58 @@ class FeatureMatchingService(Node):
         if len(cropped_person_imgs) > self.max_person_per_image:
             cropped_person_imgs = cropped_person_imgs[: self.max_person_per_image]
 
-        person_img_urls = []
-        for _, img, _ in cropped_person_imgs:
-            person_img_urls.append(_encode_to_data_url(img))
+        candidate_urls = [encode_to_data_url(img) for _, img, _ in cropped_person_imgs]
+
+        reference_urls = []
+        for ref_msg in request.comparison_images:
+            if len(ref_msg.data) == 0:
+                reference_urls.append(None)
+            else:
+                ref_img = self.bridge.imgmsg_to_cv2(ref_msg, 'bgr8')
+                reference_urls.append(encode_to_data_url(ref_img))
 
         self.get_logger().info(
-            f'Person cropped.     Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
+            f'Persons cropped + references encoded. Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
         )
 
+        n_cand = len(cropped_person_imgs)
         sys_prompt = (
-            f"You will be given {len(person_img_urls)} person's images and "
-            f"{len(request.features)} descriptions. "
-            'For each description, determine which image matches the described person best. '
-            "Each description will contain the person's gender, approximate age, facial features, "
-            'hair color, and clothing. '
-            f'Output a list of length {len(request.features)}, in the format of '
-            '"[image ID matching description 0, image ID matching description 1, ...]".'
-            f'Descriptions are numbered from 0 to {len(request.features) - 1}, and images are '
-            f'numbered from 0 to {len(person_img_urls) - 1}.'
-            'For each description, there will be exactly one image that matches it best.'
-            'Output the final list ONLY. Do not include explanations or other information.'
-            'Example output (3 descriptions and 4 images): [0, 3, 1].'
-            'Example output (5 descriptions and 3 images): [0, 2, 0, 1, 1].'
+            f'You will be shown {n_refs} REFERENCE images of specific people, then '
+            f'{n_cand} CANDIDATE crops taken from a wider scene. For each reference '
+            f'(0..{n_refs - 1}), output the candidate index whose person is the SAME '
+            'individual as the reference. Use clothing, hair color/length, body shape, '
+            'and posture as evidence. The user may also provide a textual description '
+            'per reference; treat it as a tiebreaker hint only. '
+            f'Output ONLY a JSON list of length {n_refs}, e.g. "[0, 2, 1]". '
+            'Use -1 for a reference with no plausible match in the candidates. '
+            'Do not include explanations.'
         )
 
-        text_prompt = 'Match the following descriptions to the images above:\n'
-        for i, feat in enumerate(request.features):
-            text_prompt += f'- Description {i}: {feat}\n'
-        if self.log_prompts:
-            self.get_logger().info(f'text_prompt: {text_prompt}')
+        user_content = []
+        for i, ref_url in enumerate(reference_urls):
+            if ref_url is None:
+                user_content.append(
+                    {'type': 'text', 'text': f'Reference {i} (text-only, see hints below):'}
+                )
+            else:
+                user_content.append({'type': 'text', 'text': f'Reference {i}:'})
+                user_content.append({'type': 'image_url', 'image_url': {'url': ref_url}})
 
-        image_contents = []
-        for i, img_url in enumerate(person_img_urls):
-            image_contents.append({'type': 'text', 'text': f'Image {i}:'})
-            image_contents.append({'type': 'image_url', 'image_url': {'url': img_url}})
+        for j, cand_url in enumerate(candidate_urls):
+            user_content.append({'type': 'text', 'text': f'Candidate {j}:'})
+            user_content.append({'type': 'image_url', 'image_url': {'url': cand_url}})
+
+        text_tail = 'Textual hints per reference:\n'
+        for i, feat in enumerate(request.features):
+            text_tail += f'- Reference {i}: {feat or "(none)"}\n'
+        text_tail += (
+            f'Now output the JSON list of length {n_refs} mapping each reference '
+            'to the matching candidate index.'
+        )
+        user_content.append({'type': 'text', 'text': text_tail})
+
+        if self.log_prompts:
+            self.get_logger().info(f'text_tail: {text_tail}')
 
         result = None
         for it in range(3):
@@ -195,10 +188,7 @@ class FeatureMatchingService(Node):
                     model=self.llm_model,
                     messages=[
                         {'role': 'system', 'content': sys_prompt},
-                        {
-                            'role': 'user',
-                            'content': image_contents + [{'type': 'text', 'text': text_prompt}],
-                        },
+                        {'role': 'user', 'content': user_content},
                     ],
                 )
             except Exception as e:
@@ -206,7 +196,7 @@ class FeatureMatchingService(Node):
                 completion = None
 
             self.get_logger().info(
-                f'GPT finished.      Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
+                f'LLM finished.      Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
             )
 
             try:
@@ -221,34 +211,34 @@ class FeatureMatchingService(Node):
 
         if result is None:
             self.get_logger().warn('Failed to parse response. Falling back...')
-            result = [i % len(cropped_person_imgs) for i in range(len(request.features))]
+            result = [i % n_cand for i in range(n_refs)]
 
         response.error_msg = ''
         response.centroids = []
 
         if not isinstance(result, list):
             response.error_msg = f'Not a list: {result}.'
-        elif len(result) != len(request.features):
+        elif len(result) != n_refs:
             response.error_msg = f'Invalid length: {result}.'
 
         if len(response.error_msg) == 0:
-            for i in range(len(request.features)):
-                img_id = result[i]
+            for i in range(n_refs):
+                cand_id = result[i]
 
-                if not isinstance(img_id, int):
+                if not isinstance(cand_id, int):
                     response.error_msg = f'result[{i}] contains non-int values: {result}.'
                     break
 
-                if img_id < -1 or img_id >= len(cropped_person_imgs):
-                    response.error_msg = f'result[{i}] contains invalid Image ID: {result}.'
+                if cand_id < -1 or cand_id >= n_cand:
+                    response.error_msg = f'result[{i}] contains invalid Candidate ID: {result}.'
                     break
 
-                if img_id == -1:
+                if cand_id == -1:
                     response.error_msg = f'result[{i}] unmatched: {result}.'
                     break
 
                 response.centroids.append(
-                    PointStamped(header=detection_res.header, point=cropped_person_imgs[img_id][2])
+                    PointStamped(header=detection_res.header, point=cropped_person_imgs[cand_id][2])
                 )
 
         if len(response.error_msg) > 0:

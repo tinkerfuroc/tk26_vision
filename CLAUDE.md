@@ -35,7 +35,7 @@ pip install -r src/tk26_vision/src/vision_track/requirements.txt
 
 `feature_recognition`, `feature_matching`, `grocery_categorize` require `OPENROUTER_API_KEY`. Copy `src/tk26_vision/src/kimi_api/.env.example` to the workspace-root `.env` and fill in the key — `python-dotenv` auto-loads `.env` from CWD upward at node startup. Missing key ⇒ `RuntimeError` at node init.
 
-Optional: `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `LLM_MODEL` (default `openai/gpt-4.1`, also `-p llm_model:=…`).
+Optional: `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `LLM_MODEL` (default `google/gemini-2.5-pro`, also `-p llm_model:=…`).
 
 ## Running Nodes
 

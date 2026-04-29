@@ -36,4 +36,4 @@ def base_url() -> str:
 
 
 def default_model() -> str:
-    return os.environ.get('LLM_MODEL', 'openai/gpt-4.1')
+    return os.environ.get('LLM_MODEL', 'google/gemini-2.5-pro')

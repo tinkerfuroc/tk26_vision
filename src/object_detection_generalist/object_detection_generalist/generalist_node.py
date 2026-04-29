@@ -107,6 +107,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 f'Subscribed to orbbec depth Image on {depth_image_topic}'
             )
 
+        # Cache the pretrained YOLO class-name set for O(1) prompt lookup
+        # in the service callback. Names map is fixed once the model is
+        # loaded; recomputing the set per call is a wasted allocation.
+        self._yolo_class_names = set(self.model.names.values())
+
         # YOLO-World is the default open-vocab fallback. It loads even when
         # `enable_vlm=True` so flipping the flag at runtime via param events
         # doesn't require a node restart. If load fails (missing weights /
@@ -255,6 +260,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         prompt = (request.prompt or '').strip()
         if not prompt:
             response.error_msg = 'prompt is empty'
+            if self._vision_logger.enabled:
+                self._log_debug(
+                    _t0, request, prompt, rgb_img,
+                    self._empty_result('none', error='prompt is empty'),
+                )
             return response
 
         ctx = dict(
@@ -263,7 +273,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             sort_mode=sort_mode, return_segments=request.return_segments,
         )
 
-        yolo_known = prompt in set(self.model.names.values())
+        yolo_known = prompt in self._yolo_class_names
 
         # --- branching ----------------------------------------------------
         if request.force_vlm_sam:
@@ -309,6 +319,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             response.error_msg = (
                 f'class "{prompt}" not in YOLO names and fallback disabled'
             )
+            if self._vision_logger.enabled:
+                self._log_debug(
+                    _t0, request, prompt, rgb_img,
+                    self._empty_result('none', error=response.error_msg),
+                )
             return response
 
         # --- response assembly --------------------------------------------
@@ -548,6 +563,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             try:
                 results['world'] = self._world_pipeline(**ctx)
             except Exception as exc:  # noqa: BLE001 — defensive
+                self.get_logger().exception('world race worker crashed')
                 results['world'] = self._empty_result(
                     'yolo_world', error=f'world worker crashed: {exc}'
                 )
@@ -562,6 +578,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     client_holder=vlm_client_holder,
                 )
             except Exception as exc:  # noqa: BLE001 — defensive
+                self.get_logger().exception('vlm race worker crashed')
                 results['vlm'] = self._empty_result(
                     'vlm_sam', error=f'vlm worker crashed: {exc}'
                 )
@@ -653,8 +670,15 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             )
 
     def _log_debug(self, _t0, request, prompt, rgb_img, result):
-        """Write per-call debug artifacts based on the winning pipeline."""
-        used_source = result['source'] if result['objects'] else 'none'
+        """Write per-call debug artifacts. Fires unconditionally — empty
+        results, errors, and rejected requests all leave an audit trail
+        whenever an RGB frame is available to render."""
+        objects = result.get('objects') or []
+        source = result.get('source') or 'none'
+        used_source = source if objects else 'none'
+        bboxes = result.get('bboxes') or []
+        masks = result.get('masks') or []
+        confs = result.get('confs') or []
         request_ctx = {
             'service': 'generalist_ObjectDetection',
             'prompt': prompt,
@@ -666,8 +690,15 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'use_vlm_sam_fallback': bool(request.use_vlm_sam_fallback),
             'enable_vlm': bool(self.enable_vlm),
             'detection_source': used_source,
+            'n_objects': len(objects),
+            'n_bboxes': len(bboxes),
+            'error': result.get('error'),
         }
+
         if used_source == 'yolo':
+            # YOLO path: parent class stashed the rendered detection list
+            # in self._last_detection_info. Use the stashed rgb to keep the
+            # exact frame YOLO ran against.
             self._write_debug_artifacts(
                 self._last_rgb_img,
                 self._last_detection_info,
@@ -675,36 +706,37 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 branch='yolo',
                 timings={'yolo': time.perf_counter() - _t0},
             )
-        elif used_source in ('vlm_sam', 'yolo_world'):
-            bboxes = result['bboxes']
-            masks = result['masks']
-            confs = result['confs']
-            detections = []
-            for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
-                if mask is None or mask.sum() == 0:
-                    continue
-                detections.append({
-                    'bbox': bbox,
-                    'mask': mask,
-                    'cls_name': prompt,
-                    'conf': confs[i] if i < len(confs) else 1.0,
-                })
-            timings = {'sam': result['sam_elapsed']}
-            if used_source == 'vlm_sam':
-                timings['vlm'] = result['vlm_elapsed']
-            else:
-                timings['yolo_world'] = result['world_elapsed']
-            self._write_debug_artifacts(
-                rgb_img,
-                detections,
-                request_ctx=request_ctx,
-                branch=used_source,
-                vlm_raw=(
-                    [list(bbox) for bbox in bboxes]
-                    if used_source == 'vlm_sam' else None
-                ),
-                timings=timings,
-            )
+            return
+
+        # vlm_sam / yolo_world / none — render from the live result dict.
+        detections = []
+        for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
+            if mask is None or mask.sum() == 0:
+                continue
+            detections.append({
+                'bbox': bbox,
+                'mask': mask,
+                'cls_name': prompt,
+                'conf': confs[i] if i < len(confs) else 1.0,
+            })
+        timings: dict[str, float] = {'total': time.perf_counter() - _t0}
+        if result.get('sam_elapsed'):
+            timings['sam'] = result['sam_elapsed']
+        if result.get('vlm_elapsed'):
+            timings['vlm'] = result['vlm_elapsed']
+        if result.get('world_elapsed'):
+            timings['yolo_world'] = result['world_elapsed']
+        self._write_debug_artifacts(
+            rgb_img,
+            detections,
+            request_ctx=request_ctx,
+            branch=used_source,
+            vlm_raw=(
+                [list(bbox) for bbox in bboxes]
+                if source == 'vlm_sam' and bboxes else None
+            ),
+            timings=timings,
+        )
 
     # --- helpers ---------------------------------------------------------
 
@@ -800,11 +832,19 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         segments: list = []
         for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
             if mask is None or mask.sum() == 0:
+                self.get_logger().warn(
+                    f'fallback object {i}: empty mask post-CC for bbox={bbox}; '
+                    'skipping'
+                )
                 continue
             centroid = self._calculate_centroid(
                 points, mask, valid_mask, bbox, camera
             )
             if centroid is None:
+                self.get_logger().warn(
+                    f'fallback object {i}: invalid centroid for bbox={bbox}; '
+                    'skipping'
+                )
                 continue
             obj = Object()
             obj.conf = float(confs[i]) if confs and i < len(confs) else 1.0

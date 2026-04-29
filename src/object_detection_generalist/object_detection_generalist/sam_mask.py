@@ -14,6 +14,8 @@ from typing import Iterable, Sequence
 import cv2
 import numpy as np
 
+from vision_util.mask_utils import largest_connected_component
+
 
 Bbox = tuple[int, int, int, int]  # (x1, y1, x2, y2) pixel coords
 
@@ -85,7 +87,10 @@ class FastSAMPredictor:
                         (w, h),
                         interpolation=cv2.INTER_NEAREST,
                     )
-                out.append(m > 0.5)
+                # FastSAM frequently returns multi-blob masks (sliver bg
+                # fragments, gaps). Drop everything except the largest CC
+                # so downstream centroid + segments contract holds.
+                out.append(largest_connected_component((m > 0.5).astype(bool)))
             else:
                 # Fewer masks than bboxes returned — emit empty mask so the
                 # caller keeps 1:1 alignment with its bbox list.

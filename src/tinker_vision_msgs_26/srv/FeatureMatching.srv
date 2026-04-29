@@ -1,5 +1,6 @@
 string camera
 string[] features
+sensor_msgs/Image[] comparison_images
 float32 max_distance
 string target_frame
 

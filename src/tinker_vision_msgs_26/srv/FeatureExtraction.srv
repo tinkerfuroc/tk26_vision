@@ -3,3 +3,4 @@ string camera
 int32 status
 string error_msg
 string feature
+sensor_msgs/Image comparison_image

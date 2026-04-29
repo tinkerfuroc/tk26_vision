@@ -2,6 +2,24 @@
 
 End-to-end walkthrough for calibrating the transform chain from `base_link` through the pan-tilt head to the Orbbec camera's `head_camera_link` frame (renamed from `camera_link` to avoid collision with the xArm URDF's `link_eef → camera_link` edge), using the xArm's forward kinematics as ground truth and a ChArUco board rigidly attached to the xArm end-effector as the observation target.
 
+
+## To Run
+
+```bash
+ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0 launch_robot_state_publisher:=false
+ros2 launch mobile_bringup grasp_bringup.launch.py
+ros2 run pick_and_place pick_and_place
+ros2 launch orbbec_camera femto_bolt.launch.py depth_registration:=true enable_ir:=false enable_frame_sync:=false enable_color_auto_exposure:=false enable_color_auto_white_balance:=false color_exposure:=25000 color_gain:=100 color_white_balance:=3500 color_width:=1920 color_height:=1080 color_fps:=30 # adjust accordingly
+```
+
+And then
+
+```bash
+ros2 run pan_tilt calibrate_web --ros-args -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml -p bind:=127.0.0.1 -p port:=8123 -p draft_yaml_out:=/tmp/calibration.draft.yaml
+```
+
+
+
 ## What this calibrates
 
 ```

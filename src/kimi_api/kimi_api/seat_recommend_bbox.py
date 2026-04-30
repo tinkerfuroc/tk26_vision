@@ -42,10 +42,19 @@ class SeatRecommendBboxService(Node):
         self.camera_types = ['orbbec']
 
         self.declare_parameter('log_prompts', True)
-        # Set to 'google/gemini-2.5-pro' for harder multi-seat scenes; Flash
-        # is cheaper / faster and works for most cases.
-        self.declare_parameter('llm_model', 'google/gemini-2.5-flash')
-        self.declare_parameter('vlm_timeout_s', 20.0)
+        # Pro is the default — Flash's pointing accuracy on cluttered
+        # multi-seat scenes was unusable in the 2026-04-30 logs (point
+        # landed on people / coffee tables / armrests, never on the
+        # named cushion). Pro is documented by Google's spatial-
+        # understanding cookbook as the higher-precision tier; the ~1 s
+        # extra latency is acceptable for an HRI intake step. Override
+        # with `-p llm_model:=google/gemini-2.5-flash` for cheap regression
+        # checks where accuracy isn't being measured.
+        self.declare_parameter('llm_model', 'google/gemini-2.5-pro')
+        # 35 s (was 20) — Pro + thinking adds 3–8 s vs. Flash; 20 s was
+        # already tight on cluttered scenes and tripped the timeout when
+        # thinking is enforced.
+        self.declare_parameter('vlm_timeout_s', 35.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
@@ -65,8 +74,16 @@ class SeatRecommendBboxService(Node):
         # cushion-like surface (or gives up and fails clean).
         self.declare_parameter('snap_enabled', True)
         self.declare_parameter('snap_patch_half_px', 8)       # 17x17 plane fit
-        self.declare_parameter('snap_search_radius_px', 80)
-        self.declare_parameter('snap_min_horizontality', 0.6)  # |n_y|: 1=level, 0=vertical
+        # 200 px (was 80) — VLM pointing error is regularly >80 px on cluttered
+        # scenes, so the spiral has to reach the next cushion over, not just
+        # denoise within the current surface.
+        self.declare_parameter('snap_search_radius_px', 200)
+        # 0.85 (was 0.6) — 0.6 admitted ~53° tilts, accepting armrests, slanted
+        # laptop screens, and the side of a person's lap as "horizontal". 0.85
+        # (~32°) requires a near-level surface like an actual seat cushion.
+        # Side-effect: more `point_not_on_horizontal_surface` failures (correct
+        # behavior; the BT retries on status=1 instead of seating on a wall).
+        self.declare_parameter('snap_min_horizontality', 0.85)  # |n_y|: 1=level, 0=vertical
 
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
@@ -155,7 +172,13 @@ class SeatRecommendBboxService(Node):
             callback_group=self.camera_cb_group,
         )
 
-        self.tf_buffer = Buffer()
+        # 60 s cache: VLM seat calls take 10-25 s and the TF lookup uses the
+        # depth image's stamp (not "now"), so default 10 s buffer falls behind
+        # when the VLM stalls or retries. Sized to absorb vlm_max_retries *
+        # vlm_timeout_s (3 * 20 = 60 s default) without falling off the back.
+        self.tf_buffer = Buffer(
+            cache_time=rclpy.duration.Duration(seconds=120.0)
+        )
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.seat_srv = self.create_service(
@@ -173,12 +196,14 @@ class SeatRecommendBboxService(Node):
         )
 
     def camera_info_orbbec_callback(self, info):
-        with self.lock_info:
-            self.camera_intrinsic['orbbec'] = info
+        self.lock_info.acquire()
+        self.camera_intrinsic['orbbec'] = info
+        self.lock_info.release()
 
     def sync_orbbec_callback(self, color_msg, depth_msg):
-        with self.lock_img:
-            self.recent_sync['orbbec'] = (color_msg, depth_msg)
+        self.lock_img.acquire()
+        self.recent_sync['orbbec'] = (color_msg, depth_msg)
+        self.lock_img.release()
 
     def _fail(self, response, msg: str, *, log: bool = True):
         if log:
@@ -318,7 +343,7 @@ class SeatRecommendBboxService(Node):
                     return uu, vv, z
         return None
 
-    async def seat_recommend_bbox_callback(
+    def seat_recommend_bbox_callback(
         self,
         request: SeatRecommendBbox.Request,
         response: SeatRecommendBbox.Response,
@@ -345,6 +370,27 @@ class SeatRecommendBboxService(Node):
         except Exception as exc:  # noqa: BLE001
             return self._fail(response, f'cv_bridge conversion failed: {exc}')
 
+        self.get_logger().info(
+            f'Received seat recommendation request for camera {request.camera} '
+            f'(model={self.llm_model}, names={request.names}, features={request.features}, target_frame={request.target_frame}).'
+        )
+        # if transform needed, record TF at this point for use after Gemini fishes processing
+        transform = None
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                request.target_frame,
+                depth_msg.header.frame_id,
+                depth_msg.header.stamp,
+                rclpy.duration.Duration(seconds=1.0),
+            )
+        except TransformException as exc:
+            self.get_logger().warn(
+                f'TF lookup failed for frame {request.target_frame}: {exc}'
+            )
+            response.status = 1
+            response.error_msg = f'TF lookup failed for frame {request.target_frame}: {exc}'
+            return response
+
         try:
             # Orbbec Femto Bolt default: 16UC1 depth in millimeters.
             depth_arr_m = (
@@ -356,6 +402,11 @@ class SeatRecommendBboxService(Node):
         except Exception as exc:  # noqa: BLE001
             return self._fail(response, f'depth image decode failed: {exc}')
 
+        self.get_logger().info(
+            'Preparing for VLM call'
+            f'Camera data ready (color {color_img.shape[1]}x{color_img.shape[0]}, depth {depth_arr_m.shape[1]}x{depth_arr_m.shape[0]}). '
+            f'Elapsed {(time.time_ns() - start_time) / 1e9:.2f}s.'
+        )
         # 2. Gemini call — returns a pointing pixel + short label.
         try:
             label, point_xy, visible_seats, vlm_elapsed = request_seat(
@@ -392,6 +443,12 @@ class SeatRecommendBboxService(Node):
         }
         log_timings = {'vlm': vlm_elapsed}
         log_extras: dict = {}
+
+        self.get_logger().info(
+            f'VLM returned label={label!r}, point={point_xy} '
+            f'(elapsed {vlm_elapsed:.2f}s). '
+            f'Preparing response (snap={"on" if self.snap_enabled else "off"}).'
+        )
 
         def _write_log(detections, branch='seat_recommend_bbox'):
             if self._vision_logger.enabled:
@@ -520,13 +577,12 @@ class SeatRecommendBboxService(Node):
         # 4. Optional TF to target_frame.
         if request.target_frame and request.target_frame != centroid_header.frame_id:
             src = PointStamped(header=centroid_header, point=centroid_point)
+            if transform is None:
+                response.status = 2
+                response.error_msg = f'TF lookup failed for frame {request.target_frame}.'
+                response.centroid = src
+                return response
             try:
-                transform = self.tf_buffer.lookup_transform(
-                    request.target_frame,
-                    centroid_header.frame_id,
-                    centroid_header.stamp,
-                    rclpy.duration.Duration(seconds=1.0),
-                )
                 transformed = do_transform_point(src, transform)
                 centroid_header = transformed.header
                 centroid_point = transformed.point
@@ -534,6 +590,10 @@ class SeatRecommendBboxService(Node):
                 log_extras['event'] = 'tf_failed'
                 log_extras['centroid_3d_camera'] = [float(x), float(y), float(z)]
                 log_extras['depth_frame'] = depth_msg.header.frame_id
+                response.status = 3
+                response.error_msg = f'TF {depth_msg.header.frame_id} -> {request.target_frame} failed: {exc}'
+                response.centroid = PointStamped(header=centroid_header, point=centroid_point)
+                return response
                 return _fail_with_log(
                     f'TF {depth_msg.header.frame_id} -> {request.target_frame} failed: {exc}',
                     [log_det] + extra_dets,

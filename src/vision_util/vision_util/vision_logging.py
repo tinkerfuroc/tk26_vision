@@ -2,24 +2,42 @@
 
 Nodes that produce bounding boxes / segmentation masks / centroids instantiate
 ``VisionLogger`` in ``__init__`` and call ``.write(...)`` from their service /
-action callback. A process-scoped timestamped subdirectory is created lazily
-under ``base_folder`` on the first successful write.
+action callback. Every node in one robot session writes into the same
+timestamped subdirectory so artifacts from sibling nodes are co-located.
+
+Session resolution (first hit wins, evaluated lazily on first write):
+
+1. ``$TINKER_VISION_SESSION_TS`` env var (must match ``YYYYmmdd_HHMMSS``).
+   Exported by ``src/tk25_basic/src/scripts/master_*.sh`` and the tmux
+   dispatchers; tmux child shells inherit it.
+2. Newest existing ``<base>/<YYYYmmdd_HHMMSS>/`` subdir by mtime — lets a
+   late-spawned standalone node join the active session even when no
+   orchestrator stamped the env var.
+3. Fresh ``time.strftime`` cold-start (first run on a new machine).
 
 Artifact layout::
 
-    <base_folder>/<YYYYmmdd_HHMMSS>/
-        orig_<YYYYmmdd_HHMMSS_mmm>.jpg        # unannotated BGR frame
-        overlay_<YYYYmmdd_HHMMSS_mmm>.jpg     # bbox + mask tint + centroid dot
-        req_<YYYYmmdd_HHMMSS_mmm>.json        # request context + detections
+    <base>/<YYYYmmdd_HHMMSS>/
+        <tag>_<branch>_orig_<YYYYmmdd_HHMMSS_mmm>.jpg
+        <tag>_<branch>_overlay_<YYYYmmdd_HHMMSS_mmm>.jpg
+        <tag>_<branch>_req_<YYYYmmdd_HHMMSS_mmm>.json
 
-``base_folder`` is resolved relative to CWD if not absolute, matching the
-convention used across the rest of the tk26_vision tree.
+Where ``tag`` is ``node.get_name()`` (sanitized) and ``branch`` is the
+per-call tag the caller passes to ``write()`` (``'yolo'``, ``'feature_extraction'``,
+``'follow_head'``, …). When ``branch`` is empty the second underscore-segment
+is dropped. Auxiliary writers (e.g. ``feature_recognition``'s person crop,
+``feature_matching``'s reference image dumps) call :meth:`aux_path` to
+get a path under the same run_dir with the same prefix scheme.
+
+``base_folder`` is resolved relative to CWD when not absolute, matching
+the convention used across the rest of the tk26_vision tree.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Iterable, Mapping
 
@@ -27,12 +45,52 @@ import cv2
 import numpy as np
 
 
+_SESSION_TS_RE = re.compile(r'^\d{8}_\d{6}$')
+
+
+def _sanitize_tag(raw: str | None) -> str:
+    """Make a node name safe for use as a filename prefix."""
+    if not raw:
+        return 'unknown'
+    cleaned = raw.strip().lstrip('/')
+    cleaned = re.sub(r'[\s/]+', '_', cleaned)
+    cleaned = re.sub(r'_+', '_', cleaned)
+    return cleaned or 'unknown'
+
+
+def _json_safe(key: str, value):
+    """Coerce a detection-dict value into something json.dump can handle.
+
+    Iterables (list/tuple/ndarray) → list. ROS Point-like objects (have .x .y
+    but no __len__) → {x, y, z?} dict so the JSON stays grep-able instead of
+    falling through to default=str and producing repr noise.
+    """
+    if key == 'mask':
+        return value
+    if hasattr(value, '__iter__') and not isinstance(value, str):
+        return list(value)
+    if hasattr(value, 'x') and hasattr(value, 'y'):
+        out = {'x': float(value.x), 'y': float(value.y)}
+        if hasattr(value, 'z'):
+            out['z'] = float(value.z)
+        return out
+    return value
+
+
 class VisionLogger:
-    def __init__(self, node, enabled: bool, base_folder: str):
+    def __init__(self, node, enabled: bool, base_folder: str, tag: str | None = None):
         self._node = node
         self._enabled = bool(enabled)
         self._base = base_folder or 'vision_log'
         self._run_dir: str | None = None
+        derived_tag = tag
+        if derived_tag is None and node is not None:
+            try:
+                derived_tag = node.get_name()
+            except Exception:  # noqa: BLE001 — defensive; never crash logging on tag derivation
+                derived_tag = None
+        self._tag = _sanitize_tag(derived_tag)
+        self._malformed_env_warned = False
 
     @property
     def enabled(self) -> bool:
@@ -45,13 +103,78 @@ class VisionLogger:
     def run_dir(self) -> str | None:
         return self._run_dir
 
+    @property
+    def tag(self) -> str:
+        return self._tag
+
+    def _resolve_run_ts(self) -> str:
+        """Layered session resolution: env var → newest-existing → cold-start."""
+        env_ts = os.environ.get('TINKER_VISION_SESSION_TS', '').strip()
+        if env_ts:
+            if _SESSION_TS_RE.match(env_ts):
+                return env_ts
+            if not self._malformed_env_warned and self._node is not None:
+                self._node.get_logger().warn(
+                    f'vision_logging: ignoring malformed '
+                    f'TINKER_VISION_SESSION_TS={env_ts!r}'
+                )
+                self._malformed_env_warned = True
+
+        try:
+            with os.scandir(self._base) as it:
+                candidates = [
+                    (entry.stat().st_mtime, entry.name)
+                    for entry in it
+                    if entry.is_dir() and _SESSION_TS_RE.match(entry.name)
+                ]
+        except FileNotFoundError:
+            candidates = []
+        except OSError as exc:
+            if self._node is not None:
+                self._node.get_logger().warn(
+                    f'vision_logging: scandir({self._base!r}) failed: {exc}'
+                )
+            candidates = []
+
+        if candidates:
+            _, newest = max(candidates, key=lambda pair: pair[0])
+            if self._node is not None:
+                self._node.get_logger().info(
+                    f'vision_logging: joining existing session {newest}'
+                )
+            return newest
+
+        run_ts = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+        if self._node is not None:
+            self._node.get_logger().info(
+                f'vision_logging: starting new session {run_ts}'
+            )
+        return run_ts
+
     def _ensure_run_dir(self) -> str:
         if self._run_dir is None:
-            run_ts = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+            run_ts = self._resolve_run_ts()
             self._run_dir = os.path.join(self._base, run_ts)
-        if not os.path.exists(self._run_dir):
             os.makedirs(self._run_dir, exist_ok=True)
         return self._run_dir
+
+    def _compose_path(self, run_dir: str, ts: str, kind: str, ext: str,
+                      branch: str = '') -> str:
+        parts = [self._tag]
+        if branch:
+            parts.append(branch)
+        parts.append(kind)
+        stem = '_'.join(parts)
+        return os.path.join(run_dir, f'{stem}_{ts}.{ext}')
+
+    def aux_path(self, ts: str, suffix: str, ext: str, branch: str = '') -> str:
+        """Compose a path under the session run_dir using the shared prefix
+        scheme (``<tag>_<branch>_<suffix>_<ts>.<ext>``). Used by side-file
+        writers (e.g. ``feature_recognition``'s ``crop``,
+        ``feature_matching``'s ``ref<i>``). Idempotently ensures the run_dir.
+        """
+        run_dir = self._ensure_run_dir()
+        return self._compose_path(run_dir, ts, suffix, ext, branch=branch)
 
     def write(
         self,
@@ -85,9 +208,9 @@ class VisionLogger:
                 time.strftime('%Y%m%d_%H%M%S', time.localtime())
                 + f'_{int(time.time() * 1000) % 1000:03d}'
             )
-            orig_path = os.path.join(run_dir, f'orig_{ts}.jpg')
-            overlay_path = os.path.join(run_dir, f'overlay_{ts}.jpg')
-            req_path = os.path.join(run_dir, f'req_{ts}.json')
+            orig_path = self._compose_path(run_dir, ts, 'orig', 'jpg', branch=branch)
+            overlay_path = self._compose_path(run_dir, ts, 'overlay', 'jpg', branch=branch)
+            req_path = self._compose_path(run_dir, ts, 'req', 'json', branch=branch)
 
             cv2.imwrite(orig_path, rgb_img)
 
@@ -127,14 +250,21 @@ class VisionLogger:
                             )
 
                 centroid = det.get('centroid')
-                if centroid is not None and len(centroid) >= 2:
-                    cx, cy = int(centroid[0]), int(centroid[1])
-                    if 0 <= cx < overlay.shape[1] and 0 <= cy < overlay.shape[0]:
-                        cv2.circle(overlay, (cx, cy), 5, (0, 0, 255), -1)
+                # Pixel-space dot only when centroid is a 2D pixel tuple/list/
+                # ndarray. geometry_msgs/Point (3D metric, no __len__) shows up
+                # here on the YOLO branch — those values aren't pixel coords,
+                # so skip the overlay marker and rely on JSON for the value.
+                if centroid is not None and hasattr(centroid, '__len__'):
+                    try:
+                        if len(centroid) >= 2:
+                            cx, cy = int(centroid[0]), int(centroid[1])
+                            if 0 <= cx < overlay.shape[1] and 0 <= cy < overlay.shape[0]:
+                                cv2.circle(overlay, (cx, cy), 5, (0, 0, 255), -1)
+                    except (TypeError, ValueError):
+                        pass
 
                 json_dets.append({
-                    k: (list(v) if hasattr(v, '__iter__') and not isinstance(v, str)
-                        and k != 'mask' else v)
+                    k: _json_safe(k, v)
                     for k, v in det.items()
                     if k != 'mask'
                 })
@@ -160,6 +290,7 @@ class VisionLogger:
 
             payload = {
                 'branch': branch,
+                'tag': self._tag,
                 'request': dict(request_ctx or {}),
                 'n_detections': len(dets_list),
                 'detections': json_dets,

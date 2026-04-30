@@ -271,6 +271,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             rgb_img=rgb_img, points=points, valid_mask=valid_mask,
             prompt=prompt, camera=camera, header=header,
             sort_mode=sort_mode, return_segments=request.return_segments,
+            target_frame=request.target_frame,
         )
 
         yolo_known = prompt in self._yolo_class_names
@@ -332,6 +333,14 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         response.objects = objects
         response.detection_source = result['source'] if objects else 'none'
         response.status = 0 if objects else 1
+        # Object centroids are now in target_frame (parent + fallback both
+        # transform). Mirror the frame on the response header so the
+        # PointStamped pair the caller builds is internally consistent.
+        if (
+            request.target_frame
+            and self._frame_supports_tf_transform(camera)
+        ):
+            response.header.frame_id = request.target_frame
         if not objects:
             response.error_msg = result.get('error') or (
                 f'no matches for "{prompt}" via {result["source"]}'
@@ -402,11 +411,13 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         }
 
     def _yolo_pipeline(self, *, rgb_img, points, valid_mask, prompt,
-                       camera, header, sort_mode, return_segments) -> dict:
+                       camera, header, sort_mode, return_segments,
+                       target_frame='') -> dict:
         """Run pretrained YOLO via the parent's `_detect_objects`."""
         yolo_objects_msg, yolo_segments = self._detect_objects(
             rgb_img, points, prompt, valid_mask, header, camera,
             request_segments=return_segments, sort_mode=sort_mode,
+            target_frame=target_frame,
         )
         result = self._empty_result('yolo')
         result['objects'] = list(yolo_objects_msg.objects)
@@ -414,7 +425,8 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         return result
 
     def _world_pipeline(self, *, rgb_img, points, valid_mask, prompt,
-                        camera, header, sort_mode, return_segments) -> dict:
+                        camera, header, sort_mode, return_segments,
+                        target_frame='') -> dict:
         """Run YOLO-World + FastSAM. Returns a result dict (never raises)."""
         if self._world is None:
             return self._empty_result(
@@ -438,6 +450,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         objects, segments = self._build_fallback_objects(
             prompt, bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments, confs=confs,
+            header=header, target_frame=target_frame,
         )
         if objects:
             objects, segments = self._sort_objects_and_segments(
@@ -455,6 +468,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
     def _vlm_pipeline(self, *, rgb_img, points, valid_mask, prompt,
                       camera, header, sort_mode, return_segments,
+                      target_frame='',
                       abandon_event=None, client_holder=None) -> dict:
         """Run VLM + FastSAM. Returns a result dict (never raises).
 
@@ -506,6 +520,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         objects, segments = self._build_fallback_objects(
             prompt, bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments,
+            header=header, target_frame=target_frame,
         )
         if objects:
             objects, segments = self._sort_objects_and_segments(
@@ -816,6 +831,8 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         camera: str,
         return_segments: bool,
         confs: list[float] | None = None,
+        header=None,
+        target_frame: str = '',
     ):
         """Convert (bbox, mask) pairs into Object[] via parent centroid logic.
 
@@ -825,11 +842,25 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         conf=1.0. Callers that want to filter on confidence should branch on
         the response's ``detection_source`` (`'yolo'` and `'yolo_world'`
         carry real scores; `'vlm_sam'` does not).
+
+        ``header`` + ``target_frame`` are forwarded to ``_transform_centroid``
+        so fallback centroids land in the same frame the YOLO branch
+        produces — see parent class for the contract.
         """
         import numpy as np
 
         objects: list[Object] = []
         segments: list = []
+        source_frame = header.frame_id if header is not None else ''
+        stamp = header.stamp if header is not None else None
+        # Hoist the source -> target lookup out of the per-bbox loop.
+        # On failure we drop the whole fallback batch (returning empty)
+        # to avoid emitting confidently-wrong centroids.
+        centroid_tf, batch_ok = self._lookup_centroid_transform(
+            source_frame, target_frame, stamp, camera,
+        )
+        if not batch_ok:
+            return [], []
         for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
             if mask is None or mask.sum() == 0:
                 self.get_logger().warn(
@@ -846,6 +877,10 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     'skipping'
                 )
                 continue
+            if centroid_tf is not None:
+                centroid = self._apply_centroid_transform(
+                    centroid, centroid_tf, source_frame, stamp,
+                )
             obj = Object()
             obj.conf = float(confs[i]) if confs and i < len(confs) else 1.0
             obj.cls = prompt

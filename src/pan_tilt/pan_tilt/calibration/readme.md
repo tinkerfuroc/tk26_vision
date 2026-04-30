@@ -280,6 +280,70 @@ Restart the robot stack.
 
 **Important:** if you used `polish.json` (T_B rotation fit), don't mentally compare the new `rpy` to the *old* URDF's `rpy` — the old value was a known artifact from a different calibration convention. Compare against the physical mount direction instead.
 
+#### Forward-camera invariant
+
+For a forward-facing head camera (the only configuration we ship), the body-frame yaw of `camera_mount_joint`'s `rpy` must be within ±π/2 of zero. The patcher and the chain/polish solvers all enforce this invariant by default. A fitted yaw near ±π is the smoking-gun signature of an upstream optical→body convention bug — typically a missed conversion in the Phase-1 hand-eye result that propagated through `warm_start_t_b_rotation` into the chain seed — and the URDF will **not** be patched until you investigate the root cause.
+
+If you encounter this refusal:
+
+```
+ERROR: Refusing to patch URDF: camera_mount_joint fitted yaw = 3.0935 rad (177.2°).
+Forward-facing cameras must have |yaw| < π/2 (90°). This usually means the
+optical→body convention was missed in the Phase-1 hand-eye warm start.
+To override (e.g. you genuinely mounted the camera backward), pass
+--allow-flipped-camera. The existing URDF rpy is preserved.
+```
+
+…it means **don't ship this calibration as-is.** The most common cause is a stale or convention-mismatched Phase-1 dataset feeding `warm_start_t_b_rotation`; re-run the hand-eye solve and confirm `t_base_cam_ref` is in body-frame coordinates (camera +X = forward in `base_link`) before retrying.
+
+For genuinely backward-mounted hardware, opt in explicitly:
+
+```bash
+# Solver side (chain or polish)
+ros2 run pan_tilt run_calibration chain ... --allow-flipped-camera
+
+# Patcher side (apply_to_urdf must also be told)
+python -m pan_tilt.calibration.apply_to_urdf \
+    --results chain.json \
+    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro \
+    --out /tmp/patched.urdf.xacro \
+    --allow-flipped-camera
+```
+
+`warm_start_t_b_rotation` also surfaces a `UserWarning` whenever the back-solved yaw exceeds ±π/4, well before the patcher refusal — watch the calibration log for that warning even on runs that ultimately succeed; it's the earliest signal that something upstream is drifting.
+
+#### Runtime joint offsets — the URDF patch is only half the story
+
+`apply_to_urdf` patches the *static* parts of the chain (`pan_joint` xyz, `camera_mount_joint` xyz/rpy), but the calibration also produces two *runtime* offsets — `theta_p_offset` and `theta_t_offset` — that the URDF's revolute joints know nothing about. The state publisher (`pan_tilt_state_publisher`) is responsible for adding these to the firmware feedback before publishing `/joint_states`, so the URDF's `R_z(-pan_joint)` and `R_y(+tilt_joint)` end up matching the calibration FK exactly.
+
+After every calibration, copy the offsets that `apply_to_urdf` prints on success into `src/tk26_vision/src/pan_tilt/config/pan_tilt.yaml`:
+
+```yaml
+pan_tilt_state_publisher:
+  ros__parameters:
+    pan_offset_rad:  <theta_p_offset_rad from polish.json>
+    tilt_offset_rad: <theta_t_offset_rad from polish.json>
+```
+
+Skipping this step leaves the URDF chain mis-representing the camera's pose by up to ~45° (the parked-tilt angle) — typical symptom is "vision points project below ground" in seat-recommend / arm-pointing tests. Restart the pan_tilt launch after both the URDF rebuild AND the YAML edit.
+
+#### Tinker 2026 is in basin-π — `--allow-flipped-camera` is the normal path here
+
+The pan-axis is rotationally periodic and `cmd_chain` runs a two-basin warm start (`basin0` at `theta_p_off=0`, `basinπ` at `theta_p_off=π`). On most hardware basin-0 wins; on this Tinker the pan servo is mounted such that **basin-π fits 18° better** (1.6° rot RMSE vs basin-0's 20°). `_prefer_basin_zero` only keeps basin-0 on near-tied data; here it correctly hands off to basin-π and prints:
+
+```
+Chosen basin: basinπ (basinπ won decisively over basin0; theta_p_off=+3.144).
+```
+
+That's expected — *for this robot*. The downstream consequence: the calibration's `t_b_rotvec` ends up with a body-frame yaw near ±π (the basin-π companion to the +π pan offset), so `apply_to_urdf` will refuse without `--allow-flipped-camera`. Pass the flag on both the solver and the patcher (the calibration data is genuinely flipped, the operator is acknowledging the hardware reality, not bypassing a safety check):
+
+```bash
+python -m pan_tilt.calibration.run_calibration polish ... --allow-flipped-camera
+python -m pan_tilt.calibration.apply_to_urdf  ... --allow-flipped-camera
+```
+
+The state-publisher offsets in `pan_tilt.yaml` and the URDF's `camera_mount_joint` rpy together encode the basin choice; they MUST be applied as a pair from the same `polish.json`. Mixing a basin-π URDF with basin-0 offsets (or vice versa) breaks the TF chain by 180° — that's the 2026-04-30 incident root cause documented at the top of this section.
+
 ### 9. Verify
 
 1. Launch the updated stack: `ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0`.

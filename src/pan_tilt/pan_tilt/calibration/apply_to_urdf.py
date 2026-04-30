@@ -35,14 +35,19 @@ import argparse
 import difflib
 import json
 import math
+import os
 import re
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .utils import body_yaw_from_rotvec, rotvec_to_xyz_euler
+from .yaml_targets import list_yaml_targets
 
 
 # ---- forward-camera invariant ----------------------------------------------
@@ -84,6 +89,18 @@ ATTACH_XYZ_DEFAULT_RE = re.compile(
 )
 ATTACH_RPY_DEFAULT_RE = re.compile(
     r"(?P<key>attach_rpy:=')(?P<val>[^']*)(?P<close>')"
+)
+
+
+# YAML patchers — surgical regex (preserves comments/whitespace; no ruamel
+# dependency). The trailing `(.*)$` capture preserves any inline comment.
+_YAML_PAN_RE = re.compile(
+    r"^(?P<lead>\s*pan_offset_rad:\s*)\S+(?P<trail>.*)$",
+    re.MULTILINE,
+)
+_YAML_TILT_RE = re.compile(
+    r"^(?P<lead>\s*tilt_offset_rad:\s*)\S+(?P<trail>.*)$",
+    re.MULTILINE,
 )
 
 
@@ -214,9 +231,174 @@ def _patched_xacro(
     )
 
 
+# ---- pan_tilt.yaml runtime-offset patcher ----------------------------------
+#
+# The URDF chain is geometrically incomplete on its own: the calibration's
+# theta_p_offset / theta_t_offset live in pan_tilt.yaml and the state
+# publisher applies them to firmware feedback. URDF + YAML must come from
+# the same calibration JSON or the TF chain is wrong. The 2026-04-30
+# below-ground-projection bug came from exactly this drift.
+#
+# We surgically substitute the two values in-place, preserving every
+# surrounding character (indentation, comments, blank lines, key order).
+
+def _patch_yaml_offsets(
+    yaml_text: str, pan_offset_rad: float, tilt_offset_rad: float,
+) -> str:
+    """Surgical in-place replacement of `pan_offset_rad` and `tilt_offset_rad`.
+
+    Raises :class:`CalibrationApplyError` if either key is missing — the
+    operator must add them once to the source YAML (see calibration/readme.md)
+    before running the patcher. Failing loudly here beats silently leaving
+    the calibration half-applied.
+    """
+    pan_text, n_pan = _YAML_PAN_RE.subn(
+        lambda m: f"{m.group('lead')}{pan_offset_rad:.10f}{m.group('trail')}",
+        yaml_text, count=1,
+    )
+    if n_pan == 0:
+        raise CalibrationApplyError(
+            "pan_tilt.yaml has no `pan_offset_rad:` key under "
+            "pan_tilt_state_publisher.ros__parameters. Add the key once "
+            "(see calibration/readme.md → Runtime joint offsets) before "
+            "running apply_to_urdf, or pass --no-yaml to skip the YAML "
+            "patch entirely."
+        )
+    out_text, n_tilt = _YAML_TILT_RE.subn(
+        lambda m: f"{m.group('lead')}{tilt_offset_rad:.10f}{m.group('trail')}",
+        pan_text, count=1,
+    )
+    if n_tilt == 0:
+        raise CalibrationApplyError(
+            "pan_tilt.yaml has no `tilt_offset_rad:` key under "
+            "pan_tilt_state_publisher.ros__parameters. Add the key once "
+            "(see calibration/readme.md → Runtime joint offsets) before "
+            "running apply_to_urdf, or pass --no-yaml to skip the YAML "
+            "patch entirely."
+        )
+    return out_text
+
+
+def _resolve_yaml_path(cli_yaml: Optional[Path], no_yaml: bool) -> Optional[Path]:
+    """Resolve which (if any) pan_tilt.yaml to patch.
+
+    Precedence:
+      1. `--no-yaml` → None.
+      2. `--yaml <path>` → that path (must exist).
+      3. Auto-discovery via `list_yaml_targets()` — install share dir.
+
+    Returns ``None`` only when the operator explicitly opted out via
+    `--no-yaml`. Auto-discovery failure raises so the operator can't
+    accidentally ship a half-applied calibration.
+    """
+    if no_yaml:
+        return None
+    if cli_yaml is not None:
+        if not cli_yaml.is_file():
+            raise CalibrationApplyError(
+                f"--yaml path {cli_yaml} does not exist."
+            )
+        return cli_yaml
+    targets = [t for t in list_yaml_targets() if t.exists]
+    if not targets:
+        raise CalibrationApplyError(
+            "Could not auto-discover pan_tilt.yaml (pan_tilt package not "
+            "installed? rebuild it). Pass --yaml <path> or --no-yaml to "
+            "skip the YAML patch."
+        )
+    return Path(targets[0].path)
+
+
+def _atomic_write_pair(
+    xacro: Path, patched_xacro: str,
+    yaml_path: Optional[Path], pan_offset_rad: float, tilt_offset_rad: float,
+    *,
+    timestamp: Optional[str] = None,
+) -> dict:
+    """Atomically replace `xacro` (and optionally `yaml_path`) with patched
+    content. Both originals are saved as `.old-<ts>` siblings on success.
+
+    Returns a dict describing what landed and the backup paths, suitable
+    for callers (CLI / calib_web) to print or render.
+
+    On YAML write failure, the URDF is rolled back from its backup so the
+    operator never sees a half-applied calibration. Idempotent: when the
+    new content matches the original, no backup is written and the
+    corresponding `*_applied` flag is False.
+    """
+    ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = uuid.uuid4().hex[:8]
+
+    original_xacro_bytes = xacro.read_bytes()
+    new_xacro_bytes = patched_xacro.encode("utf-8")
+    xacro_changed = new_xacro_bytes != original_xacro_bytes
+
+    yaml_changed = False
+    new_yaml_bytes: Optional[bytes] = None
+    original_yaml_bytes: Optional[bytes] = None
+    if yaml_path is not None:
+        original_yaml_text = yaml_path.read_text()
+        original_yaml_bytes = original_yaml_text.encode("utf-8")
+        patched_yaml = _patch_yaml_offsets(
+            original_yaml_text, pan_offset_rad, tilt_offset_rad,
+        )
+        new_yaml_bytes = patched_yaml.encode("utf-8")
+        yaml_changed = new_yaml_bytes != original_yaml_bytes
+
+    result = {
+        "xacro_path": str(xacro),
+        "xacro_applied": xacro_changed,
+        "xacro_backup_path": None,
+        "yaml_path": str(yaml_path) if yaml_path is not None else None,
+        "yaml_applied": yaml_changed,
+        "yaml_backup_path": None,
+    }
+    if not xacro_changed and not yaml_changed:
+        return result
+
+    xacro_tmp = xacro.with_name(xacro.name + f".tmp-{run_id}") if xacro_changed else None
+    if xacro_tmp is not None:
+        xacro_tmp.write_bytes(new_xacro_bytes)
+
+    yaml_tmp = (
+        yaml_path.with_name(yaml_path.name + f".tmp-{run_id}")
+        if yaml_changed and yaml_path is not None
+        else None
+    )
+    if yaml_tmp is not None:
+        yaml_tmp.write_bytes(new_yaml_bytes)  # type: ignore[arg-type]
+
+    xacro_bak: Optional[Path] = None
+    yaml_bak: Optional[Path] = None
+    try:
+        if xacro_tmp is not None:
+            xacro_bak = xacro.with_name(xacro.name + f".old-{ts}")
+            xacro_bak.write_bytes(original_xacro_bytes)
+            os.replace(xacro_tmp, xacro)
+            result["xacro_backup_path"] = str(xacro_bak)
+        if yaml_tmp is not None and yaml_path is not None:
+            yaml_bak = yaml_path.with_name(yaml_path.name + f".old-{ts}")
+            yaml_bak.write_bytes(original_yaml_bytes)  # type: ignore[arg-type]
+            os.replace(yaml_tmp, yaml_path)
+            result["yaml_backup_path"] = str(yaml_bak)
+    except Exception:
+        # Roll back URDF if the YAML side failed mid-replace; clean up tmps.
+        if xacro_bak is not None and xacro.read_bytes() != original_xacro_bytes:
+            os.replace(xacro_bak, xacro)
+        if xacro_tmp is not None:
+            xacro_tmp.unlink(missing_ok=True)
+        if yaml_tmp is not None:
+            yaml_tmp.unlink(missing_ok=True)
+        raise
+
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Emit a diff patching a pan-tilt xacro from calibration results.",
+        description="Patch a pan-tilt xacro AND pan_tilt.yaml from calibration "
+                    "results in lockstep — single command leaves the deployment "
+                    "completely ready (no manual YAML edit).",
     )
     parser.add_argument("--results", required=True, type=Path,
                         help="chain.json or polish.json produced by run_calibration")
@@ -225,7 +407,21 @@ def main(argv=None):
                              "(standalone form under tk26_vision/, or the "
                              "tk25_basic macro form under tinker_urdf/src/)")
     parser.add_argument("--out", type=Path, default=None,
-                        help="if set, write the full patched xacro here (instead of stdout diff)")
+                        help="If set, write the full patched xacro here AND "
+                             "skip the in-place URDF replacement / YAML patch "
+                             "(diff/dry-run mode).")
+    parser.add_argument("--yaml", type=Path, default=None,
+                        help="Path to pan_tilt.yaml (default: auto-discover the "
+                             "pan_tilt package's installed config). The file's "
+                             "pan_offset_rad / tilt_offset_rad keys are updated "
+                             "in place with a `.old-<ts>` backup, atomically "
+                             "alongside the URDF patch.")
+    parser.add_argument("--no-yaml", action="store_true",
+                        help="Skip the YAML patch entirely. Only use for "
+                             "dry runs or when the runtime offsets live "
+                             "elsewhere — without the YAML, the URDF chain "
+                             "mis-represents the camera pose at any non-zero "
+                             "firmware tilt.")
     parser.add_argument("--allow-flipped-camera", action="store_true",
                         help="Override the forward-camera invariant (|yaw| < π/2). "
                              "Use ONLY when the head camera is genuinely mounted "
@@ -255,34 +451,72 @@ def main(argv=None):
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(2)
 
+    # Dry-run / diff mode: --out detaches the URDF write from the YAML
+    # patch. Print the diff/file as before and a YAML-paste hint, but
+    # don't touch any installed file.
     if args.out:
         args.out.write_text(patched)
         print(f"Wrote patched xacro to {args.out}")
         print("Review, then replace the original if the content is correct.")
-    else:
-        diff = difflib.unified_diff(
-            original.splitlines(keepends=True),
-            patched.splitlines(keepends=True),
-            fromfile=str(args.xacro),
-            tofile=str(args.xacro) + " (calibrated)",
+        print(
+            f"\n→ For the matching runtime offsets (paste into "
+            f"src/tk26_vision/src/pan_tilt/config/pan_tilt.yaml under "
+            f"pan_tilt_state_publisher.ros__parameters):\n"
+            f"    pan_offset_rad:  {pan_offset_rad:.10f}\n"
+            f"    tilt_offset_rad: {tilt_offset_rad:.10f}\n"
+            f"\n(Re-run without --out to apply both URDF + YAML "
+            f"atomically in place.)"
         )
-        print("".join(diff), end="")
+        return
 
-    # Operator hint: the URDF patch alone isn't enough — the calibration's
-    # joint offsets must also land in pan_tilt.yaml so the state publisher
-    # adds them to firmware feedback before publishing /joint_states. Print
-    # the values straight from the JSON we already loaded; the operator
-    # pastes them into pan_tilt_state_publisher.ros__parameters.
+    # In-place lockstep apply: URDF + YAML, atomic with backups.
+    try:
+        yaml_path = _resolve_yaml_path(args.yaml, args.no_yaml)
+    except CalibrationApplyError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        result = _atomic_write_pair(
+            args.xacro, patched,
+            yaml_path, pan_offset_rad, tilt_offset_rad,
+        )
+    except CalibrationApplyError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    if not result["xacro_applied"] and not result["yaml_applied"]:
+        print("No change — URDF and YAML already match the calibration.")
+        return
+
+    print(f"Patched URDF: {result['xacro_path']}")
+    if result["xacro_backup_path"]:
+        print(f"  backup:    {result['xacro_backup_path']}")
+    elif not result["xacro_applied"]:
+        print(f"  (no change — URDF already matches calibration)")
+
+    if yaml_path is not None:
+        print(f"Patched YAML: {result['yaml_path']}")
+        if result["yaml_backup_path"]:
+            print(f"  backup:    {result['yaml_backup_path']}")
+        elif not result["yaml_applied"]:
+            print(f"  (no change — YAML already matches calibration)")
+        print(
+            f"  pan_offset_rad:  {pan_offset_rad:.10f}\n"
+            f"  tilt_offset_rad: {tilt_offset_rad:.10f}"
+        )
+    else:
+        print(
+            "YAML patch SKIPPED (--no-yaml). The URDF chain will misrepresent "
+            f"the camera pose by ~{abs(math.degrees(tilt_offset_rad)):.0f}° "
+            f"of tilt at firmware-zero until you set pan_offset_rad / "
+            f"tilt_offset_rad in pan_tilt.yaml manually."
+        )
+
     print(
-        f"\n→ Calibration runtime offsets (paste into "
-        f"src/tk26_vision/src/pan_tilt/config/pan_tilt.yaml under "
-        f"pan_tilt_state_publisher.ros__parameters):\n"
-        f"    pan_offset_rad:  {pan_offset_rad:.6f}\n"
-        f"    tilt_offset_rad: {tilt_offset_rad:.6f}\n"
-        f"\nRestart the pan_tilt launch after BOTH the URDF rebuild AND "
-        f"the YAML edit; without the offsets the URDF chain mis-represents "
-        f"the camera's pose by ~{abs(math.degrees(tilt_offset_rad)):.0f}° "
-        f"of tilt at firmware-zero."
+        "\nRebuild the affected URDF package, then restart the pan_tilt "
+        "launch. Both URDF and YAML are now sourced from the same "
+        f"calibration ({args.results.name})."
     )
 
 

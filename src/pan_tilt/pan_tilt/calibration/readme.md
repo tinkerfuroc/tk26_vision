@@ -312,20 +312,35 @@ python -m pan_tilt.calibration.apply_to_urdf \
 
 `warm_start_t_b_rotation` also surfaces a `UserWarning` whenever the back-solved yaw exceeds ±π/4, well before the patcher refusal — watch the calibration log for that warning even on runs that ultimately succeed; it's the earliest signal that something upstream is drifting.
 
-#### Runtime joint offsets — the URDF patch is only half the story
+#### Runtime joint offsets — patched in lockstep with the URDF
 
-`apply_to_urdf` patches the *static* parts of the chain (`pan_joint` xyz, `camera_mount_joint` xyz/rpy), but the calibration also produces two *runtime* offsets — `theta_p_offset` and `theta_t_offset` — that the URDF's revolute joints know nothing about. The state publisher (`pan_tilt_state_publisher`) is responsible for adding these to the firmware feedback before publishing `/joint_states`, so the URDF's `R_z(-pan_joint)` and `R_y(+tilt_joint)` end up matching the calibration FK exactly.
+`apply_to_urdf` patches both halves of the calibration in one shot:
 
-After every calibration, copy the offsets that `apply_to_urdf` prints on success into `src/tk26_vision/src/pan_tilt/config/pan_tilt.yaml`:
+1. **URDF static geometry** — `pan_joint` xyz, `camera_mount_joint` xyz/rpy.
+2. **Runtime offsets in `pan_tilt.yaml`** — `pan_offset_rad` / `tilt_offset_rad` under `pan_tilt_state_publisher.ros__parameters`. The state publisher adds these to firmware feedback before publishing `/joint_states`, so the URDF's `R_z(-pan_joint)` and `R_y(+tilt_joint)` end up matching the calibration FK exactly.
 
-```yaml
-pan_tilt_state_publisher:
-  ros__parameters:
-    pan_offset_rad:  <theta_p_offset_rad from polish.json>
-    tilt_offset_rad: <theta_t_offset_rad from polish.json>
+The patcher auto-discovers `pan_tilt.yaml` via `ament_index_python` and writes both files atomically, leaving `.old-<timestamp>` backups for each. The "Apply patch" button in the calib_web UI runs the same in-process orchestrator and surfaces both backups in its success message. **No manual YAML edit is required.**
+
+CLI:
+
+```bash
+python -m pan_tilt.calibration.apply_to_urdf \
+    --results polish.json \
+    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro
+# Patched URDF: .../pan_tilt.urdf.xacro
+#   backup:    .../pan_tilt.urdf.xacro.old-20260501_103000
+# Patched YAML: .../config/pan_tilt.yaml
+#   backup:    .../config/pan_tilt.yaml.old-20260501_103000
+#   pan_offset_rad:  3.1449572018
+#   tilt_offset_rad: -1.8735170869
 ```
 
-Skipping this step leaves the URDF chain mis-representing the camera's pose by up to ~45° (the parked-tilt angle) — typical symptom is "vision points project below ground" in seat-recommend / arm-pointing tests. Restart the pan_tilt launch after both the URDF rebuild AND the YAML edit.
+Flags:
+- `--yaml <path>` — override the auto-discovered YAML (e.g. for a per-robot overlay).
+- `--no-yaml` — patch the URDF only. Use only for dry runs; without the YAML offsets the URDF chain mis-represents the camera's pose by up to ~45° (the parked-tilt angle) and vision points project below ground.
+- `--out <path>` — write the patched URDF to a side file instead of replacing in place. Falls back to the legacy "paste these into YAML" hint since the in-place orchestrator doesn't run in `--out` mode.
+
+Idempotent: if a file already matches the calibration, no backup for that file is written. Restart the pan_tilt launch after the URDF rebuild — the YAML edit is loaded automatically when the state publisher restarts.
 
 #### Tinker 2026 is in basin-π — `--allow-flipped-camera` is the normal path here
 

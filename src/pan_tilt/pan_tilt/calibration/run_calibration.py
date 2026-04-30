@@ -87,6 +87,50 @@ def _save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2))
 
 
+# Basin tie-breaker margin (rad). When `basin0` and `basinπ` produce
+# rot RMSE within this much of each other we prefer `basin0`, because both
+# basins represent valid local minima for the same data but `basin0` keeps
+# `theta_p_offset` numerically small (≈0 instead of ≈±π). Small offsets are
+# friendlier to the runtime URDF + state-publisher pipeline and avoid
+# tripping the apply_to_urdf yaw guard. Only when basinπ is decisively
+# better (likely indicating physically-flipped hardware) do we keep it.
+_BASIN_PREFER_ZERO_MARGIN_RAD = np.deg2rad(1.0)
+
+
+def _prefer_basin_zero(candidates):
+    """Pick the best chain-fit candidate, preferring basin0 within the margin.
+
+    `candidates` is a list of (basin_label, initial, params, report) tuples
+    as produced by the two-basin warm-start in `cmd_chain`. Returns the
+    chosen tuple.
+
+    Selection rule:
+      - If only one basin succeeded, pick it.
+      - Otherwise, identify the basin0 candidate. If its rot_rmse is within
+        `_BASIN_PREFER_ZERO_MARGIN_RAD` of the global minimum, use it.
+        Else, use whichever has the lowest rot_rmse (typically basinπ; rare).
+
+    The naïve `min(rot_rmse)` selector is unstable on noise-free or
+    near-noise-free fixtures because both basins converge to virtually the
+    same residual; the resulting basin choice is a coin flip. With this
+    rule basin0 wins on flat-tie data, eliminating recalibration churn.
+    """
+    if not candidates:
+        raise ValueError("no candidates")
+    if len(candidates) == 1:
+        return candidates[0]
+
+    by_label = {c[0]: c for c in candidates}
+    basin0 = by_label.get("basin0")
+    if basin0 is None:
+        return min(candidates, key=lambda c: c[3].rot_rmse_rad)
+
+    best_rot = min(c[3].rot_rmse_rad for c in candidates)
+    if basin0[3].rot_rmse_rad - best_rot <= _BASIN_PREFER_ZERO_MARGIN_RAD:
+        return basin0
+    return min(candidates, key=lambda c: c[3].rot_rmse_rad)
+
+
 def _params_to_dict(p: PanTiltParams) -> dict:
     return {
         "t_a": p.t_a.tolist(),
@@ -421,6 +465,7 @@ def cmd_chain(args):
             fit_pan_offset=args.fit_pan_offset,
             fit_tb_rotation=args.unlock_tb_rotation,
             loss=args.loss,
+            allow_flipped_camera=getattr(args, "allow_flipped_camera", False),
         )
         candidates.append((basin_label, warm, params_c, report_c))
         print(
@@ -432,10 +477,36 @@ def cmd_chain(args):
     # in the right spot (chain has 7 DOF and trans contributes 3); but the
     # rotation residual sits ~20° in the wrong basin and well under 1° in
     # the right one, making it a clean separator.
-    best = min(candidates, key=lambda c: c[3].rot_rmse_rad)
+    # Path C — prefer basin0 over basinπ when their rot residuals are
+    # within `_BASIN_PREFER_ZERO_MARGIN_RAD` of each other. Both basins
+    # are valid local minima describing the same physical chain, but
+    # basin0 keeps `theta_p_offset` near 0 instead of near ±π — friendlier
+    # to the state-publisher's runtime offset and avoids tripping
+    # apply_to_urdf's yaw guard. The naive min(rot_rmse) tie-breaker
+    # oscillates between basins across recalibrations on near-noiseless
+    # data; this preference removes that churn.
+    best = _prefer_basin_zero(candidates)
     basin_label, initial, params, report = best
-    print(f"Chosen basin: {basin_label}")
+    if abs(params.theta_p_offset) > np.pi / 2:
+        print(
+            f"Chosen basin: {basin_label} (basinπ won decisively over basin0; "
+            f"theta_p_off={params.theta_p_offset:+.4f}). If this is unexpected, "
+            f"recheck the Phase-1 hand-eye conventions and the camera mount "
+            f"orientation — calibration is on the flipped basin."
+        )
+    else:
+        print(f"Chosen basin: {basin_label}")
     print("TRAIN:", report.summary())
+
+    # Operator-facing hint for the runtime offset YAML — these go straight
+    # into config/pan_tilt.yaml under pan_tilt_state_publisher.
+    print(
+        f"\n→ Calibration runtime offsets (paste into "
+        f"src/tk26_vision/src/pan_tilt/config/pan_tilt.yaml under "
+        f"pan_tilt_state_publisher.ros__parameters):\n"
+        f"    pan_offset_rad:  {params.theta_p_offset:.6f}\n"
+        f"    tilt_offset_rad: {params.theta_t_offset:.6f}\n"
+    )
 
     _, val_report = fit_chain(
         val,
@@ -443,6 +514,7 @@ def cmd_chain(args):
         initial=params,
         fit_pan_offset=args.fit_pan_offset,
         loss="linear",
+        allow_flipped_camera=getattr(args, "allow_flipped_camera", False),
     )
     # val_report re-optimizes on val; to truly measure generalization we want
     # the predicted residuals for `val` with `params` held fixed.
@@ -532,6 +604,7 @@ def cmd_polish(args):
             fit_tb_rotation=args.unlock_tb_rotation,
             fit_pan_offset=args.fit_pan_offset,
             loss=args.loss,
+            allow_flipped_camera=getattr(args, "allow_flipped_camera", False),
         )
         if not do_reject:
             break
@@ -840,6 +913,12 @@ def main(argv=None):
     pc.add_argument("--loss", default="soft_l1")
     pc.add_argument("--val-seed", type=int, default=0)
     pc.add_argument("--verbose", action="store_true")
+    pc.add_argument("--allow-flipped-camera", action="store_true",
+                    help="Override the forward-camera invariant (T_B body-frame "
+                         "yaw bound widens from ±π/2 to ±π). Use ONLY when the "
+                         "head camera is genuinely mounted backward — the default "
+                         "bound catches the 2026-04-30 backward-camera bug where "
+                         "a missed optical→body conversion produced yaw≈+π.")
     pc.set_defaults(func=cmd_chain)
 
     pp = sub.add_parser("polish", help="Phase 3: joint refinement.")
@@ -869,6 +948,10 @@ def main(argv=None):
                          "threshold still flags samples.")
     pp.add_argument("--no-reject", action="store_true",
                     help="Disable the iterative MAD-sigma rejection. --exclude-indices still applies.")
+    pp.add_argument("--allow-flipped-camera", action="store_true",
+                    help="Override the forward-camera invariant (T_B body-frame "
+                         "yaw bound widens from ±π/2 to ±π). Use ONLY when the "
+                         "head camera is genuinely mounted backward.")
     pp.set_defaults(func=cmd_polish)
 
     pg = sub.add_parser("gates", help="Print PASS/FAIL summary for static phase gates.")

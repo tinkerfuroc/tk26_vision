@@ -26,6 +26,9 @@ pose predicted via `FK^-1 @ T_base_ee @ T_ee_marker`.
 
 from __future__ import annotations
 
+import logging
+import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -42,11 +45,87 @@ from .pan_tilt_model import (
     unpack_joint,
 )
 from .utils import (
+    body_yaw_from_rotvec,
     invert_transform,
     pose_error_scalars,
     sample_to_matrices,
     se3_log_residual,
 )
+
+
+_log = logging.getLogger(__name__)
+
+
+# ---- forward-camera invariant ----------------------------------------------
+#
+# For a forward-facing head camera (the configuration we ship), the body-frame
+# yaw of `t_b_rotvec` (camera_mount_joint rpy yaw) must stay within ±π/2 of
+# zero. A value near ±π is the smoking-gun signature of a flipped optical→body
+# conversion somewhere upstream and was the root cause of the 2026-04-30
+# backward-camera incident. Anyone calibrating a genuinely backward-mounted
+# camera must opt in via `allow_flipped_camera=True`.
+
+_FORWARD_YAW_LIMIT_RAD = math.pi / 2.0
+_FLIPPED_YAW_LIMIT_RAD = math.pi
+
+
+def _t_b_rotvec_z_index_chain(fit_pan_offset: bool) -> int:
+    """Index of the t_b_rotvec Z component in `pack_chain` output.
+
+    pack_chain layout (only when fit_tb_rotation=True):
+        t_a (3) + t_b_trans (3) + theta_t (1) [+ theta_p (1)] + t_b_rotvec (3)
+
+    The Z component is the last entry of t_b_rotvec.
+    """
+    base = 3 + 3 + 1 + (1 if fit_pan_offset else 0)
+    return base + 2
+
+
+def _t_b_rotvec_z_index_joint(fit_pan_offset: bool) -> int:
+    """Index of the t_b_rotvec Z component in `pack_joint` output.
+
+    pack_joint layout (only when fit_tb_rotation=True):
+        t_a (3) + t_b_trans (3) + t_ee_marker_rot (3) + t_ee_marker_trans (3)
+        + theta_t (1) [+ theta_p (1)] + t_b_rotvec (3)
+    """
+    base = 3 + 3 + 3 + 3 + 1 + (1 if fit_pan_offset else 0)
+    return base + 2
+
+
+def _build_bounds(
+    n_params: int,
+    yaw_index: Optional[int],
+    *,
+    allow_flipped_camera: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bounds for least_squares: open on every parameter except t_b_rotvec[Z].
+
+    `yaw_index=None` means t_b_rotvec is locked at the warm-start value and
+    not in the parameter vector — return fully-open bounds.
+    """
+    lo = np.full(n_params, -np.inf)
+    hi = np.full(n_params, +np.inf)
+    if yaw_index is not None:
+        limit = (
+            _FLIPPED_YAW_LIMIT_RAD
+            if allow_flipped_camera
+            else _FORWARD_YAW_LIMIT_RAD
+        )
+        lo[yaw_index] = -limit
+        hi[yaw_index] = +limit
+    return lo, hi
+
+
+def _clip_initial_to_bounds(x0: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """Project the initial guess into the bound box.
+
+    scipy.least_squares raises if x0 is strictly outside `bounds`, so when the
+    warm-start lands at e.g. yaw=+π (the bug we're guarding against) we must
+    clip first or the solver call dies. Clipping pushes the seed onto the
+    boundary, which is the right behavior — the bound is the operator's
+    declaration that the truth lives inside.
+    """
+    return np.clip(x0, lo, hi)
 
 
 @dataclass
@@ -107,6 +186,7 @@ def fit_chain(
     fit_tb_rotation: bool = False,
     loss: str = "soft_l1",
     verbose: int = 0,
+    allow_flipped_camera: bool = False,
 ) -> tuple[PanTiltParams, OptReport]:
     """Phase-2 fit: solve pan-tilt chain params given a known T_ee_marker.
 
@@ -133,6 +213,11 @@ def fit_chain(
         breaks the degeneracy.
     loss
         scipy.optimize.least_squares `loss` kwarg; soft_l1 is robust to outliers.
+    allow_flipped_camera
+        Default **False** (forward-facing camera). When True the body-frame
+        yaw bound on T_B widens from ±π/2 to ±π — set this only when the
+        camera is genuinely mounted backward on the head. See module-level
+        forward-camera invariant.
     """
     template = initial or PanTiltParams()
     x0 = pack_chain(
@@ -140,6 +225,14 @@ def fit_chain(
         fit_pan_offset=fit_pan_offset,
         fit_tb_rotation=fit_tb_rotation,
     )
+
+    yaw_idx = (
+        _t_b_rotvec_z_index_chain(fit_pan_offset) if fit_tb_rotation else None
+    )
+    lo, hi = _build_bounds(
+        x0.size, yaw_idx, allow_flipped_camera=allow_flipped_camera,
+    )
+    x0 = _clip_initial_to_bounds(x0, lo, hi)
 
     t_base_cam_gt = _predict_chain_gt(samples, t_ee_marker)
 
@@ -150,6 +243,7 @@ def fit_chain(
         method="trf",
         loss=loss,
         verbose=verbose,
+        bounds=(lo, hi),
     )
 
     params = unpack_chain(
@@ -195,10 +289,31 @@ def warm_start_t_b_rotation(
     pre = T_a @ R_pan0 @ T_lp @ R_tilt0
     T_b = invert_transform(pre) @ t_base_cam_ref
 
+    rotvec = Rotation.from_matrix(T_b[:3, :3]).as_rotvec()
+    yaw = body_yaw_from_rotvec(rotvec)
+    # Forward-facing cameras land near 0; the original 2026-04-30
+    # backward-camera incident showed up here as ~+π. Suppress the warning
+    # only when the caller explicitly seeded a flipped-basin exploration
+    # (theta_p_offset ≈ ±π) — cmd_chain's two-basin search hits warm_start
+    # twice (basin0 + basinπ) and the basinπ branch always produces a
+    # flipped rotvec by construction, which is not a bug. The basin0 branch
+    # still triggers the warning if the bug recurs.
+    seeded_pi_basin = abs(abs(template.theta_p_offset) - math.pi) < 0.1
+    if abs(yaw) > math.pi / 4.0 and not seeded_pi_basin:
+        msg = (
+            f"warm-start t_b_rotvec yaw={yaw:.3f} rad "
+            f"({math.degrees(yaw):.1f}°) is far from 0 — this usually means "
+            f"the optical→body conversion was missed in the Phase-1 "
+            f"hand-eye result. Calibration may converge to a flipped basin; "
+            f"re-check Phase-1 conventions before trusting the URDF patch."
+        )
+        warnings.warn(msg, UserWarning, stacklevel=2)
+        _log.warning(msg)
+
     out = PanTiltParams(
         t_a=template.t_a.copy(),
         t_b_trans=T_b[:3, 3].copy(),
-        t_b_rotvec=Rotation.from_matrix(T_b[:3, :3]).as_rotvec(),
+        t_b_rotvec=rotvec,
         t_ee_marker_rotvec=template.t_ee_marker_rotvec.copy(),
         t_ee_marker_trans=template.t_ee_marker_trans.copy(),
         theta_t_offset=template.theta_t_offset,
@@ -239,11 +354,24 @@ def fit_joint(
     fit_pan_offset: bool = False,
     loss: str = "soft_l1",
     verbose: int = 0,
+    allow_flipped_camera: bool = False,
 ) -> tuple[PanTiltParams, OptReport]:
-    """Phase-3 polish: joint fit over all parameters including T_ee_marker."""
+    """Phase-3 polish: joint fit over all parameters including T_ee_marker.
+
+    `allow_flipped_camera` widens the body-frame yaw bound on T_B from ±π/2
+    to ±π — see module-level forward-camera invariant.
+    """
     x0 = pack_joint(
         initial, fit_tb_rotation=fit_tb_rotation, fit_pan_offset=fit_pan_offset
     )
+
+    yaw_idx = (
+        _t_b_rotvec_z_index_joint(fit_pan_offset) if fit_tb_rotation else None
+    )
+    lo, hi = _build_bounds(
+        x0.size, yaw_idx, allow_flipped_camera=allow_flipped_camera,
+    )
+    x0 = _clip_initial_to_bounds(x0, lo, hi)
 
     result = least_squares(
         _joint_residuals,
@@ -252,6 +380,7 @@ def fit_joint(
         method="trf",
         loss=loss,
         verbose=verbose,
+        bounds=(lo, hi),
     )
 
     params = unpack_joint(

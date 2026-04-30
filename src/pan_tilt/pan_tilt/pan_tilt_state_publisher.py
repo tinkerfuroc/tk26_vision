@@ -1,5 +1,6 @@
 """Joint-state publisher for the pan-tilt assembly."""
 
+import math
 import time
 from typing import Optional
 
@@ -18,12 +19,33 @@ class PanTiltStatePublisherNode(Node):
         self.declare_parameter('pan_joint_name', 'pan_joint')
         self.declare_parameter('tilt_joint_name', 'tilt_joint')
         self.declare_parameter('stale_timeout_sec', 0.5)
+        # Calibration-derived offsets (rad) added to firmware feedback before
+        # publishing to /joint_states. The URDF chain has no notion of the
+        # firmware-zero-vs-URDF-zero offset; without these the TF chain
+        # mis-represents the camera's pose by up to ~45° (the parked-tilt
+        # angle), which is what produced "points project below ground" in
+        # the seat-recommend pipeline. Source values from polish.json's
+        # theta_p_offset_rad / theta_t_offset_rad after each calibration.
+        self.declare_parameter('pan_offset_rad', 0.0)
+        self.declare_parameter('tilt_offset_rad', 0.0)
 
         self._state_topic = self.get_parameter('state_topic').value
         self._joint_state_topic = self.get_parameter('joint_state_topic').value
         self._pan_joint_name = self.get_parameter('pan_joint_name').value
         self._tilt_joint_name = self.get_parameter('tilt_joint_name').value
         self._stale_timeout_sec = float(self.get_parameter('stale_timeout_sec').value)
+        self._pan_offset_rad = float(self.get_parameter('pan_offset_rad').value)
+        self._tilt_offset_rad = float(self.get_parameter('tilt_offset_rad').value)
+        self.get_logger().info(
+            f"Calibration offsets: pan={self._pan_offset_rad:+.4f} rad "
+            f"({math.degrees(self._pan_offset_rad):+.2f}°), "
+            f"tilt={self._tilt_offset_rad:+.4f} rad "
+            f"({math.degrees(self._tilt_offset_rad):+.2f}°). "
+            f"Source these from polish.json's theta_p_offset_rad / "
+            f"theta_t_offset_rad after each calibration; both zero means "
+            f"the URDF will mis-represent the camera pose at any non-zero "
+            f"firmware tilt."
+        )
 
         self._joint_state_pub = self.create_publisher(
             JointState,
@@ -45,7 +67,15 @@ class PanTiltStatePublisherNode(Node):
         joint_state = JointState()
         joint_state.header = msg.header
         joint_state.name = [self._pan_joint_name, self._tilt_joint_name]
-        joint_state.position = [msg.pan_rad, msg.tilt_rad]
+        # Conventions match the calibration FK in pan_tilt_model:
+        #   forward_kinematics does R_z(-(pan + p_off)) @ ... @ R_y(tilt + t_off)
+        #   URDF pan_joint axis="0 0 -1" → R_axis(joint) = R_z(-joint)
+        #   URDF tilt_joint axis="0 1 0" → R_axis(joint) = R_y(+joint)
+        # so the URDF computes the right TF iff joint_value = firmware + offset.
+        joint_state.position = [
+            msg.pan_rad + self._pan_offset_rad,
+            msg.tilt_rad + self._tilt_offset_rad,
+        ]
         self._joint_state_pub.publish(joint_state)
 
         if msg.feedback_ok:

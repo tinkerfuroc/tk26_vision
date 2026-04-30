@@ -12,17 +12,14 @@ start cleanly even when `OPENROUTER_API_KEY` is unset (T1 invariant).
 
 from __future__ import annotations
 
-import base64
 import json
-import os
-import tempfile
 import time
 from typing import List, Tuple
 
-import cv2
 import numpy as np
 
 from kimi_api._env import base_url, load_env, require_api_key
+from kimi_api._image_utils import encode_to_data_url
 
 
 Bbox = Tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixel coords
@@ -76,19 +73,6 @@ _RESPONSE_SCHEMA = {
     'required': ['detections'],
     'additionalProperties': False,
 }
-
-
-def _encode_data_url(rgb_bgr: np.ndarray) -> str:
-    """Encode a BGR image as a JPEG data URL."""
-    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        cv2.imwrite(tmp_path, rgb_bgr)
-        with open(tmp_path, 'rb') as f:
-            data = f.read()
-    finally:
-        os.unlink(tmp_path)
-    return f'data:image/jpeg;base64,{base64.b64encode(data).decode("utf-8")}'
 
 
 def _decode_bbox(box_2d, w: int, h: int) -> Bbox | None:
@@ -186,7 +170,7 @@ def request_bboxes(
 
     _t0 = time.perf_counter()
     try:
-        data_url = _encode_data_url(rgb_bgr)
+        data_url = encode_to_data_url(rgb_bgr)
         h, w = rgb_bgr.shape[:2]
 
         messages = [

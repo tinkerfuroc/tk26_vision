@@ -1409,3 +1409,196 @@ def test_prefer_basin_zero_handles_single_candidate():
 
     only = _make_chain_candidate("basin0", np.deg2rad(0.5))
     assert _prefer_basin_zero([only])[0] == "basin0"
+
+
+# ---- pan_tilt.yaml lockstep patching ---------------------------------------
+#
+# 2026-05-01 follow-up: the URDF and pan_tilt.yaml runtime offsets must be
+# updated atomically from the same calibration JSON. apply_to_urdf gained a
+# YAML patcher; these tests pin its surface.
+
+
+_YAML_FIXTURE = """\
+pan_tilt_state_publisher:
+  ros__parameters:
+    state_topic: /pan_tilt_controller/state
+    joint_state_topic: /pan_tilt/joint_states
+    pan_joint_name: pan_joint
+    tilt_joint_name: tilt_joint
+    stale_timeout_sec: 0.5
+    # Source values from polish.json after every calibration.
+    pan_offset_rad: 0.0
+    tilt_offset_rad: 0.0  # parked-tilt nominal
+
+follow_head_node:
+  ros__parameters:
+    home_pan_deg: 0.0
+    home_tilt_deg: 45.0
+"""
+
+
+def test_patch_yaml_offsets_replaces_values_only():
+    """The YAML patcher must update the two offset values and leave every
+    other byte (comments, blank lines, indentation, unrelated keys) untouched."""
+    from pan_tilt.calibration.apply_to_urdf import _patch_yaml_offsets
+
+    out = _patch_yaml_offsets(_YAML_FIXTURE, 0.012345, -0.785398)
+
+    # Values updated.
+    assert "pan_offset_rad: 0.0123450000" in out
+    assert "tilt_offset_rad: -0.7853980000" in out
+    # Comments preserved.
+    assert "# Source values from polish.json after every calibration." in out
+    assert "# parked-tilt nominal" in out
+    # Unrelated keys / sections preserved.
+    assert "follow_head_node:" in out
+    assert "home_pan_deg: 0.0" in out
+    # All other lines byte-identical (sanity: line count unchanged).
+    assert out.count("\n") == _YAML_FIXTURE.count("\n")
+
+
+def test_patch_yaml_offsets_idempotent():
+    """Patching twice with the same offsets returns the same string —
+    exercise the no-op path the orchestrator uses to skip backups."""
+    from pan_tilt.calibration.apply_to_urdf import _patch_yaml_offsets
+
+    once = _patch_yaml_offsets(_YAML_FIXTURE, 0.012345, -0.785398)
+    twice = _patch_yaml_offsets(once, 0.012345, -0.785398)
+    assert once == twice
+
+
+def test_patch_yaml_offsets_missing_keys_raises():
+    """A YAML without the keys must raise CalibrationApplyError naming the
+    missing key — the operator's signal to add them once before re-running
+    apply_to_urdf."""
+    from pan_tilt.calibration.apply_to_urdf import (
+        CalibrationApplyError, _patch_yaml_offsets,
+    )
+
+    no_pan = "\n".join(
+        line for line in _YAML_FIXTURE.splitlines()
+        if "pan_offset_rad: 0.0" not in line
+    ) + "\n"
+    with pytest.raises(CalibrationApplyError, match=r"pan_offset_rad"):
+        _patch_yaml_offsets(no_pan, 0.1, 0.2)
+
+    no_tilt = "\n".join(
+        line for line in _YAML_FIXTURE.splitlines()
+        if "tilt_offset_rad: 0.0" not in line
+    ) + "\n"
+    with pytest.raises(CalibrationApplyError, match=r"tilt_offset_rad"):
+        _patch_yaml_offsets(no_tilt, 0.1, 0.2)
+
+
+def test_apply_to_urdf_main_writes_both_files(tmp_path):
+    """`apply_to_urdf.main` must update URDF AND YAML in lockstep, leave
+    `.old-<ts>` backups for both, and source both values from the same
+    calibration JSON. This is the regression for the 2026-04-30 manual-
+    paste failure mode."""
+    import json
+    from pan_tilt.calibration import apply_to_urdf
+
+    xacro_src = (
+        '<?xml version="1.0"?>\n'
+        '<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <parent link="base_link"/><child link="pan_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <parent link="tilt_link"/><child link="head_camera_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '</robot>\n'
+    )
+    xacro_path = tmp_path / "pan_tilt.urdf.xacro"
+    xacro_path.write_text(xacro_src)
+    yaml_path = tmp_path / "pan_tilt.yaml"
+    yaml_path.write_text(_YAML_FIXTURE)
+
+    # Forward-facing calibration so the yaw guard doesn't refuse.
+    results = {
+        "params": {
+            "t_a": [-0.30, -0.02, 1.52],
+            "t_b_trans": [-0.08, -0.01, 0.08],
+            "t_b_rotvec": [0.0, 0.0, -0.05],
+            "theta_p_offset_rad": 0.012345,
+            "theta_t_offset_rad": -0.785398,
+        }
+    }
+    results_path = tmp_path / "polish.json"
+    results_path.write_text(json.dumps(results))
+
+    apply_to_urdf.main([
+        "--results", str(results_path),
+        "--xacro",   str(xacro_path),
+        "--yaml",    str(yaml_path),
+    ])
+
+    # URDF rewritten with the new mount values.
+    new_xacro = xacro_path.read_text()
+    assert 'xyz="-0.08 -0.01 0.08"' in new_xacro
+    # YAML rewritten with the matching offsets (10-decimal precision).
+    new_yaml = yaml_path.read_text()
+    assert "pan_offset_rad: 0.0123450000" in new_yaml
+    assert "tilt_offset_rad: -0.7853980000" in new_yaml
+    # Comments preserved.
+    assert "# Source values from polish.json after every calibration." in new_yaml
+
+    # Both `.old-<ts>` backups present.
+    xacro_backups = list(tmp_path.glob("pan_tilt.urdf.xacro.old-*"))
+    yaml_backups = list(tmp_path.glob("pan_tilt.yaml.old-*"))
+    assert len(xacro_backups) == 1, f"expected 1 URDF backup, got {xacro_backups}"
+    assert len(yaml_backups) == 1, f"expected 1 YAML backup, got {yaml_backups}"
+    # Backups carry the original (pre-patch) content byte-for-byte.
+    assert xacro_backups[0].read_text() == xacro_src
+    assert yaml_backups[0].read_text() == _YAML_FIXTURE
+    # No tmp files left behind.
+    assert not list(tmp_path.glob("*.tmp-*"))
+
+
+def test_apply_to_urdf_main_yaml_idempotent(tmp_path):
+    """Running apply_to_urdf twice with the same calibration must NOT create
+    a second pair of backups — the no-op path keeps the workspace tidy."""
+    import json, time
+    from pan_tilt.calibration import apply_to_urdf
+
+    xacro_src = (
+        '<?xml version="1.0"?>\n<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n</robot>\n'
+    )
+    xacro_path = tmp_path / "pan_tilt.urdf.xacro"
+    xacro_path.write_text(xacro_src)
+    yaml_path = tmp_path / "pan_tilt.yaml"
+    yaml_path.write_text(_YAML_FIXTURE)
+    results_path = tmp_path / "polish.json"
+    results_path.write_text(json.dumps({
+        "params": {
+            "t_a": [-0.30, -0.02, 1.52],
+            "t_b_trans": [-0.08, -0.01, 0.08],
+            "t_b_rotvec": [0.0, 0.0, -0.05],
+            "theta_p_offset_rad": 0.012345,
+            "theta_t_offset_rad": -0.785398,
+        }
+    }))
+
+    argv = [
+        "--results", str(results_path),
+        "--xacro", str(xacro_path),
+        "--yaml", str(yaml_path),
+    ]
+    apply_to_urdf.main(argv)
+    time.sleep(1.05)  # ensure a different timestamp would be issued
+    apply_to_urdf.main(argv)
+
+    # First run produced a pair of backups; second run is a no-op so
+    # only the original pair survives.
+    xacro_backups = list(tmp_path.glob("pan_tilt.urdf.xacro.old-*"))
+    yaml_backups = list(tmp_path.glob("pan_tilt.yaml.old-*"))
+    assert len(xacro_backups) == 1, f"second run should be no-op, got {xacro_backups}"
+    assert len(yaml_backups) == 1, f"second run should be no-op, got {yaml_backups}"

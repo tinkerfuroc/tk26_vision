@@ -800,6 +800,38 @@ if (BTN_PROMOTE) BTN_PROMOTE.addEventListener('click', async () => {
   }
 });
 
+const BTN_DEDUPE = $('#btn-dedupe');
+if (BTN_DEDUPE) BTN_DEDUPE.addEventListener('click', async () => {
+  const status = $('#dedupe-status');
+  if (!confirm('Drop near-duplicate waypoints from the in-memory lists?\n\nThe change is in-memory only -- click Save or Promote afterward to persist.')) {
+    return;
+  }
+  status.textContent = 'deduping…';
+  status.className = 'status-line warn';
+  try {
+    const r = await fetch('/api/waypoints/dedupe', { method: 'POST' });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      const removed = body.removed || {};
+      const entries = Object.entries(removed);
+      if (entries.length === 0) {
+        status.textContent = 'no duplicates found';
+      } else {
+        const summary = entries.map(([k, v]) => `${k}=${v}`).join(', ');
+        status.textContent = `removed: ${summary}  (Save or Promote to persist)`;
+      }
+      status.className = 'status-line ok';
+      await fetchWaypoints();
+    } else {
+      status.textContent = 'FAIL: ' + (body.detail || JSON.stringify(body));
+      status.className = 'status-line err';
+    }
+  } catch (e) {
+    status.textContent = 'ERROR: ' + e;
+    status.className = 'status-line err';
+  }
+});
+
 async function _reloadWaypointsFromSource(source, confirmMsg) {
   const status = $('#reload-status');
   if (confirmMsg && !confirm(confirmMsg)) return;
@@ -1632,10 +1664,23 @@ $('#calib-urdf-diff-btn').addEventListener('click', async () => {
     });
     const body = await r.json();
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
-    const diff = body.diff || '(no changes)';
-    diffEl.innerHTML = _colorizeDiff(diff);
-    const changed = diff.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length;
-    statusEl.textContent = `diff: ${changed} changed lines`;
+    const urdfDiff = body.diff || '(no URDF changes)';
+    const yamlDiff = body.yaml_diff || '';
+    const yamlPath = body.yaml_path || '';
+    let combined = urdfDiff;
+    if (yamlDiff) {
+      combined += '\n\n' + (
+        yamlPath
+          ? `--- ${yamlPath} (runtime offsets)\n+++ ${yamlPath} (calibrated)\n`
+          : ''
+      ) + yamlDiff;
+    } else if (yamlPath) {
+      combined += `\n\n# YAML ${yamlPath} already matches calibration\n`;
+    }
+    diffEl.innerHTML = _colorizeDiff(combined);
+    const changed = (urdfDiff + '\n' + yamlDiff)
+      .split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length;
+    statusEl.textContent = `diff: ${changed} changed lines (URDF + YAML)`;
     statusEl.className = 'status-line ok';
   } catch (e) {
     statusEl.textContent = 'FAIL: ' + e.message;
@@ -1690,12 +1735,34 @@ $('#calib-urdf-apply-btn').addEventListener('click', async () => {
     statusEl.className = 'status-line ok';
     $('#calib-urdf-rebuild-cmd').textContent = body.build_command || '';
     $('#calib-urdf-rebuild-hint').textContent = body.workspace_hint || '';
-    $('#calib-urdf-backup-hint').textContent = body.backup_path
-      ? `Backup: ${body.backup_path}`
-      : '';
+    // Two-line backup hint: URDF + YAML. The YAML line surfaces whether
+    // the runtime offsets just changed (or were already current) so the
+    // operator never wonders whether they still need to hand-edit it.
+    const backupLines = [];
+    if (body.backup_path) {
+      backupLines.push(`URDF backup: ${body.backup_path}`);
+    }
+    if (body.yaml_path) {
+      if (body.yaml_applied && body.yaml_backup_path) {
+        const pan = body.pan_offset_rad?.toFixed(10) ?? '?';
+        const tilt = body.tilt_offset_rad?.toFixed(10) ?? '?';
+        backupLines.push(
+          `YAML backup: ${body.yaml_backup_path}`,
+          `Runtime offsets: pan=${pan}, tilt=${tilt}`,
+        );
+      } else {
+        backupLines.push(`YAML: already matches calibration (no change)`);
+      }
+    }
+    $('#calib-urdf-backup-hint').textContent = backupLines.join('\n');
     rebuildEl.hidden = false;
-    if (body.diff_preview) {
-      $('#calib-urdf-diff').innerHTML = _colorizeDiff(body.diff_preview);
+    // Combined diff preview: URDF first, YAML below.
+    let preview = body.diff_preview || '';
+    if (body.yaml_diff_preview) {
+      preview += (preview ? '\n\n' : '') + body.yaml_diff_preview;
+    }
+    if (preview) {
+      $('#calib-urdf-diff').innerHTML = _colorizeDiff(preview);
     }
   } catch (e) {
     statusEl.textContent = 'FAIL: ' + e.message;

@@ -162,9 +162,11 @@
           <div class="joint-controls">
             <button id="btn-save" class="primary" type="button">Save to draft YAML</button>
             <button id="btn-promote" type="button">Promote to calibration.yaml</button>
+            <button id="btn-dedupe" type="button" title="Drop near-duplicate waypoints from the in-memory lists. Save or Promote afterward to persist.">Dedupe duplicates</button>
           </div>
           <p id="save-status" class="status-line"></p>
           <p id="promote-status" class="status-line"></p>
+          <p id="dedupe-status" class="status-line"></p>
 
           <h3>Reload</h3>
           <p class="muted">
@@ -388,7 +390,7 @@
         <p><b>Patch written.</b> Rebuild the package so the new geometry is loaded:</p>
         <pre id="calib-urdf-rebuild-cmd"></pre>
         <p class="muted" id="calib-urdf-rebuild-hint"></p>
-        <p class="muted" id="calib-urdf-backup-hint"></p>
+        <pre class="muted" id="calib-urdf-backup-hint" style="white-space: pre-line; font-size: 0.9em;"></pre>
       </div>
     </section>
 

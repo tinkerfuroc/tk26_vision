@@ -25,6 +25,7 @@ from pan_tilt.calibration.optimize import (
 )
 from pan_tilt.calibration.pan_tilt_model import PanTiltParams, forward_kinematics
 from pan_tilt.calibration.utils import (
+    body_yaw_from_rotvec,
     invert_transform,
     matrix_to_pose_dict,
     pose_error_scalars,
@@ -984,3 +985,620 @@ def test_validate_round_trip(tmp_path):
     bad_out = json.loads((tmp_path / "validation.json").read_text())
     assert bad_out["verdict"] in ("WARN", "FAIL"), bad_out
     assert np.degrees(bad_out["self_consistency"]["rot_rmse_rad"]) > 0.5, bad_out
+
+
+# ---- forward-camera invariant guardrails -----------------------------------
+#
+# 2026-04-30 incident: calibration shipped a `camera_mount_joint` URDF with
+# yaw ≈ +π, registering the head camera as facing backward in base_link. The
+# seat-recommend service then returned 3D centroids behind the robot and the
+# arm-pointing test (`hri-point-at-seat`) saturated joint0 at its limit.
+#
+# The invariant we now enforce: for a forward-facing head camera (the only
+# configuration we ship), the fitted/applied `t_b_rotvec` must have body-frame
+# yaw within ±π/2 of zero. Anything else is a calibration failure unless the
+# operator explicitly opts into a flipped mount via `--allow-flipped-camera`.
+#
+# Tests below cover all four defense layers from the plan.
+
+
+def test_chain_fit_does_not_flip_forward_camera_under_bad_warm_start():
+    """Layer-1 bounds: even with t_b_rotvec warm-started near +π, fit_chain in
+    unlock-rotation mode must converge to a body-frame yaw inside ±π/2.
+
+    Without the bounds the SE(3)-log cost has equal residual at yaw=0 and
+    yaw=π for a sufficiently noisy warm start; the solver can stay in the
+    flipped basin. This is the regression for the live incident.
+    """
+    truth, t_ee_marker = _make_truth()  # truth.t_b_rotvec = zeros
+    noise_rng = np.random.default_rng(RNG_SEED + 8001)
+    samples = _phase2_samples(truth, t_ee_marker, noise_rng=noise_rng)
+
+    bad_warm = PanTiltParams(
+        t_a=truth.t_a.copy(),
+        t_b_trans=truth.t_b_trans.copy(),
+        t_b_rotvec=np.array([0.0, 0.0, np.pi - 0.1]),  # 169° yaw
+        theta_t_offset=truth.theta_t_offset,
+        theta_p_offset=truth.theta_p_offset,
+        l_pan=truth.l_pan,
+    )
+
+    params, report = fit_chain(
+        samples,
+        t_ee_marker=t_ee_marker,
+        initial=bad_warm,
+        fit_pan_offset=True,
+        fit_tb_rotation=True,    # rotation is a free parameter
+        loss="soft_l1",
+    )
+    assert report.success, report.summary()
+    fitted_yaw = body_yaw_from_rotvec(params.t_b_rotvec)
+    assert abs(fitted_yaw) < np.pi / 2, (
+        f"chain fit converged to body-frame yaw={fitted_yaw:.3f} rad "
+        f"({np.degrees(fitted_yaw):.1f}°) — bounds did not constrain to "
+        f"the forward basin"
+    )
+
+
+def test_chain_fit_allow_flipped_camera_admits_pi_solution():
+    """Layer-1 escape hatch: with allow_flipped_camera=True, bounds widen to
+    ±π so legitimately backward-mounted hardware can still be calibrated.
+
+    Truth has t_b_rotvec = [0, 0, π/2 + 0.3] (~107°). The default ±π/2 bound
+    would clip this; with the override the solver recovers it.
+    """
+    flipped_yaw_truth = np.pi / 2 + 0.3
+    truth = PanTiltParams(
+        t_a=np.array([-0.28, -0.02, 1.55]),
+        t_b_trans=np.array([-0.07, -0.01, 0.08]),
+        t_b_rotvec=np.array([0.0, 0.0, flipped_yaw_truth]),
+        theta_t_offset=-np.pi / 4 + np.deg2rad(0.5),
+        theta_p_offset=np.deg2rad(0.2),
+        l_pan=0.135,
+    )
+    Rem = Rotation.from_euler("xyz", [0.05, 0.3, -0.05]).as_matrix()
+    t_ee_marker = np.eye(4)
+    t_ee_marker[:3, :3] = Rem
+    t_ee_marker[:3, 3] = np.array([0.02, 0.0, -0.11])
+
+    noise_rng = np.random.default_rng(RNG_SEED + 8002)
+    samples = _phase2_samples(truth, t_ee_marker, noise_rng=noise_rng)
+
+    warm = PanTiltParams(
+        t_a=truth.t_a.copy(),
+        t_b_trans=truth.t_b_trans.copy(),
+        t_b_rotvec=np.array([0.0, 0.0, flipped_yaw_truth - 0.1]),
+        theta_t_offset=truth.theta_t_offset,
+        theta_p_offset=truth.theta_p_offset,
+        l_pan=truth.l_pan,
+    )
+
+    params, report = fit_chain(
+        samples,
+        t_ee_marker=t_ee_marker,
+        initial=warm,
+        fit_pan_offset=True,
+        fit_tb_rotation=True,
+        loss="soft_l1",
+        allow_flipped_camera=True,
+    )
+    assert report.success, report.summary()
+    fitted_yaw = body_yaw_from_rotvec(params.t_b_rotvec)
+    assert abs(fitted_yaw - flipped_yaw_truth) < np.deg2rad(5.0), (
+        f"override path did not recover legit flipped-camera yaw: "
+        f"got {np.degrees(fitted_yaw):.1f}°, truth {np.degrees(flipped_yaw_truth):.1f}°"
+    )
+
+
+def test_warm_start_logs_warning_when_yaw_is_far_from_zero():
+    """Layer-2: warm_start_t_b_rotation must surface a warning whenever the
+    back-solved t_b_rotvec has body-frame yaw outside ±π/4. Quietness on a
+    flipped warm start is what made the original bug invisible until it
+    reached the URDF."""
+    import logging
+
+    truth, _ = _make_truth()
+    truth_with_flip = PanTiltParams(
+        t_a=truth.t_a.copy(),
+        t_b_trans=truth.t_b_trans.copy(),
+        t_b_rotvec=np.array([0.0, 0.0, np.pi - 0.05]),  # 177°
+        theta_t_offset=truth.theta_t_offset,
+        theta_p_offset=truth.theta_p_offset,
+        l_pan=truth.l_pan,
+    )
+    t_base_cam_ref = forward_kinematics(0.0, 0.0, truth_with_flip)
+
+    with pytest.warns(UserWarning, match=r"warm-start.*yaw"):
+        warm_start_t_b_rotation(PanTiltParams(), t_base_cam_ref)
+
+
+def test_warm_start_silent_when_yaw_is_small():
+    """Layer-2 negative: a forward-facing reference must not trigger the warning.
+    Otherwise every clean run would scream and operators would learn to ignore
+    the signal."""
+    import warnings
+
+    truth, _ = _make_truth()  # t_b_rotvec = zeros
+    t_base_cam_ref = forward_kinematics(0.0, 0.0, truth)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")        # any warning -> exception
+        warm_start_t_b_rotation(PanTiltParams(), t_base_cam_ref)
+
+
+def test_apply_to_urdf_refuses_flipped_yaw_by_default():
+    """Layer-3: the URDF patcher must refuse to write a `camera_mount_joint`
+    rpy with |yaw| > π/2 unless --allow-flipped-camera is explicitly set.
+    This is the universal failsafe — catches every path that produces a
+    flipped rotvec, regardless of which solver/warm-start fed it."""
+    from pan_tilt.calibration.apply_to_urdf import (
+        CalibrationApplyError,
+        _patched_xacro,
+    )
+
+    t_a = np.array([-0.30, -0.02, 1.52])
+    t_b_trans = np.array([-0.08, -0.01, 0.08])
+    flipped_rotvec = np.array([0.10, -0.005, 3.06])  # the live-incident value
+
+    src = (
+        '<?xml version="1.0"?>\n'
+        '<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <parent link="base_link"/><child link="pan_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <parent link="tilt_link"/><child link="head_camera_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '</robot>\n'
+    )
+
+    with pytest.raises(CalibrationApplyError, match=r"yaw"):
+        _patched_xacro(src, t_a, t_b_trans, flipped_rotvec)
+
+
+def test_apply_to_urdf_allows_flipped_yaw_with_override():
+    """Layer-3 escape hatch: the same input under the override flag is patched
+    normally."""
+    from pan_tilt.calibration.apply_to_urdf import _patched_xacro
+
+    t_a = np.array([-0.30, -0.02, 1.52])
+    t_b_trans = np.array([-0.08, -0.01, 0.08])
+    flipped_rotvec = np.array([0.10, -0.005, 3.06])
+
+    src = (
+        '<?xml version="1.0"?>\n'
+        '<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <parent link="base_link"/><child link="pan_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <parent link="tilt_link"/><child link="head_camera_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '</robot>\n'
+    )
+
+    patched = _patched_xacro(
+        src, t_a, t_b_trans, flipped_rotvec, allow_flipped_camera=True,
+    )
+    # camera_mount rpy must reflect the flipped yaw (~3.06 rad after Euler conv).
+    assert 'name="camera_mount_joint"' in patched
+    # The new rpy line must be present and contain a yaw component near ±π.
+    import re as _re
+    cam_match = _re.search(
+        r'<joint\s+name="camera_mount_joint"[^>]*>.*?<origin\s+xyz="[^"]+"\s+rpy="(?P<rpy>[^"]+)"',
+        patched, _re.DOTALL,
+    )
+    assert cam_match is not None
+    yaw_written = float(cam_match.group("rpy").split()[2])
+    assert abs(abs(yaw_written) - np.pi) < 0.2, (
+        f"override produced yaw={yaw_written:.3f}, expected near ±π"
+    )
+
+
+def test_apply_to_urdf_passes_normal_yaw():
+    """Layer-3 happy path: a normal forward-facing rotvec passes the guard."""
+    from pan_tilt.calibration.apply_to_urdf import _patched_xacro
+
+    t_a = np.array([-0.30, -0.02, 1.52])
+    t_b_trans = np.array([-0.08, -0.01, 0.08])
+    normal_rotvec = np.array([0.10, -0.005, 0.05])  # ~3° yaw, fine
+
+    src = (
+        '<?xml version="1.0"?>\n'
+        '<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <parent link="base_link"/><child link="pan_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <parent link="tilt_link"/><child link="head_camera_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '</robot>\n'
+    )
+
+    # Should not raise.
+    _patched_xacro(src, t_a, t_b_trans, normal_rotvec)
+
+
+# ---- Path A — state publisher applies calibration offsets ------------------
+#
+# 2026-04-30 follow-up: the URDF chain has no notion of theta_p_offset /
+# theta_t_offset; the state publisher applies them to firmware feedback before
+# publishing /joint_states. Without this the URDF mis-represents the camera
+# pose by up to ~45° (the parked-tilt angle), projecting vision points below
+# ground in the seat-recommend pipeline.
+
+def _run_state_publisher_round_trip(pan_offset_rad, tilt_offset_rad,
+                                    pan_in, tilt_in, *, suffix):
+    """Spin a `PanTiltStatePublisherNode` against isolated topics, send one
+    synthetic `PanTiltState`, and return the resulting `JointState`.
+
+    Uses unique topic names per call so the live pan_tilt driver — if
+    running on this host — cannot inject real messages into the test.
+    Construction-time parameters are supplied via `parameter_overrides`
+    on the underlying `rclpy.Node`, then reapplied to the cached instance
+    attributes which the production code reads once at init.
+    """
+    import threading
+    import rclpy
+    from rclpy.parameter import Parameter as RclParam
+    from sensor_msgs.msg import JointState
+    from tinker_vision_msgs_26.msg import PanTiltState
+    from pan_tilt.pan_tilt_state_publisher import PanTiltStatePublisherNode
+
+    state_topic = f'/test_{suffix}_state'
+    joint_topic = f'/test_{suffix}_joint_states'
+
+    rclpy.init()
+    try:
+        # Override parameters via the standard rclpy mechanism: pass them in
+        # at Node.__init__ via the parent class. We monkey-patch the bound
+        # `__init__` of PanTiltStatePublisherNode briefly so its
+        # `super().__init__('pan_tilt_state_publisher')` carries our
+        # overrides — equivalent to a YAML config but in-process.
+        original_super_init = PanTiltStatePublisherNode.__bases__[0].__init__
+
+        overrides = [
+            RclParam('state_topic', RclParam.Type.STRING, state_topic),
+            RclParam('joint_state_topic', RclParam.Type.STRING, joint_topic),
+            RclParam('pan_offset_rad', RclParam.Type.DOUBLE, float(pan_offset_rad)),
+            RclParam('tilt_offset_rad', RclParam.Type.DOUBLE, float(tilt_offset_rad)),
+        ]
+
+        def _patched_super_init(self_, name, *args, **kwargs):
+            kwargs.setdefault('parameter_overrides', list(overrides))
+            return original_super_init(self_, name, *args, **kwargs)
+
+        PanTiltStatePublisherNode.__bases__[0].__init__ = _patched_super_init
+        try:
+            n = PanTiltStatePublisherNode()
+        finally:
+            PanTiltStatePublisherNode.__bases__[0].__init__ = original_super_init
+
+        received: list[JointState] = []
+        cv = threading.Event()
+        listener = rclpy.create_node(f'test_{suffix}_listener')
+        listener.create_subscription(
+            JointState, joint_topic,
+            lambda m: (received.append(m), cv.set()),
+            10,
+        )
+        pub = listener.create_publisher(PanTiltState, state_topic, 10)
+
+        # Wait for pub/sub matching.
+        for _ in range(40):
+            rclpy.spin_once(listener, timeout_sec=0.05)
+            rclpy.spin_once(n, timeout_sec=0.05)
+            if (listener.count_publishers(joint_topic) > 0
+                    and n.count_subscribers(state_topic) > 0):
+                break
+
+        msg = PanTiltState()
+        msg.pan_rad = float(pan_in)
+        msg.tilt_rad = float(tilt_in)
+        msg.feedback_ok = True
+        pub.publish(msg)
+
+        for _ in range(80):
+            rclpy.spin_once(n, timeout_sec=0.05)
+            rclpy.spin_once(listener, timeout_sec=0.05)
+            if cv.is_set():
+                break
+
+        assert received, "PanTiltStatePublisher never published a JointState"
+        out = received[-1]
+        listener.destroy_node()
+        n.destroy_node()
+        return out
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def test_state_publisher_applies_offsets():
+    """`pan_tilt_state_publisher` must add pan/tilt offsets (in radians) to
+    firmware feedback before publishing JointState. The URDF then reads the
+    offset-corrected values through R_z(-pan_joint) and R_y(+tilt_joint),
+    matching the calibration FK exactly."""
+    out = _run_state_publisher_round_trip(
+        pan_offset_rad=0.10, tilt_offset_rad=-np.pi / 4,
+        pan_in=0.5, tilt_in=0.3, suffix='offset',
+    )
+    assert out.name == ['pan_joint', 'tilt_joint']
+    assert out.position[0] == pytest.approx(0.5 + 0.10, abs=1e-9)
+    assert out.position[1] == pytest.approx(0.3 - np.pi / 4, abs=1e-9)
+
+
+def test_state_publisher_zero_offsets_passthrough():
+    """Defaults (zero offsets) must passthrough firmware values unchanged
+    so existing deployments without the new YAML keys still work."""
+    out = _run_state_publisher_round_trip(
+        pan_offset_rad=0.0, tilt_offset_rad=0.0,
+        pan_in=0.42, tilt_in=-0.17, suffix='zero',
+    )
+    assert out.position[0] == pytest.approx(0.42, abs=1e-9)
+    assert out.position[1] == pytest.approx(-0.17, abs=1e-9)
+
+
+# ---- Path C — basin0 preference in cmd_chain -------------------------------
+#
+# `cmd_chain` runs a two-basin warm-start search (basin0 at theta_p_off=0,
+# basinπ at theta_p_off=π). Both basins typically converge to valid
+# parameterizations of the same data, with the basin labels reflecting
+# distinct local minima — NOT a clean group action that can be folded into
+# each other. The naive `min(rot_rmse)` selector is unstable on near-
+# noiseless data because the residuals tie: small numerical perturbations
+# flip the winner across recalibrations. `_prefer_basin_zero` adds a margin
+# so basin0 wins all ties, keeping `theta_p_offset` near 0 (friendly to the
+# state-publisher's runtime offset and apply_to_urdf's yaw guard).
+
+
+def _make_chain_candidate(label, rot_rmse_rad, theta_p_offset=0.0):
+    """Synthesize a (label, initial, params, report) candidate tuple
+    matching the shape produced by cmd_chain's two-basin search."""
+    from pan_tilt.calibration.optimize import OptReport
+
+    params = PanTiltParams(theta_p_offset=theta_p_offset)
+    report = OptReport(
+        success=True, message="ok", cost=0.0, n_samples=10,
+        trans_rmse_m=0.001, rot_rmse_rad=float(rot_rmse_rad),
+    )
+    return (label, None, params, report)
+
+
+def test_prefer_basin_zero_wins_when_tied():
+    """When both basins converge to similar rot residuals (within the
+    1° margin), basin0 must win — even if basinπ has a microscopically
+    lower residual."""
+    from pan_tilt.calibration.run_calibration import _prefer_basin_zero
+
+    candidates = [
+        _make_chain_candidate("basin0", np.deg2rad(0.30), theta_p_offset=0.01),
+        _make_chain_candidate("basinπ", np.deg2rad(0.29), theta_p_offset=np.pi),
+    ]
+    chosen = _prefer_basin_zero(candidates)
+    assert chosen[0] == "basin0", (
+        f"basin0 should win on a 0.01° tie; got {chosen[0]} instead"
+    )
+
+
+def test_prefer_basin_zero_keeps_basin_pi_when_decisive():
+    """When basinπ is decisively better (more than the 1° margin),
+    keep it. This is the rare case of physically-flipped hardware
+    where basinπ genuinely fits better than basin0."""
+    from pan_tilt.calibration.run_calibration import _prefer_basin_zero
+
+    candidates = [
+        _make_chain_candidate("basin0", np.deg2rad(5.0), theta_p_offset=0.0),
+        _make_chain_candidate("basinπ", np.deg2rad(0.3), theta_p_offset=np.pi),
+    ]
+    chosen = _prefer_basin_zero(candidates)
+    assert chosen[0] == "basinπ", (
+        f"basinπ should win on a 4.7° gap; got {chosen[0]}"
+    )
+
+
+def test_prefer_basin_zero_handles_single_candidate():
+    """Defensive: with a single basin (e.g. one converged, one diverged
+    upstream), pass it through unchanged."""
+    from pan_tilt.calibration.run_calibration import _prefer_basin_zero
+
+    only = _make_chain_candidate("basin0", np.deg2rad(0.5))
+    assert _prefer_basin_zero([only])[0] == "basin0"
+
+
+# ---- pan_tilt.yaml lockstep patching ---------------------------------------
+#
+# 2026-05-01 follow-up: the URDF and pan_tilt.yaml runtime offsets must be
+# updated atomically from the same calibration JSON. apply_to_urdf gained a
+# YAML patcher; these tests pin its surface.
+
+
+_YAML_FIXTURE = """\
+pan_tilt_state_publisher:
+  ros__parameters:
+    state_topic: /pan_tilt_controller/state
+    joint_state_topic: /pan_tilt/joint_states
+    pan_joint_name: pan_joint
+    tilt_joint_name: tilt_joint
+    stale_timeout_sec: 0.5
+    # Source values from polish.json after every calibration.
+    pan_offset_rad: 0.0
+    tilt_offset_rad: 0.0  # parked-tilt nominal
+
+follow_head_node:
+  ros__parameters:
+    home_pan_deg: 0.0
+    home_tilt_deg: 45.0
+"""
+
+
+def test_patch_yaml_offsets_replaces_values_only():
+    """The YAML patcher must update the two offset values and leave every
+    other byte (comments, blank lines, indentation, unrelated keys) untouched."""
+    from pan_tilt.calibration.apply_to_urdf import _patch_yaml_offsets
+
+    out = _patch_yaml_offsets(_YAML_FIXTURE, 0.012345, -0.785398)
+
+    # Values updated.
+    assert "pan_offset_rad: 0.0123450000" in out
+    assert "tilt_offset_rad: -0.7853980000" in out
+    # Comments preserved.
+    assert "# Source values from polish.json after every calibration." in out
+    assert "# parked-tilt nominal" in out
+    # Unrelated keys / sections preserved.
+    assert "follow_head_node:" in out
+    assert "home_pan_deg: 0.0" in out
+    # All other lines byte-identical (sanity: line count unchanged).
+    assert out.count("\n") == _YAML_FIXTURE.count("\n")
+
+
+def test_patch_yaml_offsets_idempotent():
+    """Patching twice with the same offsets returns the same string —
+    exercise the no-op path the orchestrator uses to skip backups."""
+    from pan_tilt.calibration.apply_to_urdf import _patch_yaml_offsets
+
+    once = _patch_yaml_offsets(_YAML_FIXTURE, 0.012345, -0.785398)
+    twice = _patch_yaml_offsets(once, 0.012345, -0.785398)
+    assert once == twice
+
+
+def test_patch_yaml_offsets_missing_keys_raises():
+    """A YAML without the keys must raise CalibrationApplyError naming the
+    missing key — the operator's signal to add them once before re-running
+    apply_to_urdf."""
+    from pan_tilt.calibration.apply_to_urdf import (
+        CalibrationApplyError, _patch_yaml_offsets,
+    )
+
+    no_pan = "\n".join(
+        line for line in _YAML_FIXTURE.splitlines()
+        if "pan_offset_rad: 0.0" not in line
+    ) + "\n"
+    with pytest.raises(CalibrationApplyError, match=r"pan_offset_rad"):
+        _patch_yaml_offsets(no_pan, 0.1, 0.2)
+
+    no_tilt = "\n".join(
+        line for line in _YAML_FIXTURE.splitlines()
+        if "tilt_offset_rad: 0.0" not in line
+    ) + "\n"
+    with pytest.raises(CalibrationApplyError, match=r"tilt_offset_rad"):
+        _patch_yaml_offsets(no_tilt, 0.1, 0.2)
+
+
+def test_apply_to_urdf_main_writes_both_files(tmp_path):
+    """`apply_to_urdf.main` must update URDF AND YAML in lockstep, leave
+    `.old-<ts>` backups for both, and source both values from the same
+    calibration JSON. This is the regression for the 2026-04-30 manual-
+    paste failure mode."""
+    import json
+    from pan_tilt.calibration import apply_to_urdf
+
+    xacro_src = (
+        '<?xml version="1.0"?>\n'
+        '<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <parent link="base_link"/><child link="pan_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <parent link="tilt_link"/><child link="head_camera_link"/>\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '</robot>\n'
+    )
+    xacro_path = tmp_path / "pan_tilt.urdf.xacro"
+    xacro_path.write_text(xacro_src)
+    yaml_path = tmp_path / "pan_tilt.yaml"
+    yaml_path.write_text(_YAML_FIXTURE)
+
+    # Forward-facing calibration so the yaw guard doesn't refuse.
+    results = {
+        "params": {
+            "t_a": [-0.30, -0.02, 1.52],
+            "t_b_trans": [-0.08, -0.01, 0.08],
+            "t_b_rotvec": [0.0, 0.0, -0.05],
+            "theta_p_offset_rad": 0.012345,
+            "theta_t_offset_rad": -0.785398,
+        }
+    }
+    results_path = tmp_path / "polish.json"
+    results_path.write_text(json.dumps(results))
+
+    apply_to_urdf.main([
+        "--results", str(results_path),
+        "--xacro",   str(xacro_path),
+        "--yaml",    str(yaml_path),
+    ])
+
+    # URDF rewritten with the new mount values.
+    new_xacro = xacro_path.read_text()
+    assert 'xyz="-0.08 -0.01 0.08"' in new_xacro
+    # YAML rewritten with the matching offsets (10-decimal precision).
+    new_yaml = yaml_path.read_text()
+    assert "pan_offset_rad: 0.0123450000" in new_yaml
+    assert "tilt_offset_rad: -0.7853980000" in new_yaml
+    # Comments preserved.
+    assert "# Source values from polish.json after every calibration." in new_yaml
+
+    # Both `.old-<ts>` backups present.
+    xacro_backups = list(tmp_path.glob("pan_tilt.urdf.xacro.old-*"))
+    yaml_backups = list(tmp_path.glob("pan_tilt.yaml.old-*"))
+    assert len(xacro_backups) == 1, f"expected 1 URDF backup, got {xacro_backups}"
+    assert len(yaml_backups) == 1, f"expected 1 YAML backup, got {yaml_backups}"
+    # Backups carry the original (pre-patch) content byte-for-byte.
+    assert xacro_backups[0].read_text() == xacro_src
+    assert yaml_backups[0].read_text() == _YAML_FIXTURE
+    # No tmp files left behind.
+    assert not list(tmp_path.glob("*.tmp-*"))
+
+
+def test_apply_to_urdf_main_yaml_idempotent(tmp_path):
+    """Running apply_to_urdf twice with the same calibration must NOT create
+    a second pair of backups — the no-op path keeps the workspace tidy."""
+    import json, time
+    from pan_tilt.calibration import apply_to_urdf
+
+    xacro_src = (
+        '<?xml version="1.0"?>\n<robot>\n'
+        '  <joint name="pan_joint" type="revolute">\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n'
+        '  <joint name="camera_mount_joint" type="fixed">\n'
+        '    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        '  </joint>\n</robot>\n'
+    )
+    xacro_path = tmp_path / "pan_tilt.urdf.xacro"
+    xacro_path.write_text(xacro_src)
+    yaml_path = tmp_path / "pan_tilt.yaml"
+    yaml_path.write_text(_YAML_FIXTURE)
+    results_path = tmp_path / "polish.json"
+    results_path.write_text(json.dumps({
+        "params": {
+            "t_a": [-0.30, -0.02, 1.52],
+            "t_b_trans": [-0.08, -0.01, 0.08],
+            "t_b_rotvec": [0.0, 0.0, -0.05],
+            "theta_p_offset_rad": 0.012345,
+            "theta_t_offset_rad": -0.785398,
+        }
+    }))
+
+    argv = [
+        "--results", str(results_path),
+        "--xacro", str(xacro_path),
+        "--yaml", str(yaml_path),
+    ]
+    apply_to_urdf.main(argv)
+    time.sleep(1.05)  # ensure a different timestamp would be issued
+    apply_to_urdf.main(argv)
+
+    # First run produced a pair of backups; second run is a no-op so
+    # only the original pair survives.
+    xacro_backups = list(tmp_path.glob("pan_tilt.urdf.xacro.old-*"))
+    yaml_backups = list(tmp_path.glob("pan_tilt.yaml.old-*"))
+    assert len(xacro_backups) == 1, f"second run should be no-op, got {xacro_backups}"
+    assert len(yaml_backups) == 1, f"second run should be no-op, got {yaml_backups}"

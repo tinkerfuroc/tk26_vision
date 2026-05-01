@@ -41,7 +41,7 @@ class FollowHeadNode(Node):
 
         # Vision logging runs at the node's existing 1 Hz YOLO cadence
         # (control_interval=1.0), so no extra throttle state machine is needed.
-        self.declare_parameter('vision_logging_enabled', True)
+        self.declare_parameter('vision_logging_enabled', False)
         self.declare_parameter('vision_log_folder', 'vision_log')
         self.declare_parameter('command_topic', '/pan_tilt_controller/cmd')
         self.declare_parameter('state_topic', '/pan_tilt_controller/state')

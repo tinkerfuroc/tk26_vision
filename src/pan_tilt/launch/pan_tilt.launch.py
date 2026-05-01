@@ -32,6 +32,7 @@ def generate_launch_description():
             ('robot_description', '/pan_tilt/robot_description'),
             ('joint_states', '/pan_tilt/joint_states'),
         ],
+        condition=IfCondition(launch_rsp),
     )
 
     return LaunchDescription(

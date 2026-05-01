@@ -206,7 +206,7 @@ class FollowHeadNode(Node):
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=5,
         )
         image_sub = Subscriber(
             self, Image, '/camera/color/image_raw', qos_profile=sensor_qos,
@@ -215,7 +215,7 @@ class FollowHeadNode(Node):
             self, Image, '/camera/depth/image_raw', qos_profile=sensor_qos,
         )
         image_sync_sub = ApproximateTimeSynchronizer(
-            [image_sub, depth_sub], queue_size=3, slop=0.05,
+            [image_sub, depth_sub], queue_size=10, slop=0.1,
         )
         image_sync_sub.registerCallback(self.img_orbbec_callback)
 
@@ -259,11 +259,6 @@ class FollowHeadNode(Node):
         self._last_commanded_pan_rad = None
         self._last_commanded_tilt_rad = None
         self._last_detection_time = None
-        # Blur-gate cache: Laplacian only every Kth detection tick; reuse
-        # the verdict on intermediate ticks.
-        self._blur_counter = 0
-        self._blur_check_every = 3
-        self._last_blur_result = False
         # Timing counters (reset every 2 s in follow_head_logic). Tracks
         # callback rate, per-stage durations, and early-return reasons.
         self._perf_window_start = time.monotonic()
@@ -272,7 +267,7 @@ class FollowHeadNode(Node):
         self._perf_logic_count = 0
         self._perf_yolo_count = 0
         self._perf_sum = {
-            'pc_parse': 0.0, 'blur': 0.0, 'yolo': 0.0,
+            'pc_parse': 0.0, 'yolo': 0.0,
             'extract': 0.0, 'total': 0.0,
         }
         self._perf_early = collections.Counter()
@@ -407,17 +402,9 @@ class FollowHeadNode(Node):
         self.last_used_header = recent_header
 
         color_img = self.bridge.imgmsg_to_cv2(recent_img, desired_encoding='bgr8')
-        # Laplacian blur gate — Laplacian + cvtColor is ~5-10 ms on 720×1280,
-        # so we run it every Nth tick and cache the verdict. YOLO itself
-        # handles mild blur better than the Laplacian threshold does.
-        _blur_t0 = time.perf_counter()
-        self._blur_counter += 1
-        if self._blur_counter % self._blur_check_every == 0:
-            self._last_blur_result = self._is_image_blurred(color_img)
-        self._perf_sum['blur'] += time.perf_counter() - _blur_t0
-        if self._last_blur_result:
-            self._perf_early['blurred'] += 1
-            return None, 'Image blurred, waiting for stable frame.'
+        # Blur gate removed — Orbbec frames are clean enough that a Laplacian
+        # variance threshold drops more good frames than bad. YOLO handles
+        # mild blur on its own.
         self._last_detection_time = now_mono
         _pc_t0 = time.perf_counter()
         points, validmask_points = self._depth_image_to_points(recent_depth_msg)
@@ -636,15 +623,10 @@ class FollowHeadNode(Node):
             self._perf_sum['total'] += time.perf_counter() - _total_t0
             return (target_pan_deg, target_tilt_deg), ''
 
-        # Feedback-gated settle on the COMMAND only. Detection already ran
-        # above so the tracker + EMA stay fresh; we just hold off re-issuing
-        # a new command until the servo has converged on the last one.
-        settle_state, settle_reason = self._classify_settle_state()
-        if settle_state == 'wait':
-            self.get_logger().debug(f'Command held: {settle_reason}')
-            self._perf_early['settle_wait'] += 1
-            self._perf_sum['total'] += time.perf_counter() - _total_t0
-            return (target_pan_deg, target_tilt_deg), ''
+        # Settle gate removed — joint state is fresh enough that re-issuing
+        # commands while the servo is still converging is harmless; the
+        # firmware handles command supersession. Anti-chatter below is the
+        # only remaining guard against command spam.
 
         # Anti-chatter: if the new target barely differs from the last
         # commanded position, don't re-issue. This protects the Waveshare
@@ -758,18 +740,20 @@ class FollowHeadNode(Node):
                     self.get_logger().debug(
                         f'follow_head_logic returned error: {error_msg}',
                     )
-                    # Short yield — min_detection_interval_sec already paces
-                    # YOLO work from inside follow_head_logic; a long sleep
-                    # here just multiplies the per-iteration cost of the
-                    # early-return branches (e.g. "image already used").
-                    time.sleep(0.005)
+                    # Yield long enough that this loop does not starve the
+                    # image-sync / state-callback threads. At ~30 Hz camera
+                    # rate, ~33 ms between frames; 20 ms early-return sleep
+                    # gives the executor headroom while still picking up new
+                    # frames promptly. min_detection_interval_sec=0.1 caps
+                    # YOLO work, so faster polling here yields no benefit.
+                    time.sleep(0.02)
                     continue
 
                 pan_deg, tilt_deg = pan_tilt
                 self._populate_feedback(feedback_msg, pan_deg, tilt_deg)
                 goal_handle.publish_feedback(feedback_msg)
 
-                time.sleep(0.005)
+                time.sleep(0.02)
         except Exception as e:
             self.get_logger().error(f'Error in loop: {e}')
             goal_handle.abort()
@@ -859,7 +843,6 @@ class FollowHeadNode(Node):
         elapsed_safe = max(elapsed, 1e-3)
         avg_ms = {
             'pc_parse': 1000.0 * self._perf_sum['pc_parse'] / n_yolo,
-            'blur': 1000.0 * self._perf_sum['blur'] / n_logic,
             'yolo': 1000.0 * self._perf_sum['yolo'] / n_yolo,
             'extract': 1000.0 * self._perf_sum['extract'] / n_yolo,
             'total': 1000.0 * self._perf_sum['total'] / n_logic,
@@ -874,7 +857,7 @@ class FollowHeadNode(Node):
             f'[follow_head perf {elapsed:.1f}s] sync={sync_hz:.1f}Hz '
             f'logic={logic_hz:.1f}Hz yolo={yolo_hz:.1f}Hz | '
             f'ms/yolo: pc={avg_ms["pc_parse"]:.1f} '
-            f'blur={avg_ms["blur"]:.1f} yolo={avg_ms["yolo"]:.1f} '
+            f'yolo={avg_ms["yolo"]:.1f} '
             f'extract={avg_ms["extract"]:.1f} total={avg_ms["total"]:.1f} | '
             f'branches: {early_str}'
         )

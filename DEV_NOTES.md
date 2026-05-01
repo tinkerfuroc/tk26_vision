@@ -16,6 +16,77 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-05-01 — Orbbec cloud floating + upside-down: stale install + wrong-basin polish
+
+### Symptom
+
+After grasp_bringup + Orbbec launch, the published Orbbec point cloud rendered floating in mid-air and rotated ~180° in RViz with `fixed_frame=base_link`. `bc95713`/`d22ae8f` had already shipped the runtime-offset + atomic apply fixes on `dev`, and a peer workstation was rendering the same cloud correctly, but this workstation still produced the bad TF.
+
+### Root cause (three concurrent issues)
+
+1. **Wrong-basin polish lurking in `install/`.** `calibration_data/0426_opus_fix/polish.json` had been re-run on 2026-05-01 17:17 *without* `--allow-flipped-camera`. Tinker 2026's head camera is the basin-π hardware (per `bc95713`: "basin0 fits 18° worse"), and `chain.json` had correctly converged there (`t_b_rotvec≈[0.004, -0.018, 3.088]`, `theta_t_offset_rad=-0.79`). The Layer-1 forward-camera bound on `t_b_rotvec[Z]` (±π/2) prevented the polish solver from staying in chain's seed basin once T_B rotation was unlocked, and it drifted into a degenerate-but-low-residual alternate basin: `t_b_rotvec=[2.77, 0.06, 1.43]` (~178° about a tilted axis) with `theta_t_offset_rad=-2.97` (-170°) compensating in joint space. The Layer-3 `apply_to_urdf` yaw guard checks **extracted Euler-Z**, not `rotvec[Z]` — and the degenerate basin's Euler-yaw came out at 0.07 rad, well inside the bound. So the patcher accepted the bad basin and wrote its values into `install/tinker_urdf/.../pan_tilt.urdf.xacro` (`rpy 3.083 -0.953 0.071`) and `install/pan_tilt/.../pan_tilt.yaml` (`pan=3.149 tilt=-2.97`). Both files were internally self-consistent, but the basin was geometrically wrong → the camera-mount link was rolled ~180° and pitched ~-55° from physical reality, which is exactly the "upside down + floating" RViz signature.
+2. **Source URDF and source YAML never came from a single calibration run.** `bc95713` (Apr 30) committed YAML offsets and patched only the `tk26_vision` legacy standalone xacro. `b833cde` (Apr 26, before the lockstep patcher landed) committed the authoritative `tk25_basic` macro xacro with values from a different earlier calibration. Even a perfectly clean rebuild from source would have left `pan_tilt.launch.py` (which loads the `tk25_basic` macro through `tinker_urdf/pan_tilt_standalone.urdf.xacro`) running with offsets that didn't match the URDF's `camera_mount_joint` rpy.
+3. **`tkbuild` strips `--symlink-install`** (intentional, see comment in `/home/tinker/tk25_ws/tkbuild` — `ament_python` packages built with `--symlink-install` lose entry-point metadata for `importlib.metadata`, which broke `grasp_service`). Consequence: `install/` is a real-file copy of `src/`. The calibration apply tools resolve targets through `ament_index_python.get_package_share_directory(...)`, which points at `install/`, so a successful apply *only* updates the install tree. Source stays stale; the next `tkbuild` reverts the install. This is the structural channel through which the wrong-basin polish wedged itself in: someone re-ran `colcon build` without symlinks between two apply attempts, the install URDF reverted to source, then a second apply at 17:33 wrote the bad values back. The atomic-pair backup chain (`pan_tilt.urdf.xacro.old-20260501_171807` then `…_173340`) records the round-trip.
+
+### Fix
+
+Single fresh polish on the existing 0426_opus_fix dataset, this time with `--allow-flipped-camera`, then atomic apply against **source** files (overriding the auto-discovery that would have written to `install/`), then a normal `tkbuild` to copy source over install.
+
+```bash
+cd /home/tinker/tk25_ws/src/tk26_vision && source .venv-vision-main/bin/activate && source /home/tinker/tk25_ws/install/setup.bash
+
+python -m pan_tilt.calibration.run_calibration polish \
+  --phase1 /home/tinker/tk25_ws/calibration_data/0426_opus_fix/phase1_handeye.json \
+           /home/tinker/tk25_ws/calibration_data/0426_opus_fix/phase1_handeye_custom.json \
+  --phase2 /home/tinker/tk25_ws/calibration_data/0426_opus_fix/phase2_chain.json \
+  --seed   /home/tinker/tk25_ws/calibration_data/0426_opus_fix/chain.json \
+  --unlock-tb-rotation --allow-flipped-camera \
+  --out    /home/tinker/tk25_ws/calibration_data/0426_opus_fix
+
+python -m pan_tilt.calibration.run_calibration validate \
+  --phase4 /home/tinker/tk25_ws/calibration_data/0426_opus_fix/phase4_validation.json \
+  --params /home/tinker/tk25_ws/calibration_data/0426_opus_fix/polish.json \
+  --out    /home/tinker/tk25_ws/calibration_data/0426_opus_fix
+
+# Apply against source (NOT install). Both URDFs in lockstep with YAML.
+python -m pan_tilt.calibration.apply_to_urdf \
+  --results /home/tinker/tk25_ws/calibration_data/0426_opus_fix/polish.json \
+  --xacro   /home/tinker/tk25_ws/src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro \
+  --yaml    /home/tinker/tk25_ws/src/tk26_vision/src/pan_tilt/config/pan_tilt.yaml \
+  --allow-flipped-camera
+
+python -m pan_tilt.calibration.apply_to_urdf \
+  --results /home/tinker/tk25_ws/calibration_data/0426_opus_fix/polish.json \
+  --xacro   /home/tinker/tk25_ws/src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro \
+  --yaml    /home/tinker/tk25_ws/src/tk26_vision/src/pan_tilt/config/pan_tilt.yaml \
+  --allow-flipped-camera
+
+tkbuild tk25_basic --packages-select tinker_urdf
+tkbuild tk26_vision --packages-select pan_tilt
+```
+
+### Resulting params (deployed in lockstep)
+
+| File | Value |
+|---|---|
+| `tk25_basic/.../tinker_urdf/src/pan_tilt.urdf.xacro` | `attach_xyz=-0.310913 0.00283274 1.35846`, `camera_mount rpy=0.0406528 -0.79457 3.0833` |
+| `tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro` | same `attach_xyz` + same `camera_mount rpy` |
+| `tk26_vision/src/pan_tilt/config/pan_tilt.yaml` | `pan_offset_rad=3.1489192105`, `tilt_offset_rad=-1.5778771268` (-90.4°) |
+
+Polish residuals: `trans_rmse=5.22 mm`, `rot_rmse=0.619°` (under the 5 mm / 0.5° gate on rotation; trans is right at the line). Phase-4 self-consistency: `verdict=PASS`, `trans_rmse=3.54 mm`, `rot_rmse=0.361°`, `trans_max=7.16 mm`, `rot_max=0.639°`. RViz cloud lands correctly after the build.
+
+### Why the previous polish passed self-consistency despite being wrong
+
+Phase-4 validation only asserts that for any `(pan, tilt)`, `T_base_marker` from the model matches across views. A degenerate basin that fits the dataset internally satisfies this — even though it places the camera in the wrong physical orientation. Self-consistency is necessary but not sufficient; the missing check is whether the basin matches physical hardware. `bc95713`'s Layer-2 warm-start warning ("yaw exceeds ±π/4") and the basin0/basinπ tie-breaker were intended to catch this, but they fire at chain-stage warm-start, not at polish-stage drift.
+
+### Defense-in-depth follow-ups (separate from this fix)
+
+- `apply_to_urdf._rotvec_to_rpy_str` should also reject when |Euler-roll| or |Euler-pitch| exceed π/2 — extracted yaw alone misses 178°-rotation-about-tilted-axis basins like the May-1 polish output.
+- `cmd_polish` should auto-set `allow_flipped_camera=True` when the seed (`chain.json`) is in basin-π (e.g. `|seed.t_b_rotvec[Z]| > π/4`), or refuse with a clear error message — silently clamping into basin-0 because the bound is tighter than the seed is the worst possible behavior.
+- Lockstep would be much harder to break if `apply_to_urdf`'s `--xacro`/`--yaml` defaults pointed at *source* paths, not `install/`-resolved paths. Auto-discovery should walk `urdf_targets`/`yaml_targets` on the source tree (which is where the patches need to persist across `tkbuild`).
+
+---
+
 ## 2026-04-23 — `follow_head` rewritten for the new pan_tilt stack
 
 The `ce3abec` refactor gave us `PanTiltCommand` (radians, ABSOLUTE/RELATIVE, speed/accel), `PanTiltState` (20 Hz hardware feedback), and `SetTorque`/`SetZero` services — but `follow_head` was still running the old pattern: 1 Hz detection, 1 s fixed settle, camera-frame relative deltas, closest-by-depth person selection, open-loop. This pass rewrites `follow_head.py` to exploit the new interface plus adds a small local tracker.

@@ -59,7 +59,7 @@ def main() -> int:
     )
 
     try:
-        bboxes = request_bboxes(
+        bboxes, raw_labels, _elapsed = request_bboxes(
             img,
             args.prompt,
             model=args.model,
@@ -77,10 +77,11 @@ def main() -> int:
     raw_path = out_dir / f'{stem}_raw.json'
 
     overlay = img.copy()
-    for (x1, y1, x2, y2) in bboxes:
+    for i, (x1, y1, x2, y2) in enumerate(bboxes):
         cv2.rectangle(overlay, (int(x1), int(y1)), (int(x2), int(y2)),
                       (0, 255, 0), 2)
-        cv2.putText(overlay, args.prompt, (int(x1), max(int(y1) - 6, 12)),
+        caption = raw_labels[i] if i < len(raw_labels) and raw_labels[i] else args.prompt
+        cv2.putText(overlay, caption, (int(x1), max(int(y1) - 6, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
     cv2.imwrite(str(overlay_path), overlay)
 
@@ -90,6 +91,7 @@ def main() -> int:
             'prompt': args.prompt,
             'model': args.model,
             'bboxes_xyxy': [list(bbox) for bbox in bboxes],
+            'raw_labels': list(raw_labels),
             'n_detections': len(bboxes),
         }, fp, indent=2)
 

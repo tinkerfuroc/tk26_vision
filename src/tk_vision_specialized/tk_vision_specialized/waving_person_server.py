@@ -46,7 +46,7 @@ class DetectWavingPersonsNode(Node):
         image_sub = Subscriber(self, Image, '/camera/color/image_raw')
         point_cloud_sub = Subscriber(self, PointCloud2, '/camera/depth_registered/points')
 
-        self.ts = ApproximateTimeSynchronizer([image_sub, point_cloud_sub], queue_size=10, slop=0.2)
+        self.ts = ApproximateTimeSynchronizer([image_sub, point_cloud_sub], queue_size=10, slop=0.3)
         self.ts.registerCallback(self.image_callback)
 
         self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
@@ -59,11 +59,13 @@ class DetectWavingPersonsNode(Node):
         self.mp_draw = mp.solutions.drawing_utils
         self.pose = self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-        self.lock = threading.Lock()
+        self.img_lock = threading.Lock()
+        self.intrinsiscs_lock = threading.Lock()
         self.rgb_image = None
         self.depth_points = None
         self.header = None
         self.camera_k = None
+        self.received_intrinsics = False
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -116,16 +118,32 @@ class DetectWavingPersonsNode(Node):
         return frame
 
     def camera_info_callback(self, msg):
-        if self.camera_k is None:
+        if self.received_intrinsics:
+            return
+        self.intrinsiscs_lock.acquire()
+        try:
             self.camera_k = np.array(msg.k).reshape((3, 3))
             self.get_logger().info('Camera info received.')
+            self.received_intrinsics = True
+        finally:
+            self.intrinsiscs_lock.release()
 
     def image_callback(self, rgb_msg, depth_msg):
-        with self.lock:
-            self.rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
+        # Convert outside the lock — CvBridge can raise on a malformed image
+        # message, and a leaked img_lock would deadlock every subsequent
+        # image callback and service request under MultiThreadedExecutor.
+        try:
+            cv_img = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
+        except Exception as exc:  # noqa: BLE001 — drop bad frame, keep node alive
+            self.get_logger().warn(f'imgmsg_to_cv2 failed: {exc}; dropping frame')
+            return
+        self.img_lock.acquire()
+        try:
+            self.rgb_image = cv_img
             self.depth_points = depth_msg
             self.header = rgb_msg.header
-            #self.get_logger().info('Image info received.')
+        finally:
+            self.img_lock.release()
 
     def is_waving(self, pose_landmarks, person_roi):
         if pose_landmarks is None:
@@ -179,17 +197,28 @@ class DetectWavingPersonsNode(Node):
     def detect_waving_callback(self, request, response):
         _t0 = time.perf_counter()
         self.get_logger().info('Detect waving request received. Detecting persons now...')
-        with self.lock:
-            if self.rgb_image is None or self.depth_points is None or self.camera_k is None:
+        
+        self.img_lock.acquire()
+        try:
+            if self.rgb_image is None or self.depth_points is None:
                 response.status = -1
-                response.error_msg = 'No image, depth data, or camera info received yet'
+                response.error_msg = 'No image, depth data received yet'
+                self.get_logger().error(response.error_msg)
+                return response
+            if self.camera_k is None:
+                response.status = -1
+                response.error_msg = 'No camera info received yet'
+                self.get_logger().error(response.error_msg)
                 return response
 
             rgb_image = self.rgb_image.copy()
             depth_points = self.depth_points
             header = self.header
             camera_k = self.camera_k
+        finally:
+            self.img_lock.release()
 
+        self.get_logger().info('Data copied for processing. Starting detection...')
         transform = None
         if request.target_frame and request.target_frame != header.frame_id:
             try:
@@ -204,6 +233,8 @@ class DetectWavingPersonsNode(Node):
                 response.error_msg = f"Failed to lookup transform from {header.frame_id} to {request.target_frame}: {e}"
                 self.get_logger().error(response.error_msg)
                 return response
+            
+        self.get_logger().info('Transform lookup successful (if needed). Processing depth points and running YOLO...')
 
         points, validmask_points = get_array_from_points(depth_points, camera_k)
         yolo_results = self.yolo(rgb_image)
@@ -321,6 +352,8 @@ class DetectWavingPersonsNode(Node):
             response.status = 1
             response.error_msg = "No waving persons detected"
             self.get_logger().info(response.error_msg)
+        
+        self.get_logger().info(f'Detect waving request processing complete in {time.perf_counter() - _t0:.3f} seconds.')
 
         return response
 

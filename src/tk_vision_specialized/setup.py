@@ -24,6 +24,7 @@ setup(
             'waving_person_server = tk_vision_specialized.waving_person_server:main',
             'waving_client = tk_vision_specialized.waving_client:main',
             'check_waving_inference = tk_vision_specialized.check_waving_inference:main',
+            'placing_location_server = tk_vision_specialized.placing_location_server:main',
         ],
     },
 )

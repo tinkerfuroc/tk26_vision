@@ -33,6 +33,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ObjectDetection.srv"
   "srv/ObjectDetectionGeneralist.srv"
   "srv/ObjectDetectionImage.srv"
+  "srv/PlacingLocation.srv"
   "srv/PointDirection.srv"
   "srv/SetTorque.srv"
   "srv/SetZero.srv"

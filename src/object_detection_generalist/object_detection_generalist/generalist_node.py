@@ -36,6 +36,7 @@ the parent class. No duplication.
 from __future__ import annotations
 
 import copy
+import re
 import threading
 import time
 
@@ -467,7 +468,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         work and exits.
         """
         try:
-            bboxes, vlm_elapsed = request_bboxes(
+            bboxes, raw_labels, vlm_elapsed = request_bboxes(
                 rgb_img, prompt,
                 model=self.vlm_model,
                 max_retries=self.vlm_max_retries,
@@ -495,6 +496,12 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 'vlm_sam', vlm_elapsed=vlm_elapsed,
             )
 
+        prompt_classes = self._parse_prompt_classes(prompt)
+        cls_per_box = [
+            self._normalize_vlm_label(lbl, prompt_classes, prompt)
+            for lbl in raw_labels
+        ]
+
         with self._sam_lock:
             # Re-check after acquiring the lock — caller may have abandoned
             # while we were queued behind another SAM call.
@@ -506,6 +513,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         objects, segments = self._build_fallback_objects(
             prompt, bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments,
+            labels=cls_per_box,
         )
         if objects:
             objects, segments = self._sort_objects_and_segments(
@@ -518,6 +526,8 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'bboxes': bboxes, 'masks': masks, 'confs': [],
             'world_elapsed': 0.0, 'vlm_elapsed': vlm_elapsed,
             'sam_elapsed': sam_elapsed,
+            'vlm_labels': cls_per_box,
+            'vlm_raw_labels': list(raw_labels),
             'error': None,
         }
 
@@ -709,14 +719,20 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             return
 
         # vlm_sam / yolo_world / none — render from the live result dict.
+        vlm_labels = result.get('vlm_labels') or []
+        vlm_raw_labels = result.get('vlm_raw_labels') or []
         detections = []
         for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
             if mask is None or mask.sum() == 0:
                 continue
+            cls_name = (
+                vlm_labels[i] if source == 'vlm_sam' and i < len(vlm_labels)
+                else prompt
+            )
             detections.append({
                 'bbox': bbox,
                 'mask': mask,
-                'cls_name': prompt,
+                'cls_name': cls_name,
                 'conf': confs[i] if i < len(confs) else 1.0,
             })
         timings: dict[str, float] = {'total': time.perf_counter() - _t0}
@@ -726,15 +742,27 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             timings['vlm'] = result['vlm_elapsed']
         if result.get('world_elapsed'):
             timings['yolo_world'] = result['world_elapsed']
+        if source == 'vlm_sam' and bboxes:
+            vlm_raw = [
+                {
+                    'box': list(bbox),
+                    'raw_label': (
+                        vlm_raw_labels[i] if i < len(vlm_raw_labels) else ''
+                    ),
+                    'cls': (
+                        vlm_labels[i] if i < len(vlm_labels) else prompt
+                    ),
+                }
+                for i, bbox in enumerate(bboxes)
+            ]
+        else:
+            vlm_raw = None
         self._write_debug_artifacts(
             rgb_img,
             detections,
             request_ctx=request_ctx,
             branch=used_source,
-            vlm_raw=(
-                [list(bbox) for bbox in bboxes]
-                if source == 'vlm_sam' and bboxes else None
-            ),
+            vlm_raw=vlm_raw,
             timings=timings,
         )
 
@@ -806,6 +834,46 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             return 'highest'
         return 'none'
 
+    @staticmethod
+    def _parse_prompt_classes(prompt: str) -> list[str]:
+        """Split a ' . '-joined open-vocab prompt into class strings.
+
+        ``'apple . banana . pear'`` → ``['apple', 'banana', 'pear']``. Empty /
+        whitespace-only segments are dropped. A single-word prompt yields a
+        single-element list, so downstream normalization collapses to the
+        identity case.
+        """
+        parts = [p.strip() for p in prompt.split(' . ') if p.strip()]
+        return parts or [prompt.strip()]
+
+    @staticmethod
+    def _normalize_vlm_label(label: str, prompt_classes: list[str],
+                             full_prompt: str) -> str:
+        """Map a free-form Gemini label to one of the prompt classes.
+
+        Tokenize both. A prompt class matches when ALL of its tokens are
+        present in the label tokens (case-insensitive). Pick the class with
+        the most matched tokens (longest/most-specific wins). Ties broken
+        by first occurrence in ``prompt_classes``. Falls back to
+        ``full_prompt`` when nothing matches — preserves pre-change behavior.
+        """
+        if not label:
+            return full_prompt
+        label_tokens = set(re.findall(r'[a-z0-9]+', label.lower()))
+        if not label_tokens:
+            return full_prompt
+        best_cls = None
+        best_score = 0
+        for cls in prompt_classes:
+            cls_tokens = re.findall(r'[a-z0-9]+', cls.lower())
+            if not cls_tokens:
+                continue
+            if all(t in label_tokens for t in cls_tokens):
+                if len(cls_tokens) > best_score:
+                    best_cls = cls
+                    best_score = len(cls_tokens)
+        return best_cls if best_cls is not None else full_prompt
+
     def _build_fallback_objects(
         self,
         prompt: str,
@@ -816,6 +884,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         camera: str,
         return_segments: bool,
         confs: list[float] | None = None,
+        labels: list[str] | None = None,
     ):
         """Convert (bbox, mask) pairs into Object[] via parent centroid logic.
 
@@ -825,6 +894,12 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         conf=1.0. Callers that want to filter on confidence should branch on
         the response's ``detection_source`` (`'yolo'` and `'yolo_world'`
         carry real scores; `'vlm_sam'` does not).
+
+        ``labels`` is the per-box ``Object.cls`` to write. VLM-path callers
+        normalize Gemini's free-form label down to one of the prompt classes
+        and pass the result here. YOLO-World callers pass nothing (their
+        model is configured single-class) and every object's ``cls`` falls
+        back to the full ``prompt``.
         """
         import numpy as np
 
@@ -848,7 +923,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 continue
             obj = Object()
             obj.conf = float(confs[i]) if confs and i < len(confs) else 1.0
-            obj.cls = prompt
+            obj.cls = labels[i] if labels and i < len(labels) else prompt
             obj.centroid = centroid
             obj.id = 0
             obj.object_id = -1

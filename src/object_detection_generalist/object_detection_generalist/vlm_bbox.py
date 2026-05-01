@@ -145,13 +145,16 @@ def request_bboxes(
     logger=None,
     abandon_event=None,
     client_holder: dict | None = None,
-) -> tuple[List[Bbox], float]:
+) -> tuple[List[Bbox], List[str], float]:
     """Ask Gemini for every xyxy bounding box matching `prompt` in the image.
 
-    Returns ``(boxes, elapsed_s)`` where ``elapsed_s`` is wall-clock seconds
-    for the entire VLM call (including retries). Returns an empty list on parse
-    exhaustion or an explicit "no matches" response. Raises `VlmBboxError` only
-    for configuration problems we want the caller to surface (missing API key).
+    Returns ``(boxes, labels, elapsed_s)`` where ``labels[i]`` is Gemini's
+    free-form distinguishing label for ``boxes[i]`` (parallel arrays; empty
+    string if Gemini omitted the field for that detection). ``elapsed_s`` is
+    wall-clock seconds for the entire VLM call (including retries). Returns
+    empty lists on parse exhaustion or an explicit "no matches" response.
+    Raises `VlmBboxError` only for configuration problems we want the caller
+    to surface (missing API key).
 
     Cancellation
     ------------
@@ -224,7 +227,7 @@ def request_bboxes(
                         f'VLM call abandoned before attempt '
                         f'{attempt}/{max_retries}'
                     )
-                return [], time.perf_counter() - _t0
+                return [], [], time.perf_counter() - _t0
             response_format = (
                 response_format_strict if use_strict
                 else response_format_loose
@@ -240,11 +243,16 @@ def request_bboxes(
                 detections = parsed.get('detections', []) or []
 
                 boxes: List[Bbox] = []
+                labels: List[str] = []
                 for det in detections:
-                    box_2d = det.get('box_2d') if isinstance(det, dict) else None
-                    decoded = _decode_bbox(box_2d, w, h)
-                    if decoded is not None:
-                        boxes.append(decoded)
+                    if not isinstance(det, dict):
+                        continue
+                    decoded = _decode_bbox(det.get('box_2d'), w, h)
+                    if decoded is None:
+                        continue
+                    boxes.append(decoded)
+                    raw_label = det.get('label')
+                    labels.append(raw_label if isinstance(raw_label, str) else '')
 
                 if logger is not None:
                     logger.info(
@@ -252,7 +260,7 @@ def request_bboxes(
                         f'{len(boxes)} valid box(es) after decode (attempt '
                         f'{attempt}/{max_retries}).'
                     )
-                return boxes, time.perf_counter() - _t0
+                return boxes, labels, time.perf_counter() - _t0
             except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
                 last_error = exc
                 if logger is not None:
@@ -269,7 +277,7 @@ def request_bboxes(
                             f'VLM call abandoned mid-flight '
                             f'({type(exc).__name__}: {exc}); exiting'
                         )
-                    return [], time.perf_counter() - _t0
+                    return [], [], time.perf_counter() - _t0
                 # If json_schema isn't supported by this route (typical
                 # signature: HTTP 400 with response_format / schema in the
                 # message), drop to plain json_object for remaining
@@ -298,7 +306,7 @@ def request_bboxes(
                 f'VLM bbox request exhausted {max_retries} retries; '
                 f'last error: {last_error}'
             )
-        return [], time.perf_counter() - _t0
+        return [], [], time.perf_counter() - _t0
     finally:
         # Always close the client we own. Idempotent — caller may have
         # already closed it as part of the abandon path.

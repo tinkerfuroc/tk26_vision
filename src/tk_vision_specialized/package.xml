@@ -17,6 +17,8 @@
   <depend>cv_bridge</depend>
   <depend>message_filters</depend>
   <exec_depend>vision_util</exec_depend>
+  <exec_depend>object_detection_new</exec_depend>
+  <exec_depend>kimi_api</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

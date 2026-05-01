@@ -66,6 +66,8 @@ from .calibration.aruco_detect import (
 from .calibration.run_calibration import GATES as _RC_GATES
 from .calibration.safety import SafetyEnvelope
 from .calibration.urdf_targets import list_targets as list_urdf_targets
+from .calibration.yaml_targets import list_yaml_targets
+from .calibration import apply_to_urdf as _apply_to_urdf_mod
 from .calibration.utils import matrix_to_pose, pose_to_matrix
 from .calibration.waypoint_predict import (
     chain_predictors,
@@ -235,38 +237,87 @@ class CalibrateRunner:
         return True
 
     # ---- apply_to_urdf diff (synchronous, short-running) -------------------
+    #
+    # Renders unified diffs for BOTH the xacro and pan_tilt.yaml targets in
+    # one shot — runtime offsets must be applied in lockstep with the URDF,
+    # and the operator should see both changes before clicking Apply. We
+    # call the patcher functions in-process (no subprocess) for deterministic
+    # error handling and to avoid stdout parsing.
 
     async def urdf_diff(self, session: str, results_file: str, xacro_path: str) -> dict:
         session_path = self.session_path(session)
         results_path = session_path / results_file
-        argv = [
-            sys.executable, "-m", "pan_tilt.calibration.apply_to_urdf",
-            "--results", str(results_path),
-            "--xacro", xacro_path,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"apply_to_urdf exited {proc.returncode}: "
-                f"{stderr.decode('utf-8', errors='replace').strip()}"
+        if not results_path.is_file():
+            raise FileNotFoundError(
+                f"results file {results_file!r} not found in session {session!r}"
             )
-        return {"diff": stdout.decode("utf-8", errors="replace")}
+
+        params = _apply_to_urdf_mod._load_params(results_path)
+        import numpy as _np
+        t_a = _np.asarray(params["t_a"], dtype=float)
+        t_b_trans = _np.asarray(params["t_b_trans"], dtype=float)
+        t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
+        pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
+        tilt_offset_rad = float(params.get("theta_t_offset_rad", 0.0))
+
+        xacro = Path(xacro_path)
+        if not xacro.is_file():
+            raise FileNotFoundError(f"xacro {xacro_path!r} not present")
+        original_xacro = xacro.read_text()
+        try:
+            patched_xacro = _apply_to_urdf_mod._patched_xacro(
+                original_xacro, t_a, t_b_trans, t_b_rotvec,
+                allow_flipped_camera=True,  # diff mode — show what would land
+            )
+        except _apply_to_urdf_mod.CalibrationApplyError as exc:
+            return {"diff": "", "yaml_diff": "", "error": str(exc)}
+
+        urdf_diff_text = "".join(difflib.unified_diff(
+            original_xacro.splitlines(keepends=True),
+            patched_xacro.splitlines(keepends=True),
+            fromfile=str(xacro),
+            tofile=str(xacro) + " (calibrated)",
+        ))
+
+        yaml_diff_text = ""
+        yaml_targets = [t for t in list_yaml_targets() if t.exists]
+        if yaml_targets:
+            yaml_path = Path(yaml_targets[0].path)
+            original_yaml = yaml_path.read_text()
+            try:
+                patched_yaml = _apply_to_urdf_mod._patch_yaml_offsets(
+                    original_yaml, pan_offset_rad, tilt_offset_rad,
+                )
+            except _apply_to_urdf_mod.CalibrationApplyError as exc:
+                yaml_diff_text = f"# YAML patch error: {exc}\n"
+            else:
+                yaml_diff_text = "".join(difflib.unified_diff(
+                    original_yaml.splitlines(keepends=True),
+                    patched_yaml.splitlines(keepends=True),
+                    fromfile=str(yaml_path),
+                    tofile=str(yaml_path) + " (calibrated)",
+                ))
+
+        return {
+            "diff": urdf_diff_text,
+            "yaml_diff": yaml_diff_text,
+            "yaml_path": str(yaml_targets[0].path) if yaml_targets else None,
+        }
 
     # ---- apply_to_urdf write (atomic in-place patch with backup) -----------
 
     async def urdf_apply(self, session: str, results_file: str, xacro_path: str) -> dict:
-        """Patch ``xacro_path`` from ``<session>/<results_file>`` and replace
-        in place. Writes a timestamped backup unless the patch is a no-op.
+        """Patch ``xacro_path`` AND `pan_tilt.yaml` from ``<session>/<results_file>``,
+        replace in place, leave timestamped backups for both.
 
         ``xacro_path`` must match one of the entries in ``list_urdf_targets()``.
         That allowlist is the only thing standing between an HTTP body and
-        an arbitrary file write, so the check is mandatory here even though
-        ``urdf_diff`` (read-only) doesn't need it.
+        an arbitrary file write, so the check is mandatory here. The YAML
+        path is server-side discovered via ``list_yaml_targets()`` and is
+        never accepted from the request body.
+
+        Idempotent: when either file already matches the calibration, no
+        backup for that file is written.
         """
         target = next(
             (t for t in list_urdf_targets() if t.path == xacro_path),
@@ -289,67 +340,75 @@ class CalibrateRunner:
                 f"results file {results_file!r} not found in session {session!r}"
             )
 
+        params = _apply_to_urdf_mod._load_params(results_path)
+        import numpy as _np
+        t_a = _np.asarray(params["t_a"], dtype=float)
+        t_b_trans = _np.asarray(params["t_b_trans"], dtype=float)
+        t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
+        pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
+        tilt_offset_rad = float(params.get("theta_t_offset_rad", 0.0))
+
         xacro = Path(xacro_path)
-        # Sit the temp file next to the target so os.replace() is atomic
-        # (same filesystem) and a crash leaves a debuggable artifact rather
-        # than a half-written xacro.
-        run_id = uuid.uuid4().hex[:8]
-        tmp_path = xacro.with_name(xacro.name + f".tmp-{run_id}")
-
-        argv = [
-            sys.executable, "-m", "pan_tilt.calibration.apply_to_urdf",
-            "--results", str(results_path),
-            "--xacro", str(xacro),
-            "--out", str(tmp_path),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            tmp_path.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"apply_to_urdf exited {proc.returncode}: "
-                f"{stderr.decode('utf-8', errors='replace').strip()}"
+        original_xacro = xacro.read_text()
+        try:
+            patched_xacro = _apply_to_urdf_mod._patched_xacro(
+                original_xacro, t_a, t_b_trans, t_b_rotvec,
+                allow_flipped_camera=True,
             )
-        if not tmp_path.is_file():
-            raise RuntimeError(
-                f"apply_to_urdf produced no output at {tmp_path}; "
-                f"stdout was: {stdout.decode('utf-8', errors='replace').strip()}"
+        except _apply_to_urdf_mod.CalibrationApplyError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        yaml_targets = [t for t in list_yaml_targets() if t.exists]
+        yaml_path = Path(yaml_targets[0].path) if yaml_targets else None
+
+        try:
+            atomic = _apply_to_urdf_mod._atomic_write_pair(
+                xacro, patched_xacro,
+                yaml_path, pan_offset_rad, tilt_offset_rad,
             )
+        except _apply_to_urdf_mod.CalibrationApplyError as exc:
+            raise RuntimeError(str(exc)) from exc
 
-        original_bytes = xacro.read_bytes()
-        patched_bytes = tmp_path.read_bytes()
-        if original_bytes == patched_bytes:
-            tmp_path.unlink(missing_ok=True)
-            return {
-                "applied": False,
-                "reason": "no change — xacro already matches calibration",
-                "build_package": target.build_package,
-                "build_command": target.build_command,
-                "workspace_hint": target.workspace_hint,
-            }
+        # Diff previews for the UI's success card. Compare current file
+        # contents (post-replace) against the .old-<ts> backups.
+        urdf_diff_preview = ""
+        if atomic["xacro_applied"] and atomic["xacro_backup_path"]:
+            urdf_diff_preview = "".join(list(difflib.unified_diff(
+                Path(atomic["xacro_backup_path"]).read_text().splitlines(keepends=True),
+                xacro.read_text().splitlines(keepends=True),
+                fromfile=str(xacro),
+                tofile=str(xacro) + " (calibrated)",
+            ))[:24])
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = xacro.with_name(xacro.name + f".old-{ts}")
-        backup_path.write_bytes(original_bytes)
-        os.replace(tmp_path, xacro)
+        yaml_diff_preview = ""
+        if atomic["yaml_applied"] and atomic["yaml_backup_path"] and yaml_path is not None:
+            yaml_diff_preview = "".join(list(difflib.unified_diff(
+                Path(atomic["yaml_backup_path"]).read_text().splitlines(keepends=True),
+                yaml_path.read_text().splitlines(keepends=True),
+                fromfile=str(yaml_path),
+                tofile=str(yaml_path) + " (calibrated)",
+            ))[:12])
 
-        diff_lines = list(difflib.unified_diff(
-            original_bytes.decode("utf-8", errors="replace").splitlines(keepends=True),
-            patched_bytes.decode("utf-8", errors="replace").splitlines(keepends=True),
-            fromfile=str(xacro),
-            tofile=str(xacro) + " (calibrated)",
-        ))
+        applied_anything = atomic["xacro_applied"] or atomic["yaml_applied"]
         return {
-            "applied": True,
-            "backup_path": str(backup_path),
+            "applied": applied_anything,
+            "reason": (
+                None if applied_anything else
+                "no change — URDF and YAML already match calibration"
+            ),
             "build_package": target.build_package,
             "build_command": target.build_command,
             "workspace_hint": target.workspace_hint,
-            "diff_preview": "".join(diff_lines[:24]),
+            # URDF surface (back-compat with old client code).
+            "backup_path": atomic["xacro_backup_path"],
+            "diff_preview": urdf_diff_preview,
+            # YAML surface (new).
+            "yaml_path": atomic["yaml_path"],
+            "yaml_applied": atomic["yaml_applied"],
+            "yaml_backup_path": atomic["yaml_backup_path"],
+            "yaml_diff_preview": yaml_diff_preview,
+            "pan_offset_rad": pan_offset_rad,
+            "tilt_offset_rad": tilt_offset_rad,
         }
 
 
@@ -913,26 +972,23 @@ class CalibWebNode(Node):
         with self.lock:
             self._waypoints[phase] = list(wps)
 
-    def _dedupe_waypoints_inplace(self, eps_rad: float = 1e-3) -> dict:
+    def dedupe_waypoints(self, eps_rad: float = 1e-3) -> dict:
         """Drop near-duplicate waypoints in place across all waypoint lists.
 
         Two waypoints are duplicates if every joint angle agrees within
         `eps_rad` (~0.06 deg, well below the xArm's joint repeatability).
-        Operates on `self._waypoints` directly so subsequent /api/waypoints
-        reads reflect the cleanup. Returns a per-phase dict of how many
-        entries were removed, so the caller can log it.
+        Order-preserving: first occurrence wins. List-of-floats phases
+        (sanity_xarm_angles_rad) are skipped. Returns a per-phase dict of
+        how many entries were removed.
 
-        Order-preserving: the first occurrence wins; later duplicates are
-        dropped. List-of-floats and list-of-lists are both handled (the
-        sanity-pose phase is a flat float list, not a list of waypoints).
+        Operator-triggered only -- save no longer dedupes implicitly so
+        intentional duplicates used as a self-consistency probe survive.
         """
         removed: dict = {}
         with self.lock:
             for phase, wps in self._waypoints.items():
                 if not isinstance(wps, list) or not wps:
                     continue
-                # Skip flat float lists (e.g. sanity_xarm_angles_rad is a
-                # single waypoint encoded as a flat list of joint angles).
                 if not isinstance(wps[0], (list, tuple)):
                     continue
                 kept: list = []
@@ -956,18 +1012,10 @@ class CalibWebNode(Node):
     def _serialize_waypoints_yaml(self) -> str:
         """Build the full YAML string for the current waypoint state.
 
-        Dedupes near-identical waypoints first so the on-disk yaml is the
-        canonical, deduplicated form. Operator-defined duplicates were used
-        as a self-consistency probe earlier in the calibration workflow,
-        but downstream solvers (Park-Martin) get nothing extra from them
-        and the inter-duplicate check at collection time is a better
-        signal anyway -- so save-time dedup keeps the yaml clean.
+        Duplicates are preserved on save: operators intentionally repeat
+        waypoints as a self-consistency probe, and stripping them on save
+        silently undoes that. Use the explicit dedupe action instead.
         """
-        removed = self._dedupe_waypoints_inplace()
-        if removed:
-            self.get_logger().info(
-                f"deduped waypoints before save: {removed}"
-            )
         base = {k: v for k, v in self._loaded_cfg.items() if k != "__passthrough__"}
         with self.lock:
             for k, v in self._waypoints.items():
@@ -1359,6 +1407,19 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         except Exception as exc:
             raise HTTPException(500, f"save failed: {exc}")
         return {"ok": True, "path": str(path)}
+
+    @app.post("/api/waypoints/dedupe")
+    async def api_waypoints_dedupe():
+        """Drop near-duplicate waypoints from the in-memory lists.
+
+        Operator-triggered: save/promote no longer dedupe implicitly.
+        Caller is expected to follow up with /save or /promote to persist.
+        """
+        try:
+            removed = node.dedupe_waypoints()
+        except Exception as exc:
+            raise HTTPException(500, f"dedupe failed: {exc}")
+        return {"ok": True, "removed": removed}
 
     @app.post("/api/waypoints/promote")
     async def api_waypoints_promote():

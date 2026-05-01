@@ -8,14 +8,12 @@ that layer and returns a PointStamped.
 Changes from tk23:
 - API key/base URL/model from environment.
 - `detection_service` ROS param (default `object_detection`) for retargeting.
-- Temporary JPEG encoded via `tempfile.NamedTemporaryFile`.
+- JPEG encoding shared with feature_recognition / feature_matching via
+  `kimi_api._image_utils.encode_to_data_url` (in-memory `cv2.imencode`).
 - Dead Chinese-prompt block removed.
 """
 
-import base64
 import json
-import os
-import tempfile
 import threading
 import time
 
@@ -37,6 +35,7 @@ from tinker_vision_msgs_26.action import Categorize
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
 from ._env import base_url, default_model, load_env, require_api_key
+from ._image_utils import encode_to_data_url
 
 USE_SHELF_HEIGHT = False
 PROJECT_ON_LINE = False
@@ -46,18 +45,6 @@ def get_bounding_box(mask):
     nonzero = np.nonzero(mask)
     x1, y1, x2, y2 = np.min(nonzero[0]), np.min(nonzero[1]), np.max(nonzero[0]), np.max(nonzero[1])
     return x1, y1, x2, y2
-
-
-def _encode_to_data_url(img) -> str:
-    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        cv2.imwrite(tmp_path, img)
-        with open(tmp_path, 'rb') as f:
-            data = f.read()
-    finally:
-        os.unlink(tmp_path)
-    return f'data:image/jpg;base64,{base64.b64encode(data).decode("utf-8")}'
 
 
 class GroceryCategorizeAction(Node):
@@ -232,8 +219,8 @@ class GroceryCategorizeAction(Node):
         feedback_msg.message = 'Determining layer to put on...'
         goal_handle.publish_feedback(feedback_msg)
 
-        obj_seg_url = _encode_to_data_url(obj_segment)
-        shelf_img_url = _encode_to_data_url(rgb_image)
+        obj_seg_url = encode_to_data_url(obj_segment)
+        shelf_img_url = encode_to_data_url(rgb_image)
 
         sys_prompt = (
             f'You will be given a picture of a shelf with {goal_handle.request.n_layers} main'

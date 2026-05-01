@@ -23,78 +23,78 @@ client, client.close in finally). Kept dependency-leaf: no import from
 
 from __future__ import annotations
 
-import base64
 import json
-import os
-import tempfile
 import time
 from typing import Sequence, Tuple
 
-import cv2
 import numpy as np
 
 from ._env import base_url, load_env, require_api_key
+from ._image_utils import encode_to_data_url
 
 
 Point = Tuple[int, int]  # (x, y) in pixel coords
 
 
 _SYSTEM_PROMPT = (
-    'You are helping a robot place a new guest on an empty seat. Fill '
-    'the JSON fields in this exact order: `visible_seats`, then '
-    '`label`, then `point`.\n'
+    'You are helping a robot place a new guest on an empty seat.\n'
     '\n'
-    '- The `visible_seats` field (emitted FIRST): an array covering '
-    'EVERY sittable spot visible in the image. For each spot, include '
-    '  {"label": "<unique short identifier>", "occupied": true|false, '
-    '"reason": "<why occupied / why empty>"}.\n'
-    '  Count the cushions accurately — if a sofa has two visible '
-    'cushions, list two entries, not three.\n'
-    '  Occupancy rules — read carefully:\n'
-    '    (i) A spot is OCCUPIED only if a person sits on it, OR a '
-    'substantial object rests DIRECTLY on the cushion surface '
-    '(laptop, bag, folded clothes, cushion-pillow etc.).\n'
-    '    (ii) Objects on a nearby COFFEE TABLE, SIDE TABLE, FLOOR, '
-    'or other furniture do NOT occupy the seat. Cables / wires '
-    'draped loosely DO NOT occupy the seat. A water bottle on a '
-    'coffee table in front of the sofa does NOT occupy the sofa. Be '
-    'strict about physical contact with the cushion.\n'
-    '    (iii) If in doubt about whether an item is on the cushion '
-    'vs on a table in front of it, mark the seat as empty.\n'
-    '  If NO sittable furniture is visible at all, return an empty '
-    'array [].\n'
+    'Look at the image and produce a JSON object with three fields, in '
+    'this order: visible_seats, label, point.\n'
     '\n'
-    '- The `label` field: copy the label of one entry from '
-    '`visible_seats` that has occupied=false. This is the seat you '
-    'recommend. If every entry in `visible_seats` has occupied=true, '
-    'or the array is empty, set label to exactly "none".\n'
+    'visible_seats — array of every sittable spot visible in the image. '
+    'One entry per cushion or per single-person seat (a 2-cushion sofa = '
+    '2 entries; a 3-cushion sofa = 3 entries; a continuous-cushion '
+    'loveseat = 1 entry). Each entry:\n'
+    '{"label": "<short identifier with a visual anchor>", "occupied": '
+    'true|false, "reason": "<one short clause>"}\n'
     '\n'
-    '- The `point` field: exactly two integers [y, x] normalized to '
-    '0-1000, pointing at the sitting surface of the seat named by '
-    '`label` — the exact spot a guest would land on when they sit '
-    'down. Axis convention: y=0 is the TOP of the image, y=1000 is '
-    'the BOTTOM; x=0 is the LEFT, x=1000 is the RIGHT.\n'
-    '  Hard constraints on where the point may land:\n'
-    '    (a) It MUST be on visible seating furniture (cushion / seat '
-    'pan). Never on a wall, poster, floor, air, backrest, armrest, '
-    'another occupant, or the gap between two cushions.\n'
-    '    (b) The sitting surface you target must belong to the seat '
-    'named by `label`. If that seat is partially occluded, point at '
-    'a visibly-empty portion of its cushion.\n'
-    '    (c) For any seat that has a visible backrest, the pointing '
-    'pixel MUST lie BELOW the bottom edge of that backrest — i.e., on '
-    'the horizontal seat cushion, not on the vertical backrest. The '
-    'cushion typically sits in the lower half of a chair\'s visible '
-    'bounding extent.\n'
-    '    (d) Before committing, mentally check: is the pixel at [y, '
-    'x] the same colour/material as the cushion? If it matches a '
-    'wall / poster / different colour behind the sofa, SHIFT y '
-    'downward (larger y value) until the pixel is on the cushion.\n'
-    '  If `label` is "none", set point to [0, 0].\n'
+    'The label must include a visual anchor that uniquely locates this '
+    'cushion — describe what is on it, next to it, or behind it. Good '
+    'labels: "left cushion of the gray sofa, next to the white pillow", '
+    '"armchair under the window", "middle seat between the two people '
+    'on the couch". Avoid bare numbering like "seat 1" or "cushion 2".\n'
     '\n'
-    'Do not hallucinate a seat that is not visibly present. It is '
-    'correct and expected to return label="none" when every seat in '
-    'view is occupied — the robot will handle that case.'
+    'A spot is OCCUPIED when a person is sitting on it, or a large object is '
+    'resting directly on the cushion fabric (backpack, laptop).\n'
+    '\n'
+    'A spot is EMPTY when the cushion fabric is visible and clear. '
+    'Objects on a coffee table, side table, floor, or armrest do not '
+    'occupy the cushion. Loose cables or wires do not occupy the '
+    'cushion. When uncertain whether an item rests on the cushion or on '
+    'a table in front of it, mark EMPTY.\n'
+    '\n'
+    'Only include seats that are actually present in the image. If no '
+    'sittable furniture is visible, return [].\n'
+    '\n'
+    'label — copy the label of one entry from visible_seats whose '
+    'occupied is false. This is your recommendation. If every entry is '
+    'occupied, or visible_seats is empty, set label to "none".\n'
+    '\n'
+    'point — [y, x] with each value an integer in 0–1000, normalized to '
+    'image dimensions. y=0 is the top of the image, y=1000 is the '
+    'bottom; x=0 is the left, x=1000 is the right. The point must land '
+    'on the visible cushion fabric of the seat named by label — the '
+    'flat horizontal surface a person\'s seat would touch.\n'
+    '\n'
+    'The point must satisfy all of:\n'
+    '- on cushion fabric, not on a backrest, armrest, wall, floor, or '
+    'the gap between cushions\n'
+    '- on the seat named by label, not a neighboring seat\n'
+    '- not on a person, laptop, bag, bottle, food, blanket, or the '
+    'coffee table in front of the sofa (coffee tables look horizontal '
+    'too, so verify the y value lands on the seat itself, not on a '
+    'table surface in front of it)\n'
+    '- if the seat has a backrest, below the bottom edge of that '
+    'backrest\n'
+    '- the same color and material as the cushion (if the pixel matches '
+    'the wall behind the sofa, increase y until you are on the '
+    'cushion)\n'
+    '\n'
+    'If label is "none", set point to [0, 0].\n'
+    '\n'
+    'It is correct to return label="none" when every visible seat is '
+    'occupied. The robot handles that case.'
 )
 
 
@@ -129,18 +129,6 @@ _RESPONSE_SCHEMA = {
     'required': ['visible_seats', 'label', 'point'],
     'additionalProperties': False,
 }
-
-
-def _encode_data_url(rgb_bgr: np.ndarray) -> str:
-    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        cv2.imwrite(tmp_path, rgb_bgr)
-        with open(tmp_path, 'rb') as f:
-            data = f.read()
-    finally:
-        os.unlink(tmp_path)
-    return f'data:image/jpeg;base64,{base64.b64encode(data).decode("utf-8")}'
 
 
 def _decode_point(point_yx, w: int, h: int) -> Point | None:
@@ -212,7 +200,7 @@ def request_seat(
 
     t0 = time.perf_counter()
     try:
-        data_url = _encode_data_url(rgb_bgr)
+        data_url = encode_to_data_url(rgb_bgr)
         h, w = rgb_bgr.shape[:2]
 
         text_prompt = _build_text_prompt(names, features)
@@ -239,6 +227,17 @@ def request_seat(
         response_format_loose = {'type': 'json_object'}
         use_strict = True
 
+        # Force thinking on for Gemini 2.5 Pro: by default Pro auto-budgets
+        # thinking tokens, which OpenRouter sometimes routes through with
+        # zero budget on cached prompts — silently falling back to non-
+        # thinking accuracy. Setting an explicit budget via OpenRouter's
+        # `reasoning` extra_body passes through to Gemini's thinkingConfig.
+        # Flash 2.5 also accepts the field but doesn't benefit; we gate on
+        # 'pro' to avoid request rejections from Flash-only routes.
+        extra_body: dict | None = None
+        if 'pro' in model.lower():
+            extra_body = {'reasoning': {'enabled': True, 'max_tokens': 2048}}
+
         last_error: Exception | None = None
         last_label = ''
         for attempt in range(1, max_retries + 1):
@@ -246,13 +245,20 @@ def request_seat(
                 response_format_strict if use_strict else response_format_loose
             )
             try:
-                completion = client.with_options(timeout=timeout_s).chat.completions.create(
+                create_kwargs = dict(
                     model=model,
                     messages=messages,
                     response_format=response_format,
-                    # Google cookbook recommends ~0.5 for spatial output;
-                    # fully-deterministic 0 can cause looping.
-                    temperature=0.5,
+                    # 0.2 — Google cookbook caps spatial at 0.5 and notes
+                    # 0 can cause looping; 0.2 keeps just enough variance
+                    # to avoid loops while reducing per-call jitter on the
+                    # pointing pixel.
+                    temperature=0.2,
+                )
+                if extra_body is not None:
+                    create_kwargs['extra_body'] = extra_body
+                completion = client.with_options(timeout=timeout_s).chat.completions.create(
+                    **create_kwargs,
                 )
                 raw = completion.choices[0].message.content or ''
                 parsed = json.loads(raw)

@@ -62,8 +62,13 @@ class YOLOSegmentationNode(Node):
         # State variables
         self.bridge = CvBridge()
 
-        # TF2 buffer and listener for coordinate transformations
-        self.tf_buffer = Buffer()
+        # TF2 buffer and listener for coordinate transformations.
+        # 60 s cache covers the generalist subclass's VLM/race path, where
+        # a 20-30 s VLM call runs between camera frame capture and the
+        # 'highest' sort's TF lookup against header.stamp.
+        self.tf_buffer = Buffer(
+            cache_time=rclpy.duration.Duration(seconds=60.0)
+        )
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Thread locks for data protection
@@ -587,7 +592,8 @@ class YOLOSegmentationNode(Node):
             valid_mask: np.ndarray, header: Header,
             camera: str = 'realsense',
             request_segments: bool = False,
-            sort_mode: str = 'none') -> tuple:
+            sort_mode: str = 'none',
+            target_frame: str = '') -> tuple:
         """
         Run object detection and return results.
 
@@ -646,7 +652,16 @@ class YOLOSegmentationNode(Node):
         segments = []
         detection_info = []  # Store info for visualization: (bbox, mask, cls_name, conf, centroid)
         detection_info_all = []
-        
+
+        # Look up the source -> target frame transform once for the whole
+        # batch. None when no transform is needed; failure aborts cleanly.
+        centroid_tf, batch_ok = self._lookup_centroid_transform(
+            header.frame_id, target_frame, header.stamp, camera,
+        )
+        if not batch_ok:
+            objects_msg.status = 1
+            return objects_msg, []
+
         # Process detections
         for result in results:
             
@@ -715,7 +730,14 @@ class YOLOSegmentationNode(Node):
 
                 if cls_name != target_cls:
                     continue
-                
+
+                # Express centroid in target_frame; the source->target
+                # lookup was hoisted above, so this is just in-memory math.
+                if centroid_tf is not None:
+                    centroid = self._apply_centroid_transform(
+                        centroid, centroid_tf, header.frame_id, header.stamp,
+                    )
+
                 # Store detection info for visualization
                 detection_info.append({
                     'bbox': (x1, y1, x2, y2),
@@ -724,7 +746,7 @@ class YOLOSegmentationNode(Node):
                     'conf': conf,
                     'centroid': centroid
                 })
-                
+
                 # Create Object message
                 obj = Object()
                 obj.conf = conf
@@ -776,6 +798,12 @@ class YOLOSegmentationNode(Node):
         self._last_rgb_img = rgb_img.copy()
 
         objects_msg.status = 0 if len(objects_msg.objects) > 0 else 1
+
+        # Centroids were transformed into target_frame above; reflect that
+        # on the response header so the (PointStamped header, point) pair
+        # the BT consumes is self-consistent.
+        if target_frame and self._frame_supports_tf_transform(camera):
+            objects_msg.header.frame_id = target_frame
 
         return objects_msg, segments
 
@@ -844,6 +872,59 @@ class YOLOSegmentationNode(Node):
             point.z = float(centroid_3d[2])
 
         return point
+
+    # RealSense centroids use hand-rolled body-axis values (x=fwd, y=left,
+    # z=up) that disagree with their reported optical header.frame_id;
+    # skipping TF preserves existing grasp-service behavior. Orbbec values
+    # match their frame_id and transform cleanly.
+    _CAMERAS_WITH_UNRELIABLE_FRAME_ID = frozenset({'realsense'})
+
+    def _frame_supports_tf_transform(self, camera: str) -> bool:
+        return camera not in self._CAMERAS_WITH_UNRELIABLE_FRAME_ID
+
+    def _lookup_centroid_transform(self, source_frame: str,
+                                   target_frame: str, stamp,
+                                   camera: str = 'orbbec'):
+        """Look up source_frame -> target_frame once per service call.
+
+        Returns (tf_or_None, batch_ok).
+          * tf_or_None=None, batch_ok=True  — no transform needed (empty
+            target, same frame, or camera flagged unreliable). Loop just
+            uses the raw centroids.
+          * tf_or_None=<TransformStamped>, batch_ok=True — apply this to
+            every centroid; do_transform_point is in-memory math.
+          * tf_or_None=None, batch_ok=False — TF lookup failed; caller
+            should abort the batch rather than emit mis-framed centroids.
+
+        Hoisted out of the per-detection loop so a 20-person scene with
+        an unavailable TF doesn't pay 20 × the lookup_transform timeout.
+        """
+        if not target_frame or target_frame == source_frame:
+            return None, True
+        if not self._frame_supports_tf_transform(camera):
+            return None, True
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                target_frame, source_frame, stamp,
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+        except (LookupException, ConnectivityException,
+                ExtrapolationException) as e:
+            self.get_logger().warn(
+                f'TF {source_frame} -> {target_frame} failed: {e}; '
+                'dropping batch'
+            )
+            return None, False
+        return tf, True
+
+    @staticmethod
+    def _apply_centroid_transform(point, tf, source_frame: str, stamp):
+        """Apply a pre-fetched transform to a centroid Point. Cheap; no I/O."""
+        ps = geometry_msgs.msg.PointStamped()
+        ps.header.frame_id = source_frame
+        ps.header.stamp = stamp
+        ps.point = point
+        return do_transform_point(ps, tf).point
 
     def _visualize_all_detections(
             self, img: np.ndarray, detection_info: list, displaying_all=False):
@@ -916,11 +997,12 @@ class YOLOSegmentationNode(Node):
             ).astype(np.uint8)
             vis_img = cv2.addWeighted(vis_img, 0.7, mask_overlay, 0.3, 0)
         
-        # Save with timestamp
+        # Save with timestamp into the shared session run_dir.
         timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-        if displaying_all:
-            timestamp += '_all'
-        filename = f'{self.vision_log_folder}/detection_{timestamp}.png'
+        suffix = 'detection_all' if displaying_all else 'detection'
+        filename = self._vision_logger.aux_path(
+            timestamp, suffix, 'png', branch='yolo',
+        )
         cv2.imwrite(filename, vis_img)
         self.get_logger().info(f'Saved visualization to {filename}')
 
@@ -1034,7 +1116,8 @@ class YOLOSegmentationNode(Node):
                 header,
                 camera=camera,
                 request_segments=request_segments,
-                sort_mode=sort_mode
+                sort_mode=sort_mode,
+                target_frame=request.target_frame,
             )
 
             # Fill response

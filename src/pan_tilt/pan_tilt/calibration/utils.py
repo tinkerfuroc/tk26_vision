@@ -105,6 +105,29 @@ R_BODY_FROM_OPTICAL = np.array([
 ])
 
 
+def rotvec_to_xyz_euler(rotvec) -> np.ndarray:
+    """Convert a 3-vector axis-angle rotation to URDF-style XYZ Euler angles.
+
+    Single canonical conversion shared by the URDF patcher, the solver, and
+    the warm-start sanity check. Use this rather than calling
+    `Rotation.from_rotvec(...).as_euler("xyz")` inline so all three sites
+    agree on the convention.
+    """
+    return Rotation.from_rotvec(np.asarray(rotvec, dtype=float)).as_euler("xyz")
+
+
+def body_yaw_from_rotvec(rotvec) -> float:
+    """Body-frame yaw (rotation about +Z) implied by a rotvec, in radians.
+
+    For a forward-facing head camera, the URDF's `camera_mount_joint` rpy yaw
+    is expected to be near zero. A value near ±π is the smoking-gun signature
+    of a flipped optical→body conversion somewhere upstream (calibration
+    warm-start, hand-eye solve, etc.) and must be caught before it lands in
+    the URDF.
+    """
+    return float(rotvec_to_xyz_euler(rotvec)[2])
+
+
 def optical_to_body(T_optical: np.ndarray) -> np.ndarray:
     """Re-express a pose measured in the optical frame as a pose in the body frame.
 

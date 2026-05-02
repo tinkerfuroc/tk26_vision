@@ -18,7 +18,7 @@ Request fields that matter for path selection:
 | Field | Meaning |
 |---|---|
 | `prompt` | Natural-language or class name. Must match one of `model.names.values()` for the YOLO branch; anything else forces the open-vocab fallback branch. |
-| `force_vlm_sam` | Skip YOLO entirely, always use **VLM + FastSAM only** (operator override; ignores `enable_vlm`). Field name is historical. |
+| `force_vlm_sam` | Skip YOLO entirely, always use **VLM + FastSAM only** (operator override; ignores `enable_vlm`). Short-circuits **before** any YOLO-World code path — `force_vlm_sam=True` guarantees YOLO-World does not run. Field name is historical. |
 | `use_vlm_sam_fallback` | Per-request opt-in for the open-vocab fallback. Runs **YOLO-World and VLM concurrently**: if YOLO-World returns objects first, the VLM result is abandoned (the network call continues in the background as a daemon thread but its output is discarded); otherwise we wait for VLM. |
 | `sort_closest` / `sort_highest` | Typed boolean replacements for the old substring-parsed `flags` string. |
 | `return_rgb_image` / `return_depth_image` / `return_segments` | Payload toggles (save bandwidth when false). |
@@ -101,8 +101,10 @@ Common parameter overrides:
 | `world_conf_threshold` | `0.05` | YOLO-World tends to need a low threshold for novel classes; raise if you see false positives. |
 | `world_iou_threshold` | `0.5` | NMS IoU for YOLO-World. |
 | `vlm_model` | `google/gemini-2.5-flash` | OpenRouter model tag. Override per deployment via `-p vlm_model:=anthropic/claude-sonnet-4-6` etc. |
-| `vlm_timeout_s` | `20.0` | Per-VLM-call timeout. |
+| `vlm_timeout_s` | `20.0` | Per-VLM-call timeout. With `vlm_stream=True` (default) this is the per-chunk inactivity bound rather than a total-response deadline. |
 | `vlm_max_retries` | `3` | JSON parse / API retries before returning empty. |
+| `vlm_stream` | `True` | Stream the OpenRouter VLM response as SSE chunks. Keeps the HTTP connection active during long Gemini generations so intermediate proxies don't reap the silent socket, and gives sub-100 ms cancellation latency when the YOLO-World race partner wins. Flip to `False` to fall back to a single blocking response. |
+| `realsense_max_distance_m` | `1.0` | Range gate: drop detections whose centroid is farther than this from the realsense (arm) camera. Applied **only** when `request.camera == 'realsense'` — orbbec is unaffected. Set to `0.0` (or any non-positive value) to disable. Distance is Euclidean from the camera origin in the camera body frame (`sqrt(x²+y²+z²)` on `Object.centroid`, which on realsense is never TF-transformed). |
 | `allow_auto_fallback` | `True` | See branching above. |
 | `orbbec_depth_topic` | `/camera/depth_registered/points` | Must match what the camera launch publishes. For the canonical Femto Bolt launch this is `/camera/depth/points` — override accordingly. |
 
@@ -154,3 +156,9 @@ YOLO-World keeps the open-vocab path within real-time-ish budget (sub-second tot
 
 - `/object_detection_yolo` — specialist, custom-trained competition model, `excluded_classes=['person']`. Served by `object_detection_new/yolo_seg_node`.
 - `/object_detection` — pretrained COCO YOLO on the **legacy** `tinker_vision_msgs_26/srv/ObjectDetection` (string-flag schema inherited from tk23). Kept for backward compatibility with tk25_decision BTs that still hard-code this name. Served by `object_detection_new/yolo_seg_default_node`.
+
+## Changelog
+
+- **2026-05-02** — VLM call now streams the OpenRouter response by default (`vlm_stream=True`). Concatenates SSE `delta.content` chunks into the same JSON we parsed before, so the wire is never silent and intermediate proxies / NAT can't reap the connection mid-call. `vlm_timeout_s` becomes a per-chunk inactivity bound; abandon (race-cancel) latency drops from "up to one full HTTP attempt" to sub-100 ms because every chunk is a checkpoint. Strict→loose `response_format` fallback and `client_holder` cross-thread close path preserved unchanged. Set `-p vlm_stream:=false` to revert to the blocking call.
+- **2026-05-02** — `sort_closest` now uses Euclidean distance `sqrt(x²+y²+z²)` on `Object.centroid` instead of single-axis (was sorting by `centroid.x` on realsense / `centroid.z` on orbbec). Single-axis ignored lateral / vertical offset and broke entirely on orbbec because centroids are TF-transformed to `target_frame` before sort. Fix lives in the parent class `_sort_objects_and_segments` (`object_detection_new/object_seg_yolo.py`); `generalist_node` inherits it.
+- **2026-05-02** — Added `realsense_max_distance_m` (default `1.0`). Detections whose centroid sits farther than this from the realsense (arm) camera are dropped before the response is built. Applies to all three branches (yolo, yolo_world, vlm_sam) via a single shared post-build helper `_apply_realsense_range_gate`. Orbbec is untouched. Set `0.0` to disable. Same commit also documents the `force_vlm_sam ⇒ no YOLO-World` invariant in the dispatch chain (no behavior change — the dispatch was already correct, but the comment + README note guard against future regressions).

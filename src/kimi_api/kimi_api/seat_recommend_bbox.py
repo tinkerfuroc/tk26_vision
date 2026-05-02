@@ -63,6 +63,14 @@ class SeatRecommendBboxService(Node):
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
         self.declare_parameter('min_depth_m', 0.1)
         self.declare_parameter('max_depth_m', 10.0)
+        # Half-size in pixels of the neighbourhood walked by `_sample_depth_at`
+        # (5 → 11x11). Bump higher when Orbbec depth holes are large near the
+        # VLM target (transparent / specular / edge pixels).
+        self.declare_parameter('sample_depth_halfsize_px', 5)
+        # Last-resort depth (metres) when every fallback tier fails. The
+        # caller asked for an always-valid centroid, so we surface a
+        # plausible seat distance rather than a service failure.
+        self.declare_parameter('fallback_depth_m', 1.5)
         # Half-size in pixels of the bbox synthesized around the VLM pointing
         # pixel for the response's `bbox` field (used for overlay and pan-tilt
         # aiming; depth is sampled at the point itself, not the bbox centre).
@@ -103,6 +111,16 @@ class SeatRecommendBboxService(Node):
         )
         self.max_depth_m = (
             self.get_parameter('max_depth_m').get_parameter_value().double_value
+        )
+        self.sample_depth_halfsize_px = max(1, int(
+            self.get_parameter('sample_depth_halfsize_px')
+            .get_parameter_value()
+            .integer_value
+        ))
+        self.fallback_depth_m = float(
+            self.get_parameter('fallback_depth_m')
+            .get_parameter_value()
+            .double_value
         )
         self.point_bbox_halfsize_px = int(
             self.get_parameter('point_bbox_halfsize_px')
@@ -316,10 +334,11 @@ class SeatRecommendBboxService(Node):
         return best_uv[0], best_uv[1], best_score, best_normal, False
 
     def _sample_depth_at(self, depth_arr_m: np.ndarray, u: int, v: int):
-        """Return depth (metres) at pixel (u, v) or None.
+        """Return (u, v, depth_m) at pixel (u, v) or None.
 
-        Walks a 5x5 neighbourhood when the centre pixel has no valid depth
-        (Orbbec depth holes are common at object edges).
+        Walks a (2*hp+1)x(2*hp+1) neighbourhood (hp = ``sample_depth_halfsize_px``)
+        ring-by-ring outward. Orbbec depth holes near edges / dark / specular
+        surfaces are common, so the radius is configurable.
         """
         h, w = depth_arr_m.shape
         if w == 0 or h == 0:
@@ -327,8 +346,9 @@ class SeatRecommendBboxService(Node):
         u = max(0, min(int(u), w - 1))
         v = max(0, min(int(v), h - 1))
 
+        hp = self.sample_depth_halfsize_px
         offsets = [(0, 0)]
-        for r in range(1, 3):
+        for r in range(1, hp + 1):
             for du in range(-r, r + 1):
                 for dv in range(-r, r + 1):
                     if abs(du) == r or abs(dv) == r:
@@ -342,6 +362,71 @@ class SeatRecommendBboxService(Node):
                 if np.isfinite(z) and self.min_depth_m < z < self.max_depth_m:
                     return uu, vv, z
         return None
+
+    def _region_median_depth(
+        self,
+        depth_arr_m: np.ndarray,
+        u0: int, v0: int, u1: int, v1: int,
+    ):
+        """Median valid depth in [u0,u1)x[v0,v1) or None."""
+        h, w = depth_arr_m.shape
+        u0 = max(0, int(u0)); v0 = max(0, int(v0))
+        u1 = min(w, int(u1)); v1 = min(h, int(v1))
+        if u1 <= u0 or v1 <= v0:
+            return None
+        patch = depth_arr_m[v0:v1, u0:u1]
+        valid = (
+            np.isfinite(patch)
+            & (patch > self.min_depth_m)
+            & (patch < self.max_depth_m)
+        )
+        if not valid.any():
+            return None
+        return float(np.median(patch[valid]))
+
+    def _resolve_depth_robust(
+        self,
+        depth_arr_m: np.ndarray,
+        cx: int, cy: int,
+        bbox_xyxy: tuple[int, int, int, int],
+    ):
+        """Always return (uu, vv, z, tier).
+
+        Tier order:
+          0 'point'        : valid pixel in (2*hp+1)^2 neighbourhood at (cx,cy).
+          1 'bbox_median'  : median depth across synthesized response bbox.
+          2 'roi_median'   : median in expanded ROI (8x bbox half-size).
+          3 'image_median' : median over whole depth image.
+          4 'fallback'     : constant ``fallback_depth_m`` — last resort.
+        Pixel (uu, vv) is the original (cx, cy) for tiers >= 1; only the
+        depth value differs. The arm gets a well-defined ray every time.
+        """
+        h, w = depth_arr_m.shape
+        cx = max(0, min(int(cx), max(0, w - 1)))
+        cy = max(0, min(int(cy), max(0, h - 1)))
+
+        sampled = self._sample_depth_at(depth_arr_m, cx, cy)
+        if sampled is not None:
+            uu, vv, z = sampled
+            return uu, vv, z, 'point'
+
+        x0, y0, x1, y1 = bbox_xyxy
+        z = self._region_median_depth(depth_arr_m, x0, y0, x1 + 1, y1 + 1)
+        if z is not None:
+            return cx, cy, z, 'bbox_median'
+
+        r = max(self.point_bbox_halfsize_px * 8, 200)
+        z = self._region_median_depth(
+            depth_arr_m, cx - r, cy - r, cx + r + 1, cy + r + 1,
+        )
+        if z is not None:
+            return cx, cy, z, 'roi_median'
+
+        z = self._region_median_depth(depth_arr_m, 0, 0, w, h)
+        if z is not None:
+            return cx, cy, z, 'image_median'
+
+        return cx, cy, float(self.fallback_depth_m), 'fallback'
 
     def seat_recommend_bbox_callback(
         self,
@@ -554,16 +639,19 @@ class SeatRecommendBboxService(Node):
                 'centroid': vlm_px,
             })
 
-        # 3. Unproject the (snapped) pixel from depth.
-        sampled = self._sample_depth_at(depth_arr_m, cx, cy)
-        if sampled is None:
-            log_extras['event'] = 'no_depth_at_point'
-            log_extras['depth_frame'] = depth_msg.header.frame_id
-            return _fail_with_log(
-                f'No valid depth near point ({cx},{cy}).',
-                [log_det] + extra_dets,
+        # 3. Unproject the (snapped) pixel from depth. Always succeed —
+        # caller (BT) needs a 3D point to drive the arm even when Orbbec
+        # depth has a hole at the seat. `_resolve_depth_robust` walks
+        # progressively wider regions then falls back to a constant.
+        uu, vv, z, depth_tier = self._resolve_depth_robust(
+            depth_arr_m, cx, cy, bbox_xyxy,
+        )
+        log_extras['depth_tier'] = depth_tier
+        log_extras['depth_frame'] = depth_msg.header.frame_id
+        if depth_tier != 'point':
+            self.get_logger().warning(
+                f'Depth fallback tier={depth_tier} at ({cx},{cy}); z={z:.3f} m.'
             )
-        uu, vv, z = sampled
 
         x = (uu - px) * z / fx
         y = (vv - py) * z / fy

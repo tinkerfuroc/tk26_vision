@@ -171,7 +171,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         self.declare_parameter('world_conf_threshold', 0.05)
         self.declare_parameter('world_iou_threshold', 0.5)
         # Orbbec depth Image to surface in the response. Two viable choices:
-        #   - /camera/depth_to_color/image_raw — depth registered to color,
+        #   - /camera/depth/image_raw — depth registered to color,
         #     so size MATCHES rgb_image and segments. Requires the camera
         #     launched with `enable_d2c_viewer:=true`.
         #   - /camera/depth/image_raw — raw depth-sensor resolution
@@ -179,7 +179,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         #     segments. Use only if the caller does its own alignment.
         # Default to the d2c topic so segments fit by construction.
         self.declare_parameter(
-            'orbbec_depth_image_topic', '/camera/depth_to_color/image_raw'
+            'orbbec_depth_image_topic', '/camera/depth/image_raw'
         )
 
     def _load_parameters(self):
@@ -807,7 +807,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 'segments will not overlay depth pixel-for-pixel. '
                 'For orbbec, launch the camera with '
                 'enable_d2c_viewer:=true and use '
-                '/camera/depth_to_color/image_raw, or override '
+                '/camera/depth/image_raw, or override '
                 'orbbec_depth_image_topic.'
             )
 

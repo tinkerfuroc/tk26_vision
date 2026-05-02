@@ -5,6 +5,11 @@ string camera
 string[] names
 string[] features
 string target_frame
+# Optional pre-known seat labels. When non-empty, the VLM is instructed
+# to choose `recommendation` from this list (or return "none"); the
+# server rejects out-of-catalog labels with status=1. Empty preserves
+# open-vocabulary behavior.
+string[] known_seats
 ---
 int32 status
 string error_msg

@@ -467,9 +467,11 @@ class SeatRecommendBboxService(Node):
         except Exception as exc:  # noqa: BLE001
             return self._fail(response, f'cv_bridge conversion failed: {exc}')
 
+        known_seats = list(request.known_seats)
         self.get_logger().info(
             f'Received seat recommendation request for camera {request.camera} '
-            f'(model={self.llm_model}, names={request.names}, features={request.features}, target_frame={request.target_frame}).'
+            f'(model={self.llm_model}, names={request.names}, features={request.features}, '
+            f'target_frame={request.target_frame}, known_seats={known_seats}).'
         )
         # if transform needed, record TF at this point for use after Gemini fishes processing
         transform = None
@@ -522,6 +524,7 @@ class SeatRecommendBboxService(Node):
                 max_retries=self.vlm_max_retries,
                 logger=self.get_logger(),
                 fewshots=fewshots,
+                known_seats=known_seats,
             )
         except VlmSeatError as exc:
             return self._fail(response, f'VLM unavailable: {exc}')
@@ -543,6 +546,7 @@ class SeatRecommendBboxService(Node):
             'names': list(request.names),
             'features': list(request.features),
             'target_frame': request.target_frame,
+            'known_seats': list(known_seats),
             'label': label,
             'visible_seats': visible_seats,
             'fewshot_enabled': bool(self.fewshot_enabled),
@@ -575,6 +579,17 @@ class SeatRecommendBboxService(Node):
             log_extras['event'] = 'no_empty_seat'
             _write_log(None)
             return self._fail(response, 'No empty seat detected by VLM.')
+
+        # When a catalog is supplied, the VLM must pick exactly one of the
+        # listed labels (the prompt tells it as much). Reject anything else
+        # before downstream snap/depth work commits to a hallucinated seat.
+        if known_seats and label not in known_seats:
+            log_extras['event'] = 'out_of_catalog_label'
+            return _fail_with_log(
+                f'VLM returned out-of-catalog label {label!r}; '
+                f'catalog={list(known_seats)}.',
+                None,
+            )
 
         vlm_px = (int(point_xy[0]), int(point_xy[1]))
         log_extras['vlm_point'] = [vlm_px[0], vlm_px[1]]

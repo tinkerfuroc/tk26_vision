@@ -2,6 +2,7 @@
 
 import collections
 import math
+import multiprocessing
 import os
 import sys
 import threading
@@ -16,7 +17,7 @@ import rclpy.time
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.action import ActionServer, CancelResponse
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -54,6 +55,12 @@ class FollowHeadNode(Node):
         # Phase B — feedback-gated settle
         self.declare_parameter('min_detection_interval_sec', 0.2)
         self.declare_parameter('max_settle_timeout_sec', 1.5)
+        # Distance-aware command hold-off after a slew. Suppresses new
+        # command issuance for clamp(base + per_deg * slew_deg, base,
+        # max_settle_timeout_sec). Detection keeps running so the
+        # tracker/EMA stay fresh for the next allowed command.
+        self.declare_parameter('settle_base_sec', 0.05)
+        self.declare_parameter('settle_per_deg_sec', 0.012)
         self.declare_parameter('steady_pan_eps_deg', 0.5)
         self.declare_parameter('steady_tilt_eps_deg', 0.5)
         self.declare_parameter('steady_velocity_eps_deg_per_sec', 10.0)
@@ -118,6 +125,16 @@ class FollowHeadNode(Node):
         )
         self.max_settle_timeout_sec = (
             self.get_parameter('max_settle_timeout_sec')
+            .get_parameter_value()
+            .double_value
+        )
+        self.settle_base_sec = (
+            self.get_parameter('settle_base_sec')
+            .get_parameter_value()
+            .double_value
+        )
+        self.settle_per_deg_sec = (
+            self.get_parameter('settle_per_deg_sec')
             .get_parameter_value()
             .double_value
         )
@@ -237,11 +254,23 @@ class FollowHeadNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
+        # ReentrantCallbackGroup for the high-rate sensor + state
+        # subscribers so they don't serialize on the node default group
+        # (which is MutuallyExclusive in Humble). Sharing the default
+        # group with all other subs starves the executor of free
+        # threads under load — the cancel-service handler ends up
+        # queueing for a thread instead of running. Locks
+        # (lock_msg/lock_state/lock_info) already enforce data
+        # correctness inside the callbacks, so concurrent dispatch on
+        # different threads is safe.
+        self._sensor_cb_group = ReentrantCallbackGroup()
         image_sub = Subscriber(
             self, Image, '/camera/color/image_raw', qos_profile=sensor_qos,
+            callback_group=self._sensor_cb_group,
         )
         depth_sub = Subscriber(
             self, Image, '/camera/depth/image_raw', qos_profile=sensor_qos,
+            callback_group=self._sensor_cb_group,
         )
         image_sync_sub = ApproximateTimeSynchronizer(
             [image_sub, depth_sub], queue_size=10, slop=0.1,
@@ -253,14 +282,28 @@ class FollowHeadNode(Node):
             '/camera/color/camera_info',
             self.camera_info_orbbec_callback,
             qos_profile=10,
+            callback_group=self._sensor_cb_group,
         )
 
+        # ReentrantCallbackGroup so the action server's internal cancel
+        # service handler (and our user-level cancel_callback, which it
+        # invokes) can run on a different MultiThreadedExecutor thread
+        # while execute_callback is sitting in its loop. With
+        # MutuallyExclusiveCallbackGroup the cancel handler queues
+        # behind execute on the same group mutex; since the execute
+        # coroutine never `await`s (it uses time.sleep), the mutex is
+        # held until the coroutine returns — which it can't, because
+        # is_cancel_requested only flips after cancel_callback runs.
+        # Classic deadlock; observed as "the action can't be canceled."
+        # Safe here because rclpy's ActionServer enforces single-active-
+        # goal semantics by default, so execute_callback is not
+        # re-entered for two goals concurrently.
         self.action_server = ActionServer(
             self,
             FollowHeadAction,
             'follow_head_action',
             self.execute_callback,
-            callback_group=MutuallyExclusiveCallbackGroup(),
+            callback_group=ReentrantCallbackGroup(),
             cancel_callback=self.cancel_callback,
         )
         self.service = self.create_service(
@@ -316,9 +359,14 @@ class FollowHeadNode(Node):
             state_topic,
             self.pan_tilt_state_callback,
             10,
+            callback_group=self._sensor_cb_group,
         )
 
         self.last_command_time = None
+        # Distance-aware command hold-off deadline (monotonic seconds).
+        # Set on each _publish_absolute_command; gates command issuance
+        # in follow_head_logic. 0.0 = no active hold-off.
+        self._settle_until_mono = 0.0
 
         self.get_logger().info('Follow Head Node has been started.')
         print(
@@ -723,11 +771,6 @@ class FollowHeadNode(Node):
             self._perf_sum['total'] += time.perf_counter() - _total_t0
             return (target_pan_deg, target_tilt_deg), ''
 
-        # Settle gate removed — joint state is fresh enough that re-issuing
-        # commands while the servo is still converging is harmless; the
-        # firmware handles command supersession. Anti-chatter below is the
-        # only remaining guard against command spam.
-
         # Anti-chatter: if the new target barely differs from the last
         # commanded position, don't re-issue. This protects the Waveshare
         # firmware from a stream of near-identical commands that each
@@ -750,6 +793,20 @@ class FollowHeadNode(Node):
                 self._perf_early['min_cmd_change'] += 1
                 self._perf_sum['total'] += time.perf_counter() - _total_t0
                 return (target_pan_deg, target_tilt_deg), ''
+
+        # Distance-aware settle hold-off: after a slew, suppress new
+        # command issuance for a window proportional to the commanded
+        # distance. Detection above kept running so the next allowed
+        # command fires on the latest target.
+        now_settle_mono = time.monotonic()
+        if now_settle_mono < self._settle_until_mono:
+            remaining = self._settle_until_mono - now_settle_mono
+            self.get_logger().debug(
+                f'Settling for {remaining:.2f}s more before next command.',
+            )
+            self._perf_early['settling'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
+            return (target_pan_deg, target_tilt_deg), ''
 
         # Speed scaling: small errors get a slower profile to reduce motion
         # blur; large slews run at the controller default.
@@ -781,8 +838,22 @@ class FollowHeadNode(Node):
         self.pan_tilt_cmd_pub.publish(pan_tilt_msg)
         self.last_command_time = self.get_clock().now()
         with self.lock_state:
+            cur_pan_deg = self.current_pan_deg
+            cur_tilt_deg = self.current_tilt_deg
             self._last_commanded_pan_rad = float(target_pan_rad)
             self._last_commanded_tilt_rad = float(target_tilt_rad)
+        if cur_pan_deg is not None and cur_tilt_deg is not None:
+            slew_deg = max(
+                abs(math.degrees(target_pan_rad) - cur_pan_deg),
+                abs(math.degrees(target_tilt_rad) - cur_tilt_deg),
+            )
+        else:
+            slew_deg = 0.0
+        hold_sec = min(
+            self.settle_base_sec + self.settle_per_deg_sec * slew_deg,
+            self.max_settle_timeout_sec,
+        )
+        self._settle_until_mono = time.monotonic() + hold_sec
 
     def follow_head_callback(self, request, response):
         self.get_logger().info('Follow Head Service has been called.')
@@ -803,6 +874,7 @@ class FollowHeadNode(Node):
         self._person_tracker.reset()
         self._world_target_ema.reset()
         self._last_detection_time = None
+        self._settle_until_mono = 0.0
 
         # Read the goal-time fresh-lock policy. Priority: seed > centermost
         # > legacy/closest. The fields stay set for the lifetime of the
@@ -894,7 +966,10 @@ class FollowHeadNode(Node):
             result.message = 'Error in loop.'
             return result
 
-        if goal_handle.is_cancel_requested:
+        # Either the client asked rclpy to cancel (is_cancel_requested) or
+        # the cancel_callback set our self.is_canceled flag — treat both
+        # as a real cancellation and terminate the goal cleanly.
+        if goal_handle.is_cancel_requested or self.is_canceled:
             goal_handle.canceled()
             result = FollowHeadAction.Result()
             result.message = 'Goal canceled'
@@ -917,6 +992,7 @@ class FollowHeadNode(Node):
         self._goal_seed_xy = None
         self._goal_seed_radius_m = self.default_seed_radius_m
         self._goal_track_centermost = False
+        self._settle_until_mono = 0.0
         return CancelResponse.ACCEPT
 
     def _populate_feedback(self, feedback_msg, pan_deg, tilt_deg):
@@ -1381,96 +1457,6 @@ class FollowHeadNode(Node):
             },
         )
 
-    def _classify_settle_state(self):
-        """Decide whether we can act on a fresh frame given the servo state.
-
-        Returns (state, reason) where state is one of:
-          - 'go'             — servo is steady at the last commanded pose
-          - 'wait'           — feedback says we are still in motion; skip this tick
-          - 'stale_feedback' — feedback is missing/stale; caller falls back
-                               to the Laplacian blur gate
-          - 'blurred'        — reserved for future expansion
-        """
-        # No command has been issued yet → nothing to settle against.
-        if (
-            self._last_commanded_pan_rad is None
-            or self._last_commanded_tilt_rad is None
-            or self.last_command_time is None
-        ):
-            return 'go', ''
-
-        with self.lock_state:
-            history = list(self._state_history)
-
-        if not history:
-            return 'stale_feedback', 'No pan/tilt state feedback received yet.'
-
-        latest_ts, latest_pan, latest_tilt, latest_ok = history[-1]
-        now_mono = time.monotonic()
-        if (
-            not latest_ok
-            or (now_mono - latest_ts) > self.state_stale_timeout_sec
-        ):
-            return (
-                'stale_feedback',
-                f'Pan/tilt feedback is stale ({now_mono - latest_ts:.2f}s) '
-                f'or feedback_ok=false; falling back to blur gate.',
-            )
-
-        # Safety watchdog: if we've been waiting for convergence longer than
-        # max_settle_timeout_sec, act anyway to avoid deadlock on a lost cmd
-        # or stuck servo.
-        elapsed_since_cmd = (
-            self.get_clock().now() - self.last_command_time
-        ).nanoseconds / 1e9
-        if elapsed_since_cmd > self.max_settle_timeout_sec:
-            self.get_logger().warning(
-                f'max_settle_timeout_sec={self.max_settle_timeout_sec:.2f}s '
-                f'exceeded (elapsed={elapsed_since_cmd:.2f}s); '
-                'advancing without steady-state confirmation.',
-                throttle_duration_sec=5.0,
-            )
-            return 'go', ''
-
-        pan_err_deg = math.degrees(latest_pan - self._last_commanded_pan_rad)
-        tilt_err_deg = math.degrees(latest_tilt - self._last_commanded_tilt_rad)
-        # Condition 1: state must track the last command (so we're not
-        # conflating a slow slew with a steady hold).
-        if (
-            abs(pan_err_deg) > self.steady_pan_eps_deg
-            or abs(tilt_err_deg) > self.steady_tilt_eps_deg
-        ):
-            return (
-                'wait',
-                f'Servo settling: pan_err={pan_err_deg:.2f} deg, '
-                f'tilt_err={tilt_err_deg:.2f} deg.',
-            )
-
-        # Condition 2: velocity ≈ 0 over the last N samples.
-        need = max(2, self.steady_sample_count + 1)
-        if len(history) < need:
-            return (
-                'wait',
-                f'Need {need} state samples for velocity check, '
-                f'have {len(history)}.',
-            )
-        samples = history[-need:]
-        for (t0, p0, tl0, _), (t1, p1, tl1, _) in zip(samples, samples[1:]):
-            dt = max(t1 - t0, 1e-6)
-            pan_vel_deg = abs(math.degrees(p1 - p0) / dt)
-            tilt_vel_deg = abs(math.degrees(tl1 - tl0) / dt)
-            if (
-                pan_vel_deg > self.steady_velocity_eps_deg_per_sec
-                or tilt_vel_deg > self.steady_velocity_eps_deg_per_sec
-            ):
-                return (
-                    'wait',
-                    f'Servo still moving: pan_vel={pan_vel_deg:.1f} deg/s, '
-                    f'tilt_vel={tilt_vel_deg:.1f} deg/s.',
-                )
-
-        return 'go', ''
-
     def _camera_to_pan_tilt_root(self, xyz_cam, cur_pan_rad, cur_tilt_rad):
         """Map a camera-frame centroid into a pan-tilt-rooted Cartesian frame.
 
@@ -1527,11 +1513,20 @@ class FollowHeadNode(Node):
 def main():
     rclpy.init()
     follow_head_node = FollowHeadNode()
+    # Pin the executor's worker pool so the cancel-service handler can
+    # always grab a free thread under high-load YAML configs (10 Hz YOLO
+    # + 30 Hz camera + 20 Hz state publisher). MultiThreadedExecutor's
+    # default num_threads is environment-dependent (cpu_count() can
+    # collapse to a small value on constrained hosts) and matches the
+    # documented floor used in object_detection_generalist.
+    num_threads = max(8, multiprocessing.cpu_count())
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=num_threads)
+    follow_head_node.get_logger().info(
+        f'Spinning follow_head with MultiThreadedExecutor '
+        f'(num_threads={num_threads})'
+    )
     try:
-        rclpy.spin(
-            follow_head_node,
-            executor=rclpy.executors.MultiThreadedExecutor(),
-        )
+        rclpy.spin(follow_head_node, executor=executor)
     except KeyboardInterrupt:
         pass
     finally:

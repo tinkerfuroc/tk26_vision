@@ -174,6 +174,7 @@ def request_seat(
     max_retries: int = 3,
     timeout_s: float = 20.0,
     logger=None,
+    fewshots: Sequence[object] | None = None,
 ) -> tuple[str, Point | None, list, float]:
     """Ask Gemini for a single pointing pixel + short label.
 
@@ -183,6 +184,13 @@ def request_seat(
     ``visible_seats`` is the model's enumeration of all seats visible
     in the image with occupancy status (useful for logging / debugging
     the pointing decision).
+
+    ``fewshots`` is an optional iterable of ``_seat_fewshot.FewshotExample``
+    (kept loosely typed here to avoid an import cycle). When non-empty,
+    each example is prepended as a ``user(image+generic-prompt) /
+    assistant(json.dumps(answer))`` turn before the live request — the
+    model mimics the form and judgement, not the content (the few-shot
+    user prompt deliberately omits per-call names/features).
 
     Raises ``VlmSeatError`` only on configuration problems the caller
     should propagate as `status=1` (missing API key).
@@ -205,16 +213,31 @@ def request_seat(
 
         text_prompt = _build_text_prompt(names, features)
 
-        messages = [
-            {'role': 'system', 'content': _SYSTEM_PROMPT},
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'image_url', 'image_url': {'url': data_url}},
-                    {'type': 'text', 'text': text_prompt},
-                ],
-            },
-        ]
+        messages: list = [{'role': 'system', 'content': _SYSTEM_PROMPT}]
+        if fewshots:
+            for ex in fewshots:
+                ex_url = encode_to_data_url(ex.image_bgr)
+                messages.append({
+                    'role': 'user',
+                    'content': [
+                        {'type': 'image_url', 'image_url': {'url': ex_url}},
+                        {
+                            'type': 'text',
+                            'text': 'Recommend a seat for a new guest.',
+                        },
+                    ],
+                })
+                messages.append({
+                    'role': 'assistant',
+                    'content': json.dumps(ex.answer),
+                })
+        messages.append({
+            'role': 'user',
+            'content': [
+                {'type': 'image_url', 'image_url': {'url': data_url}},
+                {'type': 'text', 'text': text_prompt},
+            ],
+        })
 
         response_format_strict = {
             'type': 'json_schema',

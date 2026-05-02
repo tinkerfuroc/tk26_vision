@@ -32,6 +32,7 @@ from tinker_vision_msgs_26.srv import SeatRecommendBbox
 from vision_util.vision_logging import VisionLogger
 
 from ._env import load_env, require_api_key
+from ._seat_fewshot import load_fewshots
 from ._seat_vlm import VlmSeatError, request_seat
 
 
@@ -84,6 +85,11 @@ class SeatRecommendBboxService(Node):
         # Side-effect: more `point_not_on_horizontal_surface` failures (correct
         # behavior; the BT retries on status=1 instead of seating on a wall).
         self.declare_parameter('snap_min_horizontality', 0.85)  # |n_y|: 1=level, 0=vertical
+        # Few-shot in-context examples (kimi_api/fewshot/<slug>/answer.json,
+        # produced by `seat_fewshot_annotator`). Off by default so existing
+        # deployments stay bit-identical until examples are curated.
+        self.declare_parameter('fewshot_enabled', False)
+        self.declare_parameter('max_fewshots', 3)
 
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
@@ -126,6 +132,12 @@ class SeatRecommendBboxService(Node):
             self.get_parameter('snap_min_horizontality')
             .get_parameter_value()
             .double_value
+        )
+        self.fewshot_enabled = bool(
+            self.get_parameter('fewshot_enabled').get_parameter_value().bool_value
+        )
+        self.max_fewshots = int(
+            self.get_parameter('max_fewshots').get_parameter_value().integer_value
         )
         self._vision_logger = VisionLogger(
             self,
@@ -408,6 +420,13 @@ class SeatRecommendBboxService(Node):
             f'Elapsed {(time.time_ns() - start_time) / 1e9:.2f}s.'
         )
         # 2. Gemini call — returns a pointing pixel + short label.
+        fewshots = None
+        if self.fewshot_enabled:
+            fewshots = load_fewshots(self.max_fewshots, logger=self.get_logger())
+            self.get_logger().info(
+                f'Few-shot enabled: applying {len(fewshots)} example(s) '
+                f'(max_fewshots={self.max_fewshots}).'
+            )
         try:
             label, point_xy, visible_seats, vlm_elapsed = request_seat(
                 color_img,
@@ -417,6 +436,7 @@ class SeatRecommendBboxService(Node):
                 timeout_s=self.vlm_timeout_s,
                 max_retries=self.vlm_max_retries,
                 logger=self.get_logger(),
+                fewshots=fewshots,
             )
         except VlmSeatError as exc:
             return self._fail(response, f'VLM unavailable: {exc}')
@@ -440,6 +460,8 @@ class SeatRecommendBboxService(Node):
             'target_frame': request.target_frame,
             'label': label,
             'visible_seats': visible_seats,
+            'fewshot_enabled': bool(self.fewshot_enabled),
+            'n_fewshots': int(len(fewshots)) if fewshots is not None else 0,
         }
         log_timings = {'vlm': vlm_elapsed}
         log_extras: dict = {}

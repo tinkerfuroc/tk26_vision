@@ -601,6 +601,30 @@ class FollowHeadNode(Node):
         if chosen_root is None:
             self._last_logic_info['person_visible'] = False
             self._perf_early['tracker_no_lock'] += 1
+            # Surface why the seed-mode lock failed so the operator can
+            # see whether the seed and the live candidates actually
+            # agree. Throttled to ~0.5 Hz to avoid spamming the log
+            # while still firing on every test run.
+            if (
+                fresh_lock_mode == 'seed'
+                and self._person_tracker.locked_xyz is None
+            ):
+                seed_xy = self._goal_seed_xy
+                radius = self._goal_seed_radius_m
+                cand_summary = ', '.join(
+                    f'(x={x:.2f}, y={y:.2f}, '
+                    f'dist={math.hypot(x - seed_xy[0], y - seed_xy[1]):.2f}m)'
+                    for (x, y, _z) in candidates_root
+                )
+                self.get_logger().warning(
+                    f'Seed-mode rejected all {len(candidates_root)} '
+                    f'candidate(s): seed_xy=({seed_xy[0]:.2f}, '
+                    f'{seed_xy[1]:.2f}), radius={radius:.2f} m, '
+                    f'candidates: [{cand_summary}]. Increase '
+                    f'seed_radius_m on the goal or tighten the '
+                    f'detect-time centroid heuristic.',
+                    throttle_duration_sec=2.0,
+                )
             self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'PersonTracker returned no lock.'
         target_xyz_root = self._world_target_ema.update(chosen_root, now_mono)
@@ -1197,15 +1221,21 @@ class FollowHeadNode(Node):
 
         Used when ``results[0].keypoints`` is ``None`` (e.g. the model is
         ``yolo11s-seg.pt`` / ``yolov8s-seg.pt`` instead of a ``-pose``
-        variant). Aims at the upper portion of the bbox — roughly where
-        the head sits — and samples depth over the bbox upper third.
+        variant). Aims at ~15% down from the bbox top, centered, and
+        samples depth in a small window around that pixel — narrow
+        enough to dodge background bleed at the head silhouette, which
+        a full upper-third region would catch (wall / sky behind a
+        standing person can pull the median depth several meters out,
+        which moves the unprojected XY by >>seed_radius_m and causes
+        seed-mode tracker_no_lock).
+
         Returns ``(xyz_cam, (px, py), meta)`` or ``(None, None, None)``
         if the depth region is too sparse.
         """
         h, w = img_hw
         x1, y1, x2, y2 = (float(v) for v in bbox_xyxy)
-        bbox_w = max(1.0, x2 - x1)
         bbox_h = max(1.0, y2 - y1)
+        bbox_w = max(1.0, x2 - x1)
         # Aim at ~15% down from the bbox top, horizontally centered —
         # approximates head position on a standing/sitting person.
         cx = (x1 + x2) / 2.0
@@ -1214,20 +1244,26 @@ class FollowHeadNode(Node):
             int(np.clip(round(cx), 0, w - 1)),
             int(np.clip(round(cy), 0, h - 1)),
         )
-        x1i = int(np.clip(round(x1), 0, w - 1))
-        x2i = int(np.clip(round(x2), 0, w))
-        y1i = int(np.clip(round(y1), 0, h - 1))
-        y2i = int(np.clip(round(y2), 0, h))
-        if x2i <= x1i or y2i <= y1i:
+        # Depth-sampling window: a square centered on the aim point,
+        # sized to ~30% of the bbox shorter side but capped at +/- 25 px.
+        # The cap prevents enormous boxes (close-up of a person) from
+        # sampling well outside the head silhouette; the percentage
+        # ensures small/distant boxes still have enough valid depth.
+        half = int(max(self.face_depth_window_px // 2,
+                       min(25, max(2, int(0.15 * min(bbox_w, bbox_h))))))
+        px, py = target_px
+        x0i = int(np.clip(px - half, 0, w - 1))
+        x1i = int(np.clip(px + half + 1, 0, w))
+        y0i = int(np.clip(py - half, 0, h - 1))
+        y1i = int(np.clip(py + half + 1, 0, h))
+        if x1i <= x0i or y1i <= y0i:
             return (None, None, None)
-        # Sample depth over the upper third of the bbox (head + neck +
-        # upper torso) to dodge background-bleed at the head silhouette.
-        upper = np.zeros((h, w), dtype=bool)
-        upper[y1i : y1i + max(1, (y2i - y1i) // 3), x1i:x2i] = True
+        win = np.zeros((h, w), dtype=bool)
+        win[y0i:y1i, x0i:x1i] = True
         valid_bool = (
             validmask if validmask.dtype == bool else validmask.astype(bool)
         )
-        combined = upper & valid_bool
+        combined = win & valid_bool
         xyz = self._depth_in_mask_median(points, combined)
         if xyz is None or xyz[2] <= 0:
             return (None, None, None)
@@ -1235,7 +1271,7 @@ class FollowHeadNode(Node):
             (float(xyz[0]), float(xyz[1]), float(xyz[2])),
             target_px,
             {
-                'depth_region': 'bbox_upper_third',
+                'depth_region': 'bbox_head_window',
                 'region_pixel_count': int(combined.sum()),
             },
         )

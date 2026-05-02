@@ -46,8 +46,8 @@ class FollowHeadNode(Node):
         self.declare_parameter('vision_log_folder', 'vision_log')
         self.declare_parameter('command_topic', '/pan_tilt_controller/cmd')
         self.declare_parameter('state_topic', '/pan_tilt_controller/state')
-        self.declare_parameter('home_pan_deg', 0.0)
-        self.declare_parameter('home_tilt_deg', 45.0)
+        self.declare_parameter('home_pan_deg', 0.0) # ignore these
+        self.declare_parameter('home_tilt_deg', 45.0) # ignore these
         self.declare_parameter('pan_deadband_deg', 3.0)
         self.declare_parameter('tilt_deadband_deg', 3.0)
         self.declare_parameter('min_command_change_deg', 1.5)
@@ -70,6 +70,11 @@ class FollowHeadNode(Node):
         self.declare_parameter('kp_confidence_threshold', 0.5)
         self.declare_parameter('face_depth_window_px', 11)
         self.declare_parameter('min_triangle_valid_depth_pixels', 10)
+        # Distance gate: when the person's body-center depth exceeds
+        # this threshold, follow_head aims at the upper-body center
+        # (full-bbox depth median, robust to silhouette bleed) instead
+        # of the small face/eye window (which loses depth at distance).
+        self.declare_parameter('face_target_max_distance_m', 2.5)
         # Phase E — config surface + motion profile
         self.declare_parameter('blur_threshold', 80.0)
         self.declare_parameter('small_error_deg', 10.0)
@@ -173,6 +178,11 @@ class FollowHeadNode(Node):
             self.get_parameter('min_triangle_valid_depth_pixels')
             .get_parameter_value()
             .integer_value
+        )
+        self.face_target_max_distance_m = (
+            self.get_parameter('face_target_max_distance_m')
+            .get_parameter_value()
+            .double_value
         )
         self.blur_threshold = (
             self.get_parameter('blur_threshold')
@@ -479,15 +489,13 @@ class FollowHeadNode(Node):
             if self.model.names[int(box.cls[0])] != 'person':
                 continue
             bbox_xyxy = results[0].boxes.xyxy[i].cpu().numpy()
-            if has_keypoints:
-                xyz_cam, target_px, meta = self._extract_face_target(
-                    kps_xy[i], kps_cf[i], bbox_xyxy,
-                    points, validmask_points, (h, w),
-                )
-            else:
-                xyz_cam, target_px, meta = self._extract_bbox_head_target(
-                    bbox_xyxy, points, validmask_points, (h, w),
-                )
+            xyz_cam, target_px, meta = self._extract_person_target(
+                bbox_xyxy,
+                kps_xy[i] if has_keypoints else None,
+                kps_cf[i] if has_keypoints else None,
+                has_keypoints,
+                points, validmask_points, (h, w),
+            )
             if xyz_cam is None:
                 continue
 
@@ -837,7 +845,7 @@ class FollowHeadNode(Node):
             ),
         )
         home_tilt_rad = float(np.deg2rad(self.home_tilt_deg))
-        self._publish_absolute_command(home_pan_rad, home_tilt_rad)
+        # self._publish_absolute_command(home_pan_rad, home_tilt_rad)
 
         if not goal_handle.request.start_following:
             goal_handle.abort()
@@ -1213,6 +1221,103 @@ class FollowHeadNode(Node):
                     return res
 
         return (None, None, None)
+
+    def _extract_body_center_target(
+        self, bbox_xyxy, points, validmask, img_hw,
+    ):
+        """Full-bbox body-center target for the at-distance regime.
+
+        Used when the person is far enough that face/head depth is
+        unreliable (small bbox, small face, sparse depth pixels under
+        the floor). Aims at the bbox horizontal center, ~25% down from
+        the bbox top (upper-body / chest) for a natural "looking at
+        this person" tilt rather than a stomach-aim. Samples depth
+        over the *entire* bbox interior — that's robust against the
+        silhouette-edge background bleed that breaks the small head
+        window at distance.
+
+        Returns ``(xyz_cam, (px, py), meta)`` or ``(None, None, None)``
+        if even the full bbox has no valid depth.
+        """
+        h, w = img_hw
+        x1, y1, x2, y2 = (float(v) for v in bbox_xyxy)
+        bbox_h = max(1.0, y2 - y1)
+        cx = (x1 + x2) / 2.0
+        cy = y1 + 0.25 * bbox_h
+        target_px = (
+            int(np.clip(round(cx), 0, w - 1)),
+            int(np.clip(round(cy), 0, h - 1)),
+        )
+        x1i = int(np.clip(round(x1), 0, w - 1))
+        x2i = int(np.clip(round(x2), 0, w))
+        y1i = int(np.clip(round(y1), 0, h - 1))
+        y2i = int(np.clip(round(y2), 0, h))
+        if x2i <= x1i or y2i <= y1i:
+            return (None, None, None)
+        body = np.zeros((h, w), dtype=bool)
+        body[y1i:y2i, x1i:x2i] = True
+        valid_bool = (
+            validmask if validmask.dtype == bool else validmask.astype(bool)
+        )
+        combined = body & valid_bool
+        xyz = self._depth_in_mask_median(points, combined)
+        if xyz is None or xyz[2] <= 0:
+            return (None, None, None)
+        return (
+            (float(xyz[0]), float(xyz[1]), float(xyz[2])),
+            target_px,
+            {
+                'depth_region': 'bbox_full_body',
+                'region_pixel_count': int(combined.sum()),
+            },
+        )
+
+    def _extract_person_target(
+        self,
+        bbox_xyxy,
+        kps_xy_i,
+        kps_cf_i,
+        has_keypoints,
+        points,
+        validmask,
+        img_hw,
+    ):
+        """Distance-aware person target.
+
+        Always probes body-center depth first — cheap, robust at any
+        distance, and tells us whether to bother running the face
+        cascade. When the body sits beyond
+        ``face_target_max_distance_m`` we use the body target directly
+        ("look at this person" — coarse but never fails at distance).
+        Within the threshold we run the eye/head cascade for
+        receptionist-style precise gaze, falling back to body-center
+        only if the cascade also fails (e.g., person facing away with
+        no usable face keypoints).
+        """
+        body_xyz, body_px, body_meta = self._extract_body_center_target(
+            bbox_xyxy, points, validmask, img_hw,
+        )
+        if body_xyz is None:
+            return (None, None, None)
+
+        if body_xyz[2] > self.face_target_max_distance_m:
+            return (body_xyz, body_px, body_meta)
+
+        if has_keypoints:
+            xyz, px, meta = self._extract_face_target(
+                kps_xy_i, kps_cf_i, bbox_xyxy,
+                points, validmask, img_hw,
+            )
+        else:
+            xyz, px, meta = self._extract_bbox_head_target(
+                bbox_xyxy, points, validmask, img_hw,
+            )
+        if xyz is not None:
+            return (xyz, px, meta)
+        # Close-range face/head extraction failed (e.g., person facing
+        # away, severe occlusion, or extreme blur). Fall back to the
+        # body probe we already computed so we still produce a candidate.
+        return (body_xyz, body_px, body_meta)
 
     def _extract_bbox_head_target(
         self, bbox_xyxy, points, validmask, img_hw,

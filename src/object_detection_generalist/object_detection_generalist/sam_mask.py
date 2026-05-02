@@ -9,12 +9,12 @@ amortize across requests.
 from __future__ import annotations
 
 import time
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import cv2
 import numpy as np
 
-from vision_util.mask_utils import largest_connected_component
+from vision_util.mask_utils import largest_connected_component_in_bbox
 
 
 Bbox = tuple[int, int, int, int]  # (x1, y1, x2, y2) pixel coords
@@ -88,9 +88,14 @@ class FastSAMPredictor:
                         interpolation=cv2.INTER_NEAREST,
                     )
                 # FastSAM frequently returns multi-blob masks (sliver bg
-                # fragments, gaps). Drop everything except the largest CC
-                # so downstream centroid + segments contract holds.
-                out.append(largest_connected_component((m > 0.5).astype(bool)))
+                # fragments, gaps). Keep the largest component inside the
+                # bbox this mask was prompted with so centroid ROI stays
+                # aligned with the detector box.
+                out.append(
+                    largest_connected_component_in_bbox(
+                        (m > 0.5).astype(bool), bboxes[i]
+                    )
+                )
             else:
                 # Fewer masks than bboxes returned — emit empty mask so the
                 # caller keeps 1:1 alignment with its bbox list.

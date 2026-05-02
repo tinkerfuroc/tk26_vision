@@ -37,3 +37,27 @@ def largest_connected_component(mask: np.ndarray) -> np.ndarray:
     areas = stats[1:, cv2.CC_STAT_AREA]
     winner = 1 + int(np.argmax(areas))
     return (labels == winner).astype(mask.dtype, copy=False)
+
+
+def largest_connected_component_in_bbox(
+    mask: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Return the largest connected component after confining mask to bbox."""
+    if mask is None:
+        return mask
+    if mask.size == 0 or not mask.any():
+        return mask
+
+    h, w = mask.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    x1 = max(0, min(x1, w))
+    x2 = max(0, min(x2, w))
+    y1 = max(0, min(y1, h))
+    y2 = max(0, min(y2, h))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros_like(mask)
+
+    confined = np.zeros_like(mask)
+    confined[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
+    return largest_connected_component(confined)

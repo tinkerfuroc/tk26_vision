@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -62,6 +63,9 @@ class FollowHeadNode(Node):
         self.declare_parameter('target_ttl_sec', 0.8)
         self.declare_parameter('ema_alpha', 0.4)
         self.declare_parameter('reassoc_dist_m', 0.4)
+        # Default search radius for goal-supplied seed (XY, m). Overridable
+        # per-goal via FollowHeadAction.Goal.seed_radius_m (<= 0 -> default).
+        self.declare_parameter('seed_radius_m', 0.5)
         # Pose-target params (YOLO-pose face aiming)
         self.declare_parameter('kp_confidence_threshold', 0.5)
         self.declare_parameter('face_depth_window_px', 11)
@@ -150,6 +154,11 @@ class FollowHeadNode(Node):
             .get_parameter_value()
             .double_value
         )
+        self.default_seed_radius_m = (
+            self.get_parameter('seed_radius_m')
+            .get_parameter_value()
+            .double_value
+        )
         self.kp_conf_thr = (
             self.get_parameter('kp_confidence_threshold')
             .get_parameter_value()
@@ -195,6 +204,16 @@ class FollowHeadNode(Node):
             reassoc_dist_m=self.reassoc_dist_m,
             ttl_sec=self.target_ttl_sec,
         )
+        # Goal-time fresh-lock policy. Read once at execute_callback,
+        # consumed each tick by follow_head_logic via fresh_lock_costs.
+        # _goal_seed_xy holds the BT-supplied seed in base_link XY (Z
+        # dropped — base_link XY axes match pan-tilt-root XY by URDF
+        # symmetry, so no explicit conversion is needed). When None and
+        # _goal_track_centermost is False, the tracker uses its default
+        # (closest person).
+        self._goal_seed_xy: Optional[Tuple[float, float]] = None
+        self._goal_seed_radius_m: float = self.default_seed_radius_m
+        self._goal_track_centermost: bool = False
         self._world_target_ema = WorldTargetEMA(
             alpha=self.ema_alpha,
             ttl_sec=self.target_ttl_sec,
@@ -429,57 +448,77 @@ class FollowHeadNode(Node):
             )
 
         _yolo_t0 = time.perf_counter()
+        # Plain detection — no ByteTrack persistence. Identity continuity
+        # comes from PersonTracker's spatial-sticky logic; the goal-side
+        # `target_seed_xyz` / `track_centermost` only affects the FRESH
+        # lock at goal start.
         results = self.model(color_img, imgsz=(H, W))
         _yolo_elapsed = time.perf_counter() - _yolo_t0
         self._perf_sum['yolo'] += _yolo_elapsed
         self._perf_yolo_count += 1
 
-        person_centroids_3d = []
-        log_detections = []  # image-space bboxes + pose targets for the overlay/JSON
-        # Pose results: no segmentation masks. Keypoints shape (N, 17, 2/conf).
+        person_centroids_3d: list[tuple[float, float, float]] = []
+        # Parallel list of face-anchor pixels matching person_centroids_3d
+        # 1:1. Used by the `track_centermost` cost; otherwise unused.
+        person_target_pixels: list[tuple[int, int]] = []
+        log_detections = []  # image-space bboxes + pose/bbox targets for the overlay/JSON
+        # COCO-17 keypoints come from `*-pose.pt` weights. Multi-class
+        # det/seg weights (e.g. `yolo11s-seg.pt`) leave `keypoints=None`,
+        # in which case we fall back to a bbox-only head proxy so the
+        # tracker still gets candidates.
         kps_obj = getattr(results[0], 'keypoints', None)
-        _extract_t0 = time.perf_counter()
-        if (
+        has_keypoints = (
             kps_obj is not None
             and getattr(kps_obj, 'xy', None) is not None
             and getattr(kps_obj, 'conf', None) is not None
-        ):
-            kps_xy = kps_obj.xy.cpu().numpy()
-            kps_cf = kps_obj.conf.cpu().numpy()
-            for i, box in enumerate(results[0].boxes):
-                if self.model.names[int(box.cls[0])] != 'person':
-                    continue
-                bbox_xyxy = results[0].boxes.xyxy[i].cpu().numpy()
+        )
+        kps_xy = kps_obj.xy.cpu().numpy() if has_keypoints else None
+        kps_cf = kps_obj.conf.cpu().numpy() if has_keypoints else None
+        _extract_t0 = time.perf_counter()
+        for i, box in enumerate(results[0].boxes):
+            if self.model.names[int(box.cls[0])] != 'person':
+                continue
+            bbox_xyxy = results[0].boxes.xyxy[i].cpu().numpy()
+            if has_keypoints:
                 xyz_cam, target_px, meta = self._extract_face_target(
                     kps_xy[i], kps_cf[i], bbox_xyxy,
                     points, validmask_points, (h, w),
                 )
-                if xyz_cam is None:
-                    continue
+            else:
+                xyz_cam, target_px, meta = self._extract_bbox_head_target(
+                    bbox_xyxy, points, validmask_points, (h, w),
+                )
+            if xyz_cam is None:
+                continue
 
-                person_centroids_3d.append(xyz_cam)
-                box_xyxy_int = [int(v) for v in bbox_xyxy.tolist()]
-                log_detections.append(
-                    {
-                        'bbox': box_xyxy_int,
-                        'cls_name': 'person',
-                        'conf': (
-                            float(box.conf[0])
-                            if box.conf is not None
-                            else None
-                        ),
-                        'keypoints': [
+            person_centroids_3d.append(xyz_cam)
+            person_target_pixels.append(
+                (int(target_px[0]), int(target_px[1]))
+            )
+            box_xyxy_int = [int(v) for v in bbox_xyxy.tolist()]
+            log_detections.append(
+                {
+                    'bbox': box_xyxy_int,
+                    'cls_name': 'person',
+                    'conf': (
+                        float(box.conf[0])
+                        if box.conf is not None
+                        else None
+                    ),
+                    'keypoints': (
+                        [
                             [float(kps_xy[i, k, 0]),
                              float(kps_xy[i, k, 1]),
                              float(kps_cf[i, k])]
                             for k in range(kps_xy.shape[1])
-                        ],
-                        'target_pixel': [int(target_px[0]), int(target_px[1])],
-                        'depth_region': meta['depth_region'],
-                        'region_pixel_count': meta['region_pixel_count'],
-                        'centroid_3d': [float(c) for c in xyz_cam],
-                    },
-                )
+                        ] if has_keypoints else []
+                    ),
+                    'target_pixel': [int(target_px[0]), int(target_px[1])],
+                    'depth_region': meta['depth_region'],
+                    'region_pixel_count': meta['region_pixel_count'],
+                    'centroid_3d': [float(c) for c in xyz_cam],
+                },
+            )
 
         self._perf_sum['extract'] += time.perf_counter() - _extract_t0
 
@@ -512,15 +551,19 @@ class FollowHeadNode(Node):
         cur_pan_rad = math.radians(cur_pan_deg)
         cur_tilt_rad = math.radians(cur_tilt_deg)
 
-        candidates_root = []
+        candidates_root: list[tuple[float, float, float]] = []
+        candidates_pixel: list[tuple[int, int]] = []
         candidates_cam = []
-        for cam_xyz in person_centroids_3d:
+        for cam_xyz, target_px in zip(
+            person_centroids_3d, person_target_pixels,
+        ):
             xyz_root = self._camera_to_pan_tilt_root(
                 cam_xyz, cur_pan_rad, cur_tilt_rad,
             )
             if xyz_root is None:
                 continue
             candidates_root.append(xyz_root)
+            candidates_pixel.append(target_px)
             candidates_cam.append(cam_xyz)
 
         if not candidates_root:
@@ -528,8 +571,33 @@ class FollowHeadNode(Node):
             self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'No candidates with positive depth.'
 
+        # Build the fresh-lock cost array from the current goal mode.
+        # Priority: seed > centermost > legacy/closest. Tracker only
+        # consults this on a fresh lock; sticky-by-spatial reassoc uses
+        # `reassoc_dist_m` against locked_xyz unconditionally.
+        fresh_lock_costs: Optional[list[float]] = None
+        fresh_lock_mode = 'closest'
+        if self._goal_seed_xy is not None:
+            seed_x, seed_y = self._goal_seed_xy
+            radius = self._goal_seed_radius_m
+            fresh_lock_costs = []
+            for cand_x, cand_y, _cand_z in candidates_root:
+                d = math.hypot(cand_x - seed_x, cand_y - seed_y)
+                fresh_lock_costs.append(d if d <= radius else math.inf)
+            fresh_lock_mode = 'seed'
+        elif self._goal_track_centermost:
+            cx, cy = w / 2.0, h / 2.0
+            fresh_lock_costs = [
+                math.hypot(px - cx, py - cy)
+                for (px, py) in candidates_pixel
+            ]
+            fresh_lock_mode = 'centermost'
+        # else: leave None -> tracker default = closest-to-origin.
+
         now_mono = time.monotonic()
-        chosen_root = self._person_tracker.update(candidates_root, now_mono)
+        chosen_root = self._person_tracker.update(
+            candidates_root, now_mono, fresh_lock_costs,
+        )
         if chosen_root is None:
             self._last_logic_info['person_visible'] = False
             self._perf_early['tracker_no_lock'] += 1
@@ -551,7 +619,6 @@ class FollowHeadNode(Node):
         )
 
         if self._vision_logger.enabled:
-            # Mark which detection the tracker selected by matching back from
             # Match the tracker's chosen root-frame xyz back to its
             # camera-frame centroid for the is_chosen annotation.
             try:
@@ -582,6 +649,7 @@ class FollowHeadNode(Node):
                         if chosen_cam is not None else None
                     ),
                     'chosen_root_xyz': [float(c) for c in chosen_root],
+                    'fresh_lock_mode': fresh_lock_mode,
                     'target_root_xyz': [float(c) for c in target_xyz_root],
                     'target_pan_deg': target_pan_deg,
                     'target_tilt_deg': target_tilt_deg,
@@ -704,6 +772,38 @@ class FollowHeadNode(Node):
         self._world_target_ema.reset()
         self._last_detection_time = None
 
+        # Read the goal-time fresh-lock policy. Priority: seed > centermost
+        # > legacy/closest. The fields stay set for the lifetime of the
+        # goal; the tracker only consults them on a fresh lock.
+        seed_pt = goal_handle.request.target_seed_xyz
+        if seed_pt.x == 0.0 and seed_pt.y == 0.0 and seed_pt.z == 0.0:
+            self._goal_seed_xy = None
+            self._goal_seed_radius_m = self.default_seed_radius_m
+        else:
+            # base_link XY ≡ pan-tilt-root XY (axes aligned, near-zero static
+            # offset by URDF symmetry). Z is dropped; we match XY only.
+            self._goal_seed_xy = (float(seed_pt.x), float(seed_pt.y))
+            radius_raw = float(goal_handle.request.seed_radius_m)
+            self._goal_seed_radius_m = (
+                radius_raw if radius_raw > 0.0 else self.default_seed_radius_m
+            )
+        self._goal_track_centermost = bool(
+            goal_handle.request.track_centermost
+        )
+        if self._goal_seed_xy is not None:
+            self.get_logger().info(
+                f'Fresh-lock mode: seed (xy=({seed_pt.x:.3f}, '
+                f'{seed_pt.y:.3f}), radius={self._goal_seed_radius_m:.2f} m).',
+            )
+        elif self._goal_track_centermost:
+            self.get_logger().info(
+                'Fresh-lock mode: centermost (image-pixel-distance cost).',
+            )
+        else:
+            self.get_logger().info(
+                'Fresh-lock mode: closest (closest-to-origin XY, legacy).',
+            )
+
         with self.lock_state:
             current_pan_deg = self.current_pan_deg
 
@@ -779,6 +879,12 @@ class FollowHeadNode(Node):
         self.is_canceled = True
         self._person_tracker.reset()
         self._world_target_ema.reset()
+        # Reset goal-mode fields so a stale seed doesn't bleed into the
+        # next goal if execute_callback never overwrites it (degenerate
+        # path, but cheap to be safe).
+        self._goal_seed_xy = None
+        self._goal_seed_radius_m = self.default_seed_radius_m
+        self._goal_track_centermost = False
         return CancelResponse.ACCEPT
 
     def _populate_feedback(self, feedback_msg, pan_deg, tilt_deg):
@@ -1083,6 +1189,56 @@ class FollowHeadNode(Node):
                     return res
 
         return (None, None, None)
+
+    def _extract_bbox_head_target(
+        self, bbox_xyxy, points, validmask, img_hw,
+    ):
+        """Bbox-only head proxy for non-pose YOLO weights.
+
+        Used when ``results[0].keypoints`` is ``None`` (e.g. the model is
+        ``yolo11s-seg.pt`` / ``yolov8s-seg.pt`` instead of a ``-pose``
+        variant). Aims at the upper portion of the bbox — roughly where
+        the head sits — and samples depth over the bbox upper third.
+        Returns ``(xyz_cam, (px, py), meta)`` or ``(None, None, None)``
+        if the depth region is too sparse.
+        """
+        h, w = img_hw
+        x1, y1, x2, y2 = (float(v) for v in bbox_xyxy)
+        bbox_w = max(1.0, x2 - x1)
+        bbox_h = max(1.0, y2 - y1)
+        # Aim at ~15% down from the bbox top, horizontally centered —
+        # approximates head position on a standing/sitting person.
+        cx = (x1 + x2) / 2.0
+        cy = y1 + 0.15 * bbox_h
+        target_px = (
+            int(np.clip(round(cx), 0, w - 1)),
+            int(np.clip(round(cy), 0, h - 1)),
+        )
+        x1i = int(np.clip(round(x1), 0, w - 1))
+        x2i = int(np.clip(round(x2), 0, w))
+        y1i = int(np.clip(round(y1), 0, h - 1))
+        y2i = int(np.clip(round(y2), 0, h))
+        if x2i <= x1i or y2i <= y1i:
+            return (None, None, None)
+        # Sample depth over the upper third of the bbox (head + neck +
+        # upper torso) to dodge background-bleed at the head silhouette.
+        upper = np.zeros((h, w), dtype=bool)
+        upper[y1i : y1i + max(1, (y2i - y1i) // 3), x1i:x2i] = True
+        valid_bool = (
+            validmask if validmask.dtype == bool else validmask.astype(bool)
+        )
+        combined = upper & valid_bool
+        xyz = self._depth_in_mask_median(points, combined)
+        if xyz is None or xyz[2] <= 0:
+            return (None, None, None)
+        return (
+            (float(xyz[0]), float(xyz[1]), float(xyz[2])),
+            target_px,
+            {
+                'depth_region': 'bbox_upper_third',
+                'region_pixel_count': int(combined.sum()),
+            },
+        )
 
     def _classify_settle_state(self):
         """Decide whether we can act on a fresh frame given the servo state.

@@ -75,7 +75,7 @@ def test_auto_download_lands_in_cache(isolated_cache, monkeypatch):
             Path.cwd().joinpath(name).write_bytes(b"fake-weights")
 
     fake_module = types.SimpleNamespace(
-        YOLO=FakeYOLO, FastSAM=FakeYOLO, YOLOWorld=FakeYOLO,
+        YOLO=FakeYOLO, FastSAM=FakeYOLO, YOLOWorld=FakeYOLO, SAM=FakeYOLO,
     )
     monkeypatch.setitem(__import__("sys").modules, "ultralytics", fake_module)
 
@@ -96,6 +96,7 @@ def test_concurrent_resolve_downloads_once(isolated_cache, monkeypatch):
 
     fake_module = types.SimpleNamespace(
         YOLO=CountingYOLO, FastSAM=CountingYOLO, YOLOWorld=CountingYOLO,
+        SAM=CountingYOLO,
     )
     monkeypatch.setitem(__import__("sys").modules, "ultralytics", fake_module)
 
@@ -115,6 +116,51 @@ def test_concurrent_resolve_downloads_once(isolated_cache, monkeypatch):
     assert call_count["n"] == 1
 
 
+def test_pick_class_dispatch(monkeypatch):
+    """Filename prefix must route to the right Ultralytics entrypoint."""
+    fake_module = types.SimpleNamespace(
+        YOLO=type("YOLO", (), {}),
+        FastSAM=type("FastSAM", (), {}),
+        YOLOWorld=type("YOLOWorld", (), {}),
+        SAM=type("SAM", (), {}),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "ultralytics", fake_module)
+    pick = weights_cache._pick_ultralytics_cls
+    assert pick("yolo11n-seg.pt").__name__ == "YOLO"
+    assert pick("yolov8s-worldv2.pt").__name__ == "YOLOWorld"
+    assert pick("FastSAM-s.pt").__name__ == "FastSAM"
+    assert pick("mobile_sam.pt").__name__ == "SAM"
+    assert pick("sam_b.pt").__name__ == "SAM"
+    assert pick("sam2_t.pt").__name__ == "SAM"
+
+
+def test_mobile_sam_auto_download_routes_to_sam_branch(isolated_cache, monkeypatch):
+    """resolve_weights('mobile_sam.pt') must instantiate the SAM class."""
+    called = {"name": None}
+
+    class FakeSAM:
+        def __init__(self, name: str):
+            called["name"] = name
+            Path.cwd().joinpath(name).write_bytes(b"sam-weights")
+
+    class FakeFastSAM:
+        def __init__(self, name: str):
+            raise AssertionError(
+                f"FastSAM should not be invoked for {name!r}"
+            )
+
+    fake_module = types.SimpleNamespace(
+        YOLO=FakeFastSAM, FastSAM=FakeFastSAM, YOLOWorld=FakeFastSAM,
+        SAM=FakeSAM,
+    )
+    monkeypatch.setitem(__import__("sys").modules, "ultralytics", fake_module)
+
+    result = resolve_weights("mobile_sam.pt")
+    assert result == isolated_cache / "mobile_sam.pt"
+    assert called["name"] == "mobile_sam.pt"
+    assert result.read_bytes() == b"sam-weights"
+
+
 def test_cwd_is_restored_after_download(isolated_cache, monkeypatch, tmp_path):
     """Resolver must not leak CWD changes back to the caller."""
 
@@ -123,7 +169,7 @@ def test_cwd_is_restored_after_download(isolated_cache, monkeypatch, tmp_path):
             Path.cwd().joinpath(name).write_bytes(b"x")
 
     fake_module = types.SimpleNamespace(
-        YOLO=FakeYOLO, FastSAM=FakeYOLO, YOLOWorld=FakeYOLO,
+        YOLO=FakeYOLO, FastSAM=FakeYOLO, YOLOWorld=FakeYOLO, SAM=FakeYOLO,
     )
     monkeypatch.setitem(__import__("sys").modules, "ultralytics", fake_module)
 

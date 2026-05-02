@@ -1,9 +1,12 @@
-"""FastSAM mask generation for the generalist detection service.
+"""SAM mask generation for the generalist detection service.
 
-Thin wrapper around Ultralytics' FastSAM that takes an RGB image plus a list
-of bounding boxes and returns one boolean HxW mask per bbox, ordered to match
-the input. Instantiated once at node startup so weights + CUDA kernels
-amortize across requests.
+Thin wrapper around Ultralytics' ``SAM`` predictor that takes an RGB image
+plus a list of bounding boxes and returns one boolean HxW mask per bbox,
+ordered to match the input. Defaults to MobileSAM (``mobile_sam.pt``); the
+same wrapper transparently handles ``sam_b.pt`` / ``sam_l.pt`` / ``sam_h.pt``
+/ ``sam2_*.pt`` because Ultralytics' ``SAM`` class dispatches on filename.
+Instantiated once at node startup so weights + CUDA kernels amortize across
+requests.
 """
 
 from __future__ import annotations
@@ -20,21 +23,20 @@ from vision_util.mask_utils import largest_connected_component_in_bbox
 Bbox = tuple[int, int, int, int]  # (x1, y1, x2, y2) pixel coords
 
 
-class FastSAMPredictor:
-    """One-shot bbox-prompted segmentation via Ultralytics FastSAM."""
+class SamPredictor:
+    """One-shot bbox-prompted segmentation via Ultralytics SAM (MobileSAM)."""
 
     def __init__(self, weights_path: str, device: str, logger=None):
         # Import lazily so the node can start even if torch/ultralytics fail.
-        from ultralytics import FastSAM
+        from ultralytics import SAM
 
         self._device = device
         self._logger = logger
-        self._model = FastSAM(weights_path)
-        # FastSAM resolves `weights_path` through ultralytics' weight cache.
+        self._model = SAM(weights_path)
         resolved = getattr(self._model, 'ckpt_path', weights_path)
         if self._logger is not None:
             self._logger.info(
-                f'FastSAM loaded from {resolved} on device={device}'
+                f'SAM loaded from {resolved} on device={device}'
             )
 
     def segment(
@@ -87,17 +89,22 @@ class FastSAMPredictor:
                         (w, h),
                         interpolation=cv2.INTER_NEAREST,
                     )
-                # FastSAM frequently returns multi-blob masks (sliver bg
-                # fragments, gaps). Keep the largest component inside the
-                # bbox this mask was prompted with so centroid ROI stays
-                # aligned with the detector box.
+                # Defensive post-step: keep the largest connected component
+                # inside the prompt bbox so centroid ROI stays aligned with
+                # the detector box. MobileSAM masks are usually already a
+                # single tight blob; FastSAM frequently returned multi-blob
+                # masks which is what made this safety net necessary
+                # historically. Cheap insurance against backend swap surprises.
                 out.append(
                     largest_connected_component_in_bbox(
                         (m > 0.5).astype(bool), bboxes[i]
                     )
                 )
             else:
-                # Fewer masks than bboxes returned — emit empty mask so the
-                # caller keeps 1:1 alignment with its bbox list.
+                # Defensive: Ultralytics' SAM predictor returns N masks for N
+                # input bboxes in input order, so this branch should never
+                # fire with the current backend. Kept as belt-and-braces in
+                # case a future Ultralytics change breaks the contract — the
+                # caller depends on len(masks) == len(bboxes).
                 out.append(np.zeros((h, w), dtype=bool))
         return out, _sam_elapsed

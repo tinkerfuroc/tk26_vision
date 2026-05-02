@@ -28,7 +28,7 @@ from tinker_vision_msgs_26.srv import (
 )
 from vision_util.vision_logging import VisionLogger
 
-from ._env import base_url, default_model, load_env, require_api_key
+from ._env import base_url, default_flash_model, load_env, require_api_key
 from ._image_utils import bbox_from_mask, encode_to_data_url
 
 
@@ -49,7 +49,7 @@ class FeatureService(Node):
         self.camera_types = ['orbbec']
 
         self.declare_parameter('log_prompts', True)
-        self.declare_parameter('llm_model', default_model())
+        self.declare_parameter('llm_model', default_flash_model())
         self.declare_parameter('detection_service', 'object_detection_generalist')
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)

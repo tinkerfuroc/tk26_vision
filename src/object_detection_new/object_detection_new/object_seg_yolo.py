@@ -32,7 +32,7 @@ from cv_bridge import CvBridge
 
 # Shared logger
 from vision_util.vision_logging import VisionLogger
-from vision_util.mask_utils import largest_connected_component
+from vision_util.mask_utils import largest_connected_component_in_bbox
 from vision_util.weights_cache import resolve_weights
 
 
@@ -701,10 +701,12 @@ class YOLOSegmentationNode(Node):
                 mask = masks[i].data.cpu().numpy().squeeze()
                 mask = mask[:h, :w]  # Crop to original size
                 mask = (mask > 0.5).astype(bool)
-                # Drop disconnected fragments — keep only the largest CC.
-                # Stabilises the depth-median centroid and guarantees the
-                # returned segment is a single closed region.
-                mask = largest_connected_component(mask)
+                # Drop disconnected fragments inside the detector bbox.
+                # Running CC globally can pick an unrelated fragment outside
+                # the bbox, leaving centroid ROI empty.
+                mask = largest_connected_component_in_bbox(
+                    mask, (x1, y1, x2, y2)
+                )
 
                 detection_info_all.append({
                     'bbox': (x1, y1, x2, y2),
@@ -822,13 +824,10 @@ class YOLOSegmentationNode(Node):
         roi_mask = mask[y1:y2, x1:x2]
         roi_valid = valid_mask[y1:y2, x1:x2]
         if np.sum(roi_mask) == 0:
-            # Empty mask in the bbox interior — used to silently fall back to
-            # bbox-centroid via np.ones_like, which produced a wrong centroid
-            # for occluded/missing instances. Surface and skip instead.
             self.get_logger().warn(
-                f'empty mask in bbox={bbox}; skipping centroid'
+                f'empty mask in bbox={bbox}; falling back to bbox depth'
             )
-            return None
+            roi_mask = np.ones_like(roi_mask)
         roi_points = points[y1:y2, x1:x2]
 
         # Combine masks using multiplication (works for both bool and float masks)

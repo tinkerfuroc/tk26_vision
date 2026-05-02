@@ -37,3 +37,13 @@ def base_url() -> str:
 
 def default_model() -> str:
     return os.environ.get('LLM_MODEL', 'google/gemini-2.5-pro')
+
+
+def gemini_api_key() -> str:
+    key = os.environ.get('GEMINI_API_KEY')
+    if not key:
+        raise RuntimeError(
+            'GEMINI_API_KEY is not set. Add it to .env at the workspace root '
+            'or export it in your shell before running the direct-Gemini path.'
+        )
+    return key

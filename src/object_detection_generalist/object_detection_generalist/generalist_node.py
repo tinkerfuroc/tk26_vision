@@ -2,12 +2,12 @@
 
 Subclasses `YOLOSegmentationNode` from `object_detection_new` and overrides
 the service registration + callback. Open-vocab path uses YOLO-World and/or
-Gemini 2.5 Flash, both feeding into FastSAM for masks; 3D centroids and
+Gemini 2.5 Flash, both feeding into MobileSAM for masks; 3D centroids and
 sorting are inherited unchanged from the parent class.
 
 Branching (after camera/prompt validation):
 
-  * ``request.force_vlm_sam=True``  → VLM + FastSAM only (operator override;
+  * ``request.force_vlm_sam=True``  → VLM + SAM only (operator override;
     bypasses YOLO-World regardless of node config).
   * ``prompt`` is a YOLO class       → run pretrained YOLO. If non-empty, done;
                                        otherwise fall through to the open-vocab path.
@@ -15,7 +15,7 @@ Branching (after camera/prompt validation):
                                      → race YOLO-World and VLM concurrently.
                                        If YOLO-World returns objects first,
                                        cancel the VLM call: an abandon-event
-                                       guarantees FastSAM + downstream work
+                                       guarantees SAM + downstream work
                                        are skipped (no zombie GPU/SAM-lock
                                        tail), and we also close the OpenAI
                                        client cross-thread as a best-effort
@@ -54,13 +54,36 @@ from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
 from vision_util.weights_cache import resolve_weights
 
-from .sam_mask import FastSAMPredictor
+from .sam_mask import SamPredictor
 from .vlm_bbox import VlmBboxError, request_bboxes
 from .world_bbox import WorldDetector, WorldDetectorError
 
 
 class GeneralistDetectionNode(YOLOSegmentationNode):
     """YOLO + VLM/SAM fallback object detection server."""
+
+    def _init_model(self):
+        """Initialize the inherited YOLO model without occupying CUDA yet."""
+        import torch
+        from ultralytics import YOLO
+
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self._yolo_model_lock = threading.Lock()
+        self._yolo_loaded_device = 'cpu'
+        self.get_logger().info(
+            f'Using device: {self.device}; loading YOLO on CPU until needed'
+        )
+        try:
+            model_file = resolve_weights(self.model_path)
+            self.model = YOLO(str(model_file))
+            self.model.to('cpu')
+            self.get_logger().info(
+                f'YOLO model loaded from {model_file} on CPU; '
+                'no warm-up performed'
+            )
+        except Exception as e:
+            self.get_logger().error(f'Failed to load YOLO model: {e}')
+            raise
 
     def __init__(self, node_name='generalist_detection_node',
                  parameter_overrides=None):
@@ -70,14 +93,14 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         )
         # Parent __init__ finished — device, YOLO model, camera subscribers,
         # TF, locks, and the generalist service are all up. Construct the
-        # FastSAM predictor once so weights & CUDA context amortize.
-        self._sam = FastSAMPredictor(
-            weights_path=str(resolve_weights(self.fastsam_weights)),
+        # SAM predictor once so weights & CUDA context amortize.
+        self._sam = SamPredictor(
+            weights_path=str(resolve_weights(self.sam_weights)),
             device=self.device,
             logger=self.get_logger(),
         )
-        # FastSAM is shared between the YOLO-World and VLM pipelines, which
-        # can run concurrently in the race path. Ultralytics models are not
+        # SAM is shared between the YOLO-World and VLM pipelines, which can
+        # run concurrently in the race path. Ultralytics models are not
         # thread-safe; serialize segmentation calls.
         self._sam_lock = threading.Lock()
 
@@ -113,38 +136,27 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # loaded; recomputing the set per call is a wasted allocation.
         self._yolo_class_names = set(self.model.names.values())
 
-        # YOLO-World is the default open-vocab fallback. It loads even when
-        # `enable_vlm=True` so flipping the flag at runtime via param events
-        # doesn't require a node restart. If load fails (missing weights /
-        # ultralytics), keep the node usable: log loudly and fall through to
-        # the VLM path on out-of-vocab prompts (which will surface its own
-        # error if the API key is missing too).
+        # YOLO-World is the default open-vocab fallback, but it is loaded
+        # lazily so force_vlm_sam requests never pull it onto the GPU. If load
+        # fails (missing weights / ultralytics), keep the node usable: log
+        # loudly and fall through to the VLM path on out-of-vocab prompts
+        # (which will surface its own error if the API key is missing too).
         self._world: WorldDetector | None = None
-        try:
-            self._world = WorldDetector(
-                weights_path=str(resolve_weights(self.world_weights)),
-                device=self.device,
-                conf_threshold=self.world_conf_threshold,
-                iou_threshold=self.world_iou_threshold,
-                logger=self.get_logger(),
-            )
-            # Pay CUDA kernel-compile + CLIP text-head allocation cost
-            # (~1.7s on RTX 5070 Ti) up front. Without this, the *first*
-            # user call observes the cost — and in race mode it contends
-            # with the VLM thread for the GIL during JPEG encode + openai
-            # client construction, slowing both legs.
-            self._world.warmup()
-        except WorldDetectorError as exc:
-            self.get_logger().error(
-                f'YOLO-World unavailable ({exc}); fallback path will skip '
-                'straight to VLM+SAM (if enabled).'
-            )
+        self._world_load_error: str | None = None
+        self._world_lock = threading.Lock()
+        self.get_logger().info(
+            'YOLO-World will be loaded lazily on first YOLO-World fallback; '
+            'no warm-up performed'
+        )
 
         self.get_logger().info(
             f'Generalist detection node ready: enable_vlm={self.enable_vlm}, '
             f'world_weights={self.world_weights}, vlm_model={self.vlm_model}, '
-            f'fastsam_weights={self.fastsam_weights}, '
-            f'allow_auto_fallback={self.allow_auto_fallback}'
+            f'vlm_fallback_models={self.vlm_fallback_models}, '
+            f'sam_weights={self.sam_weights}, '
+            f'allow_auto_fallback={self.allow_auto_fallback}, '
+            f'vlm_timeout_s={self.vlm_timeout_s} '
+            f'(per_attempt={self.vlm_per_attempt_timeout_s}s)'
         )
 
     # --- parameter wiring -------------------------------------------------
@@ -153,19 +165,28 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         super()._declare_parameters()
         self.declare_parameter('allow_auto_fallback', True)
         # Selects the fallback model used on the *auto* path (no per-request
-        # flags). When True, auto-fallback uses Gemini (VLM) + FastSAM; when
-        # False (default), it uses local YOLO-World + FastSAM. Per-request
+        # flags). When True, auto-fallback uses Gemini (VLM) + SAM; when
+        # False (default), it uses local YOLO-World + SAM. Per-request
         # flags override this:
         #   - force_vlm_sam=True  → VLM only, regardless of enable_vlm.
         #   - use_vlm_sam_fallback=True → race YOLO-World vs VLM concurrently.
         self.declare_parameter('enable_vlm', False)
         self.declare_parameter('vlm_model', 'google/gemini-2.5-flash')
-        self.declare_parameter('vlm_timeout_s', 20.0)
+        self.declare_parameter(
+            'vlm_fallback_models', ['qwen/qwen3-vl-8b-instruct']
+        )
+        self.declare_parameter('vlm_fallback_on_empty', False)
+        # vlm_timeout_s is the OVERALL wall-clock budget across all retries
+        # and fallback models for one /object_detection_generalist call.
+        # vlm_per_attempt_timeout_s is the per-attempt cap forwarded to httpx
+        # via client.with_options(timeout=...). On a hung stream, httpx
+        # raises ReadTimeout after this many seconds and the retry loop
+        # starts a fresh attempt — catches the rare 40 s outlier where one
+        # attempt would otherwise eat the entire overall budget.
+        self.declare_parameter('vlm_timeout_s', 30.0)
+        self.declare_parameter('vlm_per_attempt_timeout_s', 10.0)
         self.declare_parameter('vlm_max_retries', 3)
-        # Stream the OpenRouter VLM response (SSE). Keeps the HTTP
-        # connection active during long Gemini generations so intermediate
-        # proxies don't reap the socket, and turns vlm_timeout_s into a
-        # per-chunk inactivity bound instead of a total-response deadline.
+        # Stream the OpenRouter VLM response (SSE).
         # Flip to False to fall back to a single blocking response.
         self.declare_parameter('vlm_stream', True)
         # Range gate for the realsense (manipulation-arm) camera. Detections
@@ -174,7 +195,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # camera is 'realsense'; orbbec (head camera) is unaffected. Set to
         # 0.0 (or any non-positive value) to disable.
         self.declare_parameter('realsense_max_distance_m', 1.0)
-        self.declare_parameter('fastsam_weights', 'FastSAM-s.pt')
+        self.declare_parameter('sam_weights', 'mobile_sam.pt')
         # YOLO-World weights. yolov8s-worldv2.pt is the smallest v2 variant
         # (~25 MB, auto-downloaded). Bigger v2 variants: m / l / x.
         self.declare_parameter('world_weights', 'yolov8s-worldv2.pt')
@@ -201,13 +222,22 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         )
         self.enable_vlm = bool(self.get_parameter('enable_vlm').value)
         self.vlm_model = self.get_parameter('vlm_model').value
+        self.vlm_fallback_models = self._load_string_list_parameter(
+            'vlm_fallback_models'
+        )
+        self.vlm_fallback_on_empty = bool(
+            self.get_parameter('vlm_fallback_on_empty').value
+        )
         self.vlm_timeout_s = float(self.get_parameter('vlm_timeout_s').value)
+        self.vlm_per_attempt_timeout_s = float(
+            self.get_parameter('vlm_per_attempt_timeout_s').value
+        )
         self.vlm_max_retries = int(self.get_parameter('vlm_max_retries').value)
         self.vlm_stream = bool(self.get_parameter('vlm_stream').value)
         self.realsense_max_distance_m = float(
             self.get_parameter('realsense_max_distance_m').value
         )
-        self.fastsam_weights = self.get_parameter('fastsam_weights').value
+        self.sam_weights = self.get_parameter('sam_weights').value
         self.world_weights = self.get_parameter('world_weights').value
         self.world_conf_threshold = float(
             self.get_parameter('world_conf_threshold').value
@@ -391,7 +421,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     )
         if request.return_segments and segments:
             # Segments are produced at rgb_img.shape[:2] by both pipelines:
-            # YOLO crops to (h, w) in `_detect_objects`; FastSAM resizes via
+            # YOLO crops to (h, w) in `_detect_objects`; SAM resizes via
             # INTER_NEAREST in `sam_mask.segment`. Verify here so any future
             # pipeline regression that emits off-size masks fails loudly
             # rather than handing the caller mis-shaped buffers.
@@ -500,7 +530,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
     def _world_pipeline(self, *, rgb_img, points, valid_mask, prompt,
                         camera, header, sort_mode, return_segments,
                         target_frame='') -> dict:
-        """Run YOLO-World + FastSAM. Returns a result dict (never raises)."""
+        """Run YOLO-World + SAM. Returns a result dict (never raises)."""
         if self._world is None:
             return self._empty_result(
                 'yolo_world', error='YOLO-World unavailable at node init'
@@ -547,22 +577,26 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                       camera, header, sort_mode, return_segments,
                       target_frame='',
                       abandon_event=None, client_holder=None) -> dict:
-        """Run VLM + FastSAM. Returns a result dict (never raises).
+        """Run VLM + SAM. Returns a result dict (never raises).
 
         If ``abandon_event`` is set at any post-HTTP checkpoint (immediately
-        after `request_bboxes` returns, or before/after FastSAM), the
+        after `request_bboxes` returns, or before/after SAM), the
         pipeline returns an "abandoned" empty result without touching SAM
         or downstream centroid/sort work. This is what makes the abandoned
         VLM thread cheap: even if the HTTP call had to run to completion
         (no `client.close()` was issued), the thread still skips the GPU
         work and exits.
         """
+        vlm_meta: dict = {}
         try:
-            bboxes, raw_labels, vlm_elapsed = request_bboxes(
+            bboxes, raw_labels, vlm_elapsed, vlm_meta = request_bboxes(
                 rgb_img, prompt,
                 model=self.vlm_model,
+                fallback_models=self.vlm_fallback_models,
+                fallback_on_empty=self.vlm_fallback_on_empty,
                 max_retries=self.vlm_max_retries,
                 timeout_s=self.vlm_timeout_s,
+                per_attempt_timeout_s=self.vlm_per_attempt_timeout_s,
                 logger=self.get_logger(),
                 abandon_event=abandon_event,
                 client_holder=client_holder,
@@ -577,15 +611,20 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             return self._empty_result('vlm_sam', error=f'VLM error: {exc}')
 
         if abandon_event is not None and abandon_event.is_set():
-            # Race winner already returned. Skip FastSAM + downstream work.
-            return self._empty_result(
+            # Race winner already returned. Skip SAM + downstream work.
+            result = self._empty_result(
                 'vlm_sam', vlm_elapsed=vlm_elapsed, error='abandoned',
             )
+            result['vlm_meta'] = vlm_meta
+            return result
 
         if not bboxes:
-            return self._empty_result(
+            result = self._empty_result(
                 'vlm_sam', vlm_elapsed=vlm_elapsed,
+                error=vlm_meta.get('error'),
             )
+            result['vlm_meta'] = vlm_meta
+            return result
 
         prompt_classes = self._parse_prompt_classes(prompt)
         cls_per_box = [
@@ -623,6 +662,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'sam_elapsed': sam_elapsed,
             'vlm_labels': cls_per_box,
             'vlm_raw_labels': list(raw_labels),
+            'vlm_meta': vlm_meta,
             'error': None,
         }
 
@@ -636,7 +676,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
              worker checks it (a) at every retry boundary inside
              `request_bboxes`, (b) immediately after `request_bboxes`
              returns in `_vlm_pipeline`, and (c) right before acquiring
-             `self._sam_lock`. So FastSAM, centroid math, and TF lookups
+             `self._sam_lock`. So SAM, centroid math, and TF lookups
              are guaranteed to be skipped. The thread exits cleanly without
              touching any ROS state on its way out.
           2. **client.close() (best-effort).** Also issued. On the sync
@@ -720,11 +760,9 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             f'YOLO-World produced no objects '
             f'({world_res.get("error") or "empty"}); waiting for VLM'
         )
-        # VLM has its own internal retries with vlm_timeout_s each; allow a
-        # small grace margin on top of the upper bound.
-        vlm_wait = float(self.vlm_timeout_s) * float(
-            max(1, self.vlm_max_retries)
-        ) + 5.0
+        # request_bboxes enforces vlm_timeout_s as a hard total VLM budget;
+        # allow a small grace margin for thread scheduling and cleanup.
+        vlm_wait = float(self.vlm_timeout_s) + 5.0
         if not done_vlm.wait(timeout=vlm_wait):
             # Don't leave the VLM thread running indefinitely past our wait
             # ceiling — cancel it on our way out.
@@ -784,6 +822,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         bboxes = result.get('bboxes') or []
         masks = result.get('masks') or []
         confs = result.get('confs') or []
+        vlm_meta = result.get('vlm_meta') or {}
         request_ctx = {
             'service': 'generalist_ObjectDetection',
             'prompt': prompt,
@@ -794,6 +833,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'force_vlm_sam': bool(request.force_vlm_sam),
             'use_vlm_sam_fallback': bool(request.use_vlm_sam_fallback),
             'enable_vlm': bool(self.enable_vlm),
+            'vlm_model': self.vlm_model,
+            'vlm_fallback_models': list(self.vlm_fallback_models),
+            'vlm_fallback_on_empty': bool(self.vlm_fallback_on_empty),
+            'vlm_model_used': vlm_meta.get('model_used'),
+            'vlm_attempts': vlm_meta.get('attempts') or [],
             'detection_source': used_source,
             'n_objects': len(objects),
             'n_bboxes': len(bboxes),
@@ -847,6 +891,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     'cls': (
                         vlm_labels[i] if i < len(vlm_labels) else prompt
                     ),
+                    'model_used': vlm_meta.get('model_used'),
                 }
                 for i, bbox in enumerate(bboxes)
             ]
@@ -928,6 +973,14 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         if request.sort_highest:
             return 'highest'
         return 'none'
+
+    def _load_string_list_parameter(self, name: str) -> list[str]:
+        value = self.get_parameter(name).value
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(',') if item.strip()]
+        return [str(item).strip() for item in value if str(item).strip()]
 
     @staticmethod
     def _parse_prompt_classes(prompt: str) -> list[str]:
@@ -1085,9 +1138,9 @@ def main(args=None):
     #
     # The race-thread workers spawned inside the callback are plain
     # threading.Thread (daemon=True) and do NOT consume executor threads;
-    # they only touch (a) pure-Python/GPU model APIs (YOLO-World, FastSAM,
+    # they only touch (a) pure-Python/GPU model APIs (YOLO-World, SAM,
     # OpenAI HTTP) and (b) thread-safe rclpy facilities (logger,
-    # tf2_ros.Buffer reads). FastSAM is shared between race legs and is
+    # tf2_ros.Buffer reads). SAM is shared between race legs and is
     # serialized by self._sam_lock.
     import multiprocessing
     num_threads = max(8, multiprocessing.cpu_count())

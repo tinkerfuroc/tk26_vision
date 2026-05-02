@@ -45,7 +45,7 @@ source install/setup.bash
 # Object detection
 ros2 run object_detection_new yolo_seg_node                 # /object_detection_yolo (specialist, excludes 'person')
 ros2 run object_detection_new yolo_seg_default_node         # /object_detection (pretrained COCO, backward-compat)
-ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + YOLO-World/FastSAM fallback; flip to Gemini via -p enable_vlm:=true)
+ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + YOLO-World/MobileSAM fallback; flip to Gemini via -p enable_vlm:=true)
 
 # Tracking / shelves
 ros2 run vision_track person_track_server            # action /track_person
@@ -73,7 +73,7 @@ ros2 run vision_util get_point_cloud                 # /get_point_cloud_service
 src/tk26_vision/src/
 ├── tinker_vision_msgs_26/         # canonical vision interfaces — all msgs/srvs/actions live here (absorbed tk23's tinker_vision_msgs)
 ├── object_detection_new/          # YOLO-seg: specialist (yolo_seg_node, excludes 'person') + default (yolo_seg_default_node, pretrained COCO)
-├── object_detection_generalist/   # Pretrained YOLO + YOLO-World (default fallback) or Gemini 2.5 Flash (enable_vlm) + FastSAM mask, tk26 srv
+├── object_detection_generalist/   # Pretrained YOLO + YOLO-World (default fallback) or Gemini 2.5 Flash (enable_vlm) + MobileSAM mask, tk26 srv
 ├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
 ├── tk_vision_specialized/         # SpotOnShelf action + waving detector
 ├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head (closed-loop absolute targeting in a pan-tilt-rooted frame; feedback-gated settle; sticky ID + EMA)

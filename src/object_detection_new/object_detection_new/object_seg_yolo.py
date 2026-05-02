@@ -445,7 +445,8 @@ class YOLOSegmentationNode(Node):
     def _sort_objects_and_segments(self, objects: list, segments: list, 
                                      sort_mode: str, camera: str = 'orbbec',
                                      source_frame: str = 'camera_link',
-                                     header: Header = None) -> tuple:
+                                     header: Header = None,
+                                     closest_distances: list = None) -> tuple:
         """
         Sort detected objects and their corresponding segments based on centroid position.
         
@@ -458,12 +459,13 @@ class YOLOSegmentationNode(Node):
         sort_mode : str
             Sorting mode: 'none', 'closest', 'highest'
             - 'none': No sorting (original detection order)
-            - 'closest': Sort by distance (closest first)
-                - For realsense: uses centroid.x (forward distance in ROS frame)
-                - For orbbec: uses centroid.z (forward distance in ROS frame)
+            - 'closest': Sort by 3D distance from the camera to the centroid.
+              When `closest_distances` is provided, those camera-frame distances
+              are used even if returned object centroids have been transformed
+              into a target frame such as base_link or map.
             - 'highest': Sort by height (highest first, based on centroid.z in map frame)
         camera : str, optional
-            Camera type ('realsense' or 'orbbec') - determines which axis to use for distance
+            Camera type ('realsense' or 'orbbec')
         source_frame : str, optional
             Source frame for transformations (e.g., 'camera_link')
         header : Header, optional
@@ -483,21 +485,28 @@ class YOLOSegmentationNode(Node):
         indexed_objects = list(enumerate(objects))
         
         if sort_mode == 'closest':
-            # Sort by distance - axis depends on camera type
-            # RealSense: forward is X axis (after our coordinate transform)
-            # Orbbec: forward is Z axis (standard ROS convention)
-            if camera == 'realsense':
-                indexed_objects.sort(key=lambda x: x[1].centroid.x)
-                if indexed_objects:
-                    self.get_logger().info(
-                        f"Sorted by closest (realsense): nearest at x={indexed_objects[0][1].centroid.x:.2f}m"
-                    )
-            else:  # orbbec or default
-                indexed_objects.sort(key=lambda x: x[1].centroid.z)
-                if indexed_objects:
-                    self.get_logger().info(
-                        f"Sorted by closest (orbbec): nearest at z={indexed_objects[0][1].centroid.z:.2f}m"
-                    )
+            # Sort by 3D distance from camera to seen centroid. If the caller
+            # passes raw camera-frame distances, prefer those; otherwise fall
+            # back to the current centroid frame for older call sites.
+            def _dist_sq(obj):
+                c = obj.centroid
+                return c.x * c.x + c.y * c.y + c.z * c.z
+            if closest_distances is not None:
+                indexed_objects.sort(key=lambda x: closest_distances[x[0]])
+            else:
+                indexed_objects.sort(key=lambda x: _dist_sq(x[1]))
+            if indexed_objects:
+                nearest = indexed_objects[0][1].centroid
+                nearest_d = (
+                    closest_distances[indexed_objects[0][0]]
+                    if closest_distances is not None
+                    else _dist_sq(indexed_objects[0][1]) ** 0.5
+                )
+                self.get_logger().info(
+                    f"Sorted by closest ({camera}): nearest at "
+                    f"({nearest.x:.2f}, {nearest.y:.2f}, {nearest.z:.2f}) m, "
+                    f"camera_distance={nearest_d:.2f} m"
+                )
         
         elif sort_mode == 'highest':
             # Try to transform to map frame for proper height sorting
@@ -567,11 +576,23 @@ class YOLOSegmentationNode(Node):
                         f"All points: {[f'z={item[2]:.2f}m' for item in transformed_heights]}"
                     )
             else:
-                # Fallback to closest sorting
-                indexed_objects.sort(key=lambda x: x[1].centroid.z)
+                # Fallback to closest sorting.
+                def _dist_sq_fb(obj):
+                    c = obj.centroid
+                    return c.x * c.x + c.y * c.y + c.z * c.z
+                if closest_distances is not None:
+                    indexed_objects.sort(key=lambda x: closest_distances[x[0]])
+                else:
+                    indexed_objects.sort(key=lambda x: _dist_sq_fb(x[1]))
                 if indexed_objects:
+                    nearest_d_fb = (
+                        closest_distances[indexed_objects[0][0]]
+                        if closest_distances is not None
+                        else _dist_sq_fb(indexed_objects[0][1]) ** 0.5
+                    )
                     self.get_logger().info(
-                        f"Fallback: sorted by closest at z={indexed_objects[0][1].centroid.z:.2f}m"
+                        f"Fallback: sorted by closest at "
+                        f"camera_distance={nearest_d_fb:.2f}m"
                     )
         else:
             self.get_logger().warn(f'Unknown sort_mode: {sort_mode}, using none')
@@ -650,6 +671,7 @@ class YOLOSegmentationNode(Node):
         objects_msg.objects = []
 
         segments = []
+        closest_distances = []
         detection_info = []  # Store info for visualization: (bbox, mask, cls_name, conf, centroid)
         detection_info_all = []
 
@@ -731,6 +753,12 @@ class YOLOSegmentationNode(Node):
                 if cls_name != target_cls:
                     continue
 
+                closest_distance = math.sqrt(
+                    centroid.x * centroid.x
+                    + centroid.y * centroid.y
+                    + centroid.z * centroid.z
+                )
+
                 # Express centroid in target_frame; the source->target
                 # lookup was hoisted above, so this is just in-memory math.
                 if centroid_tf is not None:
@@ -758,6 +786,7 @@ class YOLOSegmentationNode(Node):
                 obj.being_pointed = 0
 
                 objects_msg.objects.append(obj)
+                closest_distances.append(closest_distance)
 
                 if request_segments:
                     segments.append(mask.astype(np.uint8) * 255)
@@ -771,7 +800,8 @@ class YOLOSegmentationNode(Node):
             objects_msg.objects, segments, sort_mode,
             camera=camera,
             source_frame=source_frame,
-            header=header
+            header=header,
+            closest_distances=closest_distances,
         )
         
         # # Also sort detection_info to match

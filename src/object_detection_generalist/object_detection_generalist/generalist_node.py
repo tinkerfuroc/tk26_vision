@@ -162,6 +162,18 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         self.declare_parameter('vlm_model', 'google/gemini-2.5-flash')
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
+        # Stream the OpenRouter VLM response (SSE). Keeps the HTTP
+        # connection active during long Gemini generations so intermediate
+        # proxies don't reap the socket, and turns vlm_timeout_s into a
+        # per-chunk inactivity bound instead of a total-response deadline.
+        # Flip to False to fall back to a single blocking response.
+        self.declare_parameter('vlm_stream', True)
+        # Range gate for the realsense (manipulation-arm) camera. Detections
+        # whose centroid is farther than this are unreachable by the arm so
+        # we drop them before returning. Applied ONLY when the request's
+        # camera is 'realsense'; orbbec (head camera) is unaffected. Set to
+        # 0.0 (or any non-positive value) to disable.
+        self.declare_parameter('realsense_max_distance_m', 1.0)
         self.declare_parameter('fastsam_weights', 'FastSAM-s.pt')
         # YOLO-World weights. yolov8s-worldv2.pt is the smallest v2 variant
         # (~25 MB, auto-downloaded). Bigger v2 variants: m / l / x.
@@ -191,6 +203,10 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         self.vlm_model = self.get_parameter('vlm_model').value
         self.vlm_timeout_s = float(self.get_parameter('vlm_timeout_s').value)
         self.vlm_max_retries = int(self.get_parameter('vlm_max_retries').value)
+        self.vlm_stream = bool(self.get_parameter('vlm_stream').value)
+        self.realsense_max_distance_m = float(
+            self.get_parameter('realsense_max_distance_m').value
+        )
         self.fastsam_weights = self.get_parameter('fastsam_weights').value
         self.world_weights = self.get_parameter('world_weights').value
         self.world_conf_threshold = float(
@@ -281,6 +297,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         if request.force_vlm_sam:
             # Operator override: VLM + SAM only (semantics unchanged from the
             # original generalist behavior; ignores enable_vlm).
+            # INVARIANT: force_vlm_sam ⇒ YOLO-World must NOT run. This branch
+            # calls _vlm_pipeline directly — never _race_world_vlm or
+            # _world_pipeline. Keep this check first in the dispatch chain so
+            # a future refactor cannot silently route force_vlm_sam through a
+            # world-touching path.
             self.get_logger().info(
                 f'force_vlm_sam set; running VLM+SAM only for "{prompt}"'
             )
@@ -396,6 +417,50 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
     # --- pipeline helpers -------------------------------------------------
 
+    def _apply_realsense_range_gate(
+        self, objects, segments, camera, closest_distances=None,
+    ):
+        """Drop objects beyond reach on the realsense (arm) camera.
+
+        Returns ``(filtered_objects, filtered_segments, filtered_distances)``
+        preserving 1:1 positional alignment with the input pair, so the
+        surrounding sort and response-assembly logic is unaffected.
+
+        No-op when ``camera != 'realsense'`` or the gate is disabled
+        (``realsense_max_distance_m <= 0``). Distance is Euclidean from the
+        camera origin: realsense centroids are stored in the camera body
+        frame (x=fwd, y=left, z=up) and never TF-transformed (see
+        ``_CAMERAS_WITH_UNRELIABLE_FRAME_ID`` in the parent), so
+        ``sqrt(x² + y² + z²)`` on ``Object.centroid`` is the right metric.
+        """
+        if camera != 'realsense' or self.realsense_max_distance_m <= 0.0:
+            return objects, segments, closest_distances
+        max_d = float(self.realsense_max_distance_m)
+        kept_objs: list = []
+        kept_segs: list = []
+        kept_distances: list = []
+        dropped = 0
+        has_segments = bool(segments)
+        for i, obj in enumerate(objects):
+            c = obj.centroid
+            dist = (c.x * c.x + c.y * c.y + c.z * c.z) ** 0.5
+            if dist <= max_d:
+                kept_objs.append(obj)
+                if has_segments and i < len(segments):
+                    kept_segs.append(segments[i])
+                if closest_distances is not None and i < len(closest_distances):
+                    kept_distances.append(closest_distances[i])
+            else:
+                dropped += 1
+        if dropped:
+            self.get_logger().info(
+                f'realsense range gate: dropped {dropped}/{len(objects)} '
+                f'object(s) beyond {max_d:.2f} m'
+            )
+        return kept_objs, kept_segs, (
+            kept_distances if closest_distances is not None else None
+        )
+
     @staticmethod
     def _empty_result(source: str, error: str | None = None,
                       world_elapsed: float = 0.0,
@@ -420,9 +485,16 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             request_segments=return_segments, sort_mode=sort_mode,
             target_frame=target_frame,
         )
+        objects = list(yolo_objects_msg.objects)
+        segments = list(yolo_segments)
+        # Apply post-build range gate. Parent already sorted, but the gate
+        # preserves order so the closest-first contract holds.
+        objects, segments, _ = self._apply_realsense_range_gate(
+            objects, segments, camera,
+        )
         result = self._empty_result('yolo')
-        result['objects'] = list(yolo_objects_msg.objects)
-        result['segments'] = list(yolo_segments)
+        result['objects'] = objects
+        result['segments'] = segments
         return result
 
     def _world_pipeline(self, *, rgb_img, points, valid_mask, prompt,
@@ -448,15 +520,19 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         with self._sam_lock:
             masks, sam_elapsed = self._sam.segment(rgb_img, bboxes)
-        objects, segments = self._build_fallback_objects(
+        objects, segments, closest_distances = self._build_fallback_objects(
             prompt, bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments, confs=confs,
             header=header, target_frame=target_frame,
+        )
+        objects, segments, closest_distances = self._apply_realsense_range_gate(
+            objects, segments, camera, closest_distances,
         )
         if objects:
             objects, segments = self._sort_objects_and_segments(
                 objects, segments, sort_mode,
                 camera=camera, source_frame=header.frame_id, header=header,
+                closest_distances=closest_distances,
             )
         return {
             'source': 'yolo_world',
@@ -490,6 +566,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 logger=self.get_logger(),
                 abandon_event=abandon_event,
                 client_holder=client_holder,
+                stream=self.vlm_stream,
             )
         except VlmBboxError as exc:
             return self._empty_result(
@@ -524,16 +601,20 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     'vlm_sam', vlm_elapsed=vlm_elapsed, error='abandoned',
                 )
             masks, sam_elapsed = self._sam.segment(rgb_img, bboxes)
-        objects, segments = self._build_fallback_objects(
+        objects, segments, closest_distances = self._build_fallback_objects(
             prompt, bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments,
             labels=cls_per_box,
             header=header, target_frame=target_frame,
         )
+        objects, segments, closest_distances = self._apply_realsense_range_gate(
+            objects, segments, camera, closest_distances,
+        )
         if objects:
             objects, segments = self._sort_objects_and_segments(
                 objects, segments, sort_mode,
                 camera=camera, source_frame=header.frame_id, header=header,
+                closest_distances=closest_distances,
             )
         return {
             'source': 'vlm_sam',
@@ -926,6 +1007,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         objects: list[Object] = []
         segments: list = []
+        closest_distances: list[float] = []
         source_frame = header.frame_id if header is not None else ''
         stamp = header.stamp if header is not None else None
         # Hoist the source -> target lookup out of the per-bbox loop.
@@ -935,7 +1017,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             source_frame, target_frame, stamp, camera,
         )
         if not batch_ok:
-            return [], []
+            return [], [], []
         for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
             if mask is None or mask.sum() == 0:
                 self.get_logger().warn(
@@ -952,6 +1034,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     'skipping'
                 )
                 continue
+            closest_distance = (
+                centroid.x * centroid.x
+                + centroid.y * centroid.y
+                + centroid.z * centroid.z
+            ) ** 0.5
             if centroid_tf is not None:
                 centroid = self._apply_centroid_transform(
                     centroid, centroid_tf, source_frame, stamp,
@@ -965,9 +1052,10 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             obj.similarity = 0.0
             obj.being_pointed = 0
             objects.append(obj)
+            closest_distances.append(closest_distance)
             if return_segments:
                 segments.append(mask.astype(np.uint8) * 255)
-        return objects, segments
+        return objects, segments, closest_distances
 
 
 def main(args=None):

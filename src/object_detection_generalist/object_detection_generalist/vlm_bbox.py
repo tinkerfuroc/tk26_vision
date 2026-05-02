@@ -129,6 +129,7 @@ def request_bboxes(
     logger=None,
     abandon_event=None,
     client_holder: dict | None = None,
+    stream: bool = True,
 ) -> tuple[List[Bbox], List[str], float]:
     """Ask Gemini for every xyxy bounding box matching `prompt` in the image.
 
@@ -143,8 +144,9 @@ def request_bboxes(
     Cancellation
     ------------
     If ``abandon_event`` (a ``threading.Event``) is set, the loop returns
-    early on the next retry boundary OR when an exception is raised by the
-    in-flight HTTP call (typical case: the caller closed ``client_holder['client']``
+    early on the next retry boundary, on the next streamed-chunk boundary
+    (when ``stream=True``), OR when an exception is raised by the in-flight
+    HTTP call (typical case: the caller closed ``client_holder['client']``
     from another thread, which interrupts httpx and surfaces a ReadError /
     ConnectError here). This lets the race coordinator abandon a VLM call
     without waiting for it to time out naturally.
@@ -154,6 +156,17 @@ def request_bboxes(
     cross-thread to force-cancel the HTTP. The function still owns the
     client's lifetime (closes it in `finally`); the caller's close() just
     accelerates termination.
+
+    Streaming
+    ---------
+    With ``stream=True`` (default) we use the OpenAI SSE streaming API and
+    concatenate ``delta.content`` chunks into the same ``raw`` string we
+    parse below. This keeps the OpenRouter HTTP connection active during
+    long Gemini generations (intermediate proxies / NAT may otherwise reap
+    a silent socket) and converts the httpx ``timeout_s`` into a per-chunk
+    inactivity bound rather than a total-response deadline. It also gives
+    near-instant cancellation: every chunk is an abandon checkpoint.
+    Set ``stream=False`` to fall back to a single blocking response.
     """
 
     load_env()
@@ -217,12 +230,61 @@ def request_bboxes(
                 else response_format_loose
             )
             try:
-                completion = client.with_options(timeout=timeout_s).chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    response_format=response_format,
-                )
-                raw = completion.choices[0].message.content or ''
+                if stream:
+                    raw_parts: list[str] = []
+                    chunk_count = 0
+                    response_stream = client.with_options(
+                        timeout=timeout_s
+                    ).chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        response_format=response_format,
+                        stream=True,
+                    )
+                    try:
+                        for chunk in response_stream:
+                            chunk_count += 1
+                            if (
+                                abandon_event is not None
+                                and abandon_event.is_set()
+                            ):
+                                if logger is not None:
+                                    logger.info(
+                                        f'VLM stream abandoned mid-stream '
+                                        f'(attempt {attempt}/{max_retries}, '
+                                        f'{chunk_count} chunk(s) received)'
+                                    )
+                                return [], [], time.perf_counter() - _t0
+                            choices = getattr(chunk, 'choices', None) or []
+                            if not choices:
+                                continue
+                            delta = getattr(choices[0], 'delta', None)
+                            piece = (
+                                getattr(delta, 'content', None)
+                                if delta else None
+                            )
+                            if piece:
+                                raw_parts.append(piece)
+                    finally:
+                        try:
+                            response_stream.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    raw = ''.join(raw_parts)
+                    if logger is not None:
+                        logger.info(
+                            f'VLM stream attempt {attempt}/{max_retries}: '
+                            f'{chunk_count} chunk(s), {len(raw)} char(s).'
+                        )
+                else:
+                    completion = client.with_options(
+                        timeout=timeout_s
+                    ).chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        response_format=response_format,
+                    )
+                    raw = completion.choices[0].message.content or ''
                 parsed = json.loads(raw)
                 detections = parsed.get('detections', []) or []
 

@@ -589,8 +589,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         prompt_classes = self._parse_prompt_classes(prompt)
         cls_per_box = [
-            self._normalize_vlm_label(lbl, prompt_classes, prompt)
-            for lbl in raw_labels
+            lbl for lbl in raw_labels
         ]
 
         with self._sam_lock:

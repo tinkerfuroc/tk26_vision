@@ -31,6 +31,7 @@ _SYSTEM_PROMPT = (
     # order to xmin,ymin,xmax,ymax) measurably degrade accuracy on the
     # 2.x family. Keep this string close to the official cookbook.
     "Return bounding boxes as an array of objects with labels. "
+    "Target objects will be provided with `.` separation. You should look for all of them. "
     "Never return masks. Limit to 25 objects. "
     "If an object is present multiple times, give each object a unique "
     "label according to its distinct characteristics "
@@ -180,7 +181,10 @@ def request_bboxes(
     # package depends on kimi_api at runtime, so this should succeed).
     from openai import OpenAI
 
-    client = OpenAI(api_key=api_key, base_url=base_url())
+    # Keep retry ownership here, not inside the SDK. The OpenAI client retries
+    # timeouts twice by default; combined with our outer retry loop that makes a
+    # "20s attempt" silently behave like up to three 20s HTTP attempts.
+    client = OpenAI(api_key=api_key, base_url=base_url(), max_retries=0)
     if client_holder is not None:
         client_holder['client'] = client
 
@@ -195,7 +199,7 @@ def request_bboxes(
                 'role': 'user',
                 'content': [
                     {'type': 'image_url', 'image_url': {'url': data_url}},
-                    {'type': 'text', 'text': f'Target class: {prompt}'},
+                    {'type': 'text', 'text': f'Target classes: {prompt}'},
                 ],
             },
         ]
@@ -218,6 +222,7 @@ def request_bboxes(
 
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 1):
+            attempt_t0 = time.perf_counter()
             if abandon_event is not None and abandon_event.is_set():
                 if logger is not None:
                     logger.info(
@@ -244,6 +249,11 @@ def request_bboxes(
                     try:
                         for chunk in response_stream:
                             chunk_count += 1
+                            stream_error = getattr(chunk, 'error', None)
+                            if stream_error:
+                                raise RuntimeError(
+                                    f'OpenRouter stream error: {stream_error}'
+                                )
                             if (
                                 abandon_event is not None
                                 and abandon_event.is_set()
@@ -274,7 +284,8 @@ def request_bboxes(
                     if logger is not None:
                         logger.info(
                             f'VLM stream attempt {attempt}/{max_retries}: '
-                            f'{chunk_count} chunk(s), {len(raw)} char(s).'
+                            f'{chunk_count} chunk(s), {len(raw)} char(s), '
+                            f'{time.perf_counter() - attempt_t0:.2f}s.'
                         )
                 else:
                     completion = client.with_options(
@@ -344,7 +355,9 @@ def request_bboxes(
                 last_error = exc
                 if logger is not None:
                     logger.warning(
-                        f'VLM call failed (attempt {attempt}/{max_retries}): {exc}'
+                        f'VLM call failed (attempt {attempt}/{max_retries}, '
+                        f'{time.perf_counter() - attempt_t0:.2f}s, '
+                        f'{type(exc).__name__}): {exc}'
                     )
 
         if logger is not None:

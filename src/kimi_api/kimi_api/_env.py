@@ -38,6 +38,9 @@ def base_url() -> str:
 def default_model() -> str:
     return os.environ.get('LLM_MODEL', 'google/gemini-2.5-pro')
 
+def default_flash_model() -> str:
+    return os.environ.get('FLASH_MODEL', 'google/gemini-2.5-flash')
+
 
 def gemini_api_key() -> str:
     key = os.environ.get('GEMINI_API_KEY')

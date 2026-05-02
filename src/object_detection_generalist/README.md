@@ -108,7 +108,7 @@ Common parameter overrides:
 | `vlm_stream` | `True` | Stream the OpenRouter VLM response as SSE chunks. Keeps the HTTP connection active during long Gemini generations so intermediate proxies don't reap the silent socket, and gives sub-100 ms cancellation latency when the YOLO-World race partner wins. Flip to `False` to fall back to a single blocking response. |
 | `realsense_max_distance_m` | `1.0` | Range gate: drop detections whose centroid is farther than this from the realsense (arm) camera. Applied **only** when `request.camera == 'realsense'` — orbbec is unaffected. Set to `0.0` (or any non-positive value) to disable. Distance is Euclidean from the camera origin in the camera body frame (`sqrt(x²+y²+z²)` on `Object.centroid`, which on realsense is never TF-transformed). |
 | `allow_auto_fallback` | `True` | See branching above. |
-| `orbbec_depth_topic` | `/camera/depth_registered/points` | Must match what the camera launch publishes. For the canonical Femto Bolt launch this is `/camera/depth/points` — override accordingly. |
+| `orbbec_depth_topic` | `/camera/depth_registered/points` | Must match what the camera launch publishes. Requires `enable_colored_point_cloud:=true depth_registration:=true` on `femto_bolt.launch.py`. |
 
 ## Example calls
 

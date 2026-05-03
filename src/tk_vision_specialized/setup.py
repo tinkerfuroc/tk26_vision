@@ -12,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch',
+            glob('launch/*.launch.py')),
         # Reference items map for object_match_server. Lives at
         # src/tk26_vision/src/items/ (sibling of this package); installed
         # into share/ so ament_index can resolve it after colcon build.

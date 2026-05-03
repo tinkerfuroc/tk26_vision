@@ -5,6 +5,9 @@ from sensor_msgs.msg import Image, CameraInfo
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 import cv2
+import os
+import shutil
+import subprocess
 import time
 import queue
 import numpy as np
@@ -91,15 +94,26 @@ class DetectWavingPersonsNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # OpenCV imshow from a non-main thread is fragile on Linux+Qt builds
-        # of opencv-python (silent no-show, QSocketNotifier warnings). Default
-        # off; opt in via -p show_window:=true at your own risk. The
-        # ROS-canonical view is `rqt_image_view /detect_waving_persons/debug_image`.
-        self.declare_parameter('show_window', False)
+        # show_window=true spawns rqt_image_view as a subprocess subscribed to
+        # /detect_waving_debug_image. cv2.imshow is unreliable here because the system has
+        # opencv-python-headless installed alongside opencv-python, and the
+        # headless wheel wins import resolution → cv2.waitKey raises
+        # "not implemented. Rebuild the library with GTK+ 2.x". rqt_image_view
+        # uses Qt directly and works regardless of the cv2 wheel.
+        self.declare_parameter('show_window', True)
         self.show_window = self.get_parameter('show_window').get_parameter_value().bool_value
         self.declare_parameter('min_person_conf', 0.4)
         self.min_person_conf = float(self.get_parameter('min_person_conf').value)
-        self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 1)
+        # rqt_image_view subscribes via image_transport, which hard-codes
+        # `rmw_qos_profile_default` (RELIABLE, VOLATILE, KEEP_LAST=10) and
+        # offers no GUI/CLI override (rqt_image_view#54, image_common#156).
+        # Mirror that profile here: the integer 10 means depth=10 with rcl
+        # defaults — exactly what the subscriber expects. depth=10 also
+        # prevents the outbound queue from overflowing on back-to-back
+        # service calls (which is what dropped frames at depth=1).
+        self.debug_image_pub = self.create_publisher(
+            Image, '/detect_waving_debug_image', 10,
+        )
 
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
@@ -109,24 +123,46 @@ class DetectWavingPersonsNode(Node):
             self.get_parameter('vision_log_folder').get_parameter_value().string_value,
         )
 
-        self._frame_queue = None
-        self._display_thread = None
+        self._viewer_proc = None
         if self.show_window:
-            self._frame_queue = queue.Queue(maxsize=2)
-            self._display_thread = threading.Thread(target=self._display_loop, daemon=True)
-            self._display_thread.start()
+            self._spawn_image_viewer()
 
         self.get_logger().info(f'Detect Waving Persons node started (show_window={self.show_window})')
 
-    def _display_loop(self):
-        while rclpy.ok():
+    def _spawn_image_viewer(self):
+        """Launch rqt_image_view subscribed to the debug_image topic.
+
+        Falls back to a warning if rqt_image_view isn't installed — the
+        debug_image topic is still published, so the operator can run any
+        viewer manually."""
+        topic = '/detect_waving_debug_image'
+        if shutil.which('ros2') is None:
+            self.get_logger().warn('show_window=true but `ros2` not on PATH; skipping viewer spawn.')
+            return
+        env = os.environ.copy()
+        env.setdefault('DISPLAY', ':0')
+        try:
+            self._viewer_proc = subprocess.Popen(
+                ['ros2', 'run', 'rqt_image_view', 'rqt_image_view', topic],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.get_logger().info(
+                f'Spawned rqt_image_view (pid={self._viewer_proc.pid}) on {topic}'
+            )
+        except FileNotFoundError as exc:
+            self.get_logger().warn(f'Failed to spawn rqt_image_view: {exc}')
+
+    def destroy_node(self):
+        if self._viewer_proc is not None and self._viewer_proc.poll() is None:
             try:
-                frame = self._frame_queue.get(timeout=0.1)
-                cv2.imshow('waving_persons', frame)
-            except queue.Empty:
-                pass
-            cv2.waitKey(1)
-        cv2.destroyAllWindows()
+                self._viewer_proc.terminate()
+                self._viewer_proc.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                self._viewer_proc.kill()
+        return super().destroy_node()
 
     def _annotate_frame(self, rgb_bgr, waving_annotations, waving_centroids):
         frame = rgb_bgr.copy()
@@ -145,6 +181,31 @@ class DetectWavingPersonsNode(Node):
                     self.mp_draw.draw_landmarks(roi, landmarks, self.mp_pose.POSE_CONNECTIONS)
         return frame
 
+    def _annotate_all_persons(self, rgb_bgr, person_annotations):
+        """Draw every detected person, color-coded by waving verdict.
+
+        Red bbox = waving, green bbox = still. Renders on every service call
+        so the debug window/image is populated even when no wave fires."""
+        frame = rgb_bgr.copy()
+        wave_idx = 0
+        for x1, y1, x2, y2, landmarks, is_wave in person_annotations:
+            color = (0, 0, 255) if is_wave else (0, 255, 0)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            if is_wave:
+                wave_idx += 1
+                label = f'waving #{wave_idx}'
+            else:
+                label = 'still'
+            cv2.putText(
+                frame, label, (x1, max(0, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
+            )
+            if landmarks is not None:
+                roi = frame[y1:y2, x1:x2]
+                if roi.size > 0:
+                    self.mp_draw.draw_landmarks(roi, landmarks, self.mp_pose.POSE_CONNECTIONS)
+        return frame
+
     def camera_info_callback(self, msg):
         if self.received_intrinsics:
             return
@@ -155,6 +216,90 @@ class DetectWavingPersonsNode(Node):
             self.received_intrinsics = True
         finally:
             self.intrinsiscs_lock.release()
+
+    def _snapshot_latest_transform(self, target_frame, source_frame,
+                                    wait_seconds=1.0, poll_period=0.02):
+        """Snapshot the latest available TF for (target<-source) at call time.
+
+        Called once at the *start* of the service callback so that all per-
+        centroid transforms later in the callback use the same fixed pose —
+        this both removes the "TF moved between centroid #1 and centroid #N"
+        race and sidesteps the "Lookup would require extrapolation into the
+        future" error you get when the image stamp is a few ms newer than
+        the most recent TF (the camera+TF pipeline lag a tick behind images).
+        We pass `rclpy.time.Time()` (a default-constructed Time = epoch 0,
+        which tf2 interprets as "give me the latest"), so no extrapolation
+        ever happens — we always read what's already in the buffer.
+
+        For slow-changing chains like base_link↔camera_color_optical_frame
+        on the pan-tilt this is sub-mm accurate. If the chain is empty
+        (TF listener hasn't received any frames yet on first request),
+        poll up to `wait_seconds` for one to arrive. Returns TransformStamped
+        or None on total failure."""
+        deadline = self.get_clock().now() + rclpy.duration.Duration(seconds=wait_seconds)
+        latest = rclpy.time.Time()  # tf2 magic value for "latest"
+        while True:
+            if self.tf_buffer.can_transform(target_frame, source_frame, latest):
+                try:
+                    return self.tf_buffer.lookup_transform(
+                        target_frame, source_frame, latest,
+                    )
+                except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                        tf2_ros.ExtrapolationException) as exc:
+                    self.get_logger().error(
+                        f'TF lookup raced after can_transform passed '
+                        f'({target_frame}<-{source_frame}): {exc}'
+                    )
+                    return None
+            if self.get_clock().now() >= deadline:
+                self.get_logger().error(
+                    f'TF for {target_frame}<-{source_frame} not available '
+                    f'within {wait_seconds:.2f}s'
+                )
+                return None
+            time.sleep(poll_period)
+
+    def _publish_debug_image(self, image, header, *,
+                              persons, waving, status_text=None,
+                              already_annotated=False):
+        """Publish an annotated debug frame to /detect_waving_debug_image.
+
+        Called from every service-callback exit path that has an `rgb_image`
+        in hand (success, TF failure, depth failure, post-success transform
+        failure). Publishing on failure is what lets the operator see *what
+        the camera was looking at when the request was rejected* — without
+        it, debugging "why did my service call fail" requires re-running
+        the camera capture.
+
+        `already_annotated=True` skips re-drawing (used by the success path,
+        which has already drawn red/green person bboxes via
+        `_annotate_all_persons`). For failure paths we just stamp a status
+        banner on the raw frame."""
+        if not already_annotated:
+            image = image.copy()
+        cv2.putText(
+            image,
+            f'persons={persons} waving={waving}',
+            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+        )
+        if status_text:
+            cv2.putText(
+                image, status_text, (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
+            )
+        try:
+            msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
+            msg.header = header
+            self.debug_image_pub.publish(msg)
+            n_subs = self.debug_image_pub.get_subscription_count()
+            self.get_logger().info(
+                f'/detect_waving_debug_image published '
+                f'({image.shape[1]}x{image.shape[0]}, subs={n_subs}, '
+                f'persons={persons}, waving={waving}'
+                f'{f", status={status_text}" if status_text else ""})'
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'debug_image publish failed: {exc}')
 
     def image_callback(self, rgb_msg, depth_image_msg):
         # Convert outside the lock — CvBridge can raise on a malformed image
@@ -173,11 +318,13 @@ class DetectWavingPersonsNode(Node):
         finally:
             self.img_lock.release()
 
-    # Tuned against detect_waving_test/ on 2026-05-04: visibility filter at
-    # 0.5, shoulder/elbow tolerances at 0.1 in normalized image-y units yield
-    # 12/18 wave recall with 0/7 false alarms (~76% accuracy). The remaining
-    # FNs are the far/occluded set where MediaPipe visibility is genuinely
-    # below 0.5 — correctly suppressed rather than guessed.
+    # Tuned against detect_waving_test/ (41 images) on 2026-05-04: per-side
+    # visibility gate (each arm trusted independently if its 3 joints all
+    # exceed MIN_VISIBILITY) + shoulder/elbow tolerances of 0.1 in normalized
+    # image-y units yield 24/30 wave recall with 0/11 false alarms
+    # (~85% accuracy). A *global* min-visibility gate over all 6 joints was
+    # too strict — single-arm waves naturally have the resting/occluded arm
+    # below 0.5 visibility, which collapsed recall on real wave gestures.
     MIN_VISIBILITY = 0.5
     SHOULDER_TOL_NORM = 0.1
     ELBOW_TOL_NORM = 0.1
@@ -191,37 +338,43 @@ class DetectWavingPersonsNode(Node):
         rh, re, rs = landmarks[PL.RIGHT_WRIST], landmarks[PL.RIGHT_ELBOW], landmarks[PL.RIGHT_SHOULDER]
         lh, le, ls = landmarks[PL.LEFT_WRIST],  landmarks[PL.LEFT_ELBOW],  landmarks[PL.LEFT_SHOULDER]
 
-        # MediaPipe-pose landmarks carry .visibility ∈ [0, 1]; values < 0.5 mean
-        # the model isn't confident the joint is in-frame, so the (x, y) is
-        # unreliable — refuse to classify rather than guess.
-        if min(lm.visibility for lm in (rh, re, rs, lh, le, ls)) < self.MIN_VISIBILITY:
+        # Per-side visibility: an arm is "trusted" only if all 3 of its joints
+        # have visibility ≥ MIN_VISIBILITY. We then evaluate each trusted arm
+        # independently — a wave on one arm fires even if the other arm is
+        # occluded (typical when only one hand is raised).
+        right_visible = min(rh.visibility, re.visibility, rs.visibility) >= self.MIN_VISIBILITY
+        left_visible  = min(lh.visibility, le.visibility, ls.visibility) >= self.MIN_VISIBILITY
+        if not (right_visible or left_visible):
             self.get_logger().debug(
-                f'is_waving: visibility too low '
-                f'(min={min(lm.visibility for lm in (rh, re, rs, lh, le, ls)):.2f}); skip'
+                f'is_waving: neither arm visible '
+                f'(R_min={min(rh.visibility, re.visibility, rs.visibility):.2f}, '
+                f'L_min={min(lh.visibility, le.visibility, ls.visibility):.2f}); skip'
             )
             return False
 
         # All landmark .y values are normalized [0, 1] from image top.
-        rh_above_sh = rh.y <= rs.y + self.SHOULDER_TOL_NORM
-        lh_above_sh = lh.y <= ls.y + self.SHOULDER_TOL_NORM
-        rh_above_el = rh.y < re.y
-        lh_above_el = lh.y < le.y
-        re_above_sh = re.y <= rs.y + self.ELBOW_TOL_NORM
-        le_above_sh = le.y <= ls.y + self.ELBOW_TOL_NORM
-
-        self.get_logger().debug(
-            f'is_waving: rh.y={rh.y:.2f} rs.y={rs.y:.2f} re.y={re.y:.2f} | '
-            f'lh.y={lh.y:.2f} ls.y={ls.y:.2f} le.y={le.y:.2f} | '
-            f'rh^sh={rh_above_sh} lh^sh={lh_above_sh} '
-            f'rh^el={rh_above_el} lh^el={lh_above_el} '
-            f're^sh={re_above_sh} le^sh={le_above_sh}'
+        right_wave = right_visible and (
+            rh.y <= rs.y + self.SHOULDER_TOL_NORM
+            or (rh.y < re.y and re.y <= rs.y + self.ELBOW_TOL_NORM)
+        )
+        left_wave = left_visible and (
+            lh.y <= ls.y + self.SHOULDER_TOL_NORM
+            or (lh.y < le.y and le.y <= ls.y + self.ELBOW_TOL_NORM)
         )
 
-        gesture = (rh_above_sh or lh_above_sh
-                   or (rh_above_el and re_above_sh)
-                   or (lh_above_el and le_above_sh))
+        self.get_logger().debug(
+            f'is_waving: R_vis={right_visible} L_vis={left_visible} | '
+            f'rh.y={rh.y:.2f} rs.y={rs.y:.2f} re.y={re.y:.2f} | '
+            f'lh.y={lh.y:.2f} ls.y={ls.y:.2f} le.y={le.y:.2f} | '
+            f'R_wave={right_wave} L_wave={left_wave}'
+        )
+
+        gesture = right_wave or left_wave
         if gesture:
-            self.get_logger().info(f'Wave gesture detected (ROI {person_roi.shape[1]}x{person_roi.shape[0]})')
+            self.get_logger().info(
+                f'Wave gesture detected (ROI {person_roi.shape[1]}x{person_roi.shape[0]}, '
+                f'side={"R" if right_wave else "L"})'
+            )
         return gesture
 
 
@@ -252,19 +405,27 @@ class DetectWavingPersonsNode(Node):
         self.get_logger().info('Data copied for processing. Starting detection...')
         transform = None
         if request.target_frame and request.target_frame != header.frame_id:
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    request.target_frame,
-                    header.frame_id,
-                    header.stamp,
-                    timeout=rclpy.duration.Duration(seconds=1.0)
-                )
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            # Snapshot once at the start of the callback. Latest-available
+            # TF, generous 5 s budget — the pan-tilt + base chain is fixed
+            # while the service runs, so a one-time snapshot is correct
+            # for every centroid below.
+            transform = self._snapshot_latest_transform(
+                request.target_frame, header.frame_id,
+                wait_seconds=5.0,
+            )
+            if transform is None:
                 response.status = -1
-                response.error_msg = f"Failed to lookup transform from {header.frame_id} to {request.target_frame}: {e}"
+                response.error_msg = (
+                    f'Failed to lookup transform from {header.frame_id} '
+                    f'to {request.target_frame} within 5.0s'
+                )
                 self.get_logger().error(response.error_msg)
+                self._publish_debug_image(
+                    rgb_image, header, persons=0, waving=0,
+                    status_text=f'TF FAILED ({header.frame_id} -> {request.target_frame})',
+                )
                 return response
-            
+
         self.get_logger().info('Transform lookup successful (if needed). Processing depth image and running YOLO...')
 
         try:
@@ -273,6 +434,10 @@ class DetectWavingPersonsNode(Node):
             response.status = -1
             response.error_msg = f'depth conversion failed: {exc}'
             self.get_logger().error(response.error_msg)
+            self._publish_debug_image(
+                rgb_image, header, persons=0, waving=0,
+                status_text=f'DEPTH FAILED: {exc}',
+            )
             return response
         yolo_results = self.yolo(rgb_image, conf=self.min_person_conf, verbose=False)
 
@@ -284,6 +449,7 @@ class DetectWavingPersonsNode(Node):
         waving_persons_centroids = []
         waving_annotations = []
         waving_masks = []
+        all_person_annotations = []  # (x1, y1, x2, y2, landmarks, is_wave) for every person
         person_candidates = 0
         if boxes is not None:
             for i, box in enumerate(boxes):
@@ -298,8 +464,12 @@ class DetectWavingPersonsNode(Node):
                         continue
 
                     pose_results = self.pose.process(cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB))
+                    is_wave = self.is_waving(pose_results.pose_landmarks, person_roi)
+                    all_person_annotations.append(
+                        (x1, y1, x2, y2, pose_results.pose_landmarks, is_wave)
+                    )
 
-                    if self.is_waving(pose_results.pose_landmarks, person_roi):
+                    if is_wave:
                         # Prefer YOLO seg silhouette over the rectangular bbox so the
                         # centroid mean isn't pulled toward background pixels visible
                         # inside the bbox. Fall back to bbox if seg is unavailable.
@@ -344,6 +514,11 @@ class DetectWavingPersonsNode(Node):
                             centroid = np.mean(person_points, axis=0)
                             centroid[2] = np.median(person_points[:, 2])
 
+                            if request.threshold_meters > 0 and centroid[2] > request.threshold_meters:
+                                self.get_logger().info(
+                                    f'Person candidate #{person_candidates} dropped: '
+                                    f'depth {centroid[2]:.2f}m > threshold {request.threshold_meters:.2f}m'
+                                )
                             if request.threshold_meters <= 0 or centroid[2] <= request.threshold_meters:
                                 point_stamped = PointStamped()
                                 point_stamped.header = header
@@ -368,22 +543,21 @@ class DetectWavingPersonsNode(Node):
             waving_annotations = [a for _, a, _ in triples]
             waving_masks = [m for _, _, m in triples]
 
-        if waving_persons_centroids:
-            annotated = self._annotate_frame(rgb_image, waving_annotations, waving_persons_centroids)
-            # Always publish the annotated debug image — robust across all GUI
-            # backends, viewable via `rqt_image_view /detect_waving_persons/debug_image`.
+        # Always render an annotated frame — every person candidate is drawn
+        # (red=waving, green=still). Empty scenes still emit the raw RGB so
+        # operators can confirm the pipeline ran.
+        annotated = self._annotate_all_persons(rgb_image, all_person_annotations)
+        self._publish_debug_image(
+            annotated, header,
+            persons=person_candidates,
+            waving=len(waving_persons_centroids),
+            already_annotated=True,
+        )
+        if self.show_window and self._frame_queue is not None:
             try:
-                msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
-                msg.header = header
-                self.debug_image_pub.publish(msg)
-            except Exception as exc:  # noqa: BLE001
-                self.get_logger().warn(f'debug_image publish failed: {exc}')
-            # cv2.imshow path is opt-in (Linux+Qt-fragile, see __init__).
-            if self.show_window and self._frame_queue is not None:
-                try:
-                    self._frame_queue.put_nowait(annotated)
-                except queue.Full:
-                    pass
+                self._frame_queue.put_nowait(annotated)
+            except queue.Full:
+                pass
 
         if self._vision_logger.enabled:
             detections = []
@@ -420,6 +594,11 @@ class DetectWavingPersonsNode(Node):
                     response.status = -1
                     response.error_msg = f"Failed to transform point from {header.frame_id} to {request.target_frame}: {e}"
                     self.get_logger().error(response.error_msg)
+                    self._publish_debug_image(
+                        rgb_image, header, persons=person_candidates,
+                        waving=len(waving_persons_centroids),
+                        status_text=f'POINT TRANSFORM FAILED: {e}',
+                    )
                     return response
             else:
                 response.waving_persons = waving_persons_centroids

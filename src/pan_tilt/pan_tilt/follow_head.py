@@ -353,6 +353,30 @@ class FollowHeadNode(Node):
         self.model = YOLO(str(resolve_weights(yolo_model)))
         self.bridge = CvBridge()
 
+        # Warmup: move the model onto GPU (if available) and run a single
+        # dummy inference so the first real action goal doesn't eat the
+        # ~2 s cold-start hit (CUDA kernel compile + memory alloc + cuDNN
+        # autotune). The dummy frame matches the post-pad shape that
+        # follow_head_logic feeds the model on the live Orbbec stream
+        # (720 x 1280 padded up to 736 x 1280, mult-of-32). torch is a
+        # transitive dep of ultralytics so the import is free.
+        try:
+            import torch  # noqa: F401  (used by ultralytics; just for cuda check)
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.model.to(device)
+            warmup_img = np.zeros((736, 1280, 3), dtype=np.uint8)
+            _warmup_t0 = time.perf_counter()
+            self.model(warmup_img, imgsz=(736, 1280), verbose=False)
+            warmup_ms = (time.perf_counter() - _warmup_t0) * 1000.0
+            self.get_logger().info(
+                f'YOLO warmup on {device} took {warmup_ms:.1f} ms '
+                f'(model={yolo_model})'
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f'YOLO warmup failed (will warm on first real frame): {e}'
+            )
+
         self.pan_tilt_cmd_pub = self.create_publisher(PanTiltCommand, command_topic, 1)
         self.pan_tilt_state_sub = self.create_subscription(
             PanTiltState,

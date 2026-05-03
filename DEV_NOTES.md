@@ -16,6 +16,52 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-05-02 — `object_detection_generalist` SAM backend: FastSAM → MobileSAM
+
+### Symptom
+
+Replaying logged VLM bbox requests at `vision_log/20260502_*/generalist_detection_node_vlm_sam_req_*.json` through FastSAM-s showed a clear systematic failure: large foreground objects (chip can, sprite bottle, plate) and small distant objects came back with empty masks even though the VLM bbox was correct. Cases with many bboxes (`orbbec_crowded_multi_box`, 25 boxes) showed masks landing on the **wrong** boxes — different boxes were masked across `retina_masks=True` vs `False` runs, indicating the per-bbox mask assignment was non-deterministic.
+
+### Root cause (two bugs in `ultralytics 8.3.103` `FastSAMPredictor.prompt`)
+
+1. **No IoU floor + dedup collision.** `predict.py:106-115` does `idx[torch.argmax(mask_areas / union, dim=1)] = True` over a boolean selector — two input bboxes can argmax onto the same FastSAM candidate mask, leaving fewer output masks than input bboxes.
+2. **Output ordered by candidate index, not input-bbox index.** The result is `result[idx_bool]` over the candidate-mask set, so `results[0].masks.data[i]` does **not** correspond to `boxes[i]`.
+
+`/tmp/fastsam_retina_replay/` and `/tmp/fastsam_retina_replay_960/` overlays show the misalignment plainly. Bumping `imgsz` 640 → 960 reduced collisions but never fixed the per-box assignment.
+
+### Fix
+
+Swap the SAM backend from FastSAM to MobileSAM via Ultralytics' `SAM` predictor — the SAM family takes bboxes as actual prompts (not post-hoc filters over a class-agnostic all-pass), so each input bbox **always** gets exactly one mask in input order at native resolution.
+
+- `sam_mask.py` — `FastSAMPredictor` → `SamPredictor`; `from ultralytics import FastSAM` → `from ultralytics import SAM`. The `largest_connected_component_in_bbox` post-step stays as a defensive safety net (MobileSAM masks are usually a single tight blob; cheap insurance).
+- `generalist_node.py` — ROS param `fastsam_weights='FastSAM-s.pt'` → `sam_weights='mobile_sam.pt'`. The `_sam_lock` mutex is unchanged (Ultralytics models in general aren't thread-safe).
+- `vision_util/weights_cache.py:_pick_ultralytics_cls` — added `mobile_sam` / `sam_` / `sam2` prefix → `ultralytics.SAM` so the auto-download branch resolves correctly. FastSAM branch retained (harmless).
+- `download_models.py` — manifest swapped `FastSAM-s/m/x.pt` for `mobile_sam.pt`.
+- `test_weights_cache.py` — added `test_pick_class_dispatch` and `test_mobile_sam_auto_download_routes_to_sam_branch`. Suite goes 9 → 11 tests, all passing.
+
+`mobile_sam.pt` (~40 MB) is staged at `~/.cache/tk26_vision/weights/mobile_sam.pt`. The pre-existing `FastSAM-s.pt` weight is intentionally left in cache for ad-hoc rollback via git revert.
+
+### Measured impact (RTX 4080, replay benchmark `/tmp/mobilesam_replay/`)
+
+| metric | FastSAM-s @ imgsz=960 | MobileSAM (default imgsz=1024) |
+|---|---:|---:|
+| boxes with empty mask (47 total across 5 cases) | 1 | **0** |
+| boxes with mask leaking outside its bbox | n/a (FastSAM had no concept of "the bbox") | **0** |
+| peak CUDA alloc, 25-box scene | 1431 MB | **949 MB** |
+| peak CUDA alloc, 8-box scene | 922 MB | **417 MB** |
+| warm latency (regardless of box count) | 14 – 37 ms | 30 – 60 ms |
+
+Slightly higher per-call latency (TinyViT encoder vs FastSAM's tiny YOLO-seg backbone), well-compensated by ~30 % less peak VRAM at scale and correct per-box assignment. Visual contact sheets at `/tmp/mobilesam_replay/<case>/contact_sheet.jpg` confirm tight, in-bbox masks on every input box.
+
+### What still awaits live verification
+
+- T1: `generalist_node` startup logs `SAM loaded from .../mobile_sam.pt on device=cuda` and `/object_detection_generalist` advertises.
+- T2: live `force_vlm_sam:=true` request returns `len(response.segments) == len(response.objects)` with non-empty per-object masks.
+- T2: `force_vlm_sam:=false` (YOLO-World pipeline) regression check — both pipelines share the same `_sam_lock`-guarded `SamPredictor`.
+- Idle GPU footprint should sit at ~0.5–1 GB; under 25-box load peak under 1.0 GB (vs FastSAM's prior 1.4 GB).
+
+---
+
 ## 2026-05-01 — Orbbec cloud floating + upside-down: stale install + wrong-basin polish
 
 ### Symptom
@@ -393,7 +439,7 @@ Measured round-trip: YOLO ≈ 90 ms, Gemini 2.5 Pro 9–14 s, FastSAM bbox-promp
     Each retarget requires either a `detection_service` param flip at launch (for callers that have one) or a one-line default change in the BT node. Migrating `feature_matching` and `grocery_categorize` (both already parameterized) is the lowest-risk first step.
 3. **kimi_api srv migration**: `feature_matching` and `grocery_categorize` import from `tinker_vision_msgs.srv` today. They should optionally target the new `tinker_vision_msgs_26/srv/ObjectDetection` so open-vocab prompts work end-to-end. Requires a parallel `ObjectDetection` client type alongside the existing one (or a launch-time pick via an env var). See the srv field mapping in `tinker_vision_msgs_26/README.md` for what needs to change in the call site.
 4. **Test tier extensions** (`src/tk26_vision/scripts/tests/`):
-    - T0: `ros2 interface show tinker_vision_msgs_26/srv/ObjectDetection` returns a doc containing `force_vlm_sam` + `detection_source`; `python -c "from object_detection_generalist.generalist_node import GeneralistDetectionNode; from ultralytics import FastSAM"` in the venv exits 0.
+    - T0: `ros2 interface show tinker_vision_msgs_26/srv/ObjectDetection` returns a doc containing `force_vlm_sam` + `detection_source`; `python -c "from object_detection_generalist.generalist_node import GeneralistDetectionNode; from ultralytics import SAM"` in the venv exits 0.
     - T1: spawn `generalist_node` with and without `OPENROUTER_API_KEY`, assert it advertises the service in both cases and SIGTERMs cleanly. Negative: service call with `prompt='unicorn'`, `use_vlm_sam_fallback=true` under no-key → status=1, `error_msg` mentions `OPENROUTER_API_KEY`.
     - T2: one live call with `prompt='bottle'` (YOLO branch) and one with `prompt='spatula'`, `use_vlm_sam_fallback=true` (VLM+SAM branch), and one against the specialist with `prompt='person'` on a scene with a person in frame (excluded_classes positive case).
 5. **Log seen images + overlays for user verification.** Today the generalist returns only `(cls, conf, centroid)` and optionally the raw rgb/segments — no overlay. Auditing whether Gemini's bbox and FastSAM's mask look right is tedious. Add a `vision_log_folder` dump of:
@@ -461,7 +507,7 @@ Executed the plan at `plans/plan-for-the-follow-keen-platypus.md`. Closed follow
 - `debug_log_overlays` ROS param (default `False`) on `YOLOSegmentationNode`. When set, each service call dumps `orig_{ts}.jpg`, `overlay_{ts}.jpg`, `req_{ts}.json` under `vision_log_folder/`. Generalist overrides to produce equivalent artifacts on both the YOLO branch and the VLM+SAM branch (VLM raw bboxes included in the JSON payload).
 - `scripts/tests/manual/gemini_bbox_decode.py` — standalone fixture that loads a JPEG, calls `request_bboxes` with a given prompt + model, and writes `<stem>_overlay.png` + `<stem>_raw.json`. Use it to sanity-check the `[y0,x0,y1,x1]` 0-1000 decode convention after model bumps or `_SYSTEM_PROMPT` edits.
 - Test tier extensions:
-  - T0: generalist added to the shebang sweep, the venv-deps check (`FastSAM` import), a dedicated T0.3b module-import check, the interface-show list (`tinker_vision_msgs_26/srv/ObjectDetection`), and the entry-point import sweep. `object_detection_generalist` gets a smoke `OPENROUTER_API_KEY` during `--help` import just like kimi_api.
+  - T0: generalist added to the shebang sweep, the venv-deps check (`SAM` import — was `FastSAM` before the 2026-05-02 backend swap), a dedicated T0.3b module-import check, the interface-show list (`tinker_vision_msgs_26/srv/ObjectDetection`), and the entry-point import sweep. `object_detection_generalist` gets a smoke `OPENROUTER_API_KEY` during `--help` import just like kimi_api.
   - T1.12: generalist advertises `/object_detection_generalist` both with and without `OPENROUTER_API_KEY` (the generalist checks the key lazily on the VLM branch — this is the contract that distinguishes it from kimi_api's fail-at-init).
   - T2.14: live YOLO-branch call (prompt `'bottle'`) + live VLM+SAM-branch call (prompt `'spatula'`, `use_vlm_sam_fallback=true`). VLM case skips cleanly without a real key.
   - T2.15: startup-log sanity on the specialist's `excluded_classes=['person']` param (live positive-case with a person in frame remains a T4 operator check).

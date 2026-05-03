@@ -290,7 +290,7 @@ if wait_for_service /object_detection_generalist 30; then
     # VLM+SAM branch — only run if we have a real key (Gemini call costs)
     if have_api_key; then
         out="$LOG_DIR/T2.14_vlm.svcout"
-        # 90 s timeout: Gemini 2.5 Pro is 9-14 s/call plus FastSAM + sync warmup
+        # 90 s timeout: Gemini 2.5 Pro is 9-14 s/call plus SAM + sync warmup
         svc_call "$out" 90 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetectionGeneralist \
             "{camera: 'realsense', prompt: 'spatula', use_vlm_sam_fallback: true}"
         if grep -qE 'Traceback' "$out"; then

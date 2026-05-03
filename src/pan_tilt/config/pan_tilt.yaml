@@ -58,17 +58,31 @@ follow_head_node:
     home_tilt_deg: 45.0
     # Deadband on target-vs-state error (degrees). Smaller = more responsive
     # (fires commands even for small errors); larger = less twitchy.
-    pan_deadband_deg: 1.5
-    tilt_deadband_deg: 1.5
-    # Minimum change between successive COMMANDS to avoid micro-spam. With
-    # the aggressive settle params below, keep this tight so we re-command
-    # as soon as the target drifts meaningfully.
-    min_command_change_deg: 0.5
+    # Middle ground between bare 3.0 (too sluggish) and prior 1.5 (hunted
+    # back-and-forth on depth-noise drift at certain poses). 2.5 absorbs
+    # the typical noise band of a standing guest at 1.5-3 m while still
+    # chasing real motion within a tick or two.
+    pan_deadband_deg: 2.5
+    tilt_deadband_deg: 2.5
+    # Minimum change between successive COMMANDS to avoid micro-spam.
+    # 0.5 re-commanded for sub-degree depth jitter every tick; 1.0 still
+    # chases meaningful target shifts without flapping on noise.
+    min_command_change_deg: 1.0
 
     # Phase B — feedback-gated settle. Lowered aggressively so new detections
     # translate into motion fast, accepting some jerk in exchange for speed.
     min_detection_interval_sec: 0.1       # 10 Hz YOLO cap (was 0.2 / 5 Hz)
     max_settle_timeout_sec: 0.5           # state callback can lag under load
+    # Distance-aware command hold-off. After a command, suppress new
+    # command issuance for clamp(base + per_deg * slew_deg, base,
+    # max_settle_timeout_sec). Detection keeps running during the
+    # window so the tracker/EMA stay fresh for the next allowed command.
+    # 0.020 s/deg implies ~50 deg/s effective slew; slews >= ~22 deg
+    # saturate the 0.5 s cap. Bumped from 0.012 to give the servo time
+    # to actually arrive before the loop considers re-commanding into
+    # a half-finished motion (was a jitter contributor at small slews).
+    settle_base_sec: 0.05
+    settle_per_deg_sec: 0.020
     steady_pan_eps_deg: 3.0               # very loose (was 0.5)
     steady_tilt_eps_deg: 3.0              # very loose (was 0.5)
     steady_velocity_eps_deg_per_sec: 60.0 # ω ≈ 0 threshold relaxed
@@ -78,7 +92,10 @@ follow_head_node:
     # Phase C — identity continuity + smoothing. Higher alpha = faster
     # response, less smoothing (trade: noisier).
     target_ttl_sec: 0.8
-    ema_alpha: 0.7                        # was 0.4 — prioritize fresh data
+    # 0.7 propagated single-tick depth blips straight to the head; 0.5
+    # gives equal weight to new measurement and prior state (1-tick
+    # half-life) — still tracks 0.5 m/s walking guests in 1-2 ticks.
+    ema_alpha: 0.5
     reassoc_dist_m: 0.4
 
     # Pose-target params (YOLO-pose face aiming). kp_confidence_threshold is
@@ -91,6 +108,13 @@ follow_head_node:
     kp_confidence_threshold: 0.5
     face_depth_window_px: 11
     min_triangle_valid_depth_pixels: 10
+    # Distance gate for the eye-vs-body target switch. When the
+    # person's body-center depth is <= this value, follow_head runs
+    # the eye/face cascade for receptionist-style precise gaze. When
+    # depth exceeds this, it aims at the upper-body center with
+    # full-bbox depth median — robust at distance where the small
+    # face window loses depth pixels.
+    face_target_max_distance_m: 2.5
 
     # Phase E — config surface + motion profile
     blur_threshold: 80.0

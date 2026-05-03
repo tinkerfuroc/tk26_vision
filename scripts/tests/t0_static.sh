@@ -34,14 +34,14 @@ else
 fi
 
 section "T0.3 — Venv deps importable"
-if "$VENV_PY" -c "import ultralytics, openai, dotenv, serial, scipy, torch, cv2; from ultralytics import FastSAM" 2>"$LOG_DIR/t0.3.err"; then
+if "$VENV_PY" -c "import ultralytics, openai, dotenv, serial, scipy, torch, cv2; from ultralytics import SAM" 2>"$LOG_DIR/t0.3.err"; then
     pass "T0.3"
 else
     fail "T0.3" "$(cat "$LOG_DIR/t0.3.err")"
 fi
 
 section "T0.3b — Generalist module importable"
-if "$VENV_PY" -c "from object_detection_generalist.generalist_node import GeneralistDetectionNode; from object_detection_generalist.vlm_bbox import request_bboxes; from object_detection_generalist.sam_mask import FastSAMPredictor" 2>"$LOG_DIR/t0.3b.err"; then
+if "$VENV_PY" -c "from object_detection_generalist.generalist_node import GeneralistDetectionNode; from object_detection_generalist.vlm_bbox import request_bboxes; from object_detection_generalist.sam_mask import SamPredictor" 2>"$LOG_DIR/t0.3b.err"; then
     pass "T0.3b"
 else
     fail "T0.3b" "$(cat "$LOG_DIR/t0.3b.err")"

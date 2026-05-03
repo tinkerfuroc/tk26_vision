@@ -1,5 +1,19 @@
 # Goal
 bool start_following
+# Optional 3D seed of the designated person at goal-send time, in base_link.
+# XY is matched in pan-tilt-root (axes aligned with base_link, static offset
+# is near-zero in XY). All-zero (default) = no seed; the server falls
+# through to track_centermost / legacy-closest below.
+geometry_msgs/Point target_seed_xyz
+# Search radius (m) around the seed for the fresh lock. <= 0 = use the
+# server's default radius (config: pan_tilt.yaml/seed_radius_m).
+float32 seed_radius_m
+# When true AND no seed is set, fresh-lock onto the candidate whose 2D
+# face anchor (in pixels) is nearest the RGB image center. Useful after a
+# BtNode_TurnPanTilt has centered the designated person but no centroid
+# is available on the blackboard. Ignored when target_seed_xyz is set.
+# Default false -> fresh-lock onto the closest person (legacy behavior).
+bool track_centermost
 ---
 # Result
 bool success

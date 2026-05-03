@@ -7,7 +7,7 @@ paying the download cost at node-start time. It populates the *same* cache
 the nodes use, so any future cold-start resolves to a local file.
 
 Coverage:
-  * Ultralytics YOLO / YOLO-seg / YOLO-World / FastSAM .pt weights
+  * Ultralytics YOLO / YOLO-seg / YOLO-World / SAM (MobileSAM) .pt weights
   * torchvision ResNet50 + ResNet18 ImageNet weights (custom ReID)
   * MediaPipe Pose landmark model (waving detection)
 
@@ -35,13 +35,12 @@ DEFAULT_MANIFEST = [
     "yolo11n-seg.pt", "yolo11s-seg.pt", "yolo11m-seg.pt",
     "yolov8s-seg.pt", "yolov8s.pt",
     "yolov8s-worldv2.pt",
-    "FastSAM-s.pt",
+    "mobile_sam.pt",
 ]
 EXTRA_SIZES = [
     "yolo11l-seg.pt", "yolo11x-seg.pt",
     "yolov8n-seg.pt", "yolov8m-seg.pt", "yolov8l-seg.pt", "yolov8x-seg.pt",
     "yolov8m-worldv2.pt", "yolov8l-worldv2.pt", "yolov8x-worldv2.pt",
-    "FastSAM-m.pt", "FastSAM-x.pt",
 ]
 
 

@@ -1,0 +1,13 @@
+string camera
+string category
+string target_frame
+---
+std_msgs/Header header
+int32 status
+string error_msg
+Object[] objects
+string detection_source
+
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image
+sensor_msgs/Image[] segments

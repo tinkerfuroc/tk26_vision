@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'tk_vision_specialized'
@@ -10,6 +12,11 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # Reference items map for object_match_server. Lives at
+        # src/tk26_vision/src/items/ (sibling of this package); installed
+        # into share/ so ament_index can resolve it after colcon build.
+        ('share/' + package_name + '/items',
+            glob('../items/items_map.yaml') + glob('../items/*.jpg')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,6 +32,7 @@ setup(
             'waving_client = tk_vision_specialized.waving_client:main',
             'check_waving_inference = tk_vision_specialized.check_waving_inference:main',
             'placing_location_server = tk_vision_specialized.placing_location_server:main',
+            'object_match_server = tk_vision_specialized.object_match_server:main',
         ],
     },
 )

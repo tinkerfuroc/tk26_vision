@@ -30,6 +30,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/FollowHead.srv"
   "srv/GetImage.srv"
   "srv/GetPointCloud.srv"
+  "srv/GetOrbbecPC.srv"
   "srv/ObjectDetection.srv"
   "srv/ObjectDetectionGeneralist.srv"
   "srv/ObjectDetectionImage.srv"
@@ -42,6 +43,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/Categorize.action"
   "action/FollowHeadAction.action"
   "action/HumanFollowing.action"
+  "action/MonocularDepthPC.action"
   "action/SpotOnShelf.action"
   "action/TrackPerson.action"
   DEPENDENCIES geometry_msgs std_msgs sensor_msgs

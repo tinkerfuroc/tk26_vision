@@ -3,5 +3,7 @@ mediapipe>=0.10.0
 opencv-python>=4.5.0
 numpy>=1.21.0
 # placing_location_server: VLM client (OpenRouter / Gemini) via kimi_api._env.
+# object_match_server: DashScope OpenAI-compatible client for Qwen3-VL.
 openai>=1.0
 python-dotenv>=1.0
+pyyaml>=6.0

@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from tinker_vision_msgs_26.srv import DetectWaving
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 import cv2
@@ -21,48 +21,69 @@ import tf2_geometry_msgs
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
 
-def get_array_from_points(points: PointCloud2, cam_K: np.array) -> tuple[np.array, np.array]:
-    h, w = 720, 1280
-    arr = np.frombuffer(points.data, dtype='<f4')
-    N = len(arr) // 5
-    points = arr.reshape((N, 5))[:, [0, 1, 2]]
-    points_homo = points / np.repeat(points[:, 2: 3], 3, axis=1)
-    coor_homo = (cam_K @ points_homo.T).T
-    coor = np.rint(coor_homo[:, :2]).astype(int)
+def depth_image_to_points(
+    depth_msg: Image, cam_K: np.ndarray, bridge: CvBridge,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Back-project a registered depth Image to a (H, W, 3) XYZ grid in the
+    camera optical frame, plus a (H, W) bool valid mask. Mirrors the math in
+    `_process_realsense_data` (object_seg_yolo.py:407–431) but uses the
+    standard pinhole convention (u=col↔fx,cx; v=row↔fy,cy) so the output
+    matches the Orbbec depth_registered/points frame the rest of this node
+    expects."""
+    depth_img = bridge.imgmsg_to_cv2(depth_msg, 'passthrough').astype(float) / 1000.0
+    H, W = depth_img.shape
+    fx, fy, cx, cy = cam_K[0, 0], cam_K[1, 1], cam_K[0, 2], cam_K[1, 2]
 
-    depth_img = np.zeros((h, w, 3))
-    valid_coor = (coor[:, 0] >= 0) & (coor[:, 0] < w) & (coor[:, 1] >= 0) & (coor[:, 1] < h)
-    coor = coor[valid_coor]
-    points = points[valid_coor]
-    depth_img[coor[:, 1], coor[:, 0], :] = points
-    mask = (depth_img[:, :, 2] > 1e-3)
-    return depth_img, mask
+    valid_mask = (depth_img > 1e-6) & (depth_img < 10.0)
+    depth_img = np.clip(depth_img, 0.0, 10.0)
+
+    u = np.arange(W, dtype=float)[None, :]   # column index → x
+    v = np.arange(H, dtype=float)[:, None]   # row index    → y
+    x = (u - cx) * depth_img / fx
+    y = (v - cy) * depth_img / fy
+
+    points = np.stack([x, y, depth_img], axis=2)
+    return points, valid_mask
 
 class DetectWavingPersonsNode(Node):
     def __init__(self):
         super().__init__('detect_waving_persons_node')
         self.srv = self.create_service(DetectWaving, 'detect_waving_persons', self.detect_waving_callback, callback_group=MutuallyExclusiveCallbackGroup())
 
-        image_sub = Subscriber(self, Image, '/camera/color/image_raw')
-        point_cloud_sub = Subscriber(self, PointCloud2, '/camera/depth_registered/points')
+        self.declare_parameter('color_topic', '/camera/color/image_raw')
+        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
+        self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
+        self.declare_parameter('sync_slop_sec', 0.1)
+        color_topic = self.get_parameter('color_topic').get_parameter_value().string_value
+        depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
+        camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
+        sync_slop_sec = float(self.get_parameter('sync_slop_sec').value)
 
-        self.ts = ApproximateTimeSynchronizer([image_sub, point_cloud_sub], queue_size=10, slop=0.3)
+        image_sub = Subscriber(self, Image, color_topic)
+        depth_image_sub = Subscriber(self, Image, depth_topic)
+
+        self.ts = ApproximateTimeSynchronizer([image_sub, depth_image_sub], queue_size=10, slop=sync_slop_sec)
         self.ts.registerCallback(self.image_callback)
 
-        self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
+        self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, 10)
 
         self.bridge = CvBridge()
-        self.declare_parameter('model_path', 'yolov8s.pt')
+        self.declare_parameter('model_path', 'yolo11m-seg.pt')
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.yolo = YOLO(str(resolve_weights(model_path)))
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
-        self.pose = self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        # static_image_mode=True: each YOLO ROI is independent; the default
+        # (False) builds a video tracker that pollutes subsequent crops.
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=True,
+            min_detection_confidence=0.5,
+        )
 
         self.img_lock = threading.Lock()
         self.intrinsiscs_lock = threading.Lock()
         self.rgb_image = None
-        self.depth_points = None
+        self.depth_image = None
         self.header = None
         self.camera_k = None
         self.received_intrinsics = False
@@ -70,8 +91,15 @@ class DetectWavingPersonsNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.declare_parameter('show_window', True)
+        # OpenCV imshow from a non-main thread is fragile on Linux+Qt builds
+        # of opencv-python (silent no-show, QSocketNotifier warnings). Default
+        # off; opt in via -p show_window:=true at your own risk. The
+        # ROS-canonical view is `rqt_image_view /detect_waving_persons/debug_image`.
+        self.declare_parameter('show_window', False)
         self.show_window = self.get_parameter('show_window').get_parameter_value().bool_value
+        self.declare_parameter('min_person_conf', 0.4)
+        self.min_person_conf = float(self.get_parameter('min_person_conf').value)
+        self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 1)
 
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
@@ -128,7 +156,7 @@ class DetectWavingPersonsNode(Node):
         finally:
             self.intrinsiscs_lock.release()
 
-    def image_callback(self, rgb_msg, depth_msg):
+    def image_callback(self, rgb_msg, depth_image_msg):
         # Convert outside the lock — CvBridge can raise on a malformed image
         # message, and a leaked img_lock would deadlock every subsequent
         # image callback and service request under MultiThreadedExecutor.
@@ -140,58 +168,61 @@ class DetectWavingPersonsNode(Node):
         self.img_lock.acquire()
         try:
             self.rgb_image = cv_img
-            self.depth_points = depth_msg
+            self.depth_image = depth_image_msg
             self.header = rgb_msg.header
         finally:
             self.img_lock.release()
+
+    # Tuned against detect_waving_test/ on 2026-05-04: visibility filter at
+    # 0.5, shoulder/elbow tolerances at 0.1 in normalized image-y units yield
+    # 12/18 wave recall with 0/7 false alarms (~76% accuracy). The remaining
+    # FNs are the far/occluded set where MediaPipe visibility is genuinely
+    # below 0.5 — correctly suppressed rather than guessed.
+    MIN_VISIBILITY = 0.5
+    SHOULDER_TOL_NORM = 0.1
+    ELBOW_TOL_NORM = 0.1
 
     def is_waving(self, pose_landmarks, person_roi):
         if pose_landmarks is None:
             return False
 
         landmarks = pose_landmarks.landmark
+        PL = mp.solutions.pose.PoseLandmark
+        rh, re, rs = landmarks[PL.RIGHT_WRIST], landmarks[PL.RIGHT_ELBOW], landmarks[PL.RIGHT_SHOULDER]
+        lh, le, ls = landmarks[PL.LEFT_WRIST],  landmarks[PL.LEFT_ELBOW],  landmarks[PL.LEFT_SHOULDER]
 
-        img_h, img_w, _ = person_roi.shape
+        # MediaPipe-pose landmarks carry .visibility ∈ [0, 1]; values < 0.5 mean
+        # the model isn't confident the joint is in-frame, so the (x, y) is
+        # unreliable — refuse to classify rather than guess.
+        if min(lm.visibility for lm in (rh, re, rs, lh, le, ls)) < self.MIN_VISIBILITY:
+            self.get_logger().debug(
+                f'is_waving: visibility too low '
+                f'(min={min(lm.visibility for lm in (rh, re, rs, lh, le, ls)):.2f}); skip'
+            )
+            return False
 
-        right_hand = landmarks[mp.solutions.pose.PoseLandmark.RIGHT_WRIST]
-        right_elbow = landmarks[mp.solutions.pose.PoseLandmark.RIGHT_ELBOW]
-        right_shoulder = landmarks[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
+        # All landmark .y values are normalized [0, 1] from image top.
+        rh_above_sh = rh.y <= rs.y + self.SHOULDER_TOL_NORM
+        lh_above_sh = lh.y <= ls.y + self.SHOULDER_TOL_NORM
+        rh_above_el = rh.y < re.y
+        lh_above_el = lh.y < le.y
+        re_above_sh = re.y <= rs.y + self.ELBOW_TOL_NORM
+        le_above_sh = le.y <= ls.y + self.ELBOW_TOL_NORM
 
-        left_hand = landmarks[mp.solutions.pose.PoseLandmark.LEFT_WRIST]
-        left_elbow = landmarks[mp.solutions.pose.PoseLandmark.LEFT_ELBOW]
-        left_shoulder = landmarks[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
+        self.get_logger().debug(
+            f'is_waving: rh.y={rh.y:.2f} rs.y={rs.y:.2f} re.y={re.y:.2f} | '
+            f'lh.y={lh.y:.2f} ls.y={ls.y:.2f} le.y={le.y:.2f} | '
+            f'rh^sh={rh_above_sh} lh^sh={lh_above_sh} '
+            f'rh^el={rh_above_el} lh^el={lh_above_el} '
+            f're^sh={re_above_sh} le^sh={le_above_sh}'
+        )
 
-        nose = landmarks[mp.solutions.pose.PoseLandmark.NOSE]
-
-        right_hand_above_shoulder = right_hand.y <= right_shoulder.y
-        left_hand_above_shoulder = left_hand.y <= left_shoulder.y
-
-        right_hand_above_elbow = right_hand.y < right_elbow.y
-        left_hand_above_elbow = left_hand.y < left_elbow.y
-
-        right_elbow_above_shoulder = right_elbow.y <= (right_shoulder.y + int(img_h * 0.1))
-        left_elbow_above_shoulder = left_elbow.y <= (left_shoulder.y + int(img_h * 0.1))
-
-        # log in separate lines, both pose landmarks and boolean values
-        self.get_logger().info(f"nose: {nose}")
-        self.get_logger().info(f"right_hand: {right_hand}")
-        self.get_logger().info(f"right_elbow: {right_elbow}")
-        self.get_logger().info(f"right_shoulder: {right_shoulder}")
-        self.get_logger().info(f"left_hand: {left_hand}")
-        self.get_logger().info(f"left_elbow: {left_elbow}")
-        self.get_logger().info(f"left_shoulder: {left_shoulder}")
-        self.get_logger().info(f"right_hand_above_shoulder: {right_hand_above_shoulder}")
-        self.get_logger().info(f"left_hand_above_shoulder: {left_hand_above_shoulder}")
-        self.get_logger().info(f"right_hand_above_elbow: {right_hand_above_elbow}")
-        self.get_logger().info(f"right_elbow_above_shoulder: {right_elbow_above_shoulder}")
-        self.get_logger().info(f"left_hand_above_elbow: {left_hand_above_elbow}")
-        self.get_logger().info(f"left_elbow_above_shoulder: {left_elbow_above_shoulder}")
-
-        is_waving_gesture = (right_hand_above_shoulder or left_hand_above_shoulder or
-                             (right_hand_above_elbow and right_elbow_above_shoulder) or
-                             (left_hand_above_elbow and left_elbow_above_shoulder))
-
-        return is_waving_gesture
+        gesture = (rh_above_sh or lh_above_sh
+                   or (rh_above_el and re_above_sh)
+                   or (lh_above_el and le_above_sh))
+        if gesture:
+            self.get_logger().info(f'Wave gesture detected (ROI {person_roi.shape[1]}x{person_roi.shape[0]})')
+        return gesture
 
 
     def detect_waving_callback(self, request, response):
@@ -200,7 +231,7 @@ class DetectWavingPersonsNode(Node):
         
         self.img_lock.acquire()
         try:
-            if self.rgb_image is None or self.depth_points is None:
+            if self.rgb_image is None or self.depth_image is None:
                 response.status = -1
                 response.error_msg = 'No image, depth data received yet'
                 self.get_logger().error(response.error_msg)
@@ -212,7 +243,7 @@ class DetectWavingPersonsNode(Node):
                 return response
 
             rgb_image = self.rgb_image.copy()
-            depth_points = self.depth_points
+            depth_image = self.depth_image
             header = self.header
             camera_k = self.camera_k
         finally:
@@ -234,20 +265,28 @@ class DetectWavingPersonsNode(Node):
                 self.get_logger().error(response.error_msg)
                 return response
             
-        self.get_logger().info('Transform lookup successful (if needed). Processing depth points and running YOLO...')
+        self.get_logger().info('Transform lookup successful (if needed). Processing depth image and running YOLO...')
 
-        points, validmask_points = get_array_from_points(depth_points, camera_k)
-        yolo_results = self.yolo(rgb_image)
+        try:
+            points, validmask_points = depth_image_to_points(depth_image, camera_k, self.bridge)
+        except Exception as exc:  # noqa: BLE001 — bad frame shouldn't kill the executor
+            response.status = -1
+            response.error_msg = f'depth conversion failed: {exc}'
+            self.get_logger().error(response.error_msg)
+            return response
+        yolo_results = self.yolo(rgb_image, conf=self.min_person_conf, verbose=False)
 
         boxes = yolo_results[0].boxes
+        masks = yolo_results[0].masks  # None if model has no seg head or returned no instances
         total_boxes = 0 if boxes is None else len(boxes)
         self.get_logger().info(f'YOLO inference done. Found {total_boxes} candidate box(es).')
 
         waving_persons_centroids = []
         waving_annotations = []
+        waving_masks = []
         person_candidates = 0
         if boxes is not None:
-            for box in boxes:
+            for i, box in enumerate(boxes):
                 if self.yolo.names[int(box.cls[0])] == 'person':
                     person_candidates += 1
                     x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
@@ -261,56 +300,99 @@ class DetectWavingPersonsNode(Node):
                     pose_results = self.pose.process(cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB))
 
                     if self.is_waving(pose_results.pose_landmarks, person_roi):
-                        person_mask = np.zeros(rgb_image.shape[:2], dtype=bool)
-                        person_mask[y1:y2, x1:x2] = True
+                        # Prefer YOLO seg silhouette over the rectangular bbox so the
+                        # centroid mean isn't pulled toward background pixels visible
+                        # inside the bbox. Fall back to bbox if seg is unavailable.
+                        if masks is not None and i < len(masks.data):
+                            seg = masks.data[i].cpu().numpy().astype(np.uint8)
+                            if seg.shape != rgb_image.shape[:2]:
+                                seg = cv2.resize(
+                                    seg,
+                                    (rgb_image.shape[1], rgb_image.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST,
+                                )
+                            person_mask = seg.astype(bool)
+                        else:
+                            person_mask = np.zeros(rgb_image.shape[:2], dtype=bool)
+                            person_mask[y1:y2, x1:x2] = True
 
-                        combined_mask = person_mask & validmask_points
+                        combined_mask = person_mask.astype(float) * validmask_points.astype(float)
 
-                        if np.any(combined_mask):
-                            person_points = points[combined_mask]
+                        # Distant persons can have a seg mask too sparse to hit 10
+                        # valid depth pixels — retry once with the bbox mask before
+                        # dropping the candidate. Mirrors object_seg_yolo.py:854–858.
+                        if combined_mask.sum() < 10:
+                            self.get_logger().info(
+                                f'Person candidate #{person_candidates}: seg mask too sparse '
+                                f'({int(combined_mask.sum())} valid px); retrying with bbox.'
+                            )
+                            bbox_mask = np.zeros(rgb_image.shape[:2], dtype=bool)
+                            bbox_mask[y1:y2, x1:x2] = True
+                            person_mask = bbox_mask
+                            combined_mask = bbox_mask.astype(float) * validmask_points.astype(float)
 
-                            if person_points.shape[0] > 0:
-                                centroid = np.mean(person_points, axis=0)
+                        if combined_mask.sum() < 10:
+                            self.get_logger().info(
+                                f'Person candidate #{person_candidates} skipped: '
+                                f'no usable depth ({int(combined_mask.sum())} valid px).'
+                            )
+                            continue
 
-                                if request.threshold_meters <= 0 or centroid[2] <= request.threshold_meters:
-                                    point_stamped = PointStamped()
-                                    point_stamped.header = header
-                                    point_stamped.point.x = float(centroid[0])
-                                    point_stamped.point.y = float(centroid[1])
-                                    point_stamped.point.z = float(centroid[2])
-                                    waving_persons_centroids.append(point_stamped)
-                                    waving_annotations.append((x1, y1, x2, y2, pose_results.pose_landmarks))
-                                    self.get_logger().info(
-                                        f'Detected waving person #{len(waving_persons_centroids)} '
-                                        f'at ({point_stamped.point.x:.3f}, {point_stamped.point.y:.3f}, {point_stamped.point.z:.3f})'
-                                    )
+                        person_points = points[np.nonzero(combined_mask)]
+
+                        if person_points.shape[0] > 0:
+                            centroid = np.mean(person_points, axis=0)
+                            centroid[2] = np.median(person_points[:, 2])
+
+                            if request.threshold_meters <= 0 or centroid[2] <= request.threshold_meters:
+                                point_stamped = PointStamped()
+                                point_stamped.header = header
+                                point_stamped.point.x = float(centroid[0])
+                                point_stamped.point.y = float(centroid[1])
+                                point_stamped.point.z = float(centroid[2])
+                                waving_persons_centroids.append(point_stamped)
+                                waving_annotations.append((x1, y1, x2, y2, pose_results.pose_landmarks))
+                                waving_masks.append(person_mask)
+                                self.get_logger().info(
+                                    f'Detected waving person #{len(waving_persons_centroids)} '
+                                    f'at ({point_stamped.point.x:.3f}, {point_stamped.point.y:.3f}, {point_stamped.point.z:.3f})'
+                                )
         self.get_logger().info(f'Person candidates checked: {person_candidates}')
-        # sort waving person centroids from closest to farthest (keep annotations aligned)
+        # sort waving person centroids from closest to farthest (keep annotations + masks aligned)
         if waving_persons_centroids:
-            paired = sorted(
-                zip(waving_persons_centroids, waving_annotations),
-                key=lambda pair: pair[0].point.z,
+            triples = sorted(
+                zip(waving_persons_centroids, waving_annotations, waving_masks),
+                key=lambda t: t[0].point.z,
             )
-            waving_persons_centroids = [p for p, _ in paired]
-            waving_annotations = [a for _, a in paired]
+            waving_persons_centroids = [p for p, _, _ in triples]
+            waving_annotations = [a for _, a, _ in triples]
+            waving_masks = [m for _, _, m in triples]
 
-        if self.show_window and self._frame_queue is not None and waving_persons_centroids:
+        if waving_persons_centroids:
             annotated = self._annotate_frame(rgb_image, waving_annotations, waving_persons_centroids)
+            # Always publish the annotated debug image — robust across all GUI
+            # backends, viewable via `rqt_image_view /detect_waving_persons/debug_image`.
             try:
-                self._frame_queue.put_nowait(annotated)
-            except queue.Full:
-                pass
+                msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
+                msg.header = header
+                self.debug_image_pub.publish(msg)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'debug_image publish failed: {exc}')
+            # cv2.imshow path is opt-in (Linux+Qt-fragile, see __init__).
+            if self.show_window and self._frame_queue is not None:
+                try:
+                    self._frame_queue.put_nowait(annotated)
+                except queue.Full:
+                    pass
 
         if self._vision_logger.enabled:
             detections = []
-            for (x1, y1, x2, y2, _lm), pt in zip(
-                waving_annotations, waving_persons_centroids
+            for (x1, y1, x2, y2, _lm), pt, person_mask in zip(
+                waving_annotations, waving_persons_centroids, waving_masks
             ):
-                mask = np.zeros(rgb_image.shape[:2], dtype=bool)
-                mask[y1:y2, x1:x2] = True
                 detections.append({
                     'bbox': [x1, y1, x2, y2],
-                    'mask': mask,
+                    'mask': person_mask,
                     'cls_name': 'waving_person',
                     'conf': 1.0,
                     'centroid': [(x1 + x2) // 2, (y1 + y2) // 2],

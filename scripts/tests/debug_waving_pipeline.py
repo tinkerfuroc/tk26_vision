@@ -56,19 +56,25 @@ def is_waving_legacy(landmarks, mp_mod, img_h):
 
 def is_waving_fixed(landmarks, mp_mod, img_h):
     """Audit-fixed predicate — must match `is_waving` in waving_person_server.py.
-    B1: normalized tolerance. B2: visibility gate. Tolerances tuned 2026-05-04."""
+    Per-side visibility gate + normalized tolerance. Tuned 2026-05-04 against
+    expanded GT set (41 images)."""
     PL = mp_mod.solutions.pose.PoseLandmark
     rh, re, rs = landmarks[PL.RIGHT_WRIST], landmarks[PL.RIGHT_ELBOW], landmarks[PL.RIGHT_SHOULDER]
     lh, le, ls = landmarks[PL.LEFT_WRIST],  landmarks[PL.LEFT_ELBOW],  landmarks[PL.LEFT_SHOULDER]
-    if min(lm.visibility for lm in (rh, re, rs, lh, le, ls)) < 0.5:
+    MIN_VIS, SHOULDER_TOL, ELBOW_TOL = 0.5, 0.1, 0.1
+    right_visible = min(rh.visibility, re.visibility, rs.visibility) >= MIN_VIS
+    left_visible  = min(lh.visibility, le.visibility, ls.visibility) >= MIN_VIS
+    if not (right_visible or left_visible):
         return False
-    SHOULDER_TOL = 0.1
-    ELBOW_TOL = 0.1
-    return (
-        rh.y <= rs.y + SHOULDER_TOL or lh.y <= ls.y + SHOULDER_TOL
+    right_wave = right_visible and (
+        rh.y <= rs.y + SHOULDER_TOL
         or (rh.y < re.y and re.y <= rs.y + ELBOW_TOL)
+    )
+    left_wave = left_visible and (
+        lh.y <= ls.y + SHOULDER_TOL
         or (lh.y < le.y and le.y <= ls.y + ELBOW_TOL)
     )
+    return right_wave or left_wave
 
 
 # ----- per-image evaluation ---------------------------------------------------

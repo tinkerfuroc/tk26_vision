@@ -40,3 +40,13 @@ def default_model() -> str:
 
 def default_flash_model() -> str:
     return os.environ.get('FLASH_MODEL', 'google/gemini-2.5-flash')
+
+
+def gemini_api_key() -> str:
+    key = os.environ.get('GEMINI_API_KEY')
+    if not key:
+        raise RuntimeError(
+            'GEMINI_API_KEY is not set. Add it to .env at the workspace root '
+            'or export it in your shell before running the direct-Gemini path.'
+        )
+    return key

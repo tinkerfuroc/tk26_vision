@@ -2,10 +2,12 @@
 
 import collections
 import math
+import multiprocessing
 import os
 import sys
 import threading
 import time
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -15,7 +17,7 @@ import rclpy.time
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.action import ActionServer, CancelResponse
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -45,14 +47,20 @@ class FollowHeadNode(Node):
         self.declare_parameter('vision_log_folder', 'vision_log')
         self.declare_parameter('command_topic', '/pan_tilt_controller/cmd')
         self.declare_parameter('state_topic', '/pan_tilt_controller/state')
-        self.declare_parameter('home_pan_deg', 0.0)
-        self.declare_parameter('home_tilt_deg', 45.0)
+        self.declare_parameter('home_pan_deg', 0.0) # ignore these
+        self.declare_parameter('home_tilt_deg', 45.0) # ignore these
         self.declare_parameter('pan_deadband_deg', 3.0)
         self.declare_parameter('tilt_deadband_deg', 3.0)
         self.declare_parameter('min_command_change_deg', 1.5)
         # Phase B — feedback-gated settle
         self.declare_parameter('min_detection_interval_sec', 0.2)
         self.declare_parameter('max_settle_timeout_sec', 1.5)
+        # Distance-aware command hold-off after a slew. Suppresses new
+        # command issuance for clamp(base + per_deg * slew_deg, base,
+        # max_settle_timeout_sec). Detection keeps running so the
+        # tracker/EMA stay fresh for the next allowed command.
+        self.declare_parameter('settle_base_sec', 0.05)
+        self.declare_parameter('settle_per_deg_sec', 0.012)
         self.declare_parameter('steady_pan_eps_deg', 0.5)
         self.declare_parameter('steady_tilt_eps_deg', 0.5)
         self.declare_parameter('steady_velocity_eps_deg_per_sec', 10.0)
@@ -62,10 +70,18 @@ class FollowHeadNode(Node):
         self.declare_parameter('target_ttl_sec', 0.8)
         self.declare_parameter('ema_alpha', 0.4)
         self.declare_parameter('reassoc_dist_m', 0.4)
+        # Default search radius for goal-supplied seed (XY, m). Overridable
+        # per-goal via FollowHeadAction.Goal.seed_radius_m (<= 0 -> default).
+        self.declare_parameter('seed_radius_m', 0.5)
         # Pose-target params (YOLO-pose face aiming)
         self.declare_parameter('kp_confidence_threshold', 0.5)
         self.declare_parameter('face_depth_window_px', 11)
         self.declare_parameter('min_triangle_valid_depth_pixels', 10)
+        # Distance gate: when the person's body-center depth exceeds
+        # this threshold, follow_head aims at the upper-body center
+        # (full-bbox depth median, robust to silhouette bleed) instead
+        # of the small face/eye window (which loses depth at distance).
+        self.declare_parameter('face_target_max_distance_m', 2.5)
         # Phase E — config surface + motion profile
         self.declare_parameter('blur_threshold', 80.0)
         self.declare_parameter('small_error_deg', 10.0)
@@ -112,6 +128,16 @@ class FollowHeadNode(Node):
             .get_parameter_value()
             .double_value
         )
+        self.settle_base_sec = (
+            self.get_parameter('settle_base_sec')
+            .get_parameter_value()
+            .double_value
+        )
+        self.settle_per_deg_sec = (
+            self.get_parameter('settle_per_deg_sec')
+            .get_parameter_value()
+            .double_value
+        )
         self.steady_pan_eps_deg = (
             self.get_parameter('steady_pan_eps_deg')
             .get_parameter_value()
@@ -150,6 +176,11 @@ class FollowHeadNode(Node):
             .get_parameter_value()
             .double_value
         )
+        self.default_seed_radius_m = (
+            self.get_parameter('seed_radius_m')
+            .get_parameter_value()
+            .double_value
+        )
         self.kp_conf_thr = (
             self.get_parameter('kp_confidence_threshold')
             .get_parameter_value()
@@ -164,6 +195,11 @@ class FollowHeadNode(Node):
             self.get_parameter('min_triangle_valid_depth_pixels')
             .get_parameter_value()
             .integer_value
+        )
+        self.face_target_max_distance_m = (
+            self.get_parameter('face_target_max_distance_m')
+            .get_parameter_value()
+            .double_value
         )
         self.blur_threshold = (
             self.get_parameter('blur_threshold')
@@ -195,6 +231,16 @@ class FollowHeadNode(Node):
             reassoc_dist_m=self.reassoc_dist_m,
             ttl_sec=self.target_ttl_sec,
         )
+        # Goal-time fresh-lock policy. Read once at execute_callback,
+        # consumed each tick by follow_head_logic via fresh_lock_costs.
+        # _goal_seed_xy holds the BT-supplied seed in base_link XY (Z
+        # dropped — base_link XY axes match pan-tilt-root XY by URDF
+        # symmetry, so no explicit conversion is needed). When None and
+        # _goal_track_centermost is False, the tracker uses its default
+        # (closest person).
+        self._goal_seed_xy: Optional[Tuple[float, float]] = None
+        self._goal_seed_radius_m: float = self.default_seed_radius_m
+        self._goal_track_centermost: bool = False
         self._world_target_ema = WorldTargetEMA(
             alpha=self.ema_alpha,
             ttl_sec=self.target_ttl_sec,
@@ -208,11 +254,23 @@ class FollowHeadNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
+        # ReentrantCallbackGroup for the high-rate sensor + state
+        # subscribers so they don't serialize on the node default group
+        # (which is MutuallyExclusive in Humble). Sharing the default
+        # group with all other subs starves the executor of free
+        # threads under load — the cancel-service handler ends up
+        # queueing for a thread instead of running. Locks
+        # (lock_msg/lock_state/lock_info) already enforce data
+        # correctness inside the callbacks, so concurrent dispatch on
+        # different threads is safe.
+        self._sensor_cb_group = ReentrantCallbackGroup()
         image_sub = Subscriber(
             self, Image, '/camera/color/image_raw', qos_profile=sensor_qos,
+            callback_group=self._sensor_cb_group,
         )
         depth_sub = Subscriber(
             self, Image, '/camera/depth/image_raw', qos_profile=sensor_qos,
+            callback_group=self._sensor_cb_group,
         )
         image_sync_sub = ApproximateTimeSynchronizer(
             [image_sub, depth_sub], queue_size=10, slop=0.1,
@@ -224,14 +282,28 @@ class FollowHeadNode(Node):
             '/camera/color/camera_info',
             self.camera_info_orbbec_callback,
             qos_profile=10,
+            callback_group=self._sensor_cb_group,
         )
 
+        # ReentrantCallbackGroup so the action server's internal cancel
+        # service handler (and our user-level cancel_callback, which it
+        # invokes) can run on a different MultiThreadedExecutor thread
+        # while execute_callback is sitting in its loop. With
+        # MutuallyExclusiveCallbackGroup the cancel handler queues
+        # behind execute on the same group mutex; since the execute
+        # coroutine never `await`s (it uses time.sleep), the mutex is
+        # held until the coroutine returns — which it can't, because
+        # is_cancel_requested only flips after cancel_callback runs.
+        # Classic deadlock; observed as "the action can't be canceled."
+        # Safe here because rclpy's ActionServer enforces single-active-
+        # goal semantics by default, so execute_callback is not
+        # re-entered for two goals concurrently.
         self.action_server = ActionServer(
             self,
             FollowHeadAction,
             'follow_head_action',
             self.execute_callback,
-            callback_group=MutuallyExclusiveCallbackGroup(),
+            callback_group=ReentrantCallbackGroup(),
             cancel_callback=self.cancel_callback,
         )
         self.service = self.create_service(
@@ -281,15 +353,44 @@ class FollowHeadNode(Node):
         self.model = YOLO(str(resolve_weights(yolo_model)))
         self.bridge = CvBridge()
 
+        # Warmup: move the model onto GPU (if available) and run a single
+        # dummy inference so the first real action goal doesn't eat the
+        # ~2 s cold-start hit (CUDA kernel compile + memory alloc + cuDNN
+        # autotune). The dummy frame matches the post-pad shape that
+        # follow_head_logic feeds the model on the live Orbbec stream
+        # (720 x 1280 padded up to 736 x 1280, mult-of-32). torch is a
+        # transitive dep of ultralytics so the import is free.
+        try:
+            import torch  # noqa: F401  (used by ultralytics; just for cuda check)
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.model.to(device)
+            warmup_img = np.zeros((736, 1280, 3), dtype=np.uint8)
+            _warmup_t0 = time.perf_counter()
+            self.model(warmup_img, imgsz=(736, 1280), verbose=False)
+            warmup_ms = (time.perf_counter() - _warmup_t0) * 1000.0
+            self.get_logger().info(
+                f'YOLO warmup on {device} took {warmup_ms:.1f} ms '
+                f'(model={yolo_model})'
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f'YOLO warmup failed (will warm on first real frame): {e}'
+            )
+
         self.pan_tilt_cmd_pub = self.create_publisher(PanTiltCommand, command_topic, 1)
         self.pan_tilt_state_sub = self.create_subscription(
             PanTiltState,
             state_topic,
             self.pan_tilt_state_callback,
             10,
+            callback_group=self._sensor_cb_group,
         )
 
         self.last_command_time = None
+        # Distance-aware command hold-off deadline (monotonic seconds).
+        # Set on each _publish_absolute_command; gates command issuance
+        # in follow_head_logic. 0.0 = no active hold-off.
+        self._settle_until_mono = 0.0
 
         self.get_logger().info('Follow Head Node has been started.')
         print(
@@ -429,57 +530,75 @@ class FollowHeadNode(Node):
             )
 
         _yolo_t0 = time.perf_counter()
+        # Plain detection — no ByteTrack persistence. Identity continuity
+        # comes from PersonTracker's spatial-sticky logic; the goal-side
+        # `target_seed_xyz` / `track_centermost` only affects the FRESH
+        # lock at goal start.
         results = self.model(color_img, imgsz=(H, W))
         _yolo_elapsed = time.perf_counter() - _yolo_t0
         self._perf_sum['yolo'] += _yolo_elapsed
         self._perf_yolo_count += 1
 
-        person_centroids_3d = []
-        log_detections = []  # image-space bboxes + pose targets for the overlay/JSON
-        # Pose results: no segmentation masks. Keypoints shape (N, 17, 2/conf).
+        person_centroids_3d: list[tuple[float, float, float]] = []
+        # Parallel list of face-anchor pixels matching person_centroids_3d
+        # 1:1. Used by the `track_centermost` cost; otherwise unused.
+        person_target_pixels: list[tuple[int, int]] = []
+        log_detections = []  # image-space bboxes + pose/bbox targets for the overlay/JSON
+        # COCO-17 keypoints come from `*-pose.pt` weights. Multi-class
+        # det/seg weights (e.g. `yolo11s-seg.pt`) leave `keypoints=None`,
+        # in which case we fall back to a bbox-only head proxy so the
+        # tracker still gets candidates.
         kps_obj = getattr(results[0], 'keypoints', None)
-        _extract_t0 = time.perf_counter()
-        if (
+        has_keypoints = (
             kps_obj is not None
             and getattr(kps_obj, 'xy', None) is not None
             and getattr(kps_obj, 'conf', None) is not None
-        ):
-            kps_xy = kps_obj.xy.cpu().numpy()
-            kps_cf = kps_obj.conf.cpu().numpy()
-            for i, box in enumerate(results[0].boxes):
-                if self.model.names[int(box.cls[0])] != 'person':
-                    continue
-                bbox_xyxy = results[0].boxes.xyxy[i].cpu().numpy()
-                xyz_cam, target_px, meta = self._extract_face_target(
-                    kps_xy[i], kps_cf[i], bbox_xyxy,
-                    points, validmask_points, (h, w),
-                )
-                if xyz_cam is None:
-                    continue
+        )
+        kps_xy = kps_obj.xy.cpu().numpy() if has_keypoints else None
+        kps_cf = kps_obj.conf.cpu().numpy() if has_keypoints else None
+        _extract_t0 = time.perf_counter()
+        for i, box in enumerate(results[0].boxes):
+            if self.model.names[int(box.cls[0])] != 'person':
+                continue
+            bbox_xyxy = results[0].boxes.xyxy[i].cpu().numpy()
+            xyz_cam, target_px, meta = self._extract_person_target(
+                bbox_xyxy,
+                kps_xy[i] if has_keypoints else None,
+                kps_cf[i] if has_keypoints else None,
+                has_keypoints,
+                points, validmask_points, (h, w),
+            )
+            if xyz_cam is None:
+                continue
 
-                person_centroids_3d.append(xyz_cam)
-                box_xyxy_int = [int(v) for v in bbox_xyxy.tolist()]
-                log_detections.append(
-                    {
-                        'bbox': box_xyxy_int,
-                        'cls_name': 'person',
-                        'conf': (
-                            float(box.conf[0])
-                            if box.conf is not None
-                            else None
-                        ),
-                        'keypoints': [
+            person_centroids_3d.append(xyz_cam)
+            person_target_pixels.append(
+                (int(target_px[0]), int(target_px[1]))
+            )
+            box_xyxy_int = [int(v) for v in bbox_xyxy.tolist()]
+            log_detections.append(
+                {
+                    'bbox': box_xyxy_int,
+                    'cls_name': 'person',
+                    'conf': (
+                        float(box.conf[0])
+                        if box.conf is not None
+                        else None
+                    ),
+                    'keypoints': (
+                        [
                             [float(kps_xy[i, k, 0]),
                              float(kps_xy[i, k, 1]),
                              float(kps_cf[i, k])]
                             for k in range(kps_xy.shape[1])
-                        ],
-                        'target_pixel': [int(target_px[0]), int(target_px[1])],
-                        'depth_region': meta['depth_region'],
-                        'region_pixel_count': meta['region_pixel_count'],
-                        'centroid_3d': [float(c) for c in xyz_cam],
-                    },
-                )
+                        ] if has_keypoints else []
+                    ),
+                    'target_pixel': [int(target_px[0]), int(target_px[1])],
+                    'depth_region': meta['depth_region'],
+                    'region_pixel_count': meta['region_pixel_count'],
+                    'centroid_3d': [float(c) for c in xyz_cam],
+                },
+            )
 
         self._perf_sum['extract'] += time.perf_counter() - _extract_t0
 
@@ -512,15 +631,19 @@ class FollowHeadNode(Node):
         cur_pan_rad = math.radians(cur_pan_deg)
         cur_tilt_rad = math.radians(cur_tilt_deg)
 
-        candidates_root = []
+        candidates_root: list[tuple[float, float, float]] = []
+        candidates_pixel: list[tuple[int, int]] = []
         candidates_cam = []
-        for cam_xyz in person_centroids_3d:
+        for cam_xyz, target_px in zip(
+            person_centroids_3d, person_target_pixels,
+        ):
             xyz_root = self._camera_to_pan_tilt_root(
                 cam_xyz, cur_pan_rad, cur_tilt_rad,
             )
             if xyz_root is None:
                 continue
             candidates_root.append(xyz_root)
+            candidates_pixel.append(target_px)
             candidates_cam.append(cam_xyz)
 
         if not candidates_root:
@@ -528,11 +651,60 @@ class FollowHeadNode(Node):
             self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'No candidates with positive depth.'
 
+        # Build the fresh-lock cost array from the current goal mode.
+        # Priority: seed > centermost > legacy/closest. Tracker only
+        # consults this on a fresh lock; sticky-by-spatial reassoc uses
+        # `reassoc_dist_m` against locked_xyz unconditionally.
+        fresh_lock_costs: Optional[list[float]] = None
+        fresh_lock_mode = 'closest'
+        if self._goal_seed_xy is not None:
+            seed_x, seed_y = self._goal_seed_xy
+            radius = self._goal_seed_radius_m
+            fresh_lock_costs = []
+            for cand_x, cand_y, _cand_z in candidates_root:
+                d = math.hypot(cand_x - seed_x, cand_y - seed_y)
+                fresh_lock_costs.append(d if d <= radius else math.inf)
+            fresh_lock_mode = 'seed'
+        elif self._goal_track_centermost:
+            cx, cy = w / 2.0, h / 2.0
+            fresh_lock_costs = [
+                math.hypot(px - cx, py - cy)
+                for (px, py) in candidates_pixel
+            ]
+            fresh_lock_mode = 'centermost'
+        # else: leave None -> tracker default = closest-to-origin.
+
         now_mono = time.monotonic()
-        chosen_root = self._person_tracker.update(candidates_root, now_mono)
+        chosen_root = self._person_tracker.update(
+            candidates_root, now_mono, fresh_lock_costs,
+        )
         if chosen_root is None:
             self._last_logic_info['person_visible'] = False
             self._perf_early['tracker_no_lock'] += 1
+            # Surface why the seed-mode lock failed so the operator can
+            # see whether the seed and the live candidates actually
+            # agree. Throttled to ~0.5 Hz to avoid spamming the log
+            # while still firing on every test run.
+            if (
+                fresh_lock_mode == 'seed'
+                and self._person_tracker.locked_xyz is None
+            ):
+                seed_xy = self._goal_seed_xy
+                radius = self._goal_seed_radius_m
+                cand_summary = ', '.join(
+                    f'(x={x:.2f}, y={y:.2f}, '
+                    f'dist={math.hypot(x - seed_xy[0], y - seed_xy[1]):.2f}m)'
+                    for (x, y, _z) in candidates_root
+                )
+                self.get_logger().warning(
+                    f'Seed-mode rejected all {len(candidates_root)} '
+                    f'candidate(s): seed_xy=({seed_xy[0]:.2f}, '
+                    f'{seed_xy[1]:.2f}), radius={radius:.2f} m, '
+                    f'candidates: [{cand_summary}]. Increase '
+                    f'seed_radius_m on the goal or tighten the '
+                    f'detect-time centroid heuristic.',
+                    throttle_duration_sec=2.0,
+                )
             self._perf_sum['total'] += time.perf_counter() - _total_t0
             return None, 'PersonTracker returned no lock.'
         target_xyz_root = self._world_target_ema.update(chosen_root, now_mono)
@@ -551,7 +723,6 @@ class FollowHeadNode(Node):
         )
 
         if self._vision_logger.enabled:
-            # Mark which detection the tracker selected by matching back from
             # Match the tracker's chosen root-frame xyz back to its
             # camera-frame centroid for the is_chosen annotation.
             try:
@@ -582,6 +753,7 @@ class FollowHeadNode(Node):
                         if chosen_cam is not None else None
                     ),
                     'chosen_root_xyz': [float(c) for c in chosen_root],
+                    'fresh_lock_mode': fresh_lock_mode,
                     'target_root_xyz': [float(c) for c in target_xyz_root],
                     'target_pan_deg': target_pan_deg,
                     'target_tilt_deg': target_tilt_deg,
@@ -623,11 +795,6 @@ class FollowHeadNode(Node):
             self._perf_sum['total'] += time.perf_counter() - _total_t0
             return (target_pan_deg, target_tilt_deg), ''
 
-        # Settle gate removed — joint state is fresh enough that re-issuing
-        # commands while the servo is still converging is harmless; the
-        # firmware handles command supersession. Anti-chatter below is the
-        # only remaining guard against command spam.
-
         # Anti-chatter: if the new target barely differs from the last
         # commanded position, don't re-issue. This protects the Waveshare
         # firmware from a stream of near-identical commands that each
@@ -650,6 +817,20 @@ class FollowHeadNode(Node):
                 self._perf_early['min_cmd_change'] += 1
                 self._perf_sum['total'] += time.perf_counter() - _total_t0
                 return (target_pan_deg, target_tilt_deg), ''
+
+        # Distance-aware settle hold-off: after a slew, suppress new
+        # command issuance for a window proportional to the commanded
+        # distance. Detection above kept running so the next allowed
+        # command fires on the latest target.
+        now_settle_mono = time.monotonic()
+        if now_settle_mono < self._settle_until_mono:
+            remaining = self._settle_until_mono - now_settle_mono
+            self.get_logger().debug(
+                f'Settling for {remaining:.2f}s more before next command.',
+            )
+            self._perf_early['settling'] += 1
+            self._perf_sum['total'] += time.perf_counter() - _total_t0
+            return (target_pan_deg, target_tilt_deg), ''
 
         # Speed scaling: small errors get a slower profile to reduce motion
         # blur; large slews run at the controller default.
@@ -681,8 +862,22 @@ class FollowHeadNode(Node):
         self.pan_tilt_cmd_pub.publish(pan_tilt_msg)
         self.last_command_time = self.get_clock().now()
         with self.lock_state:
+            cur_pan_deg = self.current_pan_deg
+            cur_tilt_deg = self.current_tilt_deg
             self._last_commanded_pan_rad = float(target_pan_rad)
             self._last_commanded_tilt_rad = float(target_tilt_rad)
+        if cur_pan_deg is not None and cur_tilt_deg is not None:
+            slew_deg = max(
+                abs(math.degrees(target_pan_rad) - cur_pan_deg),
+                abs(math.degrees(target_tilt_rad) - cur_tilt_deg),
+            )
+        else:
+            slew_deg = 0.0
+        hold_sec = min(
+            self.settle_base_sec + self.settle_per_deg_sec * slew_deg,
+            self.max_settle_timeout_sec,
+        )
+        self._settle_until_mono = time.monotonic() + hold_sec
 
     def follow_head_callback(self, request, response):
         self.get_logger().info('Follow Head Service has been called.')
@@ -703,6 +898,39 @@ class FollowHeadNode(Node):
         self._person_tracker.reset()
         self._world_target_ema.reset()
         self._last_detection_time = None
+        self._settle_until_mono = 0.0
+
+        # Read the goal-time fresh-lock policy. Priority: seed > centermost
+        # > legacy/closest. The fields stay set for the lifetime of the
+        # goal; the tracker only consults them on a fresh lock.
+        seed_pt = goal_handle.request.target_seed_xyz
+        if seed_pt.x == 0.0 and seed_pt.y == 0.0 and seed_pt.z == 0.0:
+            self._goal_seed_xy = None
+            self._goal_seed_radius_m = self.default_seed_radius_m
+        else:
+            # base_link XY ≡ pan-tilt-root XY (axes aligned, near-zero static
+            # offset by URDF symmetry). Z is dropped; we match XY only.
+            self._goal_seed_xy = (float(seed_pt.x), float(seed_pt.y))
+            radius_raw = float(goal_handle.request.seed_radius_m)
+            self._goal_seed_radius_m = (
+                radius_raw if radius_raw > 0.0 else self.default_seed_radius_m
+            )
+        self._goal_track_centermost = bool(
+            goal_handle.request.track_centermost
+        )
+        if self._goal_seed_xy is not None:
+            self.get_logger().info(
+                f'Fresh-lock mode: seed (xy=({seed_pt.x:.3f}, '
+                f'{seed_pt.y:.3f}), radius={self._goal_seed_radius_m:.2f} m).',
+            )
+        elif self._goal_track_centermost:
+            self.get_logger().info(
+                'Fresh-lock mode: centermost (image-pixel-distance cost).',
+            )
+        else:
+            self.get_logger().info(
+                'Fresh-lock mode: closest (closest-to-origin XY, legacy).',
+            )
 
         with self.lock_state:
             current_pan_deg = self.current_pan_deg
@@ -713,7 +941,7 @@ class FollowHeadNode(Node):
             ),
         )
         home_tilt_rad = float(np.deg2rad(self.home_tilt_deg))
-        self._publish_absolute_command(home_pan_rad, home_tilt_rad)
+        # self._publish_absolute_command(home_pan_rad, home_tilt_rad)
 
         if not goal_handle.request.start_following:
             goal_handle.abort()
@@ -762,7 +990,10 @@ class FollowHeadNode(Node):
             result.message = 'Error in loop.'
             return result
 
-        if goal_handle.is_cancel_requested:
+        # Either the client asked rclpy to cancel (is_cancel_requested) or
+        # the cancel_callback set our self.is_canceled flag — treat both
+        # as a real cancellation and terminate the goal cleanly.
+        if goal_handle.is_cancel_requested or self.is_canceled:
             goal_handle.canceled()
             result = FollowHeadAction.Result()
             result.message = 'Goal canceled'
@@ -779,6 +1010,13 @@ class FollowHeadNode(Node):
         self.is_canceled = True
         self._person_tracker.reset()
         self._world_target_ema.reset()
+        # Reset goal-mode fields so a stale seed doesn't bleed into the
+        # next goal if execute_callback never overwrites it (degenerate
+        # path, but cheap to be safe).
+        self._goal_seed_xy = None
+        self._goal_seed_radius_m = self.default_seed_radius_m
+        self._goal_track_centermost = False
+        self._settle_until_mono = 0.0
         return CancelResponse.ACCEPT
 
     def _populate_feedback(self, feedback_msg, pan_deg, tilt_deg):
@@ -1084,95 +1322,164 @@ class FollowHeadNode(Node):
 
         return (None, None, None)
 
-    def _classify_settle_state(self):
-        """Decide whether we can act on a fresh frame given the servo state.
+    def _extract_body_center_target(
+        self, bbox_xyxy, points, validmask, img_hw,
+    ):
+        """Full-bbox body-center target for the at-distance regime.
 
-        Returns (state, reason) where state is one of:
-          - 'go'             — servo is steady at the last commanded pose
-          - 'wait'           — feedback says we are still in motion; skip this tick
-          - 'stale_feedback' — feedback is missing/stale; caller falls back
-                               to the Laplacian blur gate
-          - 'blurred'        — reserved for future expansion
+        Used when the person is far enough that face/head depth is
+        unreliable (small bbox, small face, sparse depth pixels under
+        the floor). Aims at the bbox horizontal center, ~25% down from
+        the bbox top (upper-body / chest) for a natural "looking at
+        this person" tilt rather than a stomach-aim. Samples depth
+        over the *entire* bbox interior — that's robust against the
+        silhouette-edge background bleed that breaks the small head
+        window at distance.
+
+        Returns ``(xyz_cam, (px, py), meta)`` or ``(None, None, None)``
+        if even the full bbox has no valid depth.
         """
-        # No command has been issued yet → nothing to settle against.
-        if (
-            self._last_commanded_pan_rad is None
-            or self._last_commanded_tilt_rad is None
-            or self.last_command_time is None
-        ):
-            return 'go', ''
+        h, w = img_hw
+        x1, y1, x2, y2 = (float(v) for v in bbox_xyxy)
+        bbox_h = max(1.0, y2 - y1)
+        cx = (x1 + x2) / 2.0
+        cy = y1 + 0.25 * bbox_h
+        target_px = (
+            int(np.clip(round(cx), 0, w - 1)),
+            int(np.clip(round(cy), 0, h - 1)),
+        )
+        x1i = int(np.clip(round(x1), 0, w - 1))
+        x2i = int(np.clip(round(x2), 0, w))
+        y1i = int(np.clip(round(y1), 0, h - 1))
+        y2i = int(np.clip(round(y2), 0, h))
+        if x2i <= x1i or y2i <= y1i:
+            return (None, None, None)
+        body = np.zeros((h, w), dtype=bool)
+        body[y1i:y2i, x1i:x2i] = True
+        valid_bool = (
+            validmask if validmask.dtype == bool else validmask.astype(bool)
+        )
+        combined = body & valid_bool
+        xyz = self._depth_in_mask_median(points, combined)
+        if xyz is None or xyz[2] <= 0:
+            return (None, None, None)
+        return (
+            (float(xyz[0]), float(xyz[1]), float(xyz[2])),
+            target_px,
+            {
+                'depth_region': 'bbox_full_body',
+                'region_pixel_count': int(combined.sum()),
+            },
+        )
 
-        with self.lock_state:
-            history = list(self._state_history)
+    def _extract_person_target(
+        self,
+        bbox_xyxy,
+        kps_xy_i,
+        kps_cf_i,
+        has_keypoints,
+        points,
+        validmask,
+        img_hw,
+    ):
+        """Distance-aware person target.
 
-        if not history:
-            return 'stale_feedback', 'No pan/tilt state feedback received yet.'
+        Always probes body-center depth first — cheap, robust at any
+        distance, and tells us whether to bother running the face
+        cascade. When the body sits beyond
+        ``face_target_max_distance_m`` we use the body target directly
+        ("look at this person" — coarse but never fails at distance).
+        Within the threshold we run the eye/head cascade for
+        receptionist-style precise gaze, falling back to body-center
+        only if the cascade also fails (e.g., person facing away with
+        no usable face keypoints).
+        """
+        body_xyz, body_px, body_meta = self._extract_body_center_target(
+            bbox_xyxy, points, validmask, img_hw,
+        )
+        if body_xyz is None:
+            return (None, None, None)
 
-        latest_ts, latest_pan, latest_tilt, latest_ok = history[-1]
-        now_mono = time.monotonic()
-        if (
-            not latest_ok
-            or (now_mono - latest_ts) > self.state_stale_timeout_sec
-        ):
-            return (
-                'stale_feedback',
-                f'Pan/tilt feedback is stale ({now_mono - latest_ts:.2f}s) '
-                f'or feedback_ok=false; falling back to blur gate.',
+        if body_xyz[2] > self.face_target_max_distance_m:
+            return (body_xyz, body_px, body_meta)
+
+        if has_keypoints:
+            xyz, px, meta = self._extract_face_target(
+                kps_xy_i, kps_cf_i, bbox_xyxy,
+                points, validmask, img_hw,
             )
-
-        # Safety watchdog: if we've been waiting for convergence longer than
-        # max_settle_timeout_sec, act anyway to avoid deadlock on a lost cmd
-        # or stuck servo.
-        elapsed_since_cmd = (
-            self.get_clock().now() - self.last_command_time
-        ).nanoseconds / 1e9
-        if elapsed_since_cmd > self.max_settle_timeout_sec:
-            self.get_logger().warning(
-                f'max_settle_timeout_sec={self.max_settle_timeout_sec:.2f}s '
-                f'exceeded (elapsed={elapsed_since_cmd:.2f}s); '
-                'advancing without steady-state confirmation.',
-                throttle_duration_sec=5.0,
+        else:
+            xyz, px, meta = self._extract_bbox_head_target(
+                bbox_xyxy, points, validmask, img_hw,
             )
-            return 'go', ''
+        if xyz is not None:
+            return (xyz, px, meta)
+        # Close-range face/head extraction failed (e.g., person facing
+        # away, severe occlusion, or extreme blur). Fall back to the
+        # body probe we already computed so we still produce a candidate.
+        return (body_xyz, body_px, body_meta)
 
-        pan_err_deg = math.degrees(latest_pan - self._last_commanded_pan_rad)
-        tilt_err_deg = math.degrees(latest_tilt - self._last_commanded_tilt_rad)
-        # Condition 1: state must track the last command (so we're not
-        # conflating a slow slew with a steady hold).
-        if (
-            abs(pan_err_deg) > self.steady_pan_eps_deg
-            or abs(tilt_err_deg) > self.steady_tilt_eps_deg
-        ):
-            return (
-                'wait',
-                f'Servo settling: pan_err={pan_err_deg:.2f} deg, '
-                f'tilt_err={tilt_err_deg:.2f} deg.',
-            )
+    def _extract_bbox_head_target(
+        self, bbox_xyxy, points, validmask, img_hw,
+    ):
+        """Bbox-only head proxy for non-pose YOLO weights.
 
-        # Condition 2: velocity ≈ 0 over the last N samples.
-        need = max(2, self.steady_sample_count + 1)
-        if len(history) < need:
-            return (
-                'wait',
-                f'Need {need} state samples for velocity check, '
-                f'have {len(history)}.',
-            )
-        samples = history[-need:]
-        for (t0, p0, tl0, _), (t1, p1, tl1, _) in zip(samples, samples[1:]):
-            dt = max(t1 - t0, 1e-6)
-            pan_vel_deg = abs(math.degrees(p1 - p0) / dt)
-            tilt_vel_deg = abs(math.degrees(tl1 - tl0) / dt)
-            if (
-                pan_vel_deg > self.steady_velocity_eps_deg_per_sec
-                or tilt_vel_deg > self.steady_velocity_eps_deg_per_sec
-            ):
-                return (
-                    'wait',
-                    f'Servo still moving: pan_vel={pan_vel_deg:.1f} deg/s, '
-                    f'tilt_vel={tilt_vel_deg:.1f} deg/s.',
-                )
+        Used when ``results[0].keypoints`` is ``None`` (e.g. the model is
+        ``yolo11s-seg.pt`` / ``yolov8s-seg.pt`` instead of a ``-pose``
+        variant). Aims at ~15% down from the bbox top, centered, and
+        samples depth in a small window around that pixel — narrow
+        enough to dodge background bleed at the head silhouette, which
+        a full upper-third region would catch (wall / sky behind a
+        standing person can pull the median depth several meters out,
+        which moves the unprojected XY by >>seed_radius_m and causes
+        seed-mode tracker_no_lock).
 
-        return 'go', ''
+        Returns ``(xyz_cam, (px, py), meta)`` or ``(None, None, None)``
+        if the depth region is too sparse.
+        """
+        h, w = img_hw
+        x1, y1, x2, y2 = (float(v) for v in bbox_xyxy)
+        bbox_h = max(1.0, y2 - y1)
+        bbox_w = max(1.0, x2 - x1)
+        # Aim at ~15% down from the bbox top, horizontally centered —
+        # approximates head position on a standing/sitting person.
+        cx = (x1 + x2) / 2.0
+        cy = y1 + 0.15 * bbox_h
+        target_px = (
+            int(np.clip(round(cx), 0, w - 1)),
+            int(np.clip(round(cy), 0, h - 1)),
+        )
+        # Depth-sampling window: a square centered on the aim point,
+        # sized to ~30% of the bbox shorter side but capped at +/- 25 px.
+        # The cap prevents enormous boxes (close-up of a person) from
+        # sampling well outside the head silhouette; the percentage
+        # ensures small/distant boxes still have enough valid depth.
+        half = int(max(self.face_depth_window_px // 2,
+                       min(25, max(2, int(0.15 * min(bbox_w, bbox_h))))))
+        px, py = target_px
+        x0i = int(np.clip(px - half, 0, w - 1))
+        x1i = int(np.clip(px + half + 1, 0, w))
+        y0i = int(np.clip(py - half, 0, h - 1))
+        y1i = int(np.clip(py + half + 1, 0, h))
+        if x1i <= x0i or y1i <= y0i:
+            return (None, None, None)
+        win = np.zeros((h, w), dtype=bool)
+        win[y0i:y1i, x0i:x1i] = True
+        valid_bool = (
+            validmask if validmask.dtype == bool else validmask.astype(bool)
+        )
+        combined = win & valid_bool
+        xyz = self._depth_in_mask_median(points, combined)
+        if xyz is None or xyz[2] <= 0:
+            return (None, None, None)
+        return (
+            (float(xyz[0]), float(xyz[1]), float(xyz[2])),
+            target_px,
+            {
+                'depth_region': 'bbox_head_window',
+                'region_pixel_count': int(combined.sum()),
+            },
+        )
 
     def _camera_to_pan_tilt_root(self, xyz_cam, cur_pan_rad, cur_tilt_rad):
         """Map a camera-frame centroid into a pan-tilt-rooted Cartesian frame.
@@ -1230,11 +1537,20 @@ class FollowHeadNode(Node):
 def main():
     rclpy.init()
     follow_head_node = FollowHeadNode()
+    # Pin the executor's worker pool so the cancel-service handler can
+    # always grab a free thread under high-load YAML configs (10 Hz YOLO
+    # + 30 Hz camera + 20 Hz state publisher). MultiThreadedExecutor's
+    # default num_threads is environment-dependent (cpu_count() can
+    # collapse to a small value on constrained hosts) and matches the
+    # documented floor used in object_detection_generalist.
+    num_threads = max(8, multiprocessing.cpu_count())
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=num_threads)
+    follow_head_node.get_logger().info(
+        f'Spinning follow_head with MultiThreadedExecutor '
+        f'(num_threads={num_threads})'
+    )
     try:
-        rclpy.spin(
-            follow_head_node,
-            executor=rclpy.executors.MultiThreadedExecutor(),
-        )
+        rclpy.spin(follow_head_node, executor=executor)
     except KeyboardInterrupt:
         pass
     finally:

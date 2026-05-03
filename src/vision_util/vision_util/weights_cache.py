@@ -1,9 +1,9 @@
 """Relocatable weight cache for tk26_vision nodes.
 
-Every vision node that loads a YOLO / FastSAM / YOLO-World `.pt` file should
-pipe the bare filename through ``resolve_weights`` before handing it to
-Ultralytics. The helper returns an absolute path so the result is independent
-of the CWD that ``ros2 run`` was launched from.
+Every vision node that loads a YOLO / SAM / FastSAM / YOLO-World `.pt` file
+should pipe the bare filename through ``resolve_weights`` before handing it
+to Ultralytics. The helper returns an absolute path so the result is
+independent of the CWD that ``ros2 run`` was launched from.
 
 Lookup order:
     1. ``name`` is an absolute path and exists on disk.
@@ -74,6 +74,12 @@ def _pick_ultralytics_cls(name: str):
     if lower.startswith("fastsam"):
         from ultralytics import FastSAM
         return FastSAM
+    if lower.startswith(("mobile_sam", "sam_", "sam2")):
+        # Ultralytics' SAM class dispatches on the filename internally —
+        # "mobile_sam.pt", "sam_b/l/h.pt", and "sam2_t/s/b/l.pt" all load
+        # through the same entrypoint.
+        from ultralytics import SAM
+        return SAM
     if "world" in lower:
         from ultralytics import YOLOWorld
         return YOLOWorld

@@ -26,6 +26,7 @@ export FASTRTPS_DEFAULT_PROFILES_FILE="$PROFILES_FILE"
 
 exec ros2 launch orbbec_camera femto_bolt.launch.py \
     depth_registration:=true \
+    enable_colored_point_cloud:=true \
     enable_ir:=false \
     enable_frame_sync:=false \
     "$@"

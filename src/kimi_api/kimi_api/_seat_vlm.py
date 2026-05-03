@@ -158,10 +158,26 @@ class VlmSeatError(RuntimeError):
     """Raised on non-recoverable VLM config failures (e.g. missing API key)."""
 
 
-def _build_text_prompt(names: Sequence[str], features: Sequence[str]) -> str:
+def _build_text_prompt(
+    names: Sequence[str],
+    features: Sequence[str],
+    known_seats: Sequence[str] | None = None,
+) -> str:
     text = 'Recommend a seat for a new guest.'
     for name, feature in zip(names, features):
         text += f' The person matching description: {feature} is called {name}.'
+    if known_seats:
+        catalog_lines = '\n'.join(f'  - "{s}"' for s in known_seats)
+        text += (
+            '\n\nThe seats in this room are pre-catalogued. The recommendation '
+            '`label` MUST be exactly one of these strings, character-for-character, '
+            'or "none" if every catalogued seat is occupied or not visible:\n'
+            f'{catalog_lines}\n'
+            'For `visible_seats`, only include catalogued seats that are actually '
+            'visible in the image (omit any seat from the catalogue that is not '
+            'visible from this viewpoint). Do not invent new seats or rename the '
+            'listed ones.'
+        )
     return text
 
 
@@ -174,6 +190,8 @@ def request_seat(
     max_retries: int = 3,
     timeout_s: float = 20.0,
     logger=None,
+    fewshots: Sequence[object] | None = None,
+    known_seats: Sequence[str] | None = None,
 ) -> tuple[str, Point | None, list, float]:
     """Ask Gemini for a single pointing pixel + short label.
 
@@ -183,6 +201,13 @@ def request_seat(
     ``visible_seats`` is the model's enumeration of all seats visible
     in the image with occupancy status (useful for logging / debugging
     the pointing decision).
+
+    ``fewshots`` is an optional iterable of ``_seat_fewshot.FewshotExample``
+    (kept loosely typed here to avoid an import cycle). When non-empty,
+    each example is prepended as a ``user(image+generic-prompt) /
+    assistant(json.dumps(answer))`` turn before the live request — the
+    model mimics the form and judgement, not the content (the few-shot
+    user prompt deliberately omits per-call names/features).
 
     Raises ``VlmSeatError`` only on configuration problems the caller
     should propagate as `status=1` (missing API key).
@@ -203,18 +228,33 @@ def request_seat(
         data_url = encode_to_data_url(rgb_bgr)
         h, w = rgb_bgr.shape[:2]
 
-        text_prompt = _build_text_prompt(names, features)
+        text_prompt = _build_text_prompt(names, features, known_seats=known_seats)
 
-        messages = [
-            {'role': 'system', 'content': _SYSTEM_PROMPT},
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'image_url', 'image_url': {'url': data_url}},
-                    {'type': 'text', 'text': text_prompt},
-                ],
-            },
-        ]
+        messages: list = [{'role': 'system', 'content': _SYSTEM_PROMPT}]
+        if fewshots:
+            for ex in fewshots:
+                ex_url = encode_to_data_url(ex.image_bgr)
+                messages.append({
+                    'role': 'user',
+                    'content': [
+                        {'type': 'image_url', 'image_url': {'url': ex_url}},
+                        {
+                            'type': 'text',
+                            'text': 'Recommend a seat for a new guest.',
+                        },
+                    ],
+                })
+                messages.append({
+                    'role': 'assistant',
+                    'content': json.dumps(ex.answer),
+                })
+        messages.append({
+            'role': 'user',
+            'content': [
+                {'type': 'image_url', 'image_url': {'url': data_url}},
+                {'type': 'text', 'text': text_prompt},
+            ],
+        })
 
         response_format_strict = {
             'type': 'json_schema',

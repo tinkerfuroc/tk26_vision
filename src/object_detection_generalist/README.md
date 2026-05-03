@@ -2,8 +2,8 @@
 
 Open-vocabulary object detection for tk26 vision. Runs a clean pretrained YOLO for classes YOLO already knows; for anything else (or when the caller explicitly opts in), falls back to an open-vocab detector. The fallback model is selected at node init by the `enable_vlm` parameter:
 
-- **`enable_vlm=False` (default)** — local **YOLO-World** for bounding boxes + **FastSAM** for masks. Hundreds of ms per call, no network.
-- **`enable_vlm=True`** — **Gemini 2.5 Flash** for bounding boxes + **FastSAM** for masks. Multi-second per call, requires `OPENROUTER_API_KEY`.
+- **`enable_vlm=False` (default)** — local **YOLO-World** for bounding boxes + **MobileSAM** for masks. Hundreds of ms per call, no network.
+- **`enable_vlm=True`** — **Gemini 2.5 Flash** for bounding boxes + **MobileSAM** for masks. Multi-second per call, requires `OPENROUTER_API_KEY`.
 
 3D centroid + camera-sync logic is inherited unchanged from `object_detection_new.object_seg_yolo.YOLOSegmentationNode`.
 
@@ -18,7 +18,7 @@ Request fields that matter for path selection:
 | Field | Meaning |
 |---|---|
 | `prompt` | Natural-language or class name. Must match one of `model.names.values()` for the YOLO branch; anything else forces the open-vocab fallback branch. |
-| `force_vlm_sam` | Skip YOLO entirely, always use **VLM + FastSAM only** (operator override; ignores `enable_vlm`). Short-circuits **before** any YOLO-World code path — `force_vlm_sam=True` guarantees YOLO-World does not run. Field name is historical. |
+| `force_vlm_sam` | Skip YOLO entirely, always use **VLM + SAM only** (operator override; ignores `enable_vlm`). Short-circuits **before** any YOLO-World code path — `force_vlm_sam=True` guarantees YOLO-World does not run. Field name is historical. |
 | `use_vlm_sam_fallback` | Per-request opt-in for the open-vocab fallback. Runs **YOLO-World and VLM concurrently**: if YOLO-World returns objects first, the VLM result is abandoned (the network call continues in the background as a daemon thread but its output is discarded); otherwise we wait for VLM. |
 | `sort_closest` / `sort_highest` | Typed boolean replacements for the old substring-parsed `flags` string. |
 | `return_rgb_image` / `return_depth_image` / `return_segments` | Payload toggles (save bandwidth when false). |
@@ -60,16 +60,16 @@ else:
 
 Both pipelines spawn as daemon `threading.Thread`s from the service callback. The service callback waits on YOLO-World first (bounded by `vlm_timeout_s`, floor 5 s). If YOLO-World produces ≥1 object, the callback returns immediately with that result and **cancels the VLM leg**:
 
-- An `abandon_event` is set. The VLM worker checks it (a) at every retry boundary inside `request_bboxes`, (b) immediately after the HTTP returns in `_vlm_pipeline`, and (c) before acquiring the FastSAM lock. So **FastSAM, centroid math, and TF lookups are guaranteed to be skipped** — the abandoned thread does no GPU work and does not contend with the next race's `_sam_lock`.
+- An `abandon_event` is set. The VLM worker checks it (a) at every retry boundary inside `request_bboxes`, (b) immediately after the HTTP returns in `_vlm_pipeline`, and (c) before acquiring the SAM lock. So **SAM, centroid math, and TF lookups are guaranteed to be skipped** — the abandoned thread does no GPU work and does not contend with the next race's `_sam_lock`.
 - The OpenAI client owned by that VLM call is also `close()`d cross-thread as a best-effort. With sync httpx this does **not** reliably interrupt a blocking socket read, so worst-case the VLM thread stays parked in `recv()` until its `vlm_timeout_s` fires (default 20 s), then exits cleanly. Best-case (close happens before the request enters `recv()`, or the platform honors close cross-thread) the thread terminates within milliseconds.
 
-If YOLO-World comes back empty (or errored), the callback waits up to `vlm_timeout_s × vlm_max_retries + 5 s` for VLM and returns whichever leg has non-empty results. If even that wait expires, we cancel the VLM leg the same way and return an error.
+If YOLO-World comes back empty (or errored), the callback waits up to `vlm_timeout_s + 5 s` for VLM and returns whichever leg has non-empty results. `vlm_timeout_s` is a hard wall-clock budget for the whole VLM bbox request, including retries and fallback models. If even that wait expires, we cancel the VLM leg the same way and return an error.
 
 **Concurrent requests.** Because the service callback returns as soon as a winner is found, the next request can start while a previous abandoned VLM thread is still parked in its socket. That thread does no useful work after abandon (it just exits when its HTTP attempt unblocks), so the practical impact is at most `N` simultaneously parked HTTP sockets where `N` is the number of races started within one `vlm_timeout_s` window.
 
 The race threads are NOT executor-managed. They access:
 - **YOLO-World** and **VLM** (independent models, no contention).
-- **FastSAM** (shared between race legs; serialized by `self._sam_lock` since Ultralytics models are not thread-safe).
+- **SAM (MobileSAM)** (shared between race legs; serialized by `self._sam_lock` since Ultralytics models are not thread-safe).
 - **`tf2_ros.Buffer`** for centroid/sort transforms (read-side is thread-safe).
 - **`rclpy` logger** (thread-safe).
 
@@ -95,18 +95,20 @@ Common parameter overrides:
 |---|---|---|
 | `service_name` | `object_detection_generalist` | Rename the advertised service. |
 | `model_path` | `yolo11m-seg.pt` | YOLO weights (auto-downloaded by Ultralytics on first run). |
-| `fastsam_weights` | `FastSAM-s.pt` | ~22 MB, auto-downloaded. |
+| `sam_weights` | `mobile_sam.pt` | ~40 MB, auto-downloaded into `~/.cache/tk26_vision/weights/` via `vision_util.weights_cache`. The wrapper accepts any Ultralytics-supported SAM family weight (`mobile_sam.pt`, `sam_b/l/h.pt`, `sam2_t/s/b/l.pt`); MobileSAM is the smallest and fastest, sufficient for bbox-prompted segmentation in this pipeline. |
 | `enable_vlm` | `False` | When `True`, the fallback path uses Gemini VLM+SAM instead of YOLO-World+SAM. |
 | `world_weights` | `yolov8s-worldv2.pt` | YOLO-World v2 weights (~25 MB, auto-downloaded). Bigger variants: `m`, `l`, `x`. |
 | `world_conf_threshold` | `0.05` | YOLO-World tends to need a low threshold for novel classes; raise if you see false positives. |
 | `world_iou_threshold` | `0.5` | NMS IoU for YOLO-World. |
-| `vlm_model` | `google/gemini-2.5-flash` | OpenRouter model tag. Override per deployment via `-p vlm_model:=anthropic/claude-sonnet-4-6` etc. |
-| `vlm_timeout_s` | `20.0` | Per-VLM-call timeout. With `vlm_stream=True` (default) this is the per-chunk inactivity bound rather than a total-response deadline. |
+| `vlm_model` | `google/gemini-2.5-flash` | Primary OpenRouter VLM model tag. |
+| `vlm_fallback_models` | `['qwen/qwen3-vl-8b-instruct']` | Ordered OpenRouter VLM model fallbacks. Used only when the primary VLM fails with timeout/API/network/stream/JSON/decode errors. |
+| `vlm_fallback_on_empty` | `False` | When `False`, a clean empty detections response is trusted and does not call fallback VLMs. |
+| `vlm_timeout_s` | `20.0` | Hard wall-clock timeout for the whole VLM bbox request, including streaming, retries, and fallback models. |
 | `vlm_max_retries` | `3` | JSON parse / API retries before returning empty. |
 | `vlm_stream` | `True` | Stream the OpenRouter VLM response as SSE chunks. Keeps the HTTP connection active during long Gemini generations so intermediate proxies don't reap the silent socket, and gives sub-100 ms cancellation latency when the YOLO-World race partner wins. Flip to `False` to fall back to a single blocking response. |
 | `realsense_max_distance_m` | `1.0` | Range gate: drop detections whose centroid is farther than this from the realsense (arm) camera. Applied **only** when `request.camera == 'realsense'` — orbbec is unaffected. Set to `0.0` (or any non-positive value) to disable. Distance is Euclidean from the camera origin in the camera body frame (`sqrt(x²+y²+z²)` on `Object.centroid`, which on realsense is never TF-transformed). |
 | `allow_auto_fallback` | `True` | See branching above. |
-| `orbbec_depth_topic` | `/camera/depth_registered/points` | Must match what the camera launch publishes. For the canonical Femto Bolt launch this is `/camera/depth/points` — override accordingly. |
+| `orbbec_depth_topic` | `/camera/depth_registered/points` | Must match what the camera launch publishes. Requires `enable_colored_point_cloud:=true depth_registration:=true` on `femto_bolt.launch.py`. |
 
 ## Example calls
 
@@ -131,8 +133,8 @@ ros2 run object_detection_generalist generalist_node --ros-args -p enable_vlm:=t
 
 - `generalist_node.py` — `GeneralistDetectionNode` subclasses `YOLOSegmentationNode`; overrides `_init_service` / `_detection_service_callback`. Camera sync, TF, depth projection, 3D centroid, and sort-mode logic are inherited, not duplicated.
 - `world_bbox.py` — `WorldDetector` wraps `ultralytics.YOLOWorld`, loads once at node init on the parent's `self.device`, exposes `detect(rgb, prompt) -> (bboxes, confs, elapsed)`. Calls `set_classes([prompt])` per request (cached against last prompt) so the CLIP text head re-projects to the new label.
-- `vlm_bbox.py` — `request_bboxes(rgb, prompt, model, …)` sends a base64 data-URL image + strict-JSON system prompt to OpenRouter, retries on parse failure, decodes Gemini's `[y0,x0,y1,x1]` 0–1000-normalized output into xyxy pixel coords. Key loading is deferred until first call via `kimi_api._env.require_api_key`, so the node starts cleanly without a key.
-- `sam_mask.py` — `FastSAMPredictor` wraps `ultralytics.FastSAM`, loads once at node init on the parent's `self.device` (GPU if available), exposes `segment(rgb, bboxes) -> list[bool HxW mask]` aligned 1:1 with the input bboxes. Used by both fallback paths.
+- `vlm_bbox.py` — `request_bboxes(rgb, prompt, model, …)` sends a base64 data-URL image + strict-JSON system prompt to OpenRouter. Gemini remains the primary VLM and decodes `[y0,x0,y1,x1]` 0–1000-normalized boxes; Qwen fallback uses `[x1,y1,x2,y2]` pixel boxes. Fallbacks run only on VLM failure by default, not on clean empty detections. Key loading is deferred until first call via `kimi_api._env.require_api_key`, so the node starts cleanly without a key.
+- `sam_mask.py` — `SamPredictor` wraps `ultralytics.SAM` (default weights `mobile_sam.pt`), loads once at node init on the parent's `self.device` (GPU if available), exposes `segment(rgb, bboxes) -> list[bool HxW mask]` aligned 1:1 with the input bboxes in input order. Used by both fallback paths. Replaced FastSAM in May 2026 — the prior FastSAM bbox-prompt path in `ultralytics 8.3.103` mis-assigned masks to bboxes due to candidate-ordered output and IoU-floor-less argmax dedup; benchmark + visual evidence at `/tmp/mobilesam_replay/`.
 
 ## Latency budget (measured on RTX 5070 Ti, 2026-04-22)
 
@@ -141,9 +143,9 @@ ros2 run object_detection_generalist generalist_node --ros-args -p enable_vlm:=t
 | YOLO only | ~90 ms / call |
 | YOLO-World (yolov8s-worldv2) | ~150 – 400 ms / call |
 | VLM round-trip (Gemini 2.5 Flash) | 5 – 10 s / call |
-| FastSAM bbox-prompted mask | ~100 ms / call |
+| MobileSAM bbox-prompted mask | ~30 – 60 ms / call (warm, RTX 4080); peak alloc ~0.4 – 1.0 GB scaling with box count |
 
-YOLO-World keeps the open-vocab path within real-time-ish budget (sub-second total with FastSAM). Switch to `enable_vlm:=true` only when YOLO-World can't recognise the target class — Gemini is much slower and network-bound.
+YOLO-World keeps the open-vocab path within real-time-ish budget (sub-second total with MobileSAM). Switch to `enable_vlm:=true` only when YOLO-World can't recognise the target class — Gemini is much slower and network-bound.
 
 ## Dependencies
 
@@ -159,6 +161,7 @@ YOLO-World keeps the open-vocab path within real-time-ish budget (sub-second tot
 
 ## Changelog
 
-- **2026-05-02** — VLM call now streams the OpenRouter response by default (`vlm_stream=True`). Concatenates SSE `delta.content` chunks into the same JSON we parsed before, so the wire is never silent and intermediate proxies / NAT can't reap the connection mid-call. `vlm_timeout_s` becomes a per-chunk inactivity bound; abandon (race-cancel) latency drops from "up to one full HTTP attempt" to sub-100 ms because every chunk is a checkpoint. Strict→loose `response_format` fallback and `client_holder` cross-thread close path preserved unchanged. Set `-p vlm_stream:=false` to revert to the blocking call.
+- **2026-05-02** — Added VLM model-chain fallback. Gemini remains the primary VLM; on timeout/API/network/stream/JSON/decode failure the node now tries `vlm_fallback_models` (default `qwen/qwen3-vl-8b-instruct`). Clean empty VLM responses are authoritative by default (`vlm_fallback_on_empty=False`). Debug artifacts now include the primary model, fallback list, model used, and per-attempt status.
+- **2026-05-02** — VLM call now streams the OpenRouter response by default (`vlm_stream=True`). Concatenates SSE `delta.content` chunks into the same JSON we parsed before, so the wire is never silent and intermediate proxies / NAT can't reap the connection mid-call. `vlm_timeout_s` is enforced as a hard wall-clock budget for the whole VLM bbox request, including retries and fallback models. Strict→loose `response_format` fallback and `client_holder` cross-thread close path preserved unchanged. Set `-p vlm_stream:=false` to revert to the blocking call.
 - **2026-05-02** — `sort_closest` now uses Euclidean distance `sqrt(x²+y²+z²)` on `Object.centroid` instead of single-axis (was sorting by `centroid.x` on realsense / `centroid.z` on orbbec). Single-axis ignored lateral / vertical offset and broke entirely on orbbec because centroids are TF-transformed to `target_frame` before sort. Fix lives in the parent class `_sort_objects_and_segments` (`object_detection_new/object_seg_yolo.py`); `generalist_node` inherits it.
 - **2026-05-02** — Added `realsense_max_distance_m` (default `1.0`). Detections whose centroid sits farther than this from the realsense (arm) camera are dropped before the response is built. Applies to all three branches (yolo, yolo_world, vlm_sam) via a single shared post-build helper `_apply_realsense_range_gate`. Orbbec is untouched. Set `0.0` to disable. Same commit also documents the `force_vlm_sam ⇒ no YOLO-World` invariant in the dispatch chain (no behavior change — the dispatch was already correct, but the comment + README note guard against future regressions).

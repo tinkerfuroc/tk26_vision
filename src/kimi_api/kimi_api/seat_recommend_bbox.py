@@ -55,7 +55,7 @@ class SeatRecommendBboxService(Node):
         # 35 s (was 20) — Pro + thinking adds 3–8 s vs. Flash; 20 s was
         # already tight on cluttered scenes and tripped the timeout when
         # thinking is enforced.
-        self.declare_parameter('vlm_timeout_s', 35.0)
+        self.declare_parameter('vlm_timeout_s', 25.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')

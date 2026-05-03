@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'vision_util'
+package_name = 'monocular_depth'
 
 setup(
     name=package_name,
@@ -15,15 +15,12 @@ setup(
     zip_safe=True,
     maintainer='cindy',
     maintainer_email='cindy.w0135@gmail.com',
-    description='Utility services (point-cloud relay, door detection) for Tinker 2026 vision',
+    description='Depth Anything 3 monocular-depth-fused point-cloud action server',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'door_detection = vision_util.door_detection:main',
-            'get_point_cloud = vision_util.get_point_cloud:main',
-            'get_orbbec_pc = vision_util.get_orbbec_pc:main',
-            'get_image = vision_util.get_image:main',
+            'monocular_depth_pc = monocular_depth.monocular_depth_pc:main',
         ],
     },
 )

@@ -8,6 +8,9 @@ vision_log/
 .ros/
 log/
 
+.venv**/
+
+src/items/
 
 scripts/tests/logs/
 

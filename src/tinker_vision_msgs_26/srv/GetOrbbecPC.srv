@@ -1,0 +1,11 @@
+# Deproject the latest Orbbec depth frame on CUDA and return a PointCloud2.
+# stride: pixel stride; 0 or 1 = full resolution.
+# include_color: true => pack RGB from latest synced color frame (XYZRGB);
+#                false => XYZ only.
+uint32 stride
+bool include_color
+
+---
+int32 status
+string error_msg
+sensor_msgs/PointCloud2 points

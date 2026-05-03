@@ -18,6 +18,14 @@ Plain `colcon build` produces `#!/usr/bin/python3` shebangs that can't see the v
 
 If a build errors on stale symlinks, `rm -rf build/<pkg> install/<pkg>` and rebuild that package.
 
+**`monocular_depth` builds under a different venv.** That package depends on `depth_anything_3`, which pins `numpy<2`. The shared `.venv-vision-main` has `numpy==2.2.6` (torch 2.11 / scipy / ultralytics / opencv-python depend on the 2.x ABI), so DA3 lives in `src/tk26_vision/.venv-da3/`. Use the dedicated wrapper:
+
+```bash
+./src/tk26_vision/scripts/build_monocular_depth.sh [colcon args...]
+```
+
+The wrapper sources `.venv-da3`, runs `colcon build --packages-select monocular_depth` (or the args you pass), then re-shebangs the entry-point script to `.venv-da3/bin/python3`. Don't pass `monocular_depth` to the main `build.sh` — it'll resolve `depth_anything_3` against the wrong venv and the entry-point script will start under `.venv-vision-main`'s python.
+
 ## Environment
 
 ### Python deps
@@ -30,6 +38,24 @@ pip install -r src/tk26_vision/src/kimi_api/requirements.txt
 pip install -r src/tk26_vision/src/pan_tilt/requirements.txt
 pip install -r src/tk26_vision/src/vision_track/requirements.txt
 ```
+
+### Second venv: `.venv-da3` for `monocular_depth`
+
+`depth_anything_3` (vendored at `thirdparty/depth-anything-3/`) pins `numpy<2`, so `monocular_depth` runs under a separate venv at `src/tk26_vision/.venv-da3/`. Provision once:
+
+```bash
+cd src/tk26_vision
+python3.10 -m venv .venv-da3 --system-site-packages --symlinks
+source .venv-da3/bin/activate
+pip install --upgrade pip wheel
+pip install "numpy==1.23.4"
+pip install -e thirdparty/depth-anything-3 --no-deps
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r src/monocular_depth/requirements.txt
+pip freeze > .venv-da3/freeze.lock.txt
+```
+
+The `requirements.txt` skips DA3's heavy export-pipeline deps (`pycolmap`, `open3d`, `moviepy`, `trimesh`, `plyfile`, `pillow_heif`, `xformers`, `uvicorn`, `fastapi`, `typer`); to drop those, `thirdparty/depth-anything-3/src/depth_anything_3/api.py` carries a tk26 patch that defers `from depth_anything_3.utils.export import export` from module-load to `_export_results` call time. That patch is the only modification to the vendored DA3 tree (search `tk26_vision patch:` to find it). The lock file at `.venv-da3/freeze.lock.txt` is the source of truth — diff against it before any further pip install in that venv.
 
 ### OpenRouter API key (kimi_api)
 
@@ -65,6 +91,10 @@ ros2 run kimi_api grocery_categorize                 # action /grocery_categoriz
 # Utilities
 ros2 run vision_util door_detection                  # /door_detection_srv
 ros2 run vision_util get_point_cloud                 # /get_point_cloud_service
+ros2 run vision_util get_orbbec_pc                   # /get_orbbec_pc — CUDA-deprojected Orbbec PC (requires CUDA; bypasses SDK colored-PC bottleneck under iGPU workaround)
+
+# DA3-fused PC (separate venv .venv-da3 + dedicated package; see scripts/build_monocular_depth.sh)
+ros2 run monocular_depth monocular_depth_pc          # action /monocular_depth_pc — DA3 + RealSense/Orbbec fusion (numpy<2 isolated venv)
 ```
 
 ## Architecture
@@ -78,7 +108,8 @@ src/tk26_vision/src/
 ├── tk_vision_specialized/         # SpotOnShelf action + waving detector
 ├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head (closed-loop absolute targeting in a pan-tilt-rooted frame; feedback-gated settle; sticky ID + EMA)
 ├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
-└── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay)
+├── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay), get_orbbec_pc (CUDA-deprojected Orbbec PC, sidesteps SDK colored-PC iGPU bottleneck); shared `_pc_utils.py` reused by monocular_depth
+└── monocular_depth/               # DA3-fused PC action server; lives in its own venv `.venv-da3` (numpy==1.23.4) because `depth_anything_3` requires numpy<2 — isolation prevents cascade-breaking the rest of the vision tree
 ```
 
 **Notes:**
@@ -103,6 +134,7 @@ Key ROS2 parameters:
 - `pan_tilt/state_publisher`: `state_topic`, `joint_state_topic`, joint names, stale timeout
 - `pan_tilt/follow_head`: full param surface in `src/pan_tilt/config/pan_tilt.yaml`. Highlights: `yolo_model`, `command_topic`/`state_topic`, `home_pan_deg`/`home_tilt_deg`, `pan_deadband_deg`/`tilt_deadband_deg`, `min_command_change_deg` (chatter suppression), `min_detection_interval_sec` (YOLO cap), `max_settle_timeout_sec` + `steady_{pan,tilt}_eps_deg` + `steady_velocity_eps_deg_per_sec` + `steady_sample_count` (feedback-gated settle), `ema_alpha` + `target_ttl_sec` + `reassoc_dist_m` (smoothing + identity lock), `command_speed_raw_{small,large}` + `small_error_deg` + `command_accel_raw` (motion profile). Defaults are biased for **responsiveness over smoothness** — turn `ema_alpha` down and `steady_*_eps_deg` tighter if you want calmer motion.
 - `kimi_api/*`: `llm_model`, `detection_service`, `log_prompts`
+- `monocular_depth/monocular_depth_pc`: `da3_model` (default `depth-anything/DA3-SMALL`, swap to `depth-anything/DA3-BASE` via `-p`), `fill_mode` (`holes_only`|`full_override`, default `holes_only`), `align_min_overlap_pixels` (2000), `align_trim_frac` (0.05), `output_frame_id` (override; default = depth msg frame), `debug_pc_topic` (default `~/debug_points`, SensorDataQoS). The action result is a single 32FC1 depth image at source RGB resolution (pixel-aligned to color); the goal's `stride` field subsamples **only** the debug PointCloud, which is published on `debug_pc_topic` only when `debug_publish=true`. DA3 weights via the `depth_anything_3` library's HuggingFace cache (`~/.cache/huggingface/hub`); `weights_cache.resolve_weights` is **not** used here. The node lives in its own ROS package + venv (`.venv-da3`) because `depth_anything_3` pins `numpy<2`. Build via `tkbuild tk26_vision --packages-select monocular_depth` (or `./scripts/build_monocular_depth.sh`), run via `ros2 run monocular_depth monocular_depth_pc`.
 - `vision_logging_enabled` (default `true` everywhere except `follow_head`, where both the code default and the yaml override default to `false` because the ~30-40 ms synchronous disk IO at 10 Hz detection stalls the action loop) + `vision_log_folder` (default `'vision_log'`) on the bbox/seg/centroid-producing nodes plus the kimi_api VLM services: `yolo_seg_{node,default_node}`, `generalist_node`, `person_track_node`, `waving_person_server`, `follow_head`, `feature_matching`, `feature_recognition` (covers both `feature_extraction_service` and `seat_recommend_service`), `seat_recommend_bbox`. **All vision nodes in one robot session share a single `vision_log/<YYYYmmdd_HHMMSS>/` subdir.** Resolution order on first write: (1) `$TINKER_VISION_SESSION_TS` env var (must match `YYYYmmdd_HHMMSS`) — exported defensively from every `master_*.sh` and `tmux_*.sh` under `src/tk25_basic/src/scripts/`; (2) newest existing `<base>/<YYYYmmdd_HHMMSS>/` subdir by mtime — lets late-spawned standalone nodes join the active session; (3) fresh `strftime` cold-start. Per-call filenames carry the producing node + branch: `<node_name>_<branch>_{orig,overlay,req}_<YYYYmmdd_HHMMSS_mmm>.{jpg,json}` (e.g. `yolo_seg_node_yolo_orig_…jpg`, `feature_recognition_node_feature_extraction_orig_…jpg`). Tracker logs only on lost/reclaim transitions; follow_head logs at its detection tick when re-enabled for debugging; `feature_matching` additionally dumps `…_feature_matching_ref<i>_<ts>.jpg` for each reference image; `feature_recognition.feature_extraction` additionally dumps `…_feature_extraction_crop_<ts>.jpg` of the chosen person; the legacy `visualization=True` debug PNGs (`yolo_seg_node`) now live in the same run_dir as `…_yolo_detection[_all]_<ts>.png`. Pass `-p vision_logging_enabled:=<bool>` to override.
 
 ## Third-party drivers

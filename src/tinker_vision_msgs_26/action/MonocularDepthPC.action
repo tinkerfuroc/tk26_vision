@@ -1,0 +1,10 @@
+# Goal
+string camera
+int32 stride
+bool debug_publish
+---
+# Result
+sensor_msgs/Image depth_image
+---
+# Feedback
+string current_stage

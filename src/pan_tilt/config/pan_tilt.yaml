@@ -40,8 +40,8 @@ pan_tilt_state_publisher:
     # URDF chain mis-represents the camera's pose by up to ~45° (the parked
     # tilt angle), which projects vision points below ground in the
     # seat-recommend / arm-pointing pipeline.
-    pan_offset_rad: 3.1489192105
-    tilt_offset_rad: -1.5778771268
+    pan_offset_rad: 3.1449570952
+    tilt_offset_rad: -1.8735174383
 
 follow_head_node:
   ros__parameters:

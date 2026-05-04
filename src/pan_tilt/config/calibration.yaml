@@ -7,10 +7,10 @@ collector:
   cartesian_move_action: cartesian_move_action
   base_frame: base_link
   ee_frame: link_eef
-  xarm_settle_sec: 1.5
+  xarm_settle_sec: 3.0
   arm_action_timeout_sec: 30.0
-  pantilt_speed_raw: 120
-  pantilt_accel_raw: 20
+  pantilt_speed_raw: 100
+  pantilt_accel_raw: 10
   servo_settle_tol_deg: 1.0
   servo_settle_hold_sec: 0.5
   servo_backlash_overshoot_deg: 0.0
@@ -20,8 +20,8 @@ collector:
   capture_timeout_sec: 8.0
   detection_lookahead_frames: 5
   min_valid_detections: 3
-  pre_capture_quiet_sec: 0.3
-  phase2_pantilt_settle_sec: 0.5
+  pre_capture_quiet_sec: 0.5
+  phase2_pantilt_settle_sec: 1.0
   sample_stamp_skew_max_ms: 200.0
   duplicate_ee_match_trans_m: 0.005
   duplicate_ee_match_rot_deg: 1.0

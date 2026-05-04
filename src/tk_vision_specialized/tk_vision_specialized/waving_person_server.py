@@ -115,6 +115,27 @@ class DetectWavingPersonsNode(Node):
             Image, '/detect_waving_debug_image', 10,
         )
 
+        # Late-subscriber recovery. rqt_image_view subscribes VOLATILE and its
+        # GUI/Qt cold start (~3-5 s) often outlives the launch's 1 s grace
+        # period, so service publishes that fire during that window are
+        # dropped forever. Cache the last published Image msg and republish
+        # at 2 Hz from a separate callback group — the next tick latches
+        # onto whatever subscriber appeared in the meantime, so the most
+        # recent annotated frame always reaches rqt within ~0.5 s. Identical
+        # content on republish ⇒ no rqt flicker.
+        self._last_debug_msg_lock = threading.Lock()
+        self._last_debug_msg = None
+        # 10 Hz republish — gives rqt a steady ~100 ms cadence. Header stamp
+        # is rewritten to `now()` on each tick (see _republish_last_debug)
+        # because image_transport drops frames whose stamp is older than
+        # the most recently displayed one; reusing the original capture
+        # stamp made republishes look intermittent.
+        self._republish_timer = self.create_timer(
+            0.1,
+            self._republish_last_debug,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
+
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
         self._vision_logger = VisionLogger(
@@ -291,6 +312,8 @@ class DetectWavingPersonsNode(Node):
             msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
             msg.header = header
             self.debug_image_pub.publish(msg)
+            with self._last_debug_msg_lock:
+                self._last_debug_msg = msg
             n_subs = self.debug_image_pub.get_subscription_count()
             self.get_logger().info(
                 f'/detect_waving_debug_image published '
@@ -300,6 +323,24 @@ class DetectWavingPersonsNode(Node):
             )
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f'debug_image publish failed: {exc}')
+
+    def _republish_last_debug(self):
+        """Re-emit the most recent annotated frame so late-joining VOLATILE
+        subscribers (rqt_image_view) eventually display it.
+
+        Stamp is rewritten to wall-clock now() on every tick — rqt /
+        image_transport drops frames whose stamp is non-monotonic vs the
+        last displayed one, so reusing the original capture stamp produced
+        an uneven display cadence."""
+        with self._last_debug_msg_lock:
+            msg = self._last_debug_msg
+        if msg is None:
+            return
+        try:
+            msg.header.stamp = self.get_clock().now().to_msg()
+            self.debug_image_pub.publish(msg)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().debug(f'debug_image republish failed: {exc}')
 
     def image_callback(self, rgb_msg, depth_image_msg):
         # Convert outside the lock — CvBridge can raise on a malformed image
@@ -594,10 +635,14 @@ class DetectWavingPersonsNode(Node):
                     response.status = -1
                     response.error_msg = f"Failed to transform point from {header.frame_id} to {request.target_frame}: {e}"
                     self.get_logger().error(response.error_msg)
+                    # Detection actually ran on this path — preserve the
+                    # red/green person overlay rather than overwriting the
+                    # cached frame with the raw rgb_image.
                     self._publish_debug_image(
-                        rgb_image, header, persons=person_candidates,
+                        annotated, header, persons=person_candidates,
                         waving=len(waving_persons_centroids),
                         status_text=f'POINT TRANSFORM FAILED: {e}',
+                        already_annotated=True,
                     )
                     return response
             else:

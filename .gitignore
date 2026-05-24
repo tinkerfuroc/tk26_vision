@@ -27,8 +27,9 @@ src/pan_tilt/config/calibration.pruned.*.yaml
 src/pan_tilt/config/prune_report.*.json
 calibration_data/
 
-thirdparty/
+thirdparty/*
 !thirdparty/README.md
+!thirdparty/foundation_stereo/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

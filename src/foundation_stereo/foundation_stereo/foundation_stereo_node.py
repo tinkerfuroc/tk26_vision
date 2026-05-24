@@ -17,7 +17,13 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
 from std_msgs.msg import Header
 
@@ -27,6 +33,17 @@ from tinker_vision_msgs_26.srv import FoundationStereoDepth as FSSrv
 from foundation_stereo.color_align import reproject_ir_to_color
 from foundation_stereo import stereo_runner as _sr
 from foundation_stereo.stereo_runner import StereoRunner
+
+
+# realsense2_camera publishes the depth_to_color Extrinsics topic latched
+# (RELIABLE + TRANSIENT_LOCAL). A VOLATILE subscriber never sees the
+# already-published message, so use a matching latched-style QoS.
+_LATCHED_QOS = QoSProfile(
+    depth=1,
+    history=HistoryPolicy.KEEP_LAST,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 # Per-camera-profile defaults. Picked by the `camera_profile` ROS param.
@@ -252,11 +269,13 @@ class FoundationStereoNode(Node):
             self._on_color_info, qos_profile_sensor_data,
         )
         # IR1->Color extrinsics (latched; small dance to avoid hard dep at import time).
+        # realsense2_camera publishes this once at startup with TRANSIENT_LOCAL,
+        # so the subscription must match that durability or it never fires.
         try:
             from realsense2_camera_msgs.msg import Extrinsics  # type: ignore
             self.create_subscription(
                 Extrinsics, self._topic_for("extrinsics_topic"),
-                self._on_extrinsics, qos_profile_sensor_data,
+                self._on_extrinsics, _LATCHED_QOS,
             )
         except ImportError:
             self.get_logger().warn(

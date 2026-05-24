@@ -199,6 +199,13 @@ uses). For D435 the depth and IR1 profiles are co-located, so
 | `stream_publish_vis` | `false` | If true, publish `~/debug/disparity/compressed` (JPEG SensorDataQoS). |
 | `stream_max_fps` | `0.0` | 0 = uncapped. |
 | `extrinsics_warmup_timeout_sec` | `5.0` | If `stream_align_to_color=true` and the latched extrinsics topic hasn't arrived within this window, refuse to start the publisher and log a clear error. **Do not silently fall back to identity** — that produces 15 mm-scale wrong depth on D435. |
+| `stream_measure_forward_ms` | `false` | When true, the streaming worker records CUDA events around `model.forward` to populate disparity-vis metadata; costs ~100 µs sync per iteration. Leave off for peak FPS — see §10. |
+
+### Measurement
+
+| Param | Default | Notes |
+|---|---|---|
+| `measure_forward_ms` | `true` | srv / action only. When true, record CUDA events to populate the response's `forward_ms` field. When false, response carries `forward_ms = 0.0` and the per-call sync is skipped. See §10 for the full overhead policy. |
 
 ### Logging
 
@@ -383,7 +390,61 @@ Adds rows to the existing tk26_vision integration suite at `scripts/tests/`:
 
 ---
 
-## 10. Out-of-scope / follow-ups
+## 10. Runtime measurement overhead policy
+
+The reference webapp's `stereo_runner.py` carries three nvidia-related
+measurement paths whose cost we do not want to pay inside the ROS graph:
+
+1. **`_gpu_rss_mib()` — `nvidia-smi` subprocess (~20 ms / call).** Defined at
+   `webapp/stereo_runner.py:116`, called twice per non-live request
+   (lines 306 and 317 — before + after inference). Exists only to populate
+   the webapp's "VRAM (nvidia-smi RSS)" UI badge (`index.html:400`). The
+   reference's `live=True` flag already guards it for streaming.
+2. **PyTorch memory counters — `torch.cuda.reset_peak_memory_stats()` +
+   `max_memory_allocated()` + `max_memory_reserved()`** at
+   `stereo_runner.py:346` and `:417–418`. Individually cheap (~µs) but run
+   unconditionally on *every* call, including streaming. Output is the
+   `peak_alloc_mib` / `peak_reserved_mib` UI fields — never consumed by ROS.
+3. **CUDA-event timing — `torch.cuda.synchronize()` + event records** around
+   `model.forward`. Adds ~100 µs of mandatory sync per call. Produces the
+   `forward_ms` metric used in the bench harness.
+
+### Policy in the tk26_vision port
+
+- **Drop `_gpu_rss_mib()` entirely.** Do not port the function; never call
+  `nvidia-smi` from inside the node. Saves ~40 ms per srv / action request.
+  Streaming was already unaffected.
+- **Drop the PyTorch peak-memory paths.** Remove the
+  `reset_peak_memory_stats()` call and the `max_memory_*` reads from the
+  ported `stereo_runner.py`. The `InferResult` dataclass loses
+  `peak_alloc_mib` / `peak_reserved_mib`. Saves negligible time per call but
+  eliminates two CUDA-allocator touches on the hot path and one branch of
+  state we'd otherwise have to think about.
+- **Make CUDA-event timing opt-in.** Add `measure_forward_ms`
+  (default `true`, srv / action path) and `stream_measure_forward_ms`
+  (default `false`, streaming worker). When the flag is false, skip the
+  event record + `torch.cuda.synchronize()` and set `forward_ms = 0.0` in
+  the response. Lets the streaming worker shave the last ~100 µs / iteration
+  when chasing peak FPS on `fast_trt`.
+- **Keep `end_to_end_s` (wall-clock) unconditionally.** It is free
+  (`time.time()` deltas, no GPU sync) and is the metric ROS callers actually
+  consume.
+
+### Expected savings
+
+| Path | Reference cost | After policy | Net |
+|---|---|---|---|
+| srv / action (cold) | ~40 ms nvidia-smi + load + infer | load + infer | ~40 ms saved |
+| srv / action (warm) | ~40 ms nvidia-smi + infer | infer | ~40 ms saved |
+| Streaming, default | infer + ~100 µs CUDA-event sync | infer | ~100 µs / iter saved |
+| Streaming, `stream_measure_forward_ms=true` | infer + ~100 µs | infer + ~100 µs | unchanged (debug mode) |
+
+At `fast_trt`'s ~9–13 ms forward, the 100 µs saving is ~1 % per iteration —
+small in absolute terms but free, and the dropped subprocess + dropped
+allocator counters together remove a non-trivial source of jitter from the
+srv / action latency distribution.
+
+## 11. Out-of-scope / follow-ups
 
 - TRT engine compilation (`make_onnx.py` + `trtexec`). Use the engines already
   built in the reference setup. Adding a build helper is a follow-up.

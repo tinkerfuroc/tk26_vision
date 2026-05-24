@@ -5,6 +5,7 @@ Spec: docs/superpowers/specs/2026-05-24-foundation-stereo-design.md.
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from typing import Optional, Tuple
@@ -17,6 +18,7 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from std_msgs.msg import Header
 
 from tinker_vision_msgs_26.action import FoundationStereoDepth as FSAction
 from tinker_vision_msgs_26.srv import FoundationStereoDepth as FSSrv
@@ -550,32 +552,31 @@ class FoundationStereoNode(Node):
 
             depth = result.depth
             if align:
-                K_color = _info_to_K(self._color_info)
+                color_info = self._color_info
+                extrinsics = self._extrinsics
+                if color_info is None or extrinsics is None:
+                    # Shouldn't happen — warmup gate already passed — but defensive.
+                    continue
+                K_color = _info_to_K(color_info)
                 K_ir_scaled = K_ir.copy()
                 K_ir_scaled[:2] *= result.scale_used  # cx, cy, fx, fy scale with resize; K[2,2] stays 1
-                R, T = self._extrinsics
+                R, T = extrinsics
                 depth = reproject_ir_to_color(
                     depth, K_ir_scaled, K_color, R, T,
-                    out_hw=(self._color_info.height, self._color_info.width),
+                    out_hw=(color_info.height, color_info.width),
                 )
-                out_info = self._color_info
+                out_info = color_info
             else:
                 out_info = info_msg
 
-            header = out_info.header
-            if out_frame:
-                header.frame_id = out_frame
+            header = Header(
+                stamp=out_info.header.stamp,
+                frame_id=(out_frame or out_info.header.frame_id),
+            )
 
             depth_msg = _depth_to_msg(depth, dtype, self._bridge, header)
-            info_out = CameraInfo()
+            info_out = copy.copy(out_info)
             info_out.header = header
-            info_out.height = out_info.height
-            info_out.width = out_info.width
-            info_out.distortion_model = out_info.distortion_model
-            info_out.d = out_info.d
-            info_out.k = out_info.k
-            info_out.r = out_info.r
-            info_out.p = out_info.p
 
             self._stream_depth_pub.publish(depth_msg)
             self._stream_info_pub.publish(info_out)

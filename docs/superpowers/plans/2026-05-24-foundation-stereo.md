@@ -2233,9 +2233,11 @@ Add a method on `FoundationStereoNode`:
             depth = result.depth
             if align:
                 K_color = _info_to_K(self._color_info)
+                K_ir_scaled = K_ir.copy()
+                K_ir_scaled[:2] *= result.scale_used  # cx, cy, fx, fy scale with resize; K[2,2] stays 1
                 R, T = self._extrinsics
                 depth = reproject_ir_to_color(
-                    depth, K_ir * result.scale_used, K_color, R, T,
+                    depth, K_ir_scaled, K_color, R, T,
                     out_hw=(self._color_info.height, self._color_info.width),
                 )
                 out_info = self._color_info

@@ -49,8 +49,7 @@ ros2 launch foundation_stereo foundation_stereo.launch.py \
 `realsense2_camera` publishes the left IR optical frame as
 `xarm_camera_infra1_optical_frame`. The xarm URDF declares it as
 `xarm_camera_left_ir_optical_frame`. No static_transform_publisher
-bridges them. Two clean options when consuming this node's raw-mode
-depth:
+bridges them. Three options when consuming this node's raw-mode depth:
 
 1. Stream aligned-to-color (the default). Output frame becomes
    `xarm_camera_color_optical_frame`, which agrees between driver and URDF.

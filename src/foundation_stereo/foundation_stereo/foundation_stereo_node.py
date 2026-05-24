@@ -58,6 +58,28 @@ def _info_to_K(info: CameraInfo) -> np.ndarray:
     return np.asarray(info.k, dtype=np.float32).reshape(3, 3).copy()
 
 
+def _depth_to_msg(depth_m: np.ndarray, dtype: str, bridge: CvBridge,
+                  header) -> Image:
+    if dtype == "16UC1_mm":
+        mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
+        msg = bridge.cv2_to_imgmsg(mm, encoding="16UC1")
+    else:  # 32FC1_m
+        msg = bridge.cv2_to_imgmsg(depth_m.astype(np.float32), encoding="32FC1")
+    msg.header = header
+    return msg
+
+
+def _resolve_stream_topics(node, align: bool) -> Tuple[str, str]:
+    depth_topic = node._p("stream_depth_topic")
+    info_topic = node._p("stream_info_topic")
+    if depth_topic and info_topic:
+        return depth_topic, info_topic
+    if align:
+        return ("~/aligned_depth_to_color/image_rect_raw",
+                "~/aligned_depth_to_color/camera_info")
+    return "~/depth/image_rect_raw", "~/depth/camera_info"
+
+
 class FoundationStereoNode(Node):
 
     def __init__(self):
@@ -78,6 +100,7 @@ class FoundationStereoNode(Node):
         self._setup_subscribers()
         self._setup_service()
         self._setup_action()
+        self._setup_stream()
 
         self.get_logger().info(
             f"foundation_stereo ready: profile={self._p('camera_profile')}, "
@@ -417,6 +440,161 @@ class FoundationStereoNode(Node):
 
         goal_handle.succeed()
         return resp
+
+    # ---------- streaming worker ----------
+
+    def _setup_stream(self) -> None:
+        if not self._p("stream_enabled"):
+            return
+        align = bool(self._p("stream_align_to_color"))
+
+        # IMPORTANT: do NOT wait for extrinsics here — __init__ runs before
+        # rclpy.spin(), so subscription callbacks can't fire and the loop
+        # would always time out. The worker thread (below) does the warmup
+        # wait once the executor is alive.
+
+        depth_topic, info_topic = _resolve_stream_topics(self, align)
+        self._stream_depth_pub = self.create_publisher(
+            Image, depth_topic, qos_profile_sensor_data
+        )
+        self._stream_info_pub = self.create_publisher(
+            CameraInfo, info_topic, qos_profile_sensor_data
+        )
+        self._stream_vis_pub = (
+            self.create_publisher(CompressedImage, "~/debug/disparity/compressed",
+                                  qos_profile_sensor_data)
+            if self._p("stream_publish_vis") else None
+        )
+
+        self._stream_stop = threading.Event()
+        self._stream_thread = threading.Thread(
+            target=self._stream_loop, name="fs-stream", daemon=True,
+        )
+        self._stream_thread.start()
+        self.get_logger().info(
+            f"streaming publisher created: depth={depth_topic}, "
+            f"info={info_topic}, dtype={self._p('stream_dtype')}, align={align}"
+        )
+
+    def _stream_loop(self) -> None:
+        align = bool(self._p("stream_align_to_color"))
+        dtype = str(self._p("stream_dtype"))
+        out_frame = str(self._p("output_frame_id"))
+        max_fps = float(self._p("stream_max_fps"))
+        min_period = (1.0 / max_fps) if max_fps > 0 else 0.0
+        measure_fwd = bool(self._p("stream_measure_forward_ms"))
+
+        # Extrinsics warm-up runs here so rclpy.spin()'s executor is
+        # already running in the main thread and the latched extrinsics +
+        # color_info callbacks can fire.
+        if align:
+            warmup = float(self._p("extrinsics_warmup_timeout_sec"))
+            deadline = time.time() + warmup
+            while time.time() < deadline and not self._stream_stop.is_set():
+                if self._extrinsics is not None and self._color_info is not None:
+                    break
+                time.sleep(0.1)
+            if self._extrinsics is None or self._color_info is None:
+                self.get_logger().error(
+                    "stream_align_to_color=true but extrinsics or "
+                    f"color_info not received within {warmup} s; "
+                    "publisher not emitting."
+                )
+                return
+
+        last_seq = None
+        last_emit = 0.0
+
+        while not self._stream_stop.is_set():
+            with self._latest_lock:
+                cached = self._latest
+            if cached is None:
+                time.sleep(0.01)
+                continue
+
+            left_msg, right_msg, info_msg = cached
+            seq = (left_msg.header.stamp.sec, left_msg.header.stamp.nanosec)
+            if seq == last_seq:
+                time.sleep(0.001)
+                continue
+            if min_period > 0 and (time.time() - last_emit) < min_period:
+                time.sleep(0.001)
+                continue
+            last_seq = seq
+
+            try:
+                left = self._bridge.imgmsg_to_cv2(left_msg, desired_encoding="rgb8")
+                right = self._bridge.imgmsg_to_cv2(right_msg, desired_encoding="rgb8")
+            except Exception as exc:
+                self.get_logger().warn(f"cv_bridge: {exc}", throttle_duration_sec=5.0)
+                continue
+
+            K_ir = _info_to_K(info_msg)
+            try:
+                result = self._runner.infer(
+                    left_rgb=left, right_rgb=right, K=K_ir,
+                    baseline=self._baseline(),
+                    kind=self._p("default_model_kind"),
+                    scale=float(self._p("default_scale")),
+                    valid_iters=(int(self._p("default_iters")) or None),
+                    z_far=float(self._p("default_z_far")),
+                    trt_variant=self._p("default_trt_variant"),
+                    live=False,
+                    measure_forward_ms=measure_fwd,
+                    want_debug_jpeg=bool(self._stream_vis_pub),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().exception("stream inference failed")
+                time.sleep(0.05)
+                continue
+
+            depth = result.depth
+            if align:
+                K_color = _info_to_K(self._color_info)
+                K_ir_scaled = K_ir.copy()
+                K_ir_scaled[:2] *= result.scale_used  # cx, cy, fx, fy scale with resize; K[2,2] stays 1
+                R, T = self._extrinsics
+                depth = reproject_ir_to_color(
+                    depth, K_ir_scaled, K_color, R, T,
+                    out_hw=(self._color_info.height, self._color_info.width),
+                )
+                out_info = self._color_info
+            else:
+                out_info = info_msg
+
+            header = out_info.header
+            if out_frame:
+                header.frame_id = out_frame
+
+            depth_msg = _depth_to_msg(depth, dtype, self._bridge, header)
+            info_out = CameraInfo()
+            info_out.header = header
+            info_out.height = out_info.height
+            info_out.width = out_info.width
+            info_out.distortion_model = out_info.distortion_model
+            info_out.d = out_info.d
+            info_out.k = out_info.k
+            info_out.r = out_info.r
+            info_out.p = out_info.p
+
+            self._stream_depth_pub.publish(depth_msg)
+            self._stream_info_pub.publish(info_out)
+
+            if self._stream_vis_pub is not None and result.vis_jpg:
+                cmp = CompressedImage()
+                cmp.header = header
+                cmp.format = "jpeg"
+                cmp.data = list(result.vis_jpg)
+                self._stream_vis_pub.publish(cmp)
+
+            last_emit = time.time()
+
+    def destroy_node(self):
+        if getattr(self, "_stream_stop", None) is not None:
+            self._stream_stop.set()
+        if getattr(self, "_stream_thread", None) is not None:
+            self._stream_thread.join(timeout=2.0)
+        super().destroy_node()
 
 
 def main(args=None):

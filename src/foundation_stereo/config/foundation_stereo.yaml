@@ -1,0 +1,39 @@
+foundation_stereo:
+  ros__parameters:
+    # Paths & model defaults
+    weights_root: "/home/tinker/projects/vision_tests/dualrRGB-foundationStereo"
+    camera_profile: "d435"
+    default_model_kind: "fast_trt"
+    default_trt_variant: "output_two_stage"
+    default_scale: 0.5
+    default_iters: 0
+    default_z_far: 10.0
+
+    # Topic overrides — leave blank to use the profile's defaults.
+    left_topic: ""
+    right_topic: ""
+    left_info_topic: ""
+    color_info_topic: ""
+    extrinsics_topic: ""
+    baseline_m: 0.0
+
+    # Sync + measurement
+    sync_slop_sec: 0.05
+    sync_queue_size: 5
+    measure_forward_ms: true
+
+    # Streaming
+    stream_enabled: false
+    stream_align_to_color: true
+    stream_depth_topic: ""
+    stream_info_topic: ""
+    stream_dtype: "16UC1_mm"
+    output_frame_id: ""
+    stream_publish_vis: false
+    stream_max_fps: 0.0
+    extrinsics_warmup_timeout_sec: 5.0
+    stream_measure_forward_ms: false
+
+    # Logging
+    vision_logging_enabled: false
+    vision_log_folder: "vision_log"

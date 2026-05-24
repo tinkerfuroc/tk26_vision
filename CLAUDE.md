@@ -26,6 +26,18 @@ If a build errors on stale symlinks, `rm -rf build/<pkg> install/<pkg>` and rebu
 
 The wrapper sources `.venv-da3`, runs `colcon build --packages-select monocular_depth` (or the args you pass), then re-shebangs the entry-point script to `.venv-da3/bin/python3`. Don't pass `monocular_depth` to the main `build.sh` — it'll resolve `depth_anything_3` against the wrong venv and the entry-point script will start under `.venv-vision-main`'s python.
 
+**`foundation_stereo` builds under a third venv.** `torch==2.8.0+cu128` +
+`tensorrt==10.16.1.11` conflict with both the shared `.venv-vision-main`
+and `.venv-da3`. Use the dedicated wrapper:
+
+```bash
+./src/tk26_vision/scripts/build_foundation_stereo.sh [colcon args...]
+```
+
+The wrapper sources `.venv-fs/`, runs `colcon build --packages-select
+foundation_stereo` (or the args you pass), then re-shebangs the entry-point
+script. Provisioning the venv once: see `src/foundation_stereo/README.md`.
+
 ## Environment
 
 ### Python deps
@@ -95,6 +107,11 @@ ros2 run vision_util get_orbbec_pc                   # /get_orbbec_pc — CUDA-d
 
 # DA3-fused PC (separate venv .venv-da3 + dedicated package; see scripts/build_monocular_depth.sh)
 ros2 run monocular_depth monocular_depth_pc          # action /monocular_depth_pc — DA3 + RealSense/Orbbec fusion (numpy<2 isolated venv)
+
+# FoundationStereo (separate venv .venv-fs)
+ros2 launch foundation_stereo foundation_stereo.launch.py
+ros2 launch foundation_stereo foundation_stereo.launch.py \
+    stream_enabled:=true stream_align_to_color:=true
 ```
 
 ## Architecture
@@ -109,7 +126,8 @@ src/tk26_vision/src/
 ├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head (closed-loop absolute targeting in a pan-tilt-rooted frame; feedback-gated settle; sticky ID + EMA)
 ├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
 ├── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay), get_orbbec_pc (CUDA-deprojected Orbbec PC, sidesteps SDK colored-PC iGPU bottleneck); shared `_pc_utils.py` reused by monocular_depth
-└── monocular_depth/               # DA3-fused PC action server; lives in its own venv `.venv-da3` (numpy==1.23.4) because `depth_anything_3` requires numpy<2 — isolation prevents cascade-breaking the rest of the vision tree
+├── monocular_depth/               # DA3-fused PC action server; lives in its own venv `.venv-da3` (numpy==1.23.4) because `depth_anything_3` requires numpy<2 — isolation prevents cascade-breaking the rest of the vision tree
+└── foundation_stereo/             # FoundationStereo + Fast-FoundationStereo service/action + streaming depth publisher; lives in its own venv `.venv-fs` (torch 2.8 + cu128 + tensorrt 10.16) because those versions conflict with the shared `.venv-vision-main`
 ```
 
 **Notes:**

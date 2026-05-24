@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Optional, Tuple
 
+import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -17,7 +18,7 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
 from std_msgs.msg import Header
 
 from tinker_vision_msgs_26.action import FoundationStereoDepth as FSAction
@@ -58,6 +59,57 @@ def _info_to_K(info: CameraInfo) -> np.ndarray:
     if np.any(P[:3, :3] != 0):
         return P[:3, :3].copy()
     return np.asarray(info.k, dtype=np.float32).reshape(3, 3).copy()
+
+
+def _depth_to_pointcloud2(depth_m: np.ndarray, K: np.ndarray, header) -> PointCloud2:
+    """Deproject a (H, W) float32 depth grid into a sensor_msgs/PointCloud2.
+
+    Points with depth==0 are skipped. K is the 3x3 intrinsics for the same grid.
+    The output cloud is in the same optical frame as `header.frame_id`.
+    """
+    H, W = depth_m.shape
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
+    vv, uu = np.indices((H, W), dtype=np.float32)
+    Z = depth_m
+    valid = Z > 0
+    if not np.any(valid):
+        msg = PointCloud2()
+        msg.header = header
+        msg.height = 1
+        msg.width = 0
+        msg.fields = [
+            PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 0
+        msg.is_dense = True
+        msg.data = b""
+        return msg
+
+    X = (uu - cx) * Z / fx
+    Y = (vv - cy) * Z / fy
+    pts = np.stack([X, Y, Z], axis=-1)[valid]  # (N, 3) float32
+
+    msg = PointCloud2()
+    msg.header = header
+    msg.height = 1
+    msg.width = int(pts.shape[0])
+    msg.fields = [
+        PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+    ]
+    msg.is_bigendian = False
+    msg.point_step = 12
+    msg.row_step = msg.point_step * msg.width
+    msg.is_dense = True
+    msg.data = pts.astype(np.float32).tobytes()
+    return msg
 
 
 def _depth_to_msg(depth_m: np.ndarray, dtype: str, bridge: CvBridge,
@@ -103,6 +155,12 @@ class FoundationStereoNode(Node):
         self._setup_service()
         self._setup_action()
         self._setup_stream()
+
+        self._log_dir = None
+        if self._p("vision_logging_enabled"):
+            from foundation_stereo._logging import resolve_session_dir
+            self._log_dir = resolve_session_dir(self._p("vision_log_folder"))
+            self.get_logger().info(f"vision_log session dir: {self._log_dir}")
 
         self.get_logger().info(
             f"foundation_stereo ready: profile={self._p('camera_profile')}, "
@@ -222,8 +280,6 @@ class FoundationStereoNode(Node):
         self._extrinsics = (R, T)
 
     # ---------- shared inference core ----------
-    # Note: req.want_pointcloud is intentionally ignored in this task —
-    # Task 10 will handle pointcloud generation if needed.
 
     def _run_inference(
         self,
@@ -233,6 +289,7 @@ class FoundationStereoNode(Node):
         scale: float,
         iters: int,
         z_far: float,
+        want_pointcloud: bool,
         want_debug_jpeg: bool,
         align_to_color: bool,
         on_stage=None,
@@ -248,6 +305,7 @@ class FoundationStereoNode(Node):
             "error_msg": "",
             "depth_image": None,
             "camera_info": None,
+            "pointcloud": None,
             "debug_jpeg": None,
             "forward_ms": 0.0,
             "load_s": 0.0,
@@ -310,6 +368,8 @@ class FoundationStereoNode(Node):
         depth = result.depth  # float32 m at the scaled grid
 
         # Optionally align into color frame.
+        # Always preserve the synced stereo frame's timestamp; frame_id
+        # depends on whether we aligned (color) or stayed in IR (info_msg).
         if align_to_color:
             _stage("aligning_to_color")
             if self._color_info is None or self._extrinsics is None:
@@ -326,20 +386,36 @@ class FoundationStereoNode(Node):
                 out_hw=(self._color_info.height, self._color_info.width),
             )
             out_info = self._color_info
+            K_for_cloud = K_color
         else:
             out_info = info_msg
+            K_ir_scaled = K_ir.copy()
+            K_ir_scaled[:2] *= result.scale_used
+            K_for_cloud = K_ir_scaled
+
+        depth_header = Header(
+            stamp=info_msg.header.stamp,
+            frame_id=out_info.header.frame_id,
+        )
 
         # 32FC1 m for srv/action (the streaming worker handles 16UC1 conversion).
         depth_msg = self._bridge.cv2_to_imgmsg(depth.astype(np.float32),
                                                encoding="32FC1")
-        depth_msg.header = out_info.header
+        depth_msg.header = depth_header
         out["depth_image"] = depth_msg
-        out["camera_info"] = out_info
+        # camera_info copy still mirrors out_info (height/width/intrinsics),
+        # but its header gets the synced stamp too.
+        info_for_resp = copy.copy(out_info)
+        info_for_resp.header = depth_header
+        out["camera_info"] = info_for_resp
+
+        if want_pointcloud:
+            out["pointcloud"] = _depth_to_pointcloud2(depth, K_for_cloud, depth_header)
 
         if want_debug_jpeg and result.vis_jpg:
             _stage("encoding_debug")
             cmp = CompressedImage()
-            cmp.header = depth_msg.header
+            cmp.header = depth_header
             cmp.format = "jpeg"
             cmp.data = list(result.vis_jpg)
             out["debug_jpeg"] = cmp
@@ -351,7 +427,25 @@ class FoundationStereoNode(Node):
         out["end_to_end_s"] = float(time.time() - wall_t0)
         out["model_used"] = self._runner.current_model or model_kind
         out["trt_variant_used"] = self._runner.current_trt_variant or ""
+
+        if self._log_dir is not None:
+            self._log_call(left, depth, depth_header)
+
         return out
+
+    def _log_call(self, left_rgb, depth, header):
+        """Dump the input left image + output depth to vision_log/."""
+        try:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            ms = int(time.time() * 1000) % 1000
+            stem = f"foundation_stereo_node_get_depth_{ts}_{ms:03d}"
+            cv2.imwrite(f"{self._log_dir}/{stem}_orig.jpg",
+                        cv2.cvtColor(left_rgb, cv2.COLOR_RGB2BGR))
+            mm = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+            cv2.imwrite(f"{self._log_dir}/{stem}_depth.png", mm)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"vision_log write failed: {exc}",
+                                   throttle_duration_sec=10.0)
 
     # ---------- service ----------
 
@@ -365,6 +459,7 @@ class FoundationStereoNode(Node):
             scale=float(req.scale) if req.scale > 0 else float(self._p("default_scale")),
             iters=int(req.iters) if req.iters > 0 else int(self._p("default_iters")),
             z_far=float(req.z_far) if req.z_far > 0 else float(self._p("default_z_far")),
+            want_pointcloud=bool(req.want_pointcloud),
             want_debug_jpeg=bool(req.want_debug_jpeg),
             align_to_color=bool(req.align_to_color),
         )
@@ -375,6 +470,8 @@ class FoundationStereoNode(Node):
             resp.depth_image = result["depth_image"]
         if result["camera_info"] is not None:
             resp.camera_info = result["camera_info"]
+        if result["pointcloud"] is not None:
+            resp.pointcloud = result["pointcloud"]
         if result["debug_jpeg"] is not None:
             resp.debug_jpeg = result["debug_jpeg"]
         resp.forward_ms = result["forward_ms"]
@@ -420,6 +517,7 @@ class FoundationStereoNode(Node):
             scale=float(req.scale) if req.scale > 0 else float(self._p("default_scale")),
             iters=int(req.iters) if req.iters > 0 else int(self._p("default_iters")),
             z_far=float(req.z_far) if req.z_far > 0 else float(self._p("default_z_far")),
+            want_pointcloud=bool(req.want_pointcloud),
             want_debug_jpeg=bool(req.want_debug_jpeg),
             align_to_color=bool(req.align_to_color),
             on_stage=fb,
@@ -432,6 +530,8 @@ class FoundationStereoNode(Node):
             resp.depth_image = result["depth_image"]
         if result["camera_info"] is not None:
             resp.camera_info = result["camera_info"]
+        if result["pointcloud"] is not None:
+            resp.pointcloud = result["pointcloud"]
         if result["debug_jpeg"] is not None:
             resp.debug_jpeg = result["debug_jpeg"]
         resp.forward_ms = result["forward_ms"]
@@ -545,6 +645,11 @@ class FoundationStereoNode(Node):
                     measure_forward_ms=measure_fwd,
                     want_debug_jpeg=bool(self._stream_vis_pub),
                 )
+            except FileNotFoundError as exc:
+                self.get_logger().error(
+                    f"streaming worker exiting — weights missing: {exc}"
+                )
+                return
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().exception("stream inference failed")
                 time.sleep(0.05)
@@ -570,7 +675,7 @@ class FoundationStereoNode(Node):
                 out_info = info_msg
 
             header = Header(
-                stamp=out_info.header.stamp,
+                stamp=info_msg.header.stamp,
                 frame_id=(out_frame or out_info.header.frame_id),
             )
 

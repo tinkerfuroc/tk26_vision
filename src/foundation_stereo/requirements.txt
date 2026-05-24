@@ -1,0 +1,12 @@
+# .venv-fs/ pins (provisioned manually per src/foundation_stereo/README.md).
+# torch / torchvision / tensorrt are not listed here because they require
+# the --index-url install dance — see the README for the canonical recipe.
+numpy==1.26.4
+omegaconf
+opencv-python-headless
+imageio
+einops
+safetensors
+huggingface_hub
+pillow
+addict

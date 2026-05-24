@@ -13,10 +13,12 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 
+from tinker_vision_msgs_26.action import FoundationStereoDepth as FSAction
 from tinker_vision_msgs_26.srv import FoundationStereoDepth as FSSrv
 
 from foundation_stereo.color_align import reproject_ir_to_color
@@ -75,6 +77,7 @@ class FoundationStereoNode(Node):
 
         self._setup_subscribers()
         self._setup_service()
+        self._setup_action()
 
         self.get_logger().info(
             f"foundation_stereo ready: profile={self._p('camera_profile')}, "
@@ -193,70 +196,102 @@ class FoundationStereoNode(Node):
         T = np.asarray(msg.translation, dtype=np.float32).reshape(3)
         self._extrinsics = (R, T)
 
-    # ---------- service ----------
+    # ---------- shared inference core ----------
     # Note: req.want_pointcloud is intentionally ignored in this task —
-    # Task 9 / 10 will handle pointcloud generation if needed.
+    # Task 10 will handle pointcloud generation if needed.
 
-    def _setup_service(self) -> None:
-        self.create_service(FSSrv, "~/get_depth", self._on_get_depth)
+    def _run_inference(
+        self,
+        *,
+        model_kind: str,
+        trt_variant: str,
+        scale: float,
+        iters: int,
+        z_far: float,
+        want_debug_jpeg: bool,
+        align_to_color: bool,
+        on_stage=None,
+    ) -> dict:
+        """Single inference + optional color alignment.
 
-    def _on_get_depth(self, req: FSSrv.Request, resp: FSSrv.Response) -> FSSrv.Response:
-        # TODO(task-9): extract _run_inference helper to share with action handler
+        Returns a dict the caller copies into srv response / action result
+        fields. `on_stage(stage_str)` is invoked at each major phase
+        boundary when provided (for action feedback)."""
         wall_t0 = time.time()
+        out: dict = {
+            "status": 0,
+            "error_msg": "",
+            "depth_image": None,
+            "camera_info": None,
+            "debug_jpeg": None,
+            "forward_ms": 0.0,
+            "load_s": 0.0,
+            "end_to_end_s": 0.0,
+            "model_used": "",
+            "trt_variant_used": "",
+        }
+
+        def _stage(name: str) -> None:
+            if on_stage is not None:
+                try:
+                    on_stage(name)
+                except Exception:  # noqa: BLE001 — feedback must not break inference
+                    self.get_logger().warn(f"on_stage callback raised at {name!r}")
 
         with self._latest_lock:
             cached = self._latest
         if cached is None:
-            resp.status = 1
-            resp.error_msg = "no synced stereo frame"
-            return resp
+            out["status"] = 1
+            out["error_msg"] = "no synced stereo frame"
+            out["end_to_end_s"] = float(time.time() - wall_t0)
+            return out
 
         left_msg, right_msg, info_msg = cached
         try:
             left = self._bridge.imgmsg_to_cv2(left_msg, desired_encoding="rgb8")
             right = self._bridge.imgmsg_to_cv2(right_msg, desired_encoding="rgb8")
-        except Exception as exc:
-            resp.status = 3
-            resp.error_msg = f"cv_bridge: {exc}"
-            return resp
+        except Exception as exc:  # noqa: BLE001
+            out["status"] = 3
+            out["error_msg"] = f"cv_bridge: {exc}"
+            out["end_to_end_s"] = float(time.time() - wall_t0)
+            return out
 
         K_ir = _info_to_K(info_msg)
         baseline = self._baseline()
-
-        kind = req.model_kind or self._p("default_model_kind")
-        trt_variant = req.trt_variant or self._p("default_trt_variant")
-        scale = float(req.scale) if req.scale > 0 else float(self._p("default_scale"))
-        iters = int(req.iters) if req.iters > 0 else int(self._p("default_iters"))
-        z_far = float(req.z_far) if req.z_far > 0 else float(self._p("default_z_far"))
         measure_fwd = bool(self._p("measure_forward_ms"))
 
+        _stage("running_forward")
         try:
             result = self._runner.infer(
                 left_rgb=left, right_rgb=right, K=K_ir, baseline=baseline,
-                kind=kind, scale=scale,
+                kind=model_kind, scale=scale,
                 valid_iters=(iters or None), z_far=z_far,
                 trt_variant=trt_variant,
                 live=False,
                 measure_forward_ms=measure_fwd,
-                want_debug_jpeg=bool(req.want_debug_jpeg),
+                want_debug_jpeg=want_debug_jpeg,
             )
         except FileNotFoundError as exc:
-            resp.status = 2
-            resp.error_msg = str(exc)
-            return resp
+            out["status"] = 2
+            out["error_msg"] = str(exc)
+            out["end_to_end_s"] = float(time.time() - wall_t0)
+            return out
         except Exception as exc:  # noqa: BLE001
-            resp.status = 3
-            resp.error_msg = f"{type(exc).__name__}: {exc}"
-            return resp
+            out["status"] = 3
+            out["error_msg"] = f"{type(exc).__name__}: {exc}"
+            out["end_to_end_s"] = float(time.time() - wall_t0)
+            return out
 
         depth = result.depth  # float32 m at the scaled grid
 
         # Optionally align into color frame.
-        if req.align_to_color:
+        if align_to_color:
+            _stage("aligning_to_color")
             if self._color_info is None or self._extrinsics is None:
-                resp.status = 3
-                resp.error_msg = "extrinsics not available"
-                return resp
+                out["status"] = 3
+                out["error_msg"] = "extrinsics not available"
+                out["end_to_end_s"] = float(time.time() - wall_t0)
+                return out
             K_color = _info_to_K(self._color_info)
             K_ir_scaled = K_ir.copy()
             K_ir_scaled[:2] *= result.scale_used  # cx, cy, fx, fy scale with resize; K[2,2] stays 1
@@ -273,23 +308,114 @@ class FoundationStereoNode(Node):
         depth_msg = self._bridge.cv2_to_imgmsg(depth.astype(np.float32),
                                                encoding="32FC1")
         depth_msg.header = out_info.header
-        resp.depth_image = depth_msg
-        resp.camera_info = out_info
+        out["depth_image"] = depth_msg
+        out["camera_info"] = out_info
 
-        if req.want_debug_jpeg and result.vis_jpg:
+        if want_debug_jpeg and result.vis_jpg:
+            _stage("encoding_debug")
             cmp = CompressedImage()
             cmp.header = depth_msg.header
             cmp.format = "jpeg"
             cmp.data = list(result.vis_jpg)
-            resp.debug_jpeg = cmp
+            out["debug_jpeg"] = cmp
 
-        resp.status = 0
-        resp.error_msg = ""
-        resp.forward_ms = float(result.forward_ms)
-        resp.load_s = float(result.load_s)
-        resp.end_to_end_s = float(time.time() - wall_t0)
-        resp.model_used = self._runner.current_model or kind
-        resp.trt_variant_used = self._runner.current_trt_variant or ""
+        out["status"] = 0
+        out["error_msg"] = ""
+        out["forward_ms"] = float(result.forward_ms)
+        out["load_s"] = float(result.load_s)
+        out["end_to_end_s"] = float(time.time() - wall_t0)
+        out["model_used"] = self._runner.current_model or model_kind
+        out["trt_variant_used"] = self._runner.current_trt_variant or ""
+        return out
+
+    # ---------- service ----------
+
+    def _setup_service(self) -> None:
+        self.create_service(FSSrv, "~/get_depth", self._on_get_depth)
+
+    def _on_get_depth(self, req: FSSrv.Request, resp: FSSrv.Response) -> FSSrv.Response:
+        result = self._run_inference(
+            model_kind=(req.model_kind or self._p("default_model_kind")),
+            trt_variant=(req.trt_variant or self._p("default_trt_variant")),
+            scale=float(req.scale) if req.scale > 0 else float(self._p("default_scale")),
+            iters=int(req.iters) if req.iters > 0 else int(self._p("default_iters")),
+            z_far=float(req.z_far) if req.z_far > 0 else float(self._p("default_z_far")),
+            want_debug_jpeg=bool(req.want_debug_jpeg),
+            align_to_color=bool(req.align_to_color),
+        )
+
+        resp.status = result["status"]
+        resp.error_msg = result["error_msg"]
+        if result["depth_image"] is not None:
+            resp.depth_image = result["depth_image"]
+        if result["camera_info"] is not None:
+            resp.camera_info = result["camera_info"]
+        if result["debug_jpeg"] is not None:
+            resp.debug_jpeg = result["debug_jpeg"]
+        resp.forward_ms = result["forward_ms"]
+        resp.load_s = result["load_s"]
+        resp.end_to_end_s = result["end_to_end_s"]
+        resp.model_used = result["model_used"]
+        resp.trt_variant_used = result["trt_variant_used"]
+        return resp
+
+    # ---------- action ----------
+
+    def _setup_action(self) -> None:
+        self._action = ActionServer(
+            self,
+            FSAction,
+            "~/infer_depth",
+            execute_callback=self._on_infer_depth,
+            goal_callback=lambda goal: GoalResponse.ACCEPT,
+            cancel_callback=lambda goal: CancelResponse.ACCEPT,
+        )
+
+    def _on_infer_depth(self, goal_handle):
+        req = goal_handle.request
+        resp = FSAction.Result()
+        feedback = FSAction.Feedback()
+        action_t0 = time.time()
+
+        def fb(stage: str) -> None:
+            feedback.current_stage = stage
+            feedback.elapsed_s = float(time.time() - action_t0)
+            goal_handle.publish_feedback(feedback)
+
+        # Cancel-check before doing any work.
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            resp.status = 3
+            resp.error_msg = "cancelled before inference"
+            return resp
+
+        result = self._run_inference(
+            model_kind=(req.model_kind or self._p("default_model_kind")),
+            trt_variant=(req.trt_variant or self._p("default_trt_variant")),
+            scale=float(req.scale) if req.scale > 0 else float(self._p("default_scale")),
+            iters=int(req.iters) if req.iters > 0 else int(self._p("default_iters")),
+            z_far=float(req.z_far) if req.z_far > 0 else float(self._p("default_z_far")),
+            want_debug_jpeg=bool(req.want_debug_jpeg),
+            align_to_color=bool(req.align_to_color),
+            on_stage=fb,
+        )
+
+        # Copy fields onto the action Result.
+        resp.status = result["status"]
+        resp.error_msg = result["error_msg"]
+        if result["depth_image"] is not None:
+            resp.depth_image = result["depth_image"]
+        if result["camera_info"] is not None:
+            resp.camera_info = result["camera_info"]
+        if result["debug_jpeg"] is not None:
+            resp.debug_jpeg = result["debug_jpeg"]
+        resp.forward_ms = result["forward_ms"]
+        resp.load_s = result["load_s"]
+        resp.end_to_end_s = result["end_to_end_s"]
+        resp.model_used = result["model_used"]
+        resp.trt_variant_used = result["trt_variant_used"]
+
+        goal_handle.succeed()
         return resp
 
 

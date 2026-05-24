@@ -9,8 +9,6 @@ Resolution order per tk26_vision convention (see top-level CLAUDE.md):
 import os
 import time
 
-import pytest
-
 from foundation_stereo._logging import resolve_session_dir
 
 

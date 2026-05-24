@@ -6,6 +6,7 @@ Spec: docs/superpowers/specs/2026-05-24-foundation-stereo-design.md.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Optional, Tuple
 
 import numpy as np
@@ -14,13 +15,13 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import CameraInfo, Image
-import time
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 
 from tinker_vision_msgs_26.srv import FoundationStereoDepth as FSSrv
 
 from foundation_stereo.color_align import reproject_ir_to_color
-from foundation_stereo.stereo_runner import StereoRunner, TRT_VARIANTS
+from foundation_stereo import stereo_runner as _sr
+from foundation_stereo.stereo_runner import StereoRunner
 
 
 # Per-camera-profile defaults. Picked by the `camera_profile` ROS param.
@@ -80,7 +81,7 @@ class FoundationStereoNode(Node):
             f"default_model={self._p('default_model_kind')}, "
             f"weights_root={self._p('weights_root')}, "
             f"stream_enabled={self._p('stream_enabled')}, "
-            f"trt_variants={list(TRT_VARIANTS.keys())}"
+            f"trt_variants={list(_sr.TRT_VARIANTS.keys())}"
         )
 
     # ---------- parameters ----------
@@ -193,11 +194,14 @@ class FoundationStereoNode(Node):
         self._extrinsics = (R, T)
 
     # ---------- service ----------
+    # Note: req.want_pointcloud is intentionally ignored in this task —
+    # Task 9 / 10 will handle pointcloud generation if needed.
 
     def _setup_service(self) -> None:
         self.create_service(FSSrv, "~/get_depth", self._on_get_depth)
 
     def _on_get_depth(self, req: FSSrv.Request, resp: FSSrv.Response) -> FSSrv.Response:
+        # TODO(task-9): extract _run_inference helper to share with action handler
         wall_t0 = time.time()
 
         with self._latest_lock:
@@ -273,7 +277,6 @@ class FoundationStereoNode(Node):
         resp.camera_info = out_info
 
         if req.want_debug_jpeg and result.vis_jpg:
-            from sensor_msgs.msg import CompressedImage
             cmp = CompressedImage()
             cmp.header = depth_msg.header
             cmp.format = "jpeg"

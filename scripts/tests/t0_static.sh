@@ -65,6 +65,8 @@ ifaces=(
     tinker_vision_msgs_26/msg/PanTiltState
     tinker_vision_msgs_26/srv/SetTorque
     tinker_vision_msgs_26/srv/SetZero
+    tinker_vision_msgs_26/srv/FoundationStereoDepth
+    tinker_vision_msgs_26/action/FoundationStereoDepth
 )
 iface_bad=0
 for i in "${ifaces[@]}"; do
@@ -130,6 +132,46 @@ elif [ -f "$ENV_FILE" ]; then
     skip "T0.7" "$ENV_FILE exists but key is placeholder; live-LLM tests will skip"
 else
     skip "T0.7" "$ENV_FILE absent; live-LLM tests will skip"
+fi
+
+# Foundation_stereo paths: lib.sh sets WS_ROOT to the tk26_vision repo root
+# (src/tk26_vision/), but colcon installs to the colcon workspace root one
+# level up (tk25_ws/install/). Resolve both explicitly here so the T0.fs.*
+# rows work regardless of CWD.
+FS_REPO_ROOT="$WS_ROOT"
+FS_COLCON_ROOT="$(cd "$WS_ROOT/../.." && pwd)"
+FS_VENV="$FS_REPO_ROOT/.venv-fs"
+
+section "T0.fs — foundation_stereo vendored trees present"
+if [ -d "$FS_REPO_ROOT/thirdparty/foundation_stereo/FoundationStereo/core" ] \
+   && [ -d "$FS_REPO_ROOT/thirdparty/foundation_stereo/Fast-FoundationStereo/core" ]; then
+    pass "T0.fs.vendor"
+else
+    fail "T0.fs.vendor" "vendored trees missing under src/tk26_vision/thirdparty/foundation_stereo/"
+fi
+
+section "T0.fs — foundation_stereo .venv-fs shebang"
+FS_ENTRY="$FS_COLCON_ROOT/install/foundation_stereo/lib/foundation_stereo/foundation_stereo_node"
+EXPECTED_FS_SHEBANG="#!$FS_VENV/bin/python3"
+if [ ! -f "$FS_ENTRY" ]; then
+    fail "T0.fs.shebang" "entry script not found: $FS_ENTRY (build first via scripts/build_foundation_stereo.sh)"
+else
+    first=$(head -1 "$FS_ENTRY" 2>/dev/null || true)
+    if [ "$first" = "$EXPECTED_FS_SHEBANG" ]; then
+        pass "T0.fs.shebang"
+    else
+        fail "T0.fs.shebang" "got: $first (want: $EXPECTED_FS_SHEBANG)"
+    fi
+fi
+
+section "T0.fs — color_align + logging pytest"
+if "$FS_VENV/bin/python" -m pytest \
+        "$FS_REPO_ROOT/src/foundation_stereo/test/test_color_align.py" \
+        "$FS_REPO_ROOT/src/foundation_stereo/test/test_logging.py" \
+        -q 2>"$LOG_DIR/t0.fs.pytest.err" >/dev/null; then
+    pass "T0.fs.pytest"
+else
+    fail "T0.fs.pytest" "$(cat "$LOG_DIR/t0.fs.pytest.err")"
 fi
 
 summary

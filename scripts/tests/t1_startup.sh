@@ -208,4 +208,10 @@ stop_all_nodes
 # Negative-path VLM call (out-of-vocab + fallback under no key → OPENROUTER_API_KEY
 # error) requires live cameras to get past the recent-frame wait, so it lives in T2.
 
+section "T1.fs — foundation_stereo advertises srv + action"
+t1_check_multi T1.fs foundation_stereo foundation_stereo_node \
+    s:/foundation_stereo/get_depth \
+    a:/foundation_stereo/infer_depth \
+    --
+
 summary

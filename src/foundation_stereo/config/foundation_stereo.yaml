@@ -3,11 +3,16 @@ foundation_stereo:
     # Paths & model defaults
     weights_root: "/home/tinker/projects/vision_tests/dualrRGB-foundationStereo"
     camera_profile: "d435"
+    # The node only serves `fast_trt`. default_model_kind is kept for
+    # backwards-compat but ignored; non-fast_trt requests are rejected.
     default_model_kind: "fast_trt"
     default_trt_variant: "output_two_stage"
     default_scale: 0.5
     default_iters: 0
     default_z_far: 10.0
+    # Pre-load + run one live forward through the default TRT variant
+    # at node startup so the first request lands at warm latency.
+    warmup_on_launch: true
 
     # Topic overrides — leave blank to use the profile's defaults.
     left_topic: ""

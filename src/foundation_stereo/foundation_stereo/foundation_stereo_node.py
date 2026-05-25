@@ -184,9 +184,12 @@ class FoundationStereoNode(Node):
             self._log_dir = resolve_session_dir(self._p("vision_log_folder"))
             self.get_logger().info(f"vision_log session dir: {self._log_dir}")
 
+        if bool(self._p("warmup_on_launch")):
+            self._warmup_model()
+
         self.get_logger().info(
             f"foundation_stereo ready: profile={self._p('camera_profile')}, "
-            f"default_model={self._p('default_model_kind')}, "
+            f"trt_variant={self._p('default_trt_variant')}, "
             f"weights_root={self._p('weights_root')}, "
             f"stream_enabled={self._p('stream_enabled')}, "
             f"trt_variants={list(_sr.TRT_VARIANTS.keys())}"
@@ -198,8 +201,17 @@ class FoundationStereoNode(Node):
         self.declare_parameter("weights_root",
                                "/home/tinker/projects/vision_tests/dualrRGB-foundationStereo")
         self.declare_parameter("camera_profile", "d435")
+        # `default_model_kind` is kept for backwards-compat but ignored;
+        # the node serves only `fast_trt`. Any other value in a request
+        # is rejected. (See _run_inference.)
         self.declare_parameter("default_model_kind", "fast_trt")
         self.declare_parameter("default_trt_variant", "output_two_stage")
+        # Warm the default TRT engine (load + one live forward) at node
+        # startup so the first real request lands at warm latency
+        # (~30 ms) instead of cold (~2-5 s for TRT engine load + CUDA
+        # init). Disable with -p warmup_on_launch:=false for fast dev
+        # iteration when you don't care about first-call latency.
+        self.declare_parameter("warmup_on_launch", True)
         self.declare_parameter("default_scale", 0.5)
         self.declare_parameter("default_iters", 0)
         self.declare_parameter("default_z_far", 10.0)
@@ -303,6 +315,65 @@ class FoundationStereoNode(Node):
         T = np.asarray(msg.translation, dtype=np.float32).reshape(3)
         self._extrinsics = (R, T)
 
+    def _warmup_model(self) -> None:
+        """Load the default TRT engine + run one live forward so the
+        first real request lands at warm latency.
+
+        Hot path inside `infer()` does: TRT engine load (~2-5 s for the
+        first variant), lazy buffer allocation on first execute (~50-
+        100 ms), CUDA kernel JIT for the resize ops (~5-20 ms). Doing
+        all that here means the user's first service call is ~30 ms
+        instead of ~5 s.
+
+        We only warm the *default* variant. Per-request overrides will
+        still pay cold cost on first use of a non-default variant —
+        that's a one-time hit and intentional. Non-TRT model_kinds are
+        rejected at the service layer, so we don't bother with them.
+        """
+        variant = str(self._p("default_trt_variant")) or "output_two_stage"
+        if variant not in _sr.TRT_VARIANTS:
+            self.get_logger().warn(
+                f"warmup skipped: default_trt_variant={variant!r} not "
+                f"in available {list(_sr.TRT_VARIANTS.keys())}")
+            return
+
+        # Build dummy IR pair at the camera profile's native resolution.
+        # `_run` inside the runner will downsample to the engine's input
+        # shape; what matters is that the call exercises the full
+        # forward path (resize → engine forward → resize back).
+        H, W = 480, 848  # native IR/color size for both d435 and d405
+        dummy_l = np.zeros((H, W, 3), dtype=np.uint8)
+        dummy_r = np.zeros((H, W, 3), dtype=np.uint8)
+        # Build a plausible K at IR resolution (used only for depth-math
+        # we'll skip via live=True).
+        K = np.array([[423.0, 0.0, W / 2.0],
+                      [0.0,   423.0, H / 2.0],
+                      [0.0,   0.0,   1.0]], dtype=np.float32)
+        baseline = float(self._baseline()) or 0.05
+
+        t0 = time.time()
+        try:
+            self._runner.infer(
+                left_rgb=dummy_l, right_rgb=dummy_r,
+                K=K, baseline=baseline,
+                kind="fast_trt", scale=float(self._p("default_scale")),
+                valid_iters=None, z_far=1.0,
+                trt_variant=variant,
+                live=True,                # skip depth math + pointcloud
+                measure_forward_ms=False,
+                want_debug_jpeg=False,
+            )
+            self.get_logger().info(
+                f"warmup ok: variant={variant} loaded + first-forward "
+                f"in {time.time() - t0:.2f}s")
+        except Exception as exc:  # noqa: BLE001
+            # Don't crash — the node may still be useful for other purposes
+            # (e.g. just streaming after extrinsics arrive). Real requests
+            # will surface the same error.
+            self.get_logger().error(
+                f"warmup FAILED (variant={variant}): {exc}. The first "
+                f"real request will pay cold-load cost instead.")
+
     def _get_aligner(self, *, K_ir: np.ndarray, ir_info: CameraInfo,
                      ir_hw: Tuple[int, int]) -> RealsenseAligner:
         """Build (or reuse a cached) RealsenseAligner for IR1→color
@@ -375,6 +446,19 @@ class FoundationStereoNode(Node):
                     on_stage(name)
                 except Exception:  # noqa: BLE001 — feedback must not break inference
                     self.get_logger().warn(f"on_stage callback raised at {name!r}")
+
+        # TRT-only: reject any non-fast_trt model kind. Empty string
+        # means "use the default" (which is also fast_trt).
+        if model_kind and model_kind != "fast_trt":
+            out["status"] = 4
+            out["error_msg"] = (
+                f"model_kind={model_kind!r} not supported; this node "
+                "only serves 'fast_trt' (TRT-engine inference). Leave "
+                "model_kind empty or set it to 'fast_trt'."
+            )
+            out["end_to_end_s"] = float(time.time() - wall_t0)
+            return out
+        model_kind = "fast_trt"
 
         with self._latest_lock:
             cached = self._latest
@@ -507,7 +591,7 @@ class FoundationStereoNode(Node):
 
     def _on_get_depth(self, req: FSSrv.Request, resp: FSSrv.Response) -> FSSrv.Response:
         result = self._run_inference(
-            model_kind=(req.model_kind or self._p("default_model_kind")),
+            model_kind=(req.model_kind or "fast_trt"),
             trt_variant=(req.trt_variant or self._p("default_trt_variant")),
             scale=float(req.scale) if req.scale > 0 else float(self._p("default_scale")),
             iters=int(req.iters) if req.iters > 0 else int(self._p("default_iters")),
@@ -565,7 +649,7 @@ class FoundationStereoNode(Node):
             return resp
 
         result = self._run_inference(
-            model_kind=(req.model_kind or self._p("default_model_kind")),
+            model_kind=(req.model_kind or "fast_trt"),
             trt_variant=(req.trt_variant or self._p("default_trt_variant")),
             scale=float(req.scale) if req.scale > 0 else float(self._p("default_scale")),
             iters=int(req.iters) if req.iters > 0 else int(self._p("default_iters")),
@@ -689,7 +773,7 @@ class FoundationStereoNode(Node):
                 result = self._runner.infer(
                     left_rgb=left, right_rgb=right, K=K_ir,
                     baseline=self._baseline(),
-                    kind=self._p("default_model_kind"),
+                    kind="fast_trt",
                     scale=float(self._p("default_scale")),
                     valid_iters=(int(self._p("default_iters")) or None),
                     z_far=float(self._p("default_z_far")),

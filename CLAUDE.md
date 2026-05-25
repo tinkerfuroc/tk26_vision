@@ -127,7 +127,7 @@ src/tk26_vision/src/
 ├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
 ├── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay), get_orbbec_pc (CUDA-deprojected Orbbec PC, sidesteps SDK colored-PC iGPU bottleneck); shared `_pc_utils.py` reused by monocular_depth
 ├── monocular_depth/               # DA3-fused PC action server; lives in its own venv `.venv-da3` (numpy==1.23.4) because `depth_anything_3` requires numpy<2 — isolation prevents cascade-breaking the rest of the vision tree
-└── foundation_stereo/             # FoundationStereo + Fast-FoundationStereo service/action + streaming depth publisher; lives in its own venv `.venv-fs` (torch 2.8 + cu128 + tensorrt 10.16) because those versions conflict with the shared `.venv-vision-main`
+└── foundation_stereo/             # FoundationStereo + Fast-FoundationStereo service/action + streaming depth publisher; lives in its own venv `.venv-fs` (torch 2.8 + cu128 + tensorrt 10.16) because those versions conflict with the shared `.venv-vision-main`. IR1→color alignment goes through `color_align_rs2.RealsenseAligner` (rs.align via software_device) — dense sub-pixel-splatted output. The naive forward-warp lives on as `color_align_legacy.reproject_ir_to_color` for non-RealSense sources; consumers of legacy output must hole-fill (medianBlur/dilate). See `debug_renders/2026-05-25-fs-vs-native-alignment/TRIAGE_FINDINGS.md` for the rationale.
 ```
 
 **Notes:**

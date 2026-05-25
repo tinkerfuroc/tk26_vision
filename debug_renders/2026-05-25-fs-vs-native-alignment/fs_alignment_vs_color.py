@@ -51,7 +51,7 @@ from smoke_rs_align import RealsenseAligner
 
 # And the legacy forward-warp from the FS package.
 sys.path.insert(0, "/home/tinker/tk25_ws/src/tk26_vision/src/foundation_stereo")
-from foundation_stereo.color_align import reproject_ir_to_color
+from foundation_stereo.color_align_legacy import reproject_ir_to_color
 
 CAM = os.environ.get("RS_CAM", "xarm_camera")
 OUT = ("/home/tinker/tk25_ws/src/tk26_vision/debug_renders/"
@@ -98,9 +98,9 @@ class Cap(Node):
             self.color, self.color_info, self.ir1_info, self.extr))
 
 
-def call_fs(node):
+def call_fs(node, *, align_to_color=False):
     req = FoundationStereoDepth.Request()
-    req.align_to_color = False
+    req.align_to_color = bool(align_to_color)
     req.want_pointcloud = False
     req.want_debug_jpeg = False
     req.z_far = 10.0
@@ -109,7 +109,7 @@ def call_fs(node):
     resp = fut.result()
     if resp is None or resp.status != 0:
         print(f"FS failed: {getattr(resp, 'error_msg', '?')}"); return None
-    print(f"FS forward={resp.forward_ms:.1f}ms shape="
+    print(f"FS (align={align_to_color}) forward={resp.forward_ms:.1f}ms shape="
           f"{(resp.depth_image.height, resp.depth_image.width)}")
     return node.bridge.imgmsg_to_cv2(resp.depth_image, "passthrough").astype(np.float32)
 
@@ -219,14 +219,14 @@ def main():
     print(f"legacy_color_raw coverage={(legacy_color_raw > 0).mean():.1%}  "
           f"after hole-fill={(legacy_color > 0).mean():.1%}")
 
-    # ----- OPTION 1 path: rs.align via software_device -----
-    aligner = RealsenseAligner(
-        K_ir=K_ir_scaled, K_color=K_color, R=R, T=T,
-        ir_hw=(H_i_fs, W_i_fs), color_hw=(H_c, W_c),
-        D_color=D_color, D_ir=D_ir)
-    aligner.align(fs_ir)  # warmup
-    rsalign_color = aligner.align(fs_ir)
-    print(f"rsalign_color shape={rsalign_color.shape}  "
+    # ----- OPTION 1 path: rs.align via software_device, end-to-end via FS service -----
+    # Ask the FS node to do the alignment itself (uses RealsenseAligner inside).
+    rsalign_color = call_fs(node, align_to_color=True)
+    if rsalign_color is None: return 1
+    if rsalign_color.shape != (H_c, W_c):
+        rsalign_color = cv2.resize(rsalign_color, (W_c, H_c),
+                                    interpolation=cv2.INTER_NEAREST)
+    print(f"rsalign_color (FS svc) shape={rsalign_color.shape}  "
           f"coverage={(rsalign_color > 0).mean():.1%}")
 
     # ----- visualisation -----

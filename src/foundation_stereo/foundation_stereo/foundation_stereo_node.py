@@ -30,7 +30,7 @@ from std_msgs.msg import Header
 from tinker_vision_msgs_26.action import FoundationStereoDepth as FSAction
 from tinker_vision_msgs_26.srv import FoundationStereoDepth as FSSrv
 
-from foundation_stereo.color_align import reproject_ir_to_color
+from foundation_stereo.color_align_rs2 import RealsenseAligner
 from foundation_stereo import stereo_runner as _sr
 from foundation_stereo.stereo_runner import StereoRunner
 
@@ -168,6 +168,11 @@ class FoundationStereoNode(Node):
         self._color_info: Optional[CameraInfo] = None
         self._extrinsics: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
+        # Cached IR1→color aligner (rs.align via software_device). Re-built
+        # only when intrinsics/extrinsics/output shape change.
+        self._aligner: Optional[RealsenseAligner] = None
+        self._aligner_key: Optional[tuple] = None
+
         self._setup_subscribers()
         self._setup_service()
         self._setup_action()
@@ -298,6 +303,37 @@ class FoundationStereoNode(Node):
         T = np.asarray(msg.translation, dtype=np.float32).reshape(3)
         self._extrinsics = (R, T)
 
+    def _get_aligner(self, *, K_ir: np.ndarray, ir_info: CameraInfo,
+                     ir_hw: Tuple[int, int]) -> RealsenseAligner:
+        """Build (or reuse a cached) RealsenseAligner for IR1→color
+        alignment. The aligner is rebuilt only when K_color, K_ir, R, T,
+        or the IR/color output shape change."""
+        K_color = _info_to_K(self._color_info)
+        R, T = self._extrinsics
+        out_hw = (self._color_info.height, self._color_info.width)
+        D_color = tuple(self._color_info.d) if self._color_info.d else None
+        D_ir = tuple(ir_info.d) if ir_info.d else None
+        key = (
+            K_color.tobytes(), K_ir.tobytes(),
+            R.tobytes(), T.tobytes(),
+            tuple(ir_hw), tuple(out_hw),
+            D_color, D_ir,
+        )
+        if self._aligner is None or self._aligner_key != key:
+            self._aligner = RealsenseAligner(
+                K_ir=K_ir, K_color=K_color,
+                R_ir_to_color=R, T_ir_to_color=T,
+                ir_hw=ir_hw, color_hw=out_hw,
+                D_color=list(D_color) if D_color else None,
+                D_ir=list(D_ir) if D_ir else None,
+            )
+            self._aligner_key = key
+            self.get_logger().info(
+                f"RealsenseAligner (re)built  ir={ir_hw} color={out_hw}  "
+                f"|T_d2c|={float(np.linalg.norm(T))*1000:.2f}mm  "
+                f"D_color_nonzero={bool(D_color) and any(D_color)}")
+        return self._aligner
+
     # ---------- shared inference core ----------
 
     def _run_inference(
@@ -399,11 +435,9 @@ class FoundationStereoNode(Node):
             K_color = _info_to_K(self._color_info)
             K_ir_scaled = K_ir.copy()
             K_ir_scaled[:2] *= result.scale_used  # cx, cy, fx, fy scale with resize; K[2,2] stays 1
-            R, T = self._extrinsics
-            depth = reproject_ir_to_color(
-                depth, K_ir_scaled, K_color, R, T,
-                out_hw=(self._color_info.height, self._color_info.width),
-            )
+            aligner = self._get_aligner(
+                K_ir=K_ir_scaled, ir_info=info_msg, ir_hw=depth.shape)
+            depth = aligner.align(np.ascontiguousarray(depth, dtype=np.float32))
             out_info = self._color_info
             K_for_cloud = K_color
         else:
@@ -681,14 +715,11 @@ class FoundationStereoNode(Node):
                 if color_info is None or extrinsics is None:
                     # Shouldn't happen — warmup gate already passed — but defensive.
                     continue
-                K_color = _info_to_K(color_info)
                 K_ir_scaled = K_ir.copy()
                 K_ir_scaled[:2] *= result.scale_used  # cx, cy, fx, fy scale with resize; K[2,2] stays 1
-                R, T = extrinsics
-                depth = reproject_ir_to_color(
-                    depth, K_ir_scaled, K_color, R, T,
-                    out_hw=(color_info.height, color_info.width),
-                )
+                aligner = self._get_aligner(
+                    K_ir=K_ir_scaled, ir_info=info_msg, ir_hw=depth.shape)
+                depth = aligner.align(np.ascontiguousarray(depth, dtype=np.float32))
                 out_info = color_info
             else:
                 out_info = info_msg

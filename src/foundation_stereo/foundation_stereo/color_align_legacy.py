@@ -1,17 +1,26 @@
-"""Reproject FoundationStereo depth from the IR1 grid into the color grid.
+"""LEGACY forward-warp IR1→color reprojection. Kept for non-RealSense
+sources or as a fallback — the FS node now uses
+`color_align_rs2.RealsenseAligner` which wraps librealsense's
+`rs.align` via a `software_device` and produces dense sub-pixel-
+splatted output without the sparse hole pattern this implementation
+leaves behind.
 
-Single pure-numpy entry point: `reproject_ir_to_color`. Used by both the
-streaming worker (`stream_align_to_color=true`) and per-call service /
-action requests (`align_to_color=true`). No GPU, no extra deps beyond
-numpy.
+Single pure-numpy entry point: `reproject_ir_to_color`. No GPU, no
+extra deps beyond numpy.
 
-Algorithm (spec §5):
+Algorithm:
   1. Backproject every valid IR1 pixel to a 3-D point in IR1 frame.
   2. Transform to color frame: P_c = R · P_ir + T.
   3. Project through K_color: (u_c, v_c) = (fx X_c / Z_c + cx, fy Y_c / Z_c + cy).
   4. Round to color pixel grid; np.minimum.at handles occlusion
      (nearer Z wins on collision).
   5. Pixels not hit by any valid projection stay zero (holes).
+
+Known artifact: forward-projection from a lower-resolution IR1 grid into
+a higher-resolution color grid leaves ~89% of color pixels as holes.
+Downstream consumers must dilate/median-blur to fill them; the sparse
+holes adjacent to valid projected pixels also make Sobel edge detection
+on the raw output produce spurious gradients everywhere.
 """
 
 from __future__ import annotations

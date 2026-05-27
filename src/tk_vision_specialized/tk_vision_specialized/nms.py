@@ -9,7 +9,10 @@ reused by `match_pipeline.py`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Sequence
+
+import numpy as np
 
 
 Bbox = tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixel coords
@@ -62,3 +65,105 @@ def suppress_within_category(
                 survivors.append(cand)
         kept.extend(survivors)
     return kept
+
+
+@dataclass(frozen=True)
+class Cluster:
+    rows: list[MatchRow]
+
+    def distinct_labels(self) -> list[str]:
+        seen: list[str] = []
+        for r in self.rows:
+            if r.label not in seen:
+                seen.append(r.label)
+        return seen
+
+    def is_conflict(self) -> bool:
+        return len(self.rows) >= 2 and len(self.distinct_labels()) >= 2
+
+
+@dataclass(frozen=True)
+class JudgePayload:
+    cluster: Cluster
+    crop: np.ndarray
+    crop_origin: tuple[int, int]                # (x_min, y_min) in scene coords
+    competing: list[tuple[str, str]]            # (label, ref_data_url), deduped
+
+
+class _UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
+    def groups(self) -> list[list[int]]:
+        gmap: dict[int, list[int]] = {}
+        for i in range(len(self.parent)):
+            gmap.setdefault(self.find(i), []).append(i)
+        return list(gmap.values())
+
+
+def cluster_for_judge(
+    rows: Sequence[MatchRow],
+    iou_thresh: float,
+) -> list[Cluster]:
+    """Greedy connected-components over the IoU graph.
+
+    Two rows share an edge iff their IoU >= `iou_thresh`. Connected
+    components become clusters. Singletons and same-label-only clusters are
+    not conflicts; multi-label clusters of size >= 2 are."""
+
+    rows = list(rows)
+    n = len(rows)
+    if n == 0:
+        return []
+
+    uf = _UnionFind(n)
+    for i, j in combinations(range(n), 2):
+        if iou(rows[i].bbox, rows[j].bbox) >= iou_thresh:
+            uf.union(i, j)
+
+    return [Cluster(rows=[rows[k] for k in members]) for members in uf.groups()]
+
+
+def build_judge_payload(
+    cluster: Cluster,
+    items: dict[str, str],            # label -> ref_data_url
+    scene_bgr: np.ndarray,
+    margin_px: int,
+) -> JudgePayload:
+    """Compute the union bbox of cluster members, expand by `margin_px`,
+    clamp to scene bounds, and produce the cropped image + the competing
+    label/ref pairs (deduped by label)."""
+
+    h, w = scene_bgr.shape[:2]
+    x1 = min(r.bbox[0] for r in cluster.rows)
+    y1 = min(r.bbox[1] for r in cluster.rows)
+    x2 = max(r.bbox[2] for r in cluster.rows)
+    y2 = max(r.bbox[3] for r in cluster.rows)
+
+    x1c = max(0, x1 - margin_px)
+    y1c = max(0, y1 - margin_px)
+    x2c = min(w, x2 + margin_px)
+    y2c = min(h, y2 + margin_px)
+    crop = scene_bgr[y1c:y2c, x1c:x2c].copy()
+
+    seen: set[str] = set()
+    competing: list[tuple[str, str]] = []
+    for r in cluster.rows:
+        if r.label in seen:
+            continue
+        if r.label in items:
+            competing.append((r.label, items[r.label]))
+            seen.add(r.label)
+    return JudgePayload(cluster=cluster, crop=crop, crop_origin=(x1c, y1c),
+                        competing=competing)

@@ -2,8 +2,8 @@
 string camera
 
 # Empty list = scan every entry in items_map.yaml. Non-empty list = scan only
-# these dataset keys; unknown keys are warned about and dropped from the scan.
-# If every key in the filter is unknown, the response is status=1.
+# these dataset keys; unknown keys are dropped from the scan. If every key in
+# the filter is unknown, the response is status=1.
 string[] category_filter
 
 # TF frame to express centroids in. Empty string = raw camera frame.
@@ -23,13 +23,18 @@ bool return_segments
 
 ---
 
-# Response shape is identical to ObjectDetection.srv so callers expecting
-# /object_detection_yolo's contract are drop-in compatible.
+# Response field set is the union of ObjectDetection.srv and
+# ObjectDetectionGeneralist.srv. person_id kept for ABI parity with
+# ObjectDetection.srv (always 0). detection_source mirrors the generalist's
+# tag field. Callers written against ObjectDetection.srv can be retargeted
+# at this service by swapping the srv import; this response's field set is
+# a superset of ObjectDetection.srv's.
 std_msgs/Header header
-int32 status                     # 0=ok with >=1 object, 1=empty/failure
+int32 status                     # 0 = ok with >=1 object, 1 = empty / failure (see error_msg)
 string error_msg
+int32 person_id                  # always 0; kept for ABI parity with ObjectDetection.srv
 Object[] objects                 # cls / conf / centroid populated
-string detection_source          # always "vlm_match_all"
+string detection_source          # e.g. "vlm_match_all"
 
 sensor_msgs/Image rgb_image
 sensor_msgs/Image depth_image

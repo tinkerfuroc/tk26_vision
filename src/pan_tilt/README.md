@@ -110,6 +110,39 @@ ros2 topic pub --once /pan_tilt_controller/cmd \
 - `config/specs.json` is retained as historical calibration/reference data only.
   The runtime stack does not load it anymore.
 
+## Calibration
+
+The pan-tilt / head-camera extrinsic calibration yaml lives in
+`tinker_robot_config` under the per-robot tree:
+
+```
+src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/calibration.yaml
+```
+
+`calib_web` and `calibrate_collect` resolve this file by default via the
+`tinker_robot_config` resolver (which keys off `$ROBOT_NAME`). Operators can
+override with `-p config:=<path>` to point at a custom file (e.g. a pruned
+sidecar produced by `calib_web`'s prune-apply endpoint).
+
+```bash
+# Default — uses $ROBOT_NAME to pick robots/<ROBOT_NAME>/pan_tilt/calibration.yaml
+ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_web --ros-args -p bind:=127.0.0.1 -p port:=8765
+ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_collect --ros-args -p phase:=both -p out_dir:=$PWD/calib_out
+
+# Override
+ros2 run pan_tilt calibrate_collect --ros-args -p config:=/path/to/custom.yaml -p phase:=both
+```
+
+`calib_web`'s write paths (`save_waypoints_to_config`,
+`_overwrite_source_with_prune`) write back to the canonical source-tree
+file under `tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/`,
+not the install share — backup `*.yaml.old-<ts>` files land alongside the
+source.
+
+There is no in-tree `config/calibration.yaml` in this package anymore (it
+was retired in P5a). Full calibration procedure docs live alongside the
+code at [`pan_tilt/calibration/readme.md`](./pan_tilt/calibration/readme.md).
+
 ## Firmware Assumptions
 
 The current controller implementation expects the firmware behavior documented

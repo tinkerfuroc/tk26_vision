@@ -1,8 +1,10 @@
 """ROS 2 node + FastAPI app for interactive calibration waypoint authoring.
 
 Run:
-    ros2 run pan_tilt calibrate_web --ros-args \\
-        -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml \\
+    # `config` defaults to the per-robot calibration.yaml resolved via
+    # tinker_robot_config (requires $ROBOT_NAME). Override with -p config:=…
+    # to point at a custom file.
+    ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_web --ros-args \\
         -p bind:=127.0.0.1 -p port:=8765
 
 Then open http://127.0.0.1:8765 in a browser.
@@ -57,6 +59,14 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 
+try:
+    # Optional at import time so unit tests / tooling can load this module
+    # without the workspace fully installed. Resolution failures fall back
+    # to an empty default — operators must then pass `-p config:=…`.
+    from tinker_robot_config import resolver as _trc_resolver
+except ImportError:  # pragma: no cover
+    _trc_resolver = None
+
 from .calibration.aruco_detect import (
     BoardSpec,
     build_board,
@@ -78,6 +88,26 @@ from .calibration.waypoint_prune import Predicted, prune_waypoints
 
 
 log = logging.getLogger("calib_web")
+
+
+def _default_calib_config_path() -> str:
+    """Resolve calibration.yaml via tinker_robot_config; fallback to legacy.
+
+    Returns the absolute install-share path for the per-robot
+    ``pan_tilt/calibration.yaml`` (the install symlink chain lands at
+    ``tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/calibration.yaml``).
+    Returns ``''`` if the resolver isn't available or fails — operators must
+    then pass ``-p config:=…`` explicitly. Operator-supplied non-empty values
+    are always respected over this default.
+    """
+    if _trc_resolver is None:
+        return ''
+    try:
+        return str(_trc_resolver.load().path('pan_tilt/calibration.yaml'))
+    except Exception:  # pragma: no cover - resolver error path
+        # ResolverError, missing ROBOT_NAME, or missing file — operator
+        # can still pass -p config:= to override.
+        return ''
 
 
 # Gate thresholds: single source of truth lives in run_calibration.GATES; here
@@ -506,7 +536,11 @@ class CalibWebNode(Node):
     def __init__(self):
         super().__init__("calib_web")
 
-        self.declare_parameter("config", "")
+        # Default resolves the per-robot calibration.yaml via
+        # tinker_robot_config — install-share path (symlink chain) lands at
+        # tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/.
+        # Operators may still pass `-p config:=…` to point at a custom file.
+        self.declare_parameter("config", _default_calib_config_path())
         self.declare_parameter("bind", "127.0.0.1")
         self.declare_parameter("port", 8765)
         self.declare_parameter("draft_yaml_out", "")
@@ -1147,20 +1181,28 @@ class CalibWebNode(Node):
 def _resolve_source_tree_yaml(config_path: str) -> Optional[Path]:
     """Walk `config_path` from the install tree back to the colcon source tree.
 
-    A typical install path looks like
-    ``<ws>/install/pan_tilt/share/pan_tilt/config/calibration.yaml``; the
-    matching source-tree file lives at
-    ``<ws>/src/<...>/pan_tilt/config/calibration.yaml``. Returns the source
-    path if a match is found under any ``src/`` sibling of the detected
-    ``install/`` ancestor; otherwise None.
+    Two install patterns are recognised:
 
-    Important: do NOT call ``Path.resolve()`` on `config_path`. Under
-    ``colcon build --symlink-install`` the install file is a symlink chain
-    into ``src/``, so resolving collapses the path to the source tree and
-    erases the ``install`` segment we depend on. We instead absolutise
-    *without* following symlinks, then -- if the install path doesn't show
-    up that way either -- fall back to ``Path.resolve()`` to handle the
-    case where the operator already passed a source-tree path directly.
+    1. Legacy in-tree layout (pre-P5a):
+       ``<ws>/install/pan_tilt/share/pan_tilt/config/calibration.yaml``
+       → ``<ws>/src/<...>/pan_tilt/config/calibration.yaml``.
+
+    2. tinker_robot_config per-robot layout (P5a and later):
+       ``<ws>/install/tinker_robot_config/share/tinker_robot_config/robots/<robot>/pan_tilt/calibration.yaml``
+       → ``<ws>/src/tk25_basic/src/tinker_robot_config/robots/<robot>/pan_tilt/calibration.yaml``.
+
+    Returns the source-tree path if a match is found; otherwise None.
+
+    Important: do NOT call ``Path.resolve()`` on `config_path` in pattern 1.
+    Under ``colcon build --symlink-install`` the install file is a symlink
+    chain into ``src/``, so resolving collapses the path and erases the
+    ``install`` segment we depend on. We instead absolutise *without*
+    following symlinks, then -- if the install path doesn't show up that
+    way either -- fall back to ``Path.resolve()`` for source-tree paths.
+
+    For pattern 2 we trust the install symlink chain directly because the
+    per-robot file is unambiguously canonical: ``Path.resolve()`` on the
+    install share lands exactly at the source-tree file we want to write.
     """
     if not config_path:
         return None
@@ -1171,6 +1213,21 @@ def _resolve_source_tree_yaml(config_path: str) -> Optional[Path]:
     p = raw if raw.is_absolute() else (Path.cwd() / raw)
 
     parts = p.parts
+
+    # Pattern 2: tinker_robot_config per-robot layout. Detect by the
+    # ``tinker_robot_config/share/tinker_robot_config/robots/`` signature in
+    # the install path, and follow the symlink chain to the source. The
+    # install share symlinks straight at the source under tk25_basic, so
+    # ``Path.resolve()`` is the cleanest way to land there.
+    if (
+        "install" in parts
+        and "tinker_robot_config" in parts
+        and "robots" in parts
+    ):
+        resolved = p.resolve()
+        if resolved.is_file() and "src" in resolved.parts:
+            return resolved
+
     if "install" in parts:
         ws = Path(*parts[: parts.index("install")])
     else:
@@ -1181,6 +1238,14 @@ def _resolve_source_tree_yaml(config_path: str) -> Optional[Path]:
         rparts = resolved.parts
         if "src" not in rparts:
             return None
+        # If the resolved source path is under the per-robot
+        # tinker_robot_config tree, return it directly — no rglob needed.
+        if (
+            "tinker_robot_config" in rparts
+            and "robots" in rparts
+            and resolved.is_file()
+        ):
+            return resolved
         ws = Path(*rparts[: rparts.index("src")])
 
     src_root = ws / "src"

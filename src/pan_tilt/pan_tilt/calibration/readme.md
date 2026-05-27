@@ -15,7 +15,10 @@ ros2 launch orbbec_camera femto_bolt.launch.py depth_registration:=true enable_i
 And then
 
 ```bash
-ros2 run pan_tilt calibrate_web --ros-args -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml -p bind:=127.0.0.1 -p port:=8123 -p draft_yaml_out:=/tmp/calibration.draft.yaml
+# `config` defaults to the per-robot calibration.yaml resolved via
+# tinker_robot_config ($ROBOT_NAME). Override with -p config:=… if you
+# need a custom file.
+ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_web --ros-args -p bind:=127.0.0.1 -p port:=8123 -p draft_yaml_out:=/tmp/calibration.draft.yaml
 ```
 
 
@@ -128,8 +131,9 @@ Paste each pose into the `.yaml` as a list of floats in radians, in the order th
 ### 4. Edit the collector config
 
 ```bash
-$EDITOR $(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml
-# ...or edit the source at src/pan_tilt/config/calibration.yaml and rebuild.
+# Per-robot calibration.yaml — edit the source directly; calib_web /
+# calibrate_collect resolve to this file via tinker_robot_config.
+$EDITOR src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/calibration.yaml
 ```
 
 Fill in `phase1_waypoints`, `phase2_waypoints`, `sanity_xarm_angles_rad`. Check that topic names, the `xarm_service`, and frame names (`base_link`, `link_eef`) match your robot. If you changed the ChArUco board, update the `board:` section.
@@ -153,8 +157,10 @@ In one terminal, bring up the robot (camera + pan-tilt + xArm driver). In anothe
 
 ```bash
 source /home/tinker/tk25_ws/install/setup.bash
-ros2 run pan_tilt calibrate_collect --ros-args \
-    -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml \
+# `config` defaults to the per-robot calibration.yaml resolved via
+# tinker_robot_config ($ROBOT_NAME). Override with -p config:=… if you
+# need a custom file (e.g. a pruned sidecar produced by calib_web).
+ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_collect --ros-args \
     -p out_dir:=$HOME/calib_out \
     -p phase:=both
 ```
@@ -373,8 +379,7 @@ The chain/polish residuals are camera-frame metrics: they say "the FK reproduces
 Optionally set explicit `validation_pan_range_deg`/`validation_tilt_range_deg` in the collector config (falls back to the convex hull of `pan_grid_deg × tilt_grid_deg` if absent). Then:
 
 ```bash
-ros2 run pan_tilt calibrate_collect --ros-args \
-    -p config:=$(ros2 pkg prefix pan_tilt)/share/pan_tilt/config/calibration.yaml \
+ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_collect --ros-args \
     -p out_dir:=$PWD/calib_out -p phase:=phase4_validation
 
 python -m pan_tilt.calibration.run_calibration validate \

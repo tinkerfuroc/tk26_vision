@@ -143,7 +143,19 @@ def build_judge_payload(
 ) -> JudgePayload:
     """Compute the union bbox of cluster members, expand by `margin_px`,
     clamp to scene bounds, and produce the cropped image + the competing
-    label/ref pairs (deduped by label)."""
+    label/ref pairs (deduped by label).
+
+    Defensive: an empty cluster yields an empty crop + empty competing list
+    rather than raising. cluster_for_judge never emits empty clusters in
+    practice, but consumers may construct payloads directly in tests."""
+
+    if not cluster.rows:
+        return JudgePayload(
+            cluster=cluster,
+            crop=np.zeros((0, 0, 3), dtype=scene_bgr.dtype),
+            crop_origin=(0, 0),
+            competing=[],
+        )
 
     h, w = scene_bgr.shape[:2]
     x1 = min(r.bbox[0] for r in cluster.rows)
@@ -155,6 +167,8 @@ def build_judge_payload(
     y1c = max(0, y1 - margin_px)
     x2c = min(w, x2 + margin_px)
     y2c = min(h, y2 + margin_px)
+    # .copy() so the judge consumer can draw on the crop without aliasing
+    # the live scene buffer (a camera callback may overwrite it later).
     crop = scene_bgr[y1c:y2c, x1c:x2c].copy()
 
     seen: set[str] = set()
@@ -165,5 +179,9 @@ def build_judge_payload(
         if r.label in items:
             competing.append((r.label, items[r.label]))
             seen.add(r.label)
-    return JudgePayload(cluster=cluster, crop=crop, crop_origin=(x1c, y1c),
-                        competing=competing)
+    return JudgePayload(
+        cluster=cluster,
+        crop=crop,
+        crop_origin=(x1c, y1c),
+        competing=competing,
+    )

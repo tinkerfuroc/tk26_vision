@@ -17,10 +17,14 @@ from tk_vision_specialized.vlm_match_client import (
     decode_qwen_response,
     build_match_client,
 )
+from tk_vision_specialized.vlm_match_client_gemini import (
+    GeminiMatchClient,
+    decode_gemini_response,
+)
 
 # Re-export so `MatchRow` is reachable from the test module — also satisfies
 # ament_flake8 which would otherwise flag the import as unused.
-__all__ = ['MatchRow']
+__all__ = ['MatchRow', 'GeminiMatchClient', 'decode_gemini_response']
 
 
 def _canned_completion(content: str):
@@ -199,3 +203,56 @@ def test_qwen_match_batch_end_to_end(monkeypatch):
 def test_build_match_client_unknown_provider_raises():
     with pytest.raises(ValueError, match='Unknown provider'):
         build_match_client('llama')
+
+
+def test_decode_gemini_pixel_xyxy_passthrough():
+    body = json.dumps({
+        'detections': [
+            {'label': 'cola',
+             'bbox_xyxy': [10, 20, 30, 40], 'confidence': 0.8},
+        ],
+    })
+    rows = decode_gemini_response(
+        body, scene_w=200, scene_h=200, allowed_labels={'cola'},
+    )
+    assert len(rows) == 1
+    assert rows[0].bbox == (10, 20, 30, 40)
+
+
+def test_decode_gemini_clamps_out_of_bounds():
+    body = json.dumps({
+        'detections': [
+            {'label': 'cola',
+             'bbox_xyxy': [-50, -10, 500, 1000], 'confidence': 0.7},
+        ],
+    })
+    rows = decode_gemini_response(
+        body, scene_w=100, scene_h=100, allowed_labels={'cola'},
+    )
+    assert len(rows) == 1
+    assert rows[0].bbox == (0, 0, 99, 99)
+
+
+def test_decode_gemini_drops_hallucinated_label():
+    body = json.dumps({
+        'detections': [
+            {'label': 'apple',
+             'bbox_xyxy': [0, 0, 50, 50], 'confidence': 0.9},
+        ],
+    })
+    rows = decode_gemini_response(
+        body, scene_w=100, scene_h=100, allowed_labels={'milk'},
+    )
+    assert rows == []
+
+
+def test_gemini_client_raises_when_key_missing(monkeypatch):
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    with pytest.raises(RuntimeError, match='OPENROUTER_API_KEY'):
+        GeminiMatchClient(model='google/gemini-2.5-pro')
+
+
+def test_build_match_client_returns_gemini(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'fake')
+    client = build_match_client('gemini')
+    assert isinstance(client, GeminiMatchClient)

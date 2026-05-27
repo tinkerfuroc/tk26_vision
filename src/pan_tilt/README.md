@@ -100,13 +100,21 @@ ros2 topic pub --once /pan_tilt_controller/cmd \
 - Runtime parameters live in [config/pan_tilt.yaml](./config/pan_tilt.yaml).
 - Runtime geometry lives in `tinker_urdf`:
   `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` is a
-  `pan_tilt_macro` (parent / prefix / attach_xyz / attach_rpy);
+  `pan_tilt_macro` (parent / prefix / attach_xyz / attach_rpy /
+  camera_mount_xyz / camera_mount_rpy);
   `pan_tilt_standalone.urdf.xacro` is the standalone wrapper this launch
   loads, and `tracer_mini_manipulator.urdf.xacro` includes the same macro
   with `parent="base_link"` for the combined `mobile_manipulator` URDF.
   The geometry lives in `tinker_urdf` so the robot-description package does
   not gain a runtime dependency on `pan_tilt`; `pan_tilt` depends on
   `tinker_urdf` instead.
+- Per-robot URDF overrides come from
+  `tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml`
+  (`attach_xyz`/`attach_rpy`/`camera_mount_xyz`/`camera_mount_rpy`).
+  `pan_tilt.launch.py` includes `tinker_robot_config`'s
+  `robot_description.launch.py` wrapper, which flattens that sub-tree
+  into xacro `--mappings`. The macro defaults still apply for manual
+  `xacro …` invocations or `tracer_mini_manipulator`. (P6.2)
 - `config/specs.json` is retained as historical calibration/reference data only.
   The runtime stack does not load it anymore.
 

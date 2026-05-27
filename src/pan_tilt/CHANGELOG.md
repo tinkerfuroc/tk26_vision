@@ -5,6 +5,16 @@ All notable changes to this package land here, newest first.
 ## [Unreleased]
 
 ### Changed
+- `pan_tilt.launch.py` publishes the URDF via the new
+  `tinker_robot_config/robot_description.launch.py` wrapper, with
+  `overrides_key='pan_tilt.urdf_overrides'` and the existing private-topic
+  remappings (`/pan_tilt/robot_description`, `/pan_tilt/joint_states`)
+  threaded through the wrapper's `remappings` arg. The xacro macro's
+  hardcoded attach/camera_mount defaults remain as a last-ditch fallback
+  for tools that don't go through the wrapper; runtime URDF now reflects
+  `robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml`. Operational disable
+  (`launch_robot_state_publisher:=false`) and `IfCondition` gating are
+  preserved. Pairs with tk25_basic P6.1 + follow-up commits. (P6.2)
 - `calib_web` and `calibrate_collect` now resolve `calibration.yaml` via
   `tinker_robot_config` — default to the per-robot file under
   `robots/<ROBOT_NAME>/pan_tilt/calibration.yaml`. Operators may still

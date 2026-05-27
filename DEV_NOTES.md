@@ -16,6 +16,35 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-05-27 — `object_match_all` node added
+
+A new service `/object_match_all` answers the dual question to `/object_match`:
+"given the items_map, where is each item in the camera frame?" Concurrent
+batched VLM calls with per-conflict VLM-judge resolution, response shape
+identical to `ObjectDetection.srv` plus the `detection_source` superset
+field.
+
+- Spec: `docs/superpowers/specs/2026-05-27-object-match-all-design.md`
+- Plan: `docs/superpowers/plans/2026-05-27-object-match-all.md`
+- Scripts: `src/tk_vision_specialized/scripts/produce_match_ground_truth.py`
+  + `benchmark_match_batch_size.py` (run before relying on the `batch_size`
+  default).
+
+Open items operator-side:
+- Capture a 10-scene benchmark set and regenerate GT + sweep to pin
+  `batch_size`.
+- T4 hardware pass against `shelf_scene` to compare detection quality with
+  `/object_detection_yolo` on the same scene.
+- Two carried-over follow-ups in match/judge clients (Important per code
+  review): (a) extract the retry loop into `_vlm_common.py` so
+  `max_retries=0` honors zero attempts rather than coercing to 1; (b) port
+  Task 6's lazy `from openai import OpenAI` pattern back into Task 5's
+  `vlm_match_client.py` to eliminate the `OpenAI = None` -> `TypeError`
+  footgun. Both are non-blocking for default-config production use
+  (default `vlm_max_retries=1`, openai installed in venv).
+
+---
+
 ## 2026-05-02 — `object_detection_generalist` SAM backend: FastSAM → MobileSAM
 
 ### Symptom

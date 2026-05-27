@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import pytest
 
 from tk_vision_specialized.nms import (
@@ -71,3 +69,16 @@ def test_within_category_idempotent():
 
 def test_within_category_empty_input():
     assert suppress_within_category([], iou_thresh=0.5) == []
+
+
+def test_within_category_suppresses_at_threshold_equality():
+    # Pin the strict `<` semantics: IoU == iou_thresh -> suppress.
+    # A=(0,0,10,10) area=100, B=(0,0,10,5) area=50, intersection=50
+    # -> IoU = 50 / (100 + 50 - 50) = 0.5.
+    rows = [
+        MatchRow(label='milk', bbox=(0, 0, 10, 10), conf=0.9),
+        MatchRow(label='milk', bbox=(0, 0, 10, 5), conf=0.5),
+    ]
+    kept = suppress_within_category(rows, iou_thresh=0.5)
+    assert len(kept) == 1
+    assert kept[0].conf == 0.9

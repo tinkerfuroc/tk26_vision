@@ -1,17 +1,15 @@
-"""Pure-function NMS and clustering helpers for object_match_all.
+"""Pure-function NMS, clustering, and judge-payload helpers for
+object_match_all.
 
 No ROS imports here on purpose: this module is unit-testable from a plain
-pytest run without sourcing the workspace. The shapes (`MatchRow`,
-`Cluster`, `JudgePayload`) are reused by `match_pipeline.py`.
+pytest run without sourcing the workspace. The shapes defined here are
+reused by `match_pipeline.py`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
 from typing import Sequence
-
-import numpy as np
 
 
 Bbox = tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixel coords

@@ -1,0 +1,36 @@
+# Camera identifier ("realsense", "orbbec", or substrings).
+string camera
+
+# Empty list = scan every entry in items_map.yaml. Non-empty list = scan only
+# these dataset keys; unknown keys are warned about and dropped from the scan.
+# If every key in the filter is unknown, the response is status=1.
+string[] category_filter
+
+# TF frame to express centroids in. Empty string = raw camera frame.
+string target_frame
+
+# Sort modes (mirrors ObjectDetectionGeneralist.srv conventions):
+#   sort_closest  - by sqrt(x^2+y^2+z^2) ascending, camera frame
+#   sort_highest  - by camera-frame Z ascending
+# Both false (default) = confidence descending.
+bool sort_closest
+bool sort_highest
+
+# Payload toggles.
+bool return_rgb_image
+bool return_depth_image
+bool return_segments
+
+---
+
+# Response shape is identical to ObjectDetection.srv so callers expecting
+# /object_detection_yolo's contract are drop-in compatible.
+std_msgs/Header header
+int32 status                     # 0=ok with >=1 object, 1=empty/failure
+string error_msg
+Object[] objects                 # cls / conf / centroid populated
+string detection_source          # always "vlm_match_all"
+
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image
+sensor_msgs/Image[] segments

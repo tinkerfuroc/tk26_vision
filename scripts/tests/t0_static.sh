@@ -67,6 +67,7 @@ ifaces=(
     tinker_vision_msgs_26/srv/SetZero
     tinker_vision_msgs_26/srv/FoundationStereoDepth
     tinker_vision_msgs_26/action/FoundationStereoDepth
+    tinker_vision_msgs_26/srv/ObjectMatchAll
 )
 iface_bad=0
 for i in "${ifaces[@]}"; do
@@ -91,6 +92,7 @@ entries=(
     kimi_api:feature_matching
     kimi_api:grocery_categorize
     tk_vision_specialized:spot_on_shelf_server
+    tk_vision_specialized:object_match_all_server
     vision_track:person_track_server
 )
 # For kimi_api nodes, give a smoke key so _env.require_api_key() doesn't kill them during node boot.
@@ -106,6 +108,10 @@ for pair in "${entries[@]}"; do
     esac
     case "$entry" in
         controller) extra_args=(--ros-args -p device:=/dev/ttyUSB_nonexistent) ;;
+        # object_match_all_server constructs QwenMatchClient at __init__,
+        # which raises RuntimeError without a DashScope key. Smoke key keeps
+        # T0.5 focused on import sanity (the negative path lives in T1).
+        object_match_all_server) env_prefix=(env DASHSCOPE_API_KEY=smoke) ;;
     esac
     # --ros-args --help exits immediately after printing; we just want to confirm
     # no ImportError/ModuleNotFoundError in the first 3 seconds of node boot.

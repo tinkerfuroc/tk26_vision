@@ -842,6 +842,10 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'n_objects': len(objects),
             'n_bboxes': len(bboxes),
             'error': result.get('error'),
+            # Plumbed from the base class's `_acquire_depth`; only meaningful
+            # on the realsense path (orbbec path doesn't touch FFS so the
+            # field stays at its 'native' default).
+            'depth_source': getattr(self, '_last_depth_source', 'native'),
         }
 
         if used_source == 'yolo':

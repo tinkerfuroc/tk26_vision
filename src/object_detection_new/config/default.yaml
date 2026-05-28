@@ -32,3 +32,11 @@
     # - 'closest': Sort by distance (closest objects first)
     # - 'highest': Sort by height (highest objects first)
     sort_mode: 'closest'
+
+    # FoundationStereo depth fallback
+    prefer_ffs: true
+    ffs_service: '/foundation_stereo/get_depth'
+    ffs_wait_for_service_s: 0.2
+    ffs_call_timeout_s: 8.0
+    ffs_align_to_color: true
+    ffs_fallback_log_period_s: 30.0

@@ -908,6 +908,108 @@ $$('.jog-buttons button').forEach(b => {
   });
 });
 
+// Zero-state wizard (firmware: T:501 raw=1 new=2, then T:502 id=1, T:502 id=2).
+// Split across two server endpoints because the operator must physically
+// disconnect and reconnect motor 2 between the two firmware writes. The state
+// machine here just gates the buttons and posts on advance.
+//
+//   idle ── start ──► unplug ── /remap ──► reconnect ── /finalize ──► done
+//                                ▲ (firmware IDs mutated past this point)
+//                                │ aborting strands the chain half-configured
+const ZW_STEPS = ['idle', 'unplug', 'reconnect', 'done'];
+
+function zwShow(stepName) {
+  for (const s of ZW_STEPS) {
+    const el = document.getElementById(`zw-${s}`);
+    if (el) el.hidden = (s !== stepName);
+  }
+}
+
+function zwSetStatus(text, cls) {
+  const status = $('#pt-set-zero-status');
+  status.textContent = text;
+  status.className = 'status-line ' + (cls || '');
+}
+
+async function zwPost(url, label) {
+  zwSetStatus(`${label}…`, 'warn');
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      zwSetStatus(`FAILED (HTTP ${r.status}): ${body.detail || body.message || r.statusText}`, 'err');
+      return { ok: false };
+    }
+    if (!body.ok) {
+      zwSetStatus(`FAILED: ${body.message || '(no message)'}`, 'err');
+      return { ok: false };
+    }
+    zwSetStatus(`${label} OK: ${body.message || ''}`, 'ok');
+    return { ok: true };
+  } catch (e) {
+    zwSetStatus(`ERROR: ${e}`, 'err');
+    return { ok: false };
+  }
+}
+
+$('#btn-zw-start').addEventListener('click', () => {
+  if (!confirm(
+    'Start the firmware zero-state wizard?\n\n'
+    + 'The CURRENT physical pan-tilt pose will become the new firmware zero. '
+    + 'Make sure the pan-tilt is already jogged to where you want (0, 0).\n\n'
+    + 'Existing pan-tilt calibration will be invalidated.'
+  )) return;
+  zwSetStatus('wizard started — waiting for motor 2 to be unplugged.', 'warn');
+  zwShow('unplug');
+});
+
+$('#btn-zw-cancel-1').addEventListener('click', () => {
+  zwSetStatus('wizard cancelled (no firmware writes were made).', '');
+  zwShow('idle');
+});
+
+$('#btn-zw-unplug-done').addEventListener('click', async () => {
+  const btn = $('#btn-zw-unplug-done');
+  btn.disabled = true;
+  const res = await zwPost('/api/pantilt/zero_wizard/remap', 'sending T:501 raw=1 new=2');
+  btn.disabled = false;
+  if (res.ok) {
+    zwShow('reconnect');
+  }
+  // On failure stay on the unplug step so the operator can retry.
+});
+
+$('#btn-zw-cancel-2').addEventListener('click', () => {
+  if (!confirm(
+    'Abort the wizard now?\n\n'
+    + 'T:501 has already been sent, so the servo ID mapping is in a transitional '
+    + 'state. To recover you must either re-run the wizard end-to-end, or power-cycle '
+    + 'the servo bus and reset IDs manually.'
+  )) return;
+  zwSetStatus('wizard aborted AFTER T:501 — servo ID mapping is half-applied.', 'err');
+  zwShow('idle');
+});
+
+$('#btn-zw-reconnect-done').addEventListener('click', async () => {
+  const btn = $('#btn-zw-reconnect-done');
+  btn.disabled = true;
+  const res = await zwPost('/api/pantilt/zero_wizard/finalize', 'sending T:502 id=1 then id=2');
+  btn.disabled = false;
+  if (res.ok) {
+    zwShow('done');
+    zwSetStatus('zero state stored on both servos.', 'ok');
+  }
+});
+
+$('#btn-zw-restart').addEventListener('click', () => {
+  zwSetStatus('', '');
+  zwShow('idle');
+});
+
 // ============================================================================
 // Calibrate tab
 // ============================================================================

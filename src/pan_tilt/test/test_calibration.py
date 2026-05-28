@@ -866,7 +866,7 @@ def _phase4_samples(truth, T_base_marker, n=20, noise_rng=None,
     """Synthesize phase-4 samples for a board fixed in base_link."""
     rng = np.random.default_rng(RNG_SEED + 4242)
     pan_min, pan_max = np.deg2rad(-30.0), np.deg2rad(30.0)
-    tilt_min, tilt_max = np.deg2rad(15.0), np.deg2rad(45.0)
+    tilt_min, tilt_max = np.deg2rad(15.0), np.deg2rad(30.0)
     samples = []
     for _ in range(n):
         theta_p = float(rng.uniform(pan_min, pan_max))
@@ -1229,7 +1229,7 @@ def test_apply_to_urdf_passes_normal_yaw():
 # 2026-04-30 follow-up: the URDF chain has no notion of theta_p_offset /
 # theta_t_offset; the state publisher applies them to firmware feedback before
 # publishing /joint_states. Without this the URDF mis-represents the camera
-# pose by up to ~45° (the parked-tilt angle), projecting vision points below
+# pose by up to ~30° (the parked-tilt angle), projecting vision points below
 # ground in the seat-recommend pipeline.
 
 def _run_state_publisher_round_trip(pan_offset_rad, tilt_offset_rad,

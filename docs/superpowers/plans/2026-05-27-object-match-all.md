@@ -26,7 +26,7 @@ source /home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/activate
 After Task 1 (interfaces build), additionally:
 
 ```bash
-source /home/tinker/tk25_ws/install/setup.bash
+source /home/tinker/tk25_ws/src/tk26_vision/install/setup.bash
 ```
 
 **Build commands** use the tk26_vision wrapper which patches install-tree shebangs:
@@ -68,8 +68,8 @@ Create `src/tk26_vision/src/tinker_vision_msgs_26/srv/ObjectMatchAll.srv` with t
 string camera
 
 # Empty list = scan every entry in items_map.yaml. Non-empty list = scan only
-# these dataset keys; unknown keys are warned about and dropped from the scan.
-# If every key in the filter is unknown, the response is status=1.
+# these dataset keys; unknown keys are dropped from the scan. If every key in
+# the filter is unknown, the response is status=1.
 string[] category_filter
 
 # TF frame to express centroids in. Empty string = raw camera frame.
@@ -89,13 +89,18 @@ bool return_segments
 
 ---
 
-# Response shape is identical to ObjectDetection.srv so callers expecting
-# /object_detection_yolo's contract are drop-in compatible.
+# Response field set is the union of ObjectDetection.srv and
+# ObjectDetectionGeneralist.srv. person_id kept for ABI parity with
+# ObjectDetection.srv (always 0). detection_source mirrors the generalist's
+# tag field. Callers written against ObjectDetection.srv can be retargeted
+# at this service by swapping the srv import; this response's field set is
+# a superset of ObjectDetection.srv's.
 std_msgs/Header header
-int32 status                     # 0=ok with >=1 object, 1=empty/failure
+int32 status                     # 0 = ok with >=1 object, 1 = empty / failure (see error_msg)
 string error_msg
+int32 person_id                  # always 0; kept for ABI parity with ObjectDetection.srv
 Object[] objects                 # cls / conf / centroid populated
-string detection_source          # always "vlm_match_all"
+string detection_source          # e.g. "vlm_match_all"
 
 sensor_msgs/Image rgb_image
 sensor_msgs/Image depth_image
@@ -125,7 +130,7 @@ Expected: `Summary: 1 package finished` with no errors. If colcon errors on stal
 - [ ] **Step 4: Verify the generated Python import**
 
 ```bash
-source /home/tinker/tk25_ws/install/setup.bash
+source /home/tinker/tk25_ws/src/tk26_vision/install/setup.bash
 python -c "from tinker_vision_msgs_26.srv import ObjectMatchAll; r = ObjectMatchAll.Request(); r.category_filter = ['milk']; print(r)"
 ```
 
@@ -165,8 +170,6 @@ Create `src/tk26_vision/src/tk_vision_specialized/test/test_nms.py`:
 """Unit tests for nms.py — pure-function NMS and clustering helpers."""
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 import pytest
 
@@ -235,6 +238,19 @@ def test_within_category_idempotent():
 
 def test_within_category_empty_input():
     assert suppress_within_category([], iou_thresh=0.5) == []
+
+
+def test_within_category_suppresses_at_threshold_equality():
+    # Pin the strict `<` semantics: IoU == iou_thresh -> suppress.
+    # A=(0,0,10,10) area=100, B=(0,0,10,5) area=50, intersection=50
+    # -> IoU = 50 / (100 + 50 - 50) = 0.5.
+    rows = [
+        MatchRow(label='milk', bbox=(0, 0, 10, 10), conf=0.9),
+        MatchRow(label='milk', bbox=(0, 0, 10, 5), conf=0.5),
+    ]
+    kept = suppress_within_category(rows, iou_thresh=0.5)
+    assert len(kept) == 1
+    assert kept[0].conf == 0.9
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -243,7 +259,7 @@ def test_within_category_empty_input():
 source /opt/ros/humble/setup.bash
 source /home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/activate
 cd /home/tinker/tk25_ws/src/tk26_vision/src/tk_vision_specialized
-pytest test/test_nms.py -v
+pytest test/test_nms.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: `ImportError: cannot import name 'iou'` (and friends) — `nms.py` doesn't exist yet.
@@ -253,20 +269,18 @@ Expected: `ImportError: cannot import name 'iou'` (and friends) — `nms.py` doe
 Create `src/tk26_vision/src/tk_vision_specialized/tk_vision_specialized/nms.py`:
 
 ```python
-"""Pure-function NMS and clustering helpers for object_match_all.
+"""Pure-function NMS, clustering, and judge-payload helpers for
+object_match_all.
 
 No ROS imports here on purpose: this module is unit-testable from a plain
-pytest run without sourcing the workspace. The shapes (`MatchRow`,
-`Cluster`, `JudgePayload`) are reused by `match_pipeline.py`.
+pytest run without sourcing the workspace. The shapes defined here are
+reused by `match_pipeline.py`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
 from typing import Sequence
-
-import numpy as np
 
 
 Bbox = tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixel coords
@@ -324,10 +338,10 @@ def suppress_within_category(
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-pytest test/test_nms.py -v
+pytest test/test_nms.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
-Expected: 8 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -355,18 +369,33 @@ EOF
 
 - [ ] **Step 1: Add failing tests for clustering and judge-payload**
 
-Append to `src/tk26_vision/src/tk_vision_specialized/test/test_nms.py`:
+Two edits to `src/tk26_vision/src/tk_vision_specialized/test/test_nms.py`:
+
+(a) Extend the existing `from tk_vision_specialized.nms import ...` block at the top of the file to include the new symbols, and add `import numpy as np` to the top imports (do **not** append imports below the test functions — flake8 will flag E402). The updated top section should look like:
 
 ```python
+"""Unit tests for nms.py — pure-function NMS and clustering helpers."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
 from tk_vision_specialized.nms import (
     Cluster,
-    JudgePayload,
     cluster_for_judge,
     build_judge_payload,
+    iou,
+    suppress_within_category,
+    MatchRow,
 )
-import numpy as np
+```
 
+(`JudgePayload` is constructed indirectly via `build_judge_payload` and accessed via attribute lookup, so it's not imported by name — that avoids the F401 unused-import warning.)
 
+(b) Append the new test functions to the **bottom** of the file (after the existing tests):
+
+```python
 def test_cluster_singletons_when_disjoint():
     rows = [
         MatchRow(label='milk', bbox=(0, 0, 10, 10), conf=0.9),
@@ -447,14 +476,38 @@ def test_build_judge_payload_collapses_duplicate_labels():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest test/test_nms.py -v
+pytest test/test_nms.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: 6 new tests fail with `ImportError` for `Cluster`, `JudgePayload`, `cluster_for_judge`, `build_judge_payload`.
 
 - [ ] **Step 3: Implement clustering and judge-payload builder**
 
-Append to `src/tk26_vision/src/tk_vision_specialized/tk_vision_specialized/nms.py`:
+First, add the two new imports at the **top** of `src/tk26_vision/src/tk_vision_specialized/tk_vision_specialized/nms.py` next to the existing ones (Task 2 deferred them since they were unused at that point):
+
+```python
+from itertools import combinations
+```
+
+and:
+
+```python
+import numpy as np
+```
+
+The full import block at the top of the file should now read:
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from itertools import combinations
+from typing import Sequence
+
+import numpy as np
+```
+
+Then append the new types and helpers to the **bottom** of `nms.py`:
 
 ```python
 @dataclass(frozen=True)
@@ -562,10 +615,10 @@ def build_judge_payload(
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-pytest test/test_nms.py -v
+pytest test/test_nms.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
-Expected: 14 passed (8 from Task 2 + 6 new).
+Expected: 16 passed (10 from Task 2 + 6 new).
 
 - [ ] **Step 5: Commit**
 
@@ -643,7 +696,7 @@ def test_encode_data_url_round_trips_jpeg_bgr():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest test/test_vlm_common.py -v
+pytest test/test_vlm_common.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: `ImportError`.
@@ -693,7 +746,7 @@ def encode_data_url(rgb_bgr: np.ndarray) -> str:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-pytest test/test_vlm_common.py -v
+pytest test/test_vlm_common.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: 4 passed.
@@ -913,7 +966,7 @@ def test_build_match_client_unknown_provider_raises():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest test/test_vlm_match_client.py -v
+pytest test/test_vlm_match_client.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: `ImportError`.
@@ -938,8 +991,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
-from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 import numpy as np
@@ -1088,7 +1139,10 @@ class QwenMatchClient:
             'text': (
                 'Image 1 is the scene. The remaining images are reference '
                 'photos, in order: '
-                + ', '.join(f'image {i+2} = "{l}"' for i, l in enumerate(labels))
+                + ', '.join(
+                    f'image {i+2} = "{lbl}"'
+                    for i, lbl in enumerate(labels)
+                )
                 + '. Return all visible instances grouped by label.'
             ),
         })
@@ -1146,10 +1200,10 @@ except ImportError:    # pragma: no cover
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-pytest test/test_vlm_match_client.py -v
+pytest test/test_vlm_match_client.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
-Expected: 11 passed (the Gemini-provider test in `test_build_match_client_unknown_provider_raises` only exercises the `Unknown provider` path, which doesn't need the Gemini module).
+Expected: 12 passed (the Gemini-provider test in `test_build_match_client_unknown_provider_raises` only exercises the `Unknown provider` path, which doesn't need the Gemini module).
 
 - [ ] **Step 5: Commit**
 
@@ -1179,15 +1233,20 @@ EOF
 
 - [ ] **Step 1: Add failing tests for the Gemini decoder + client**
 
-Append to `src/tk26_vision/src/tk_vision_specialized/test/test_vlm_match_client.py`:
+Two edits to `src/tk26_vision/src/tk_vision_specialized/test/test_vlm_match_client.py`:
+
+(a) Add a new top-level import block **directly after** the existing `from tk_vision_specialized.vlm_match_client import (...)` block (do NOT append at the bottom — flake8 E402):
 
 ```python
 from tk_vision_specialized.vlm_match_client_gemini import (
     GeminiMatchClient,
     decode_gemini_response,
 )
+```
 
+(b) Append the new test functions to the **bottom** of the file:
 
+```python
 def test_decode_gemini_pixel_xyxy_passthrough():
     body = json.dumps({
         'detections': [
@@ -1238,7 +1297,7 @@ def test_build_match_client_returns_gemini(monkeypatch):
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest test/test_vlm_match_client.py -v
+pytest test/test_vlm_match_client.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: 5 new tests fail with `ImportError` for `vlm_match_client_gemini`.
@@ -1261,6 +1320,13 @@ from dotenv import load_dotenv
 
 from ._vlm_common import strip_fences, encode_data_url
 from .nms import MatchRow, Bbox
+
+
+# Load .env once at module-import time so that pytest's monkeypatch.delenv
+# is authoritative after first construction (the workspace .env carries a
+# real OPENROUTER_API_KEY which would otherwise repopulate after delete).
+# Same pattern Task 5's QwenMatchClient uses; matches kimi_api/_env.py.
+load_dotenv(override=False)
 
 
 _GEMINI_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'
@@ -1319,8 +1385,10 @@ def decode_gemini_response(
     return rows
 
 
-def _gemini_system_prompt(labels: list[str], scene_w: int, scene_h: int) -> str:
-    label_list = ', '.join(f'"{l}"' for l in labels)
+def _gemini_system_prompt(
+    labels: list[str], scene_w: int, scene_h: int,
+) -> str:
+    label_list = ', '.join(f'"{lbl}"' for lbl in labels)
     return (
         "You are a visual-grounding assistant for a service robot. The user "
         f"provides one SCENE image of size {scene_w}x{scene_h} followed by "
@@ -1341,11 +1409,12 @@ class GeminiMatchClient:
         model: str = '',
         base_url: str = '',
     ):
-        load_dotenv()
+        # load_dotenv ran at module-import time; just read os.environ here
         self._api_key = os.environ.get('OPENROUTER_API_KEY', '')
         if not self._api_key:
             raise RuntimeError(
-                'OPENROUTER_API_KEY not found in env (required for Gemini provider)'
+                'OPENROUTER_API_KEY not found in env '
+                '(required for Gemini provider)'
             )
         self._model = model or _GEMINI_DEFAULT_MODEL
         self._base_url = base_url or _GEMINI_DEFAULT_BASE_URL
@@ -1376,7 +1445,10 @@ class GeminiMatchClient:
             'text': (
                 'Image 1 is the scene. The remaining images are reference '
                 'photos, in order: '
-                + ', '.join(f'image {i+2} = "{l}"' for i, l in enumerate(labels))
+                + ', '.join(
+                    f'image {i+2} = "{lbl}"'
+                    for i, lbl in enumerate(labels)
+                )
                 + '. Return all visible instances grouped by label.'
             ),
         })
@@ -1417,7 +1489,7 @@ class GeminiMatchClient:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-pytest test/test_vlm_match_client.py -v
+pytest test/test_vlm_match_client.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: 16 passed.
@@ -1554,7 +1626,7 @@ def test_build_judge_client_unknown_provider_raises():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest test/test_vlm_judge_client.py -v
+pytest test/test_vlm_judge_client.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: `ImportError`.
@@ -1577,6 +1649,12 @@ import numpy as np
 from dotenv import load_dotenv
 
 from ._vlm_common import strip_fences, encode_data_url
+
+
+# Load .env once at module-import time so pytest's monkeypatch.delenv is
+# authoritative after first construction. Same defensive pattern Tasks 5
+# and 6 use; matches kimi_api/_env.py.
+load_dotenv(override=False)
 
 
 _QWEN_DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
@@ -1631,7 +1709,7 @@ def decode_judge_response(
 
 
 def _judge_system_prompt(labels: list[str]) -> str:
-    label_list = ', '.join(f'"{l}"' for l in labels)
+    label_list = ', '.join(f'"{lbl}"' for lbl in labels)
     return (
         "You are a tie-breaking visual-grounding assistant. The user provides "
         "one SCENE CROP image followed by N REFERENCE images, each captioned "
@@ -1673,7 +1751,10 @@ class _BaseJudgeClient:
             'text': (
                 'Image 1 is the scene crop. The remaining images are reference '
                 'photos, in order: '
-                + ', '.join(f'image {i+2} = "{l}"' for i, l in enumerate(labels))
+                + ', '.join(
+                    f'image {i+2} = "{lbl}"'
+                    for i, lbl in enumerate(labels)
+                )
                 + '. Choose the best matching label or return null to abstain.'
             ),
         })
@@ -1711,7 +1792,7 @@ class _BaseJudgeClient:
 
 class QwenJudgeClient(_BaseJudgeClient):
     def __init__(self, model: str = '', base_url: str = ''):
-        load_dotenv()
+        # load_dotenv ran at module-import time; read os.environ here
         self._api_key = ''
         for name in _QWEN_KEY_NAMES:
             val = os.environ.get(name)
@@ -1720,7 +1801,8 @@ class QwenJudgeClient(_BaseJudgeClient):
                 break
         if not self._api_key:
             raise RuntimeError(
-                f'DashScope API key not found in env (looked for {_QWEN_KEY_NAMES})'
+                'DashScope API key not found in env '
+                f'(looked for {_QWEN_KEY_NAMES})'
             )
         self._model = model or _QWEN_DEFAULT_MODEL
         self._base_url = base_url or _QWEN_DEFAULT_BASE_URL
@@ -1728,11 +1810,12 @@ class QwenJudgeClient(_BaseJudgeClient):
 
 class GeminiJudgeClient(_BaseJudgeClient):
     def __init__(self, model: str = '', base_url: str = ''):
-        load_dotenv()
+        # load_dotenv ran at module-import time; read os.environ here
         self._api_key = os.environ.get('OPENROUTER_API_KEY', '')
         if not self._api_key:
             raise RuntimeError(
-                'OPENROUTER_API_KEY not found in env (required for Gemini provider)'
+                'OPENROUTER_API_KEY not found in env '
+                '(required for Gemini provider)'
             )
         self._model = model or _GEMINI_DEFAULT_MODEL
         self._base_url = base_url or _GEMINI_DEFAULT_BASE_URL
@@ -1755,7 +1838,7 @@ except ImportError:    # pragma: no cover
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-pytest test/test_vlm_judge_client.py -v
+pytest test/test_vlm_judge_client.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: 9 passed.
@@ -1799,7 +1882,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import numpy as np
 import pytest
@@ -1809,7 +1891,12 @@ from tk_vision_specialized.match_pipeline import (
     PipelineParams,
     FinalRow,
 )
-from tk_vision_specialized.nms import MatchRow, Bbox
+from tk_vision_specialized.nms import MatchRow
+
+# Touch FinalRow so the `from ... import FinalRow` isn't flagged unused
+# (FinalRow is the documented return-row shape; future tests will assert
+# against fields on it).
+__all__ = ['FinalRow']
 
 
 @dataclass
@@ -2184,7 +2271,7 @@ def test_category_filter_restricts_scan():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest test/test_match_pipeline.py -v
+pytest test/test_match_pipeline.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: `ImportError: cannot import name 'MatchPipeline'`.
@@ -2203,18 +2290,17 @@ TF, and response-packing layers."""
 
 from __future__ import annotations
 
-import time
 from concurrent.futures import (
     ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import numpy as np
 
 from .nms import (
     Bbox, MatchRow, Cluster, JudgePayload,
-    iou, suppress_within_category, cluster_for_judge, build_judge_payload,
+    suppress_within_category, cluster_for_judge, build_judge_payload,
 )
 
 
@@ -2488,7 +2574,7 @@ class MatchPipeline:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-pytest test/test_match_pipeline.py -v
+pytest test/test_match_pipeline.py -v -p no:launch_testing_ros --ignore=test/test_spot_on_shelf.py
 ```
 
 Expected: 9 passed.
@@ -2642,10 +2728,25 @@ class CameraDataSource:
             lambda c, d: self._on_sync('orbbec', (c, d))
         )
 
+        # VisionLogger takes (node, enabled, base_folder) — we read the
+        # corresponding ROS params (declared by the owning node, e.g. the
+        # ObjectMatchAllServer in Task 10) and pass them in directly.
+        try:
+            log_enabled = bool(
+                ros_node.get_parameter('vision_logging_enabled').value
+            )
+        except Exception:    # noqa: BLE001 — param may not be declared yet
+            log_enabled = True
+        try:
+            log_folder = str(
+                ros_node.get_parameter('vision_log_folder').value
+            )
+        except Exception:    # noqa: BLE001
+            log_folder = 'vision_log'
         self.vision_logger = VisionLogger(
             ros_node,
-            enabled_param='vision_logging_enabled',
-            folder_param='vision_log_folder',
+            enabled=log_enabled,
+            base_folder=log_folder,
         )
 
     # ---------------- subscriber callbacks ---------------------------------
@@ -2788,7 +2889,7 @@ class CameraDataSource:
 - [ ] **Step 2: Smoke-import check**
 
 ```bash
-source /home/tinker/tk25_ws/install/setup.bash
+source /home/tinker/tk25_ws/src/tk26_vision/install/setup.bash
 python -c "from tk_vision_specialized.camera_data_source import CameraDataSource, CameraTopics; print('OK')"
 ```
 
@@ -3031,6 +3132,7 @@ class ObjectMatchAllServer(Node):
         resp.header = Header(stamp=self.get_clock().now().to_msg())
         resp.status = 1
         resp.error_msg = ''
+        resp.person_id = 0
         resp.objects = []
         resp.detection_source = 'vlm_match_all'
 
@@ -3228,7 +3330,7 @@ Expected: `Summary: 1 package finished` with no errors.
 - [ ] **Step 4: Verify entry point exists**
 
 ```bash
-source /home/tinker/tk25_ws/install/setup.bash
+source /home/tinker/tk25_ws/src/tk26_vision/install/setup.bash
 ros2 pkg executables tk_vision_specialized | grep object_match_all_server
 ```
 
@@ -3437,12 +3539,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
-import os
 import sys
 from pathlib import Path
 
 import cv2
-import yaml
 
 from tk_vision_specialized.qwen_match_vlm import request_match_bboxes
 from tk_vision_specialized.items_map_loader import ItemsMapLoader
@@ -3546,7 +3646,7 @@ design doc for the rationale (spec §8.3.1).
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/activate
-source /home/tinker/tk25_ws/install/setup.bash
+source /home/tinker/tk25_ws/src/tk26_vision/install/setup.bash
 
 python -m tk_vision_specialized.scripts.produce_match_ground_truth \
     --scenes-dir /path/to/scenes \
@@ -3597,7 +3697,7 @@ auto-update.
 The script will exit at the first VLM call without credentials. Verify the help and arg parsing:
 
 ```bash
-source /home/tinker/tk25_ws/install/setup.bash
+source /home/tinker/tk25_ws/src/tk26_vision/install/setup.bash
 python -m tk_vision_specialized.scripts.produce_match_ground_truth --help
 ```
 

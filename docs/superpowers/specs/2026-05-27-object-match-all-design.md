@@ -54,9 +54,9 @@ Non-goals:
 string camera
 
 # Empty list = scan every entry in items_map.yaml.
-# Non-empty list = scan only these dataset keys; unknown keys are warned about
-# and dropped from the scan. If every key in the filter is unknown, the
-# response is status=1.
+# Non-empty list = scan only these dataset keys; unknown keys are dropped
+# from the scan. If every key in the filter is unknown, the response is
+# status=1.
 string[] category_filter
 
 # TF frame to express centroids in. Empty string = raw camera frame.
@@ -76,15 +76,21 @@ bool return_segments
 
 ---
 
-# Response shape is identical to ObjectDetection.srv so callers expecting
-# /object_detection_yolo's contract are drop-in compatible.
+# Response field set is the union of ObjectDetection.srv and
+# ObjectDetectionGeneralist.srv. person_id is kept for ABI parity with
+# ObjectDetection.srv (set to 0 — this server does not register people).
+# detection_source mirrors ObjectDetectionGeneralist.srv's tag field.
+# A caller written against ObjectDetection.srv can be retargeted at this
+# service by swapping the srv import; the response field set is a superset
+# of ObjectDetection's, so all existing field reads remain valid.
 std_msgs/Header header
-int32 status                     # 0=ok with >=1 object, 1=empty/failure
+int32 status                     # 0 = ok with >=1 object, 1 = empty / failure (see error_msg)
 string error_msg
+int32 person_id                  # always 0; kept for ABI parity with ObjectDetection.srv
 Object[] objects                 # cls / conf / centroid populated;
                                  # id, object_id, similarity, being_pointed
                                  # follow the conventions in ObjectMatch.srv
-string detection_source          # always "vlm_match_all"
+string detection_source          # e.g. "vlm_match_all"
 
 sensor_msgs/Image rgb_image      # populated iff return_rgb_image
 sensor_msgs/Image depth_image    # populated iff return_depth_image; 32FC1 metres

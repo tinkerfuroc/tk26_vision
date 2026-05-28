@@ -9,6 +9,7 @@ vision_log/
 log/
 
 .venv**/
+!.venv*.uv-project/
 
 src/items/
 

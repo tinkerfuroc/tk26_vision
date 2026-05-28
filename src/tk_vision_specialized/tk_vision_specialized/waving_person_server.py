@@ -359,15 +359,7 @@ class DetectWavingPersonsNode(Node):
         finally:
             self.img_lock.release()
 
-    # Tuned against detect_waving_test/ (41 images) on 2026-05-04: per-side
-    # visibility gate (each arm trusted independently if its 3 joints all
-    # exceed MIN_VISIBILITY) + shoulder/elbow tolerances of 0.1 in normalized
-    # image-y units yield 24/30 wave recall with 0/11 false alarms
-    # (~85% accuracy). A *global* min-visibility gate over all 6 joints was
-    # too strict — single-arm waves naturally have the resting/occluded arm
-    # below 0.5 visibility, which collapsed recall on real wave gestures.
     MIN_VISIBILITY = 0.5
-    SHOULDER_TOL_NORM = 0.1
     ELBOW_TOL_NORM = 0.1
 
     def is_waving(self, pose_landmarks, person_roi):
@@ -376,13 +368,16 @@ class DetectWavingPersonsNode(Node):
 
         landmarks = pose_landmarks.landmark
         PL = mp.solutions.pose.PoseLandmark
+        nose = landmarks[PL.NOSE]
         rh, re, rs = landmarks[PL.RIGHT_WRIST], landmarks[PL.RIGHT_ELBOW], landmarks[PL.RIGHT_SHOULDER]
         lh, le, ls = landmarks[PL.LEFT_WRIST],  landmarks[PL.LEFT_ELBOW],  landmarks[PL.LEFT_SHOULDER]
 
-        # Per-side visibility: an arm is "trusted" only if all 3 of its joints
-        # have visibility ≥ MIN_VISIBILITY. We then evaluate each trusted arm
-        # independently — a wave on one arm fires even if the other arm is
-        # occluded (typical when only one hand is raised).
+        if nose.visibility < self.MIN_VISIBILITY:
+            self.get_logger().debug(
+                f'is_waving: nose not visible ({nose.visibility:.2f}); skip'
+            )
+            return False
+
         right_visible = min(rh.visibility, re.visibility, rs.visibility) >= self.MIN_VISIBILITY
         left_visible  = min(lh.visibility, le.visibility, ls.visibility) >= self.MIN_VISIBILITY
         if not (right_visible or left_visible):
@@ -393,18 +388,18 @@ class DetectWavingPersonsNode(Node):
             )
             return False
 
-        # All landmark .y values are normalized [0, 1] from image top.
         right_wave = right_visible and (
-            rh.y <= rs.y + self.SHOULDER_TOL_NORM
+            rh.y < nose.y
             or (rh.y < re.y and re.y <= rs.y + self.ELBOW_TOL_NORM)
         )
         left_wave = left_visible and (
-            lh.y <= ls.y + self.SHOULDER_TOL_NORM
+            lh.y < nose.y
             or (lh.y < le.y and le.y <= ls.y + self.ELBOW_TOL_NORM)
         )
 
         self.get_logger().debug(
             f'is_waving: R_vis={right_visible} L_vis={left_visible} | '
+            f'nose.y={nose.y:.2f} | '
             f'rh.y={rh.y:.2f} rs.y={rs.y:.2f} re.y={re.y:.2f} | '
             f'lh.y={lh.y:.2f} ls.y={ls.y:.2f} le.y={le.y:.2f} | '
             f'R_wave={right_wave} L_wave={left_wave}'

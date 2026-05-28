@@ -223,6 +223,54 @@
         adjust the xArm anchor in the Waypoints tab or tighten the grid in
         <code>calibration.yaml</code>.
       </p>
+
+      <h3>Set zero-state (firmware wizard)</h3>
+      <p class="warn">
+        <b>Persistent &amp; irreversible from the UI.</b> The current physical
+        pose becomes the new firmware <code>(pan, tilt) = (0, 0)</code>; every
+        subsequent <code>T:133</code> command is interpreted relative to it
+        and any prior pan-tilt calibration becomes invalid.
+      </p>
+      <ol class="muted" style="margin-top:6px">
+        <li>Jog the pan-tilt above to the physical pose you want to be the new zero.</li>
+        <li>Unplug the cable from motor 2 (pan, X-axis).</li>
+        <li>Send <code>T:501 raw=1 new=2</code> (renumbers the still-attached servo).</li>
+        <li>Reconnect the motor 2 cable.</li>
+        <li>Send <code>T:502 id=1</code> then <code>T:502 id=2</code> (writes new zero into both servos).</li>
+      </ol>
+
+      <div id="zw-idle" class="zw-step">
+        <button id="btn-zw-start" type="button">Start zero-state wizard</button>
+      </div>
+
+      <div id="zw-unplug" class="zw-step" hidden>
+        <p class="warn">
+          <b>Step 2 / 5.</b> Physically disconnect the cable from
+          <b>motor 2 (pan / X-axis)</b>. Do NOT power-cycle the bus.
+          Click continue only after the cable is unplugged.
+        </p>
+        <div class="jog">
+          <button id="btn-zw-unplug-done" type="button">Motor 2 unplugged — continue</button>
+          <button id="btn-zw-cancel-1" type="button">Cancel</button>
+        </div>
+      </div>
+
+      <div id="zw-reconnect" class="zw-step" hidden>
+        <p class="warn">
+          <b>Step 4 / 5.</b> <code>T:501 raw=1 new=2</code> sent. Now
+          <b>reconnect the motor 2 cable</b>. Click continue once it's seated.
+        </p>
+        <div class="jog">
+          <button id="btn-zw-reconnect-done" type="button">Motor 2 reconnected — continue</button>
+          <button id="btn-zw-cancel-2" type="button">Abort (firmware IDs already changed)</button>
+        </div>
+      </div>
+
+      <div id="zw-done" class="zw-step" hidden>
+        <button id="btn-zw-restart" type="button">Run wizard again</button>
+      </div>
+
+      <p id="pt-set-zero-status" class="status-line"></p>
     </section>
 
     <!-- ---------- Calibrate tab ---------- -->

@@ -55,7 +55,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, JointState
+from std_srvs.srv import Trigger
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
+from tinker_vision_msgs_26.srv import SetZero
 
 from .calibration.aruco_detect import (
     BoardSpec,
@@ -520,6 +522,12 @@ class CalibWebNode(Node):
         self.declare_parameter("camera_info_topic", "/camera/color/camera_info")
         self.declare_parameter("pantilt_cmd_topic", "/pan_tilt_controller/cmd")
         self.declare_parameter("pantilt_state_topic", "/pan_tilt_controller/state")
+        self.declare_parameter(
+            "pantilt_set_zero_service", "/pan_tilt_controller/set_zero",
+        )
+        self.declare_parameter(
+            "pantilt_remap_service", "/pan_tilt_controller/remap_servo_ids",
+        )
         # Arm motion uses tinker_arm_msgs actions (JointMove / CartesianMove).
         # Both actions are served by the pick_and_place GraspNode and drive
         # MoveIt under the hood, so motion is collision-checked using
@@ -625,6 +633,12 @@ class CalibWebNode(Node):
 
         self._pt_pub = self.create_publisher(
             PanTiltCommand, self.get_parameter("pantilt_cmd_topic").value, 10,
+        )
+        self._set_zero_client = self.create_client(
+            SetZero, self.get_parameter("pantilt_set_zero_service").value,
+        )
+        self._remap_client = self.create_client(
+            Trigger, self.get_parameter("pantilt_remap_service").value,
         )
 
         self._tf_buffer = tf2_ros.Buffer()
@@ -876,6 +890,131 @@ class CalibWebNode(Node):
         msg.speed_raw = int(self.get_parameter("pantilt_speed_raw").value)
         msg.accel_raw = int(self.get_parameter("pantilt_accel_raw").value)
         self._pt_pub.publish(msg)
+
+    def call_set_zero(self, axis: str, timeout_sec: float = 5.0) -> tuple[bool, str]:
+        """Trigger the controller's SetZero service. ``axis`` is ``"both"``,
+        ``"pan"``, or ``"tilt"``. The controller forwards ``T:502`` to firmware
+        for each selected motor; the **current physical pose becomes the new
+        servo zero** until the next call.
+
+        Called from FastAPI worker threads; rclpy.spin runs in the main thread
+        and drives the future, mirroring the polling pattern in `_run_action`.
+        """
+        logger = self.get_logger()
+        axis_map = {
+            "both": SetZero.Request.BOTH,
+            "pan":  SetZero.Request.PAN,
+            "tilt": SetZero.Request.TILT,
+        }
+        if axis not in axis_map:
+            logger.error(f"[set_zero] unsupported axis {axis!r}")
+            return False, f"unsupported axis {axis!r} (expected 'both', 'pan', or 'tilt')"
+
+        service_name = self.get_parameter("pantilt_set_zero_service").value
+        logger.info(f"[set_zero] axis={axis!r} (enum={axis_map[axis]}) "
+                    f"service={service_name!r}; checking availability…")
+
+        # Spell out *why* the client thinks the service isn't there, so we can
+        # distinguish "controller not running" from "wrong topic/namespace".
+        if not self._set_zero_client.service_is_ready():
+            logger.warn(f"[set_zero] client not ready; waiting up to 1.5 s "
+                        f"for {service_name!r}")
+        if not self._set_zero_client.wait_for_service(timeout_sec=1.5):
+            try:
+                discovered = [
+                    f"{n} [{','.join(t)}]"
+                    for n, t in self.get_service_names_and_types()
+                    if any("SetZero" in tt for tt in t)
+                ]
+            except Exception:
+                discovered = ["(service discovery failed)"]
+            logger.error(
+                f"[set_zero] service {service_name!r} NOT FOUND after 1.5 s. "
+                f"SetZero services visible on the network: {discovered or '(none)'}"
+            )
+            return False, (
+                f"service {service_name!r} unavailable. "
+                f"Visible SetZero services: {discovered or '(none)'}. "
+                f"Is pan_tilt_controller running? Check `ros2 service list | grep set_zero`."
+            )
+
+        req = SetZero.Request()
+        req.axis = axis_map[axis]
+        logger.info(f"[set_zero] sending request axis={req.axis} → {service_name}")
+        fut = self._set_zero_client.call_async(req)
+        t0 = time.monotonic()
+        while not fut.done() and time.monotonic() - t0 < timeout_sec:
+            time.sleep(0.05)
+        elapsed = time.monotonic() - t0
+        if not fut.done():
+            logger.error(
+                f"[set_zero] no response from {service_name!r} after "
+                f"{elapsed:.2f}s (timeout={timeout_sec}s). The controller "
+                f"accepted the request but never replied — check the "
+                f"controller's stdout for serial errors."
+            )
+            return False, f"{service_name}: timed out after {timeout_sec:.0f}s"
+
+        resp = fut.result()
+        logger.info(
+            f"[set_zero] response in {elapsed:.2f}s: "
+            f"success={resp.success}, message={resp.message!r}"
+        )
+        return bool(resp.success), resp.message or ("ok" if resp.success else "failed")
+
+    def call_remap_servo_ids(self, timeout_sec: float = 5.0) -> tuple[bool, str]:
+        """Trigger the controller's `~/remap_servo_ids` service. Fires the
+        firmware command `{'T':501,'raw':1,'new':2}` which renumbers the
+        still-attached servo (id=1) to id=2 — the middle step of the
+        zero-state wizard. The operator must have physically disconnected
+        the motor that currently holds id=2 before this is called.
+        """
+        logger = self.get_logger()
+        service_name = self.get_parameter("pantilt_remap_service").value
+        logger.info(f"[remap] service={service_name!r}; checking availability…")
+
+        if not self._remap_client.service_is_ready():
+            logger.warn(f"[remap] client not ready; waiting up to 1.5 s for {service_name!r}")
+        if not self._remap_client.wait_for_service(timeout_sec=1.5):
+            try:
+                discovered = [
+                    f"{n} [{','.join(t)}]"
+                    for n, t in self.get_service_names_and_types()
+                    if any("Trigger" in tt for tt in t)
+                ]
+            except Exception:
+                discovered = ["(service discovery failed)"]
+            logger.error(
+                f"[remap] service {service_name!r} NOT FOUND after 1.5 s. "
+                f"Trigger services visible on the network: {discovered or '(none)'}"
+            )
+            return False, (
+                f"service {service_name!r} unavailable. "
+                f"Visible Trigger services: {discovered or '(none)'}. "
+                f"Is pan_tilt_controller running with the new build? "
+                f"Check `ros2 service list | grep remap_servo_ids`."
+            )
+
+        req = Trigger.Request()
+        logger.info(f"[remap] sending Trigger request → {service_name}")
+        fut = self._remap_client.call_async(req)
+        t0 = time.monotonic()
+        while not fut.done() and time.monotonic() - t0 < timeout_sec:
+            time.sleep(0.05)
+        elapsed = time.monotonic() - t0
+        if not fut.done():
+            logger.error(
+                f"[remap] no response from {service_name!r} after "
+                f"{elapsed:.2f}s (timeout={timeout_sec}s)."
+            )
+            return False, f"{service_name}: timed out after {timeout_sec:.0f}s"
+
+        resp = fut.result()
+        logger.info(
+            f"[remap] response in {elapsed:.2f}s: "
+            f"success={resp.success}, message={resp.message!r}"
+        )
+        return bool(resp.success), resp.message or ("ok" if resp.success else "failed")
 
     def call_joint_move(self, angles_rad, env_points=None) -> tuple[bool, str]:
         """Send a JointMove action goal. angles_rad is padded/truncated to 7 floats
@@ -1390,6 +1529,62 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         node.publish_pantilt(math.radians(pan_deg), math.radians(tilt_deg))
         return {"ok": True, "message": f"pan={pan_deg:+.1f} tilt={tilt_deg:+.1f} published"}
 
+    # Pan-tilt zero-state wizard — split across two endpoints because the
+    # firmware procedure requires the operator to physically unplug and then
+    # reconnect motor 2 between steps. The browser walks the user through:
+    #
+    #   1. (Browser-only) operator jogs the pan-tilt to the desired zero pose
+    #   2. (Browser-only) operator unplugs motor 2, clicks "continue"
+    #   3. POST /api/pantilt/zero_wizard/remap     → firmware T:501 raw=1 new=2
+    #   4. (Browser-only) operator reconnects motor 2, clicks "continue"
+    #   5. POST /api/pantilt/zero_wizard/finalize  → firmware T:502 id=1, then id=2
+    #
+    # Once step 3 has been issued the firmware servo IDs are mutated; aborting
+    # the wizard at that point leaves the chain in a half-configured state and
+    # the operator must complete step 5 manually (or restart the wizard).
+    @app.post("/api/pantilt/zero_wizard/remap")
+    async def api_pantilt_zero_wizard_remap(req: dict):
+        """Step 3 of the zero-state wizard. Sends `T:501 raw=1 new=2`.
+        The operator must have unplugged motor 2 BEFORE calling this.
+        """
+        node.get_logger().info(
+            f"[zero_wizard] HTTP POST /zero_wizard/remap received: body={req!r}"
+        )
+        loop = asyncio.get_event_loop()
+        try:
+            ok, msg = await loop.run_in_executor(None, node.call_remap_servo_ids)
+        except Exception as exc:
+            node.get_logger().error(
+                f"[zero_wizard] uncaught exception in call_remap_servo_ids: {exc!r}"
+            )
+            raise HTTPException(500, f"remap crashed: {exc}")
+        node.get_logger().info(
+            f"[zero_wizard] /remap HTTP response: ok={ok}, message={msg!r}"
+        )
+        return {"ok": ok, "message": msg, "step": "remap"}
+
+    @app.post("/api/pantilt/zero_wizard/finalize")
+    async def api_pantilt_zero_wizard_finalize(req: dict):
+        """Step 5 of the zero-state wizard. Sends T:502 for both motor IDs
+        (the controller's SetZero(BOTH) handler does id=1 then id=2 in order).
+        The operator must have reconnected motor 2 BEFORE calling this.
+        """
+        node.get_logger().info(
+            f"[zero_wizard] HTTP POST /zero_wizard/finalize received: body={req!r}"
+        )
+        loop = asyncio.get_event_loop()
+        try:
+            ok, msg = await loop.run_in_executor(None, node.call_set_zero, "both")
+        except Exception as exc:
+            node.get_logger().error(
+                f"[zero_wizard] uncaught exception in call_set_zero('both'): {exc!r}"
+            )
+            raise HTTPException(500, f"finalize crashed: {exc}")
+        node.get_logger().info(
+            f"[zero_wizard] /finalize HTTP response: ok={ok}, message={msg!r}"
+        )
+        return {"ok": ok, "message": msg, "step": "finalize"}
+
     # --- waypoints ----------------------------------------------------------
     VALID_PHASES = {"phase1_waypoints", "phase1_waypoints_custom",
                     "phase2_waypoints", "sanity_xarm_angles_rad"}
@@ -1508,8 +1703,8 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         # Soft envelope check matching the operator-declared limits.
         if not (-30.0 <= pan <= 30.0):
             raise HTTPException(400, f"pan_deg out of envelope (±30): {pan}")
-        if not (0.0 <= tilt <= 45.0):
-            raise HTTPException(400, f"tilt_deg out of envelope (0..+45): {tilt}")
+        if not (0.0 <= tilt <= 30.0):
+            raise HTTPException(400, f"tilt_deg out of envelope (0..+30): {tilt}")
         with node.lock:
             node._loaded_cfg["phase1_custom_park_pan_deg"] = pan
             node._loaded_cfg["phase1_custom_park_tilt_deg"] = tilt

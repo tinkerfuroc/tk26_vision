@@ -17,6 +17,7 @@ def generate_launch_description():
         ("camera_profile", "d435"),
         ("stream_enabled", "false"),
         ("stream_align_to_color", "true"),
+        ("stream_qos_reliability", "reliable"),
         ("default_model_kind", "fast_trt"),
         ("default_trt_variant", "output_two_stage"),
     ]:
@@ -36,6 +37,7 @@ def generate_launch_description():
                 "camera_profile": LaunchConfiguration("camera_profile"),
                 "stream_enabled": LaunchConfiguration("stream_enabled"),
                 "stream_align_to_color": LaunchConfiguration("stream_align_to_color"),
+                "stream_qos_reliability": LaunchConfiguration("stream_qos_reliability"),
                 "default_model_kind": LaunchConfiguration("default_model_kind"),
                 "default_trt_variant": LaunchConfiguration("default_trt_variant"),
             },

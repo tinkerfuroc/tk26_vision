@@ -35,9 +35,12 @@ foundation_stereo:
     stream_dtype: "16UC1_mm"
     output_frame_id: ""
     stream_publish_vis: false
-    stream_max_fps: 0.0
+    stream_max_fps: 15.0
     extrinsics_warmup_timeout_sec: 5.0
     stream_measure_forward_ms: false
+    # 'reliable' (default) = drop-in for realsense aligned_depth_to_color,
+    # visible in default-QoS RViz; 'best_effort' = lower-overhead sensor stream.
+    stream_qos_reliability: "reliable"
 
     # Logging
     vision_logging_enabled: false

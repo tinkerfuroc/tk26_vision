@@ -200,7 +200,16 @@ every new synced stereo frame:
 2. Optionally aligns to colour via `RealsenseAligner` (gated by
    `stream_align_to_color`).
 3. Publishes the depth image + camera_info on `stream_depth_topic` /
-   `stream_info_topic`, with `SensorDataQoS`.
+   `stream_info_topic`. QoS reliability is set by `stream_qos_reliability`
+   (default `reliable`); see the note below.
+
+> **QoS gotcha.** The stream defaults to **RELIABLE** so it's a drop-in for
+> realsense `aligned_depth_to_color` and appears in default-QoS RViz. If you
+> set `stream_qos_reliability:=best_effort`, remember a **RELIABLE subscriber
+> cannot receive from a BEST_EFFORT publisher** — RViz/rqt will then show
+> nothing unless you switch the display's Reliability Policy to *Best Effort*
+> (and `ros2 topic echo` needs `--qos-profile sensor_data`). Durability is
+> VOLATILE either way (camera_info is republished every frame, so no latching).
 
 ### Published topics (streaming only)
 
@@ -218,9 +227,10 @@ every new synced stereo frame:
 | `stream_align_to_color` | `true` | Route output through `RealsenseAligner`. When false, output is in IR1 frame at engine-scaled resolution. |
 | `stream_depth_topic`, `stream_info_topic` | empty (= node default) | Override the published topic names. |
 | `stream_dtype` | `"16UC1_mm"` | Either `"16UC1_mm"` (millimetre Z16, matches realsense convention) or `"32FC1"` (metres, more precision). |
+| `stream_qos_reliability` | `"reliable"` | QoS reliability for the depth + camera_info publishers: `reliable` (drop-in for realsense, default RViz-visible) or `best_effort` (lower-overhead sensor stream). See the QoS gotcha above. |
 | `output_frame_id` | empty | Override the `frame_id` on `depth_image.header`. Useful for the D435 URDF-vs-driver frame-name mismatch; see [§ D435 frame-name caveat](#d435-frame-name-caveat). |
 | `stream_publish_vis` | `false` | Also publish a colourised JPEG for human consumption. |
-| `stream_max_fps` | `0.0` | Cap the publish rate. `0` = uncapped (matches the IR sync rate). |
+| `stream_max_fps` | `15.0` | Cap the publish rate to bound GPU usage. `0` = uncapped (matches the IR sync rate). |
 | `extrinsics_warmup_timeout_sec` | `5.0` | When `stream_align_to_color=true`, the streaming worker waits this long for the latched `extrinsics` + `color_info` to arrive before erroring out. |
 | `stream_measure_forward_ms` | `false` | Skip the per-stream-frame CUDA-event timing to shave a hundred microseconds. |
 

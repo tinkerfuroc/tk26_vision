@@ -238,15 +238,43 @@ class FoundationStereoNode(Node):
         self.declare_parameter("stream_dtype", "16UC1_mm")
         self.declare_parameter("output_frame_id", "")
         self.declare_parameter("stream_publish_vis", False)
-        self.declare_parameter("stream_max_fps", 0.0)
+        self.declare_parameter("stream_max_fps", 15.0)
         self.declare_parameter("extrinsics_warmup_timeout_sec", 5.0)
         self.declare_parameter("stream_measure_forward_ms", False)
+        # QoS reliability for the streaming depth + camera_info publishers.
+        # 'reliable' (default) is a drop-in for realsense aligned_depth_to_color
+        # and shows up in default-QoS RViz; 'best_effort' is the lower-overhead
+        # sensor-stream profile (use it if a consumer subscribes BEST_EFFORT or
+        # the link drops frames under load).
+        self.declare_parameter("stream_qos_reliability", "reliable")
 
         self.declare_parameter("vision_logging_enabled", False)
         self.declare_parameter("vision_log_folder", "vision_log")
 
     def _p(self, name: str):
         return self.get_parameter(name).value
+
+    def _stream_qos(self) -> QoSProfile:
+        """QoS for the streaming depth + camera_info publishers.
+
+        Reliability is selectable via `stream_qos_reliability`; durability is
+        VOLATILE (the info is republished every frame, so no latching needed)
+        and history KEEP_LAST/5 to match realsense's sensor streams.
+        """
+        val = str(self._p("stream_qos_reliability") or "reliable").lower()
+        if val not in ("reliable", "best_effort"):
+            self.get_logger().warn(
+                f"stream_qos_reliability='{val}' invalid; using 'reliable'"
+            )
+            val = "reliable"
+        reliability = (ReliabilityPolicy.RELIABLE if val == "reliable"
+                       else ReliabilityPolicy.BEST_EFFORT)
+        return QoSProfile(
+            depth=5,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=reliability,
+            durability=DurabilityPolicy.VOLATILE,
+        )
 
     def _topic_for(self, key: str) -> str:
         explicit = self._p(key)
@@ -693,11 +721,16 @@ class FoundationStereoNode(Node):
         # wait once the executor is alive.
 
         depth_topic, info_topic = _resolve_stream_topics(self, align)
+        stream_qos = self._stream_qos()
+        self.get_logger().info(
+            f"stream depth/info QoS reliability="
+            f"{stream_qos.reliability.name.lower()}"
+        )
         self._stream_depth_pub = self.create_publisher(
-            Image, depth_topic, qos_profile_sensor_data
+            Image, depth_topic, stream_qos
         )
         self._stream_info_pub = self.create_publisher(
-            CameraInfo, info_topic, qos_profile_sensor_data
+            CameraInfo, info_topic, stream_qos
         )
         self._stream_vis_pub = (
             self.create_publisher(CompressedImage, "~/debug/disparity/compressed",

@@ -43,10 +43,43 @@ Critical: `.venv-fs/lib/python3.10/site-packages/numpy` **must be 1.x**
 NumPy 1.x and segfaults on import if NumPy 2.x is present. The lock file
 is the source of truth; diff against it before any further `pip install`.
 
+## Vendored tree resolution (both build modes)
+
+The TRT/PyTorch model code lives in the vendored tree at
+`src/tk26_vision/thirdparty/foundation_stereo/{FoundationStereo,Fast-FoundationStereo}/`,
+which is **outside** this ROS package and is **never copied into the install
+tree**. `stereo_runner.py` locates it at runtime via three anchors, in order:
+
+1. `$FOUNDATION_STEREO_VENDOR_ROOT` — explicit override (must contain
+   `Fast-FoundationStereo/` and `FoundationStereo/`). Use this for any
+   non-standard layout.
+2. `__file__`-relative walk (`../../../thirdparty/foundation_stereo`) — hits
+   when running from source or from a `--symlink-install` tree (the egg-link
+   makes `__file__` resolve back into `src/`).
+3. Ancestor scan for `<ws>/src/tk26_vision/thirdparty/foundation_stereo` —
+   the fallback for a **copied** (non-symlink) install, where anchor #2 lands
+   inside `install/` and finds nothing.
+
+This is why the package works under **both** build paths:
+
+* `scripts/build_foundation_stereo.sh` — `--symlink-install` (anchor #2).
+* `tkbuild tk26_vision --packages-select foundation_stereo` — `tkbuild`
+  strips `--symlink-install`, producing a copied install resolved by anchor
+  #3. `foundation_stereo` is mapped to `.venv-fs` via tkbuild's
+  `PER_PKG_VENV_BY_WS`, so the entry-point shebang is patched correctly.
+
+If you ever see `warmup FAILED … No module named 'core'`, anchor resolution
+failed — set `FOUNDATION_STEREO_VENDOR_ROOT` or rebuild with one of the two
+wrappers above (a bare `colcon build` from an unexpected CWD can defeat the
+ancestor scan).
+
 ## Build & launch
 
 ```bash
+# Either wrapper works; tkbuild is the workspace-wide convention.
 ./src/tk26_vision/scripts/build_foundation_stereo.sh
+# or:
+tkbuild tk26_vision --packages-select foundation_stereo
 source install/setup.bash
 
 # Default: service + action only, no streaming, warmup at launch.

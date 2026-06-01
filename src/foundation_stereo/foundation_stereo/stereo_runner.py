@@ -28,13 +28,58 @@ import torch
 from omegaconf import OmegaConf
 
 
-# Resolve the vendored thirdparty tree. This file lives at
-# src/tk26_vision/src/foundation_stereo/foundation_stereo/stereo_runner.py;
-# the vendor root is ../../../thirdparty/foundation_stereo/.
+# Resolve the vendored thirdparty tree. The vendor tree lives OUTSIDE this ROS
+# package at src/tk26_vision/thirdparty/foundation_stereo/ and is never copied
+# into the install tree, so a plain (non --symlink-install) `colcon build`
+# leaves a *copied* stereo_runner.py whose __file__ no longer points into src/.
+# Resolve through three anchors so both build modes (and run-from-source) work:
+#   1. FOUNDATION_STEREO_VENDOR_ROOT env override (non-standard layouts)
+#   2. __file__-relative walk (run-from-source / --symlink-install via egg-link)
+#   3. ancestor scan for <ws>/src/tk26_vision/thirdparty/foundation_stereo
+#      (covers a copied install, where #2 lands inside the install tree)
 _THIS = os.path.dirname(os.path.realpath(__file__))
-_VENDOR_ROOT = os.path.realpath(
-    os.path.join(_THIS, "..", "..", "..", "thirdparty", "foundation_stereo")
-)
+
+
+def _is_vendor_root(path: str) -> bool:
+    return os.path.isdir(os.path.join(path, "Fast-FoundationStereo")) and \
+        os.path.isdir(os.path.join(path, "FoundationStereo"))
+
+
+def _resolve_vendor_root() -> str:
+    env = os.environ.get("FOUNDATION_STEREO_VENDOR_ROOT")
+    if env:
+        env = os.path.realpath(os.path.expanduser(env))
+        if _is_vendor_root(env):
+            return env
+
+    # This file at src/.../foundation_stereo/foundation_stereo/stereo_runner.py
+    # ⇒ vendor root is ../../../thirdparty/foundation_stereo/.
+    rel = os.path.realpath(
+        os.path.join(_THIS, "..", "..", "..", "thirdparty", "foundation_stereo")
+    )
+    if _is_vendor_root(rel):
+        return rel
+
+    # Copied install: climb to the workspace root and look under src/.
+    d = _THIS
+    for _ in range(16):
+        cand = os.path.join(d, "src", "tk26_vision", "thirdparty", "foundation_stereo")
+        if _is_vendor_root(cand):
+            return os.path.realpath(cand)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+
+    raise RuntimeError(
+        "Cannot locate the vendored foundation_stereo tree. Set "
+        "FOUNDATION_STEREO_VENDOR_ROOT to "
+        "<workspace>/src/tk26_vision/thirdparty/foundation_stereo "
+        "(the dir containing Fast-FoundationStereo/ and FoundationStereo/)."
+    )
+
+
+_VENDOR_ROOT = _resolve_vendor_root()
 _FS_DIR = os.path.join(_VENDOR_ROOT, "FoundationStereo")
 _FAST_DIR = os.path.join(_VENDOR_ROOT, "Fast-FoundationStereo")
 

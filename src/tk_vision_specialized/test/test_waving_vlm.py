@@ -203,3 +203,53 @@ def test_request_waving_persons_falls_back_to_json_object_on_schema_reject(
     # First attempt strict, retried attempt loose.
     assert fake.calls[0]['response_format']['type'] == 'json_schema'
     assert fake.calls[-1]['response_format']['type'] == 'json_object'
+
+
+from tk_vision_specialized._waving_vlm import (  # noqa: E402
+    request_waving_persons_chain,
+)
+
+
+def test_chain_falls_through_on_error(monkeypatch):
+    calls = []
+
+    def fake(rgb, *, provider, model, **kw):
+        calls.append(provider)
+        if provider == 'qwen':
+            raise WavingVlmError('qwen down')
+        return WavingVlmResult(boxes=[(1, 2, 3, 4)], provider='gemini')
+
+    monkeypatch.setattr(
+        'tk_vision_specialized._waving_vlm.request_waving_persons', fake)
+    res = request_waving_persons_chain(
+        _img(), provider_models=[('qwen', 'q'), ('gemini', 'g')])
+    assert calls == ['qwen', 'gemini']
+    assert res.boxes == [(1, 2, 3, 4)]
+    assert res.provider == 'gemini'
+
+
+def test_chain_clean_empty_does_not_fall_through(monkeypatch):
+    calls = []
+
+    def fake(rgb, *, provider, model, **kw):
+        calls.append(provider)
+        return WavingVlmResult(boxes=[], provider=provider)  # clean empty
+
+    monkeypatch.setattr(
+        'tk_vision_specialized._waving_vlm.request_waving_persons', fake)
+    res = request_waving_persons_chain(
+        _img(), provider_models=[('qwen', 'q'), ('gemini', 'g')])
+    assert calls == ['qwen']          # gemini never tried
+    assert res.boxes == []
+    assert res.provider == 'qwen'
+
+
+def test_chain_all_fail_raises(monkeypatch):
+    def fake(rgb, *, provider, model, **kw):
+        raise WavingVlmError(f'{provider} down')
+
+    monkeypatch.setattr(
+        'tk_vision_specialized._waving_vlm.request_waving_persons', fake)
+    with pytest.raises(WavingVlmError, match='all providers failed'):
+        request_waving_persons_chain(
+            _img(), provider_models=[('qwen', 'q'), ('gemini', 'g')])

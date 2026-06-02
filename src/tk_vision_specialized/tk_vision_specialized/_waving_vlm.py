@@ -17,7 +17,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import openai
@@ -256,3 +256,36 @@ def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
             client.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def request_waving_persons_chain(rgb_bgr: np.ndarray, *,
+                                 provider_models: Sequence[tuple],
+                                 timeout_s: float = 20.0, max_retries: int = 3,
+                                 logger=None) -> WavingVlmResult:
+    """Try (provider, model) pairs in order; return the first CLEAN result.
+
+    Errors-only fallthrough: a hard WavingVlmError or a soft .error falls
+    through to the next provider, but a clean result (any boxes, or a legitimate
+    empty list with no error) is returned immediately. Raises WavingVlmError if
+    every provider fails.
+    """
+    errors = []
+    for provider, model in provider_models:
+        try:
+            res = request_waving_persons(
+                rgb_bgr, provider=provider, model=model,
+                timeout_s=timeout_s, max_retries=max_retries, logger=logger)
+        except WavingVlmError as exc:
+            errors.append(f'{provider}: {exc}')
+            if logger is not None:
+                logger.warning(f'waving VLM provider {provider} failed: {exc}; '
+                               f'trying next.')
+            continue
+        if res.error:
+            errors.append(f'{provider}: {res.error}')
+            if logger is not None:
+                logger.warning(f'waving VLM provider {provider} soft-failed: '
+                               f'{res.error}; trying next.')
+            continue
+        return res
+    raise WavingVlmError('all providers failed: ' + ' | '.join(errors))

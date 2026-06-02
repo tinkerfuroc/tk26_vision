@@ -1,5 +1,6 @@
 float32 threshold_meters
 string target_frame
+int32 min_waving_persons
 ---
 int32 status
 string error_msg

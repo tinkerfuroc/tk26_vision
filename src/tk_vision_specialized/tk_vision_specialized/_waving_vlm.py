@@ -12,8 +12,11 @@ boxes overlap YOLO person masks; the server turns each box into a 3D centroid.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+_QWEN_KEY_NAMES = ('DASHCOPE_API_KEY', 'DASHSCOPE_API_KEY')
 
 
 class WavingVlmError(RuntimeError):
@@ -79,3 +82,42 @@ def select_boxes(parsed: dict, w: int, h: int) -> WavingVlmResult:
         if box is not None:
             res.boxes.append(box)
     return res
+
+
+def _resolve_key(provider: str) -> Optional[str]:
+    """Resolve a provider's API key from os.environ only, or None."""
+    if provider == 'qwen':
+        for name in _QWEN_KEY_NAMES:
+            val = os.environ.get(name)
+            if val:
+                return val
+        return None
+    if provider == 'gemini':
+        return os.environ.get('OPENROUTER_API_KEY') or None
+    return None
+
+
+def has_provider_key(provider: str) -> bool:
+    """True if the provider's API key is present in the environment."""
+    return _resolve_key(provider) is not None
+
+
+def build_provider_models(primary: str, fallback: str, *, has_key, model_for,
+                          logger=None) -> list:
+    """Ordered (provider, model) chain, dropping providers with no key.
+
+    Non-fatal: returns [] if no provider has a key (caller treats an empty chain
+    as 'VLM fallback unavailable' rather than crashing). A blank or duplicate
+    fallback is ignored.
+    """
+    chain = []
+    if has_key(primary):
+        chain.append((primary, model_for(primary)))
+    elif logger is not None:
+        logger.warn(f'Waving VLM primary provider {primary!r} key missing.')
+    if fallback and fallback != primary:
+        if has_key(fallback):
+            chain.append((fallback, model_for(fallback)))
+        elif logger is not None:
+            logger.warn(f'Waving VLM fallback provider {fallback!r} key missing.')
+    return chain

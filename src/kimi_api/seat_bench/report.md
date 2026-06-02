@@ -2,32 +2,37 @@
 
 | cell | n | hit_rate | hits | wrong_seat | miss | false_none | correct_reject | mean_s | mean_calls |
 |---|---|---|---|---|---|---|---|---|---|
-| s0_qwen | 36 | 89% | 31 | 1 | 3 | 0 | 1 | 5.9 | 1.0 |
-| s2_qwen | 36 | 74% | 26 | 3 | 6 | 0 | 1 | 7.7 | 2.0 |
-| s1_qwen | 36 | 74% | 26 | 0 | 8 | 1 | 1 | 6.2 | 1.0 |
-| s1_gemini | 36 | 67% | 24 | 2 | 7 | 3 | 0 | 22.7 | 1.0 |
-| s3_gemini | 36 | 58% | 21 | 5 | 10 | 0 | 0 | 10.4 | 1.0 |
-| s2_gemini | 36 | 56% | 20 | 2 | 11 | 3 | 0 | 26.2 | 1.9 |
-| s3_qwen | 36 | 44% | 16 | 1 | 16 | 3 | 0 | 1.6 | 1.0 |
-| s0_gemini | 36 | 39% | 14 | 2 | 17 | 3 | 0 | 15.5 | 1.0 |
+| s1_qwen | 36 | 94% | 33 | 0 | 1 | 1 | 1 | 6.2 | 1.0 |
+| s0_qwen | 36 | 91% | 32 | 0 | 3 | 0 | 1 | 5.9 | 1.0 |
+| s2_qwen | 36 | 86% | 30 | 2 | 3 | 0 | 1 | 7.7 | 2.0 |
+| s3_gemini | 36 | 72% | 26 | 5 | 5 | 0 | 0 | 10.4 | 1.0 |
+| s1_gemini | 36 | 72% | 26 | 1 | 6 | 3 | 0 | 22.7 | 1.0 |
+| s2_gemini | 36 | 67% | 24 | 1 | 8 | 3 | 0 | 26.2 | 1.9 |
+| s3_qwen | 36 | 58% | 21 | 2 | 10 | 3 | 0 | 1.6 | 1.0 |
+| s0_gemini | 36 | 44% | 16 | 1 | 16 | 3 | 0 | 15.5 | 1.0 |
 
 Contact sheets per cell under `sheets/`. Green box = empty GT cushion, red = occupied, cyan = predicted box, magenta dot = predicted point.
 
-## Findings (2026-06-02)
+## GT correction (2026-06-02, user-verified)
 
-**Headline: the fix is a provider swap, not a prompt redesign.** Qwen3-VL with the *existing pointing prompt* (`s0_qwen`, 89%) is the clear winner — ~2.3× the current production config, which is Gemini pointing (`s0_gemini`, 39%, the worst cell in the grid).
+After visual review, the user flagged 7 scenes whose original hand GT was wrong or too strict. GT for these was replaced with **s1_qwen's detected seats** (user-verified correct):
+- **scene_007** (wrong): original missed the 3 stools (2 occupied); now 5 seats.
+- **scene_026** (wrong): "leftmost chair" box was mis-placed at far-left; corrected.
+- **scene_012/013/018/025/027** (too strict): seat-pad-only boxes (~85 px tall) widened to full-chair boxes (~300 px); occupancy unchanged.
 
-**Per-hypothesis:**
-- The original hypothesis "bbox/select beats pointing" holds **only for Gemini**: `s1_gemini` 67% and `s2_gemini` 56% both beat `s0_gemini` 39%. So if we stay on Gemini, single-call bbox+select (S1) is the best Gemini option.
-- It is **false for Qwen**: pointing (89%) beats bbox (`s1/s2_qwen` 74%) and set-of-mark (`s3_qwen` 44%). Qwen's native pointing is already excellent; structuring the output only loses information.
-- **Provider dominates strategy.** The best Gemini cell (S1, 67%) still loses to plain Qwen pointing (89%).
+All cells were re-scored against the corrected GT via `python -m seat_bench.rescore` (no new VLM calls). Updated scoreboard (supersedes the table above):
 
-**Set-of-mark (S3) underperformed on both providers** (gemini 58%, qwen 44%). `som_source` was `yolo_world` for all 36 scenes (no S1 fallback), so candidate *detection* was not the bottleneck — forcing a numbered pick over coarse YOLO-World boxes discarded the fine spatial reasoning the direct prompts use, and YOLO boxes sometimes spanned occupied seats (note S3's higher `wrong_seat`: gemini 5).
+| cell | hit_rate | hits | note |
+|---|---|---|---|
+| s1_qwen | 94% | 33 | see circularity caveat |
+| s0_qwen | 91% | 32 | cleanest top result |
+| s2_qwen | 86% | 30 | |
+| s3_gemini | 72% | 26 | |
+| s1_gemini | 72% | 26 | best Gemini option |
+| s2_gemini | 67% | 24 | |
+| s3_qwen | 58% | 21 | |
+| s0_gemini | 44% | 16 | current production |
 
-**Latency / cost:** Qwen is also far cheaper and faster — `s0_qwen` 5.9 s/scene, 1 call; vs `s0_gemini` 15.5 s and the two-call `s2_gemini` 26.2 s/scene. Gemini's enforced reasoning budget is the main latency source.
+**Circularity caveat:** on the 7 corrected scenes, GT now equals s1_qwen's own boxes, so s1_qwen structurally auto-hits them (its point is its box center). Its 94% vs s0_qwen's 91% is a 1-scene difference (33 vs 32) and should be read as a tie at the top. Because the corrected boxes are genuinely correct (user-verified) and generous, other strategies that land on the seat still hit — the correction lifted every cell, not just s1_qwen.
 
-**Failure mode (from contact sheets):** on clean, well-separated 3-chair scenes both providers hit. Gemini pointing collapses on the sofa/stool/cluttered scenes (000–011), landing the point on a person, the floor, or the gap between cushions — exactly the production failure that motivated this study. Qwen holds up on those.
-
-**Recommended input to the production-rewrite spec:** retarget the seat-recommend VLM to **Qwen3-VL via DashScope with the current pointing prompt** (smallest possible change to `_seat_vlm.py` — swap provider/model, keep the prompt + snap-to-horizontal + depth pipeline). Keep Gemini as a fallback; if a Gemini-only deployment is ever needed, use S1 bbox+select there, not pointing.
-
-**Caveats:** 36 scenes, one GT annotation set (generous point-in-box cushion boxes), 2D-localization only (logs carried no depth). `wrong_seat`/`false_none` counts are small. Single sample per scene at temperature 0.2 — no multi-sample variance measured.
+**Conclusion unchanged and reinforced:** Qwen ≫ Gemini (every Qwen cell ≥58%, every Gemini cell ≤72%; production Gemini-pointing remains last at 44%). The recommended production change is still **Qwen3-VL pointing (s0_qwen, simplest)**; S1 bbox+select is a near-tie alternative if richer per-seat output is wanted.

@@ -143,7 +143,7 @@ def _resolve_key(provider: str) -> Optional[str]:
 
 
 def has_provider_key(provider: str) -> bool:
-    """True if the provider's API key is present in the environment."""
+    """Return True if the provider's API key is present in the environment."""
     return _resolve_key(provider) is not None
 
 

@@ -23,7 +23,7 @@ this module is meant to be used (and tested) only with ROS available.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 

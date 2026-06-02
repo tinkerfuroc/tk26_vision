@@ -26,7 +26,6 @@ Keys:
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -116,7 +115,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Lazy cv2 import so module import is headless-safe.
     import cv2
-    import numpy as np
 
     bag_dir = Path(args.bag)
     out_path = Path(args.out) if args.out else bag_dir / "gt.json"

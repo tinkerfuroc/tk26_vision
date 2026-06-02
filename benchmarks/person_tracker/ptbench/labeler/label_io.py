@@ -224,6 +224,11 @@ def read_depth_and_info(
     (depth as a 2D array, native dtype — ``16UC1`` millimeters is the expected
     case) and ``K`` is a length-9 row-major intrinsics array, or ``None`` if no
     CameraInfo was found on ``camera_info_topic``.
+
+    Record depth as **16UC1 (millimetres)** — the Orbbec default and the only
+    encoding the scorer (:mod:`ptbench.replay.bag_io`) accepts. A clip labeled
+    from a non-16UC1 depth bag may not be scoreable later (and ``32FC1`` is
+    returned raw, NOT converted to millimetres — see ``_image_to_ndarray``).
     """
     from rclpy.serialization import deserialize_message
     from sensor_msgs.msg import CameraInfo, Image

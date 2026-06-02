@@ -31,7 +31,7 @@ def score_preds(
     preds: List[PredFrame],
     gt_clip: GtClip,
     throughput_hz: Optional[float] = None,
-    gates: GateConfig = GateConfig(),
+    gates: Optional[GateConfig] = None,
 ) -> Scoreboard:
     """Align ``preds`` to ``gt_clip.frames``, compute metrics, and score them.
 

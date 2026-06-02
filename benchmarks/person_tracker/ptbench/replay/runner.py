@@ -8,14 +8,17 @@ Two backends, each returning ``(list[PredFrame], throughput_hz)``:
 * :func:`run_action` — replays the bag onto a **live** ``/track_person`` action
   server and collects its feedback. Requires a running server + ROS graph.
 
-Both backends import their heavy dependencies (``vision_track`` / ``rclpy`` /
-the action types) **inside the function body**, so::
+Both backends defer their heavy/optional dependencies (``vision_track`` + the
+YOLO model / ``rclpy`` action client + the action types / ``cv2``) **into the
+function body**, so::
 
     import ptbench.replay.runner
 
-never fails when ``vision_track`` or a live server is absent (e.g. on CI without
-the colcon workspace sourced). The errors surface only when you actually call a
-backend.
+does not require ``vision_track``, the YOLO model, or a live ``/track_person``
+server — those errors surface only when you actually call a backend. Note that
+``bag_io`` imports ROS message libraries (``rosbag2_py`` / ``rclpy`` /
+``sensor_msgs``) at module load, so the ROS environment must still be sourced to
+import this module; it is only the tracker/model/server deps that are deferred.
 
 Requirements to actually run either backend:
 

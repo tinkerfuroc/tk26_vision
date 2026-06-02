@@ -229,7 +229,8 @@ def request_seat_bbox(
                               response_format=rf, temperature=0.2)
                 if extra_body is not None:
                     kwargs["extra_body"] = extra_body
-                completion = client.with_options(timeout=timeout_s).chat.completions.create(**kwargs)
+                completion = client.with_options(
+                    timeout=timeout_s).chat.completions.create(**kwargs)
                 raw = completion.choices[0].message.content or ""
                 parsed = json.loads(_strip_fences(raw))
                 res = select_box(parsed, w, h, known_seats)

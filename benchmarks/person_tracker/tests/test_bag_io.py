@@ -179,7 +179,7 @@ class TestReadSyncedFrames:
         by_t = {b.t_ns: b for b in bundles}
         # color@0 paired depth@0 (fill 0)
         assert int(by_t[0 * MS].depth_mm[0, 0]) == 0
-        # color@100 paired the NEAREST of depth@110 / depth@150 -> @110 (fill 110)
+        # color@100 paired the NEAREST of depth@110 / depth@130 -> @110 (fill 110)
         assert int(by_t[100 * MS].depth_mm[0, 0]) == 110
         # color@300 paired depth@290 (fill 290)
         assert int(by_t[300 * MS].depth_mm[0, 0]) == 290

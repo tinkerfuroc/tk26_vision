@@ -1,0 +1,5 @@
+dataset/*.jpg
+results/
+sheets/
+report.md
+__pycache__/

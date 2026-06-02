@@ -3,8 +3,12 @@
 #   t4_hardware.sh servo_motion
 #   t4_hardware.sh shelf_scene
 #   t4_hardware.sh person
+#   t4_hardware.sh follow_regression   (replay-scored person-tracker bags; SKIPs if none)
 #   t4_hardware.sh all        (default)
 # Requires: servo at /dev/ttyUSB1, live cameras. Shelf/person cases need staged scenes.
+# follow_regression needs no hardware — it replays recorded bags through the offline
+# scorer; set PTBENCH_BAGS_DIR to point at a dir of labeled clips (default
+# $WS_ROOT/benchmarks/person_tracker/bags).
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -97,13 +101,52 @@ t4_person() {
     stop_all_nodes
 }
 
+t4_follow_regression() {
+    section "T4.5 — follow regression (replay scored bags)"
+    local BAGS_DIR="${PTBENCH_BAGS_DIR:-$WS_ROOT/benchmarks/person_tracker/bags}"
+    local PT_DIR="$WS_ROOT/benchmarks/person_tracker"
+
+    # Collect every <clip> subdir that carries a gt.json.
+    local clips=()
+    if [ -d "$BAGS_DIR" ]; then
+        local gt bag
+        for gt in "$BAGS_DIR"/*/gt.json; do
+            [ -f "$gt" ] || continue
+            bag="$(dirname "$gt")"
+            clips+=("$bag")
+        done
+    fi
+
+    if [ "${#clips[@]}" -eq 0 ]; then
+        skip "T4.5" "no labeled bags in $BAGS_DIR (record + label first)"
+        return
+    fi
+
+    local bag clip out
+    for bag in "${clips[@]}"; do
+        clip="$(basename "$bag")"
+        out="$LOG_DIR/T4.5_$clip.out"
+        ( cd "$PT_DIR" && "$VENV/bin/python" -m ptbench.replay.score_cli \
+            --bag "$bag" --gt "$bag/gt.json" --backend offline ) >"$out" 2>&1
+        if grep -qE '^OVERALL[[:space:]].*PASS' "$out"; then
+            pass "T4.5 $clip OVERALL PASS"
+        else
+            local snippet
+            snippet="$(grep -E '^OVERALL' "$out" | head -1)"
+            [ -n "$snippet" ] || snippet="$(tail -3 "$out" | tr '\n' ' ')"
+            fail "T4.5" "$clip not PASS: ${snippet:-no scoreboard (see $out)}"
+        fi
+    done
+}
+
 case "${1:-all}" in
     servo_motion) t4_servo_motion ;;
     servo_tracking) t4_servo_tracking ;;
     shelf_scene) t4_shelf_scene ;;
     person) t4_person ;;
-    all) t4_servo_motion; t4_servo_tracking; t4_shelf_scene; t4_person ;;
-    *) printf 'usage: %s {servo_motion|servo_tracking|shelf_scene|person|all}\n' "$0"; exit 2 ;;
+    follow_regression) t4_follow_regression ;;
+    all) t4_servo_motion; t4_servo_tracking; t4_shelf_scene; t4_person; t4_follow_regression ;;
+    *) printf 'usage: %s {servo_motion|servo_tracking|shelf_scene|person|follow_regression|all}\n' "$0"; exit 2 ;;
 esac
 
 summary

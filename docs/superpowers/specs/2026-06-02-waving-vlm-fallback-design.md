@@ -28,9 +28,11 @@ wavers MediaPipe missed, and merge them into the response.
   centroids, add the missed wavers.
 - Every VLM-found waver still returns a depth-derived 3D `PointStamped`,
   consistent with the existing response contract.
-- Reuse the proven `_seat_bbox_vlm.py` provider-chain *pattern* while keeping
-  `tk_vision_specialized` self-contained (vendor the small env/image helpers;
-  no dependency on `kimi_api`).
+- Reuse the proven `_seat_bbox_vlm.py` provider-chain *pattern*, but implement
+  it with the package's **existing decoupled VLM-client convention**
+  (`qwen_match_vlm.py` / `vlm_match_client.py` / `_vlm_common.py`): `os.environ`
+  key resolution + base-URL constants + `_vlm_common.encode_data_url`. No
+  `kimi_api` import — the waving feature stays self-contained.
 
 **Non-goals**
 - Replacing the MediaPipe heuristic (it stays the primary, fast path).
@@ -86,26 +88,34 @@ detect_waving_callback(request, response)
   └─ existing: transform + status/error_msg
 ```
 
-### New module: `tk_vision_specialized/tk_vision_specialized/_vlm_env.py` (vendored helpers)
+### Decoupling: reuse existing in-package helpers (no new env module)
 
-Small, dependency-light primitives copied (not imported) from `kimi_api` so the
-package stays self-contained:
-- `load_env()` — `python-dotenv` `load_dotenv()` from CWD upward (no-op if absent).
-- `require_dashscope_api_key()` — `DASHSCOPE_API_KEY` or legacy `DASHCOPE_API_KEY`;
-  `RuntimeError` if unset.
-- `require_api_key()` — `OPENROUTER_API_KEY`; `RuntimeError` if unset.
-- `dashscope_base_url()` / `base_url()` — DashScope / OpenRouter base URLs
-  (env-overridable).
-- `encode_to_data_url(bgr)` — JPEG-encode + base64 `data:` URL (cv2/numpy only).
-- `decode_box_xyxy(box_2d, w, h)` — 0–1000 normalized → clamped xyxy pixels.
+The package already ships a self-contained, kimi_api-free VLM convention used by
+the match/judge clients — the waving client follows it verbatim, so **no
+`_vlm_env.py` is created** and **nothing imports `kimi_api`**:
+- Image encoding: `from ._vlm_common import encode_data_url, strip_fences`
+  (`_vlm_common.py`, already present, pure cv2/numpy).
+- `.env` discovery: `from dotenv import load_dotenv; load_dotenv(override=False)`
+  at module import (mirrors `vlm_match_client.py:32`).
+- Key resolution from `os.environ` only (so pytest `monkeypatch.delenv` works):
+  Qwen via `_QWEN_KEY_NAMES = ('DASHCOPE_API_KEY', 'DASHSCOPE_API_KEY')`, Gemini
+  via `OPENROUTER_API_KEY` — identical names/order to `vlm_match_client.py`.
+- Base URLs as module constants:
+  `_QWEN_DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'`,
+  `_GEMINI_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'`.
+- `decode_box_xyxy(box_2d, w, h)` — 0–1000 normalized → **clamped** xyxy pixels
+  (own copy; clamps to image bounds since the box drives depth sampling).
 
-This is ~40 lines of duplication versus `kimi_api._env`/`_image_utils`, chosen
-deliberately to avoid a `tk_vision_specialized → kimi_api` dependency and to
-keep the VLM unit independently buildable/testable.
+**Note on `package.xml`:** the package *already* carries
+`<exec_depend>kimi_api</exec_depend>` for the unrelated `placing_vlm.py`. We do
+**not** add to or rely on it for waving, and we do not remove it (it still serves
+`placing_location_server`). The waving path introduces zero new coupling.
 
 ### New module: `tk_vision_specialized/tk_vision_specialized/_waving_vlm.py`
 
-Structurally mirrors `kimi_api/_seat_bbox_vlm.py` so the two read identically.
+Mirrors the *control flow* of `_seat_bbox_vlm.py` (single-call → chain,
+strict-schema → json_object fallback, errors-only fallthrough) while using the
+in-package decoupled helpers above — function-based like `qwen_match_vlm.py`.
 
 ```python
 @dataclass
@@ -128,8 +138,8 @@ def request_waving_persons_chain(rgb_bgr, *, provider_models, timeout_s,
 - Chain tries `(provider, model)` pairs in order; **errors-only
   fallthrough**. A clean empty result (`boxes=[]`, no error — "nobody else is
   waving") is a legitimate terminal answer and does **not** trigger fallback.
-- Keys/base-URLs, image encoding, and box decoding all come from the vendored
-  `._vlm_env` (above) — no `kimi_api` import.
+- Keys/base-URLs from `os.environ` + module constants; image encoding from
+  `._vlm_common`; `decode_box_xyxy` local to this module — no `kimi_api` import.
 
 **Prompt (system):** identify *every* person actively waving — a raised or
 waving hand/arm at or above shoulder/head height to get attention; exclude
@@ -214,8 +224,8 @@ the success path when `show_window=true`. Guard defensively with
 | `vlm_dedup_iou` | `0.3` | IoU threshold for VLM-vs-existing dedup. |
 
 Keys: `qwen` ⇒ `DASHSCOPE_API_KEY` (or legacy `DASHCOPE_API_KEY`); `gemini` ⇒
-`OPENROUTER_API_KEY` — both resolved through the vendored `._vlm_env` (same
-semantics as `kimi_api._env`, no shared import).
+`OPENROUTER_API_KEY` — resolved directly from `os.environ` in `_waving_vlm.py`,
+matching `vlm_match_client.py`'s names/order (no `kimi_api` import).
 
 ## Error handling
 
@@ -259,16 +269,14 @@ VLM box_2d (0-1000) ─decode→ xyxy px ─dedup→ fresh? ─_centroid_from_bo
 | File | Change |
 |---|---|
 | `tinker_vision_msgs_26/srv/DetectWaving.srv` | + `int32 min_waving_persons` |
-| `tk_vision_specialized/.../_vlm_env.py` | **new** vendored env/image/box helpers (no `kimi_api` import) |
-| `tk_vision_specialized/.../_waving_vlm.py` | **new** VLM client + chain |
+| `tk_vision_specialized/.../_waving_vlm.py` | **new** VLM client + chain (uses `_vlm_common`, `os.environ`; no `kimi_api`) |
 | `tk_vision_specialized/.../waving_person_server.py` | retain person masks; trigger; `_vlm_augment`; `_resolve_provider_chain`; `_centroid_from_box`; `_box_iou`; params; overlay/log tags; `_frame_queue` guard |
-| `tk_vision_specialized/requirements.txt` | ensure `openai` + `python-dotenv` declared (already in shared venv) |
-| `tk_vision_specialized/test/…` | new unit + fallthrough tests |
-| `tk_vision_specialized/setup.py` | register new test/module if needed |
+| `tk_vision_specialized/test/test_waving_vlm.py` | **new** unit + provider-fallthrough tests |
 | `CLAUDE.md` (tk26_vision) | document the new params + fallback behavior |
 
-`tk_vision_specialized/package.xml` is **not** changed — no new ROS package
-dependency is introduced.
+Unchanged: `package.xml` (no new dependency — `kimi_api` already present for
+`placing_vlm`, untouched), `requirements.txt` (`openai`/`python-dotenv` already
+listed), `setup.py` (no new entry point), `_vlm_common.py` (reused as-is).
 
 ## Open decisions (resolved during brainstorming)
 
@@ -280,5 +288,6 @@ dependency is introduced.
   `enable_vlm_fallback` ROS kill-switch.
 - Accept count: **add all deduped VLM wavers** (threshold is trigger, not cap).
 - `_frame_queue` latent bug: **fix defensively** (in the callback we edit).
-- Package coupling: **decoupled** — vendor `_vlm_env.py` into
-  `tk_vision_specialized`; no `kimi_api` dependency.
+- Package coupling: **decoupled** — follow the package's existing kimi_api-free
+  VLM convention (`_vlm_common` + `os.environ` keys), no new env module, no
+  `kimi_api` import on the waving path.

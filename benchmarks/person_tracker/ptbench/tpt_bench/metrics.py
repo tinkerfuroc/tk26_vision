@@ -1,4 +1,4 @@
-"""TPT-Bench tracking metrics (pure python / numpy).
+"""TPT-Bench tracking metrics (pure python).
 
 Implements the evaluation metrics defined in the TPT-Bench paper
 (arXiv 2505.07446, Sec. 4.1). All functions operate on aligned per-frame
@@ -34,9 +34,7 @@ Empty input never raises — all metrics return 0.0.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
+from typing import Dict, Optional, Sequence, Tuple
 
 Box = Optional[Tuple[float, float, float, float]]
 
@@ -177,8 +175,9 @@ def compute_tpt_metrics(
             n_pred += 1
         if g is not None:
             n_gt_present += 1
-            overlap_sum += iou(g, p)  # iou handles p is None => 0.0
-            if p is not None and iou(g, p) >= iou_thr:
+            ov = iou(g, p)  # iou handles p is None => 0.0
+            overlap_sum += ov
+            if p is not None and ov >= iou_thr:
                 n_correct += 1
 
     precision = _safe_div(n_correct, n_pred)

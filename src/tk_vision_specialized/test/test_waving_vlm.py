@@ -101,3 +101,102 @@ def test_build_provider_models_blank_fallback_disabled():
         model_for=lambda p: f'model-{p}',
     )
     assert chain == [('qwen', 'model-qwen')]
+
+
+import json  # noqa: E402
+import numpy as np  # noqa: E402
+import openai  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+import pytest  # noqa: E402
+from tk_vision_specialized._waving_vlm import request_waving_persons, WavingVlmError  # noqa: E402
+
+
+def _completion(content: str):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
+def _make_fake_openai(script):
+    """Build a fake openai.OpenAI whose .create runs `script(kwargs)`.
+
+    `script` returns the response content string, or raises to simulate an API
+    error. Records constructor kwargs and create kwargs on the class for asserts.
+    """
+    class _Fake:
+        last_init = None
+        calls = []
+
+        def __init__(self, **kw):
+            _Fake.last_init = kw
+
+        def with_options(self, **_kw):
+            return self
+
+        @property
+        def chat(self):
+            return self
+
+        @property
+        def completions(self):
+            return self
+
+        def create(self, **kw):
+            _Fake.calls.append(kw)
+            return _completion(script(kw))
+
+        def close(self):
+            pass
+
+    return _Fake
+
+
+def _img():
+    return np.zeros((480, 640, 3), dtype=np.uint8)
+
+
+def test_request_waving_persons_returns_boxes(monkeypatch):
+    monkeypatch.setenv('DASHSCOPE_API_KEY', 'k')
+    payload = json.dumps({'persons': [{'box_2d': [100, 100, 200, 300],
+                                       'waving': True}]})
+    fake = _make_fake_openai(lambda kw: payload)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    res = request_waving_persons(_img(), provider='qwen', model='qwen3-vl-plus')
+
+    # box_2d [100,100,200,300] on 640x480: x*640/1000, y*480/1000.
+    assert res.boxes == [(64, 48, 128, 144)]
+    assert res.provider == 'qwen'
+    assert res.error is None
+    assert fake.last_init['base_url'] == \
+        'https://dashscope.aliyuncs.com/compatible-mode/v1'
+    assert fake.last_init['api_key'] == 'k'
+
+
+def test_request_waving_persons_missing_key_raises(monkeypatch):
+    monkeypatch.delenv('DASHSCOPE_API_KEY', raising=False)
+    monkeypatch.delenv('DASHCOPE_API_KEY', raising=False)
+    with pytest.raises(WavingVlmError, match='key'):
+        request_waving_persons(_img(), provider='qwen', model='m')
+
+
+def test_request_waving_persons_falls_back_to_json_object_on_schema_reject(
+        monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'k')
+    payload = json.dumps({'persons': []})
+
+    def script(kw):
+        rf = kw.get('response_format') or {}
+        if rf.get('type') == 'json_schema':
+            raise RuntimeError('response_format json_schema not supported')
+        return payload
+
+    fake = _make_fake_openai(script)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    res = request_waving_persons(_img(), provider='gemini', model='g',
+                                 max_retries=3)
+    assert res.boxes == []
+    assert res.error is None
+    # First attempt strict, retried attempt loose.
+    assert fake.calls[0]['response_format']['type'] == 'json_schema'
+    assert fake.calls[-1]['response_format']['type'] == 'json_object'

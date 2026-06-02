@@ -80,7 +80,7 @@ detect_waving_callback(request, response)
   ├─ NEW: if trigger → _vlm_augment(...)
   │        ├─ request_waving_persons_chain(rgb)          # qwen → gemini
   │        ├─ per VLM box: dedup vs existing wavers (IoU / center-in-box)
-  │        ├─ per fresh box: _centroid_from_box(...)     # mask reuse | box-center
+  │        ├─ per fresh box: centroid_from_box(...)     # mask reuse | box-center
   │        ├─ depth filter + target_frame transform (same as MediaPipe)
   │        └─ append all surviving VLM wavers
   ├─ existing: closest-first sort over combined list
@@ -174,19 +174,27 @@ raises at init), here the VLM is an optional augmentation:
   `chain_non_empty` is false so the VLM is never attempted.
 - `enable_vlm_fallback=false` ⇒ chain forced empty (hard kill-switch).
 
-**`_centroid_from_box(points, validmask, box_xyxy, person_records)`** returns a
-3D centroid (numpy xyz) or `None`:
+### New module: `tk_vision_specialized/tk_vision_specialized/_waving_geometry.py` (pure, ROS-free)
+
+The box→3D and dedup logic lives in a **pure numpy module** — no ROS, no
+network — so it is unit-testable without spinning up a `Node`. The server imports
+`box_iou`, `is_duplicate_box`, and `centroid_from_box` from it.
+
+**`centroid_from_box(points, validmask, box_xyxy, person_records)`** returns
+`(centroid_xyz, used_mask)` or `None`:
 1. **Mask reuse** — if `box_xyxy` overlaps a `person_records` seg-mask
    (box-vs-mask-bbox IoU over a small threshold), use `mask ∩ validmask` →
-   `mean(XY)`, `median(Z)`. Identical math to the MediaPipe waver path.
+   `mean(XY)`, `median(Z)`. Identical math to the MediaPipe waver path. The
+   `used_mask` is returned so the caller can log it.
 2. **Box-center fallback** — else gather valid `points` inside `box_xyxy`; if
    ≥10 px → `mean(XY)`, `median(Z)`; else expand the box once (×1.5) and retry;
    else return `None` (skip this VLM box).
 
-**Dedup.** `_box_iou(a, b)` helper. A VLM box is a duplicate if IoU ≥
-`vlm_dedup_iou` (default 0.3) with, or its center lies inside, any
-already-accepted waver box (MediaPipe or earlier VLM). Dedup runs against the
-growing accepted-box list so VLM boxes don't duplicate each other.
+**Dedup.** `box_iou(a, b)` + `is_duplicate_box(box, existing, *, iou_thresh)`.
+A VLM box is a duplicate if IoU ≥ `vlm_dedup_iou` (default 0.3) with, or its
+center lies inside, any already-accepted waver box (MediaPipe or earlier VLM).
+Dedup runs against the growing accepted-box list so VLM boxes don't duplicate
+each other.
 
 **Accept policy: add all.** Every deduped VLM waver that yields a centroid and
 passes the depth filter is appended. The threshold is the *trigger* only, not
@@ -240,7 +248,7 @@ matching `vlm_match_client.py`'s names/order (no `kimi_api` import).
 ## Data flow (VLM-found waver)
 
 ```
-VLM box_2d (0-1000) ─decode→ xyxy px ─dedup→ fresh? ─_centroid_from_box→ xyz (cam frame)
+VLM box_2d (0-1000) ─decode→ xyxy px ─dedup→ fresh? ─centroid_from_box→ xyz (cam frame)
    ─threshold_meters filter→ keep? ─do_transform_point(snapshot)→ PointStamped(target_frame)
    → append to waving_persons → closest-first sort → response
 ```
@@ -248,7 +256,7 @@ VLM box_2d (0-1000) ─decode→ xyxy px ─dedup→ fresh? ─_centroid_from_bo
 ## Testing
 
 - **Pure unit (no network):** `select_boxes` (well-formed / malformed / mixed
-  `waving` flags / undecodable boxes); `_box_iou` + dedup; `_centroid_from_box`
+  `waving` flags / undecodable boxes); `box_iou` + dedup; `centroid_from_box`
   over a synthetic `points`/`validmask` grid (mask-reuse tier, box-center tier,
   sparse-skip).
 - **Provider fallthrough:** mirror
@@ -270,8 +278,10 @@ VLM box_2d (0-1000) ─decode→ xyxy px ─dedup→ fresh? ─_centroid_from_bo
 |---|---|
 | `tinker_vision_msgs_26/srv/DetectWaving.srv` | + `int32 min_waving_persons` |
 | `tk_vision_specialized/.../_waving_vlm.py` | **new** VLM client + chain (uses `_vlm_common`, `os.environ`; no `kimi_api`) |
-| `tk_vision_specialized/.../waving_person_server.py` | retain person masks; trigger; `_vlm_augment`; `_resolve_provider_chain`; `_centroid_from_box`; `_box_iou`; params; overlay/log tags; `_frame_queue` guard |
-| `tk_vision_specialized/test/test_waving_vlm.py` | **new** unit + provider-fallthrough tests |
+| `tk_vision_specialized/.../_waving_geometry.py` | **new** pure ROS-free box/depth helpers (`box_iou`, `is_duplicate_box`, `centroid_from_box`) |
+| `tk_vision_specialized/.../waving_person_server.py` | retain person masks; trigger; `_vlm_augment`; `_resolve_provider_chain`; params; overlay/log tags; `_frame_queue` guard (geometry/dedup imported from `_waving_geometry`) |
+| `tk_vision_specialized/test/test_waving_vlm.py` | **new** VLM decoder/key/chain/fallthrough tests |
+| `tk_vision_specialized/test/test_waving_geometry.py` | **new** pure box/depth unit tests |
 | `CLAUDE.md` (tk26_vision) | document the new params + fallback behavior |
 
 Unchanged: `package.xml` (no new dependency — `kimi_api` already present for

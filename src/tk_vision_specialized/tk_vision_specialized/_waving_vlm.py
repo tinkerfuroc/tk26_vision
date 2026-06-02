@@ -28,7 +28,7 @@ from ._vlm_common import encode_data_url
 # Populate os.environ from .env files up the CWD tree at import time.
 load_dotenv(override=False)
 
-_QWEN_KEY_NAMES = ('DASHSCOPE_API_KEY', 'DASHCOPE_API_KEY')
+_QWEN_KEY_NAMES = ('DASHCOPE_API_KEY', 'DASHSCOPE_API_KEY')
 
 _QWEN_DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 _GEMINI_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'

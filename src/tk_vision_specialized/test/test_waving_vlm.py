@@ -155,6 +155,9 @@ def _img():
 
 
 def test_request_waving_persons_returns_boxes(monkeypatch):
+    # Hermetic: the workspace .env carries DASHCOPE_API_KEY; clear it so the
+    # resolver (typo-first) falls through to the DASHSCOPE_API_KEY set here.
+    monkeypatch.delenv('DASHCOPE_API_KEY', raising=False)
     monkeypatch.setenv('DASHSCOPE_API_KEY', 'k')
     payload = json.dumps({'persons': [{'box_2d': [100, 100, 200, 300],
                                        'waving': True}]})

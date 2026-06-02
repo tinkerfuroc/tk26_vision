@@ -38,7 +38,7 @@ def _center_in_box(box, other) -> bool:
 
 
 def is_duplicate_box(box, existing_boxes: Sequence, *, iou_thresh: float) -> bool:
-    """True if box duplicates any existing box (IoU >= thresh or center inside)."""
+    """Return True if box duplicates an existing box (IoU>=thresh/center in)."""
     for other in existing_boxes:
         if box_iou(box, other) >= iou_thresh or _center_in_box(box, other):
             return True

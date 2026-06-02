@@ -96,7 +96,8 @@ def _fmt_value(value) -> str:
     return str(value)
 
 
-def score(metrics: dict, gates: GateConfig = GateConfig()) -> Scoreboard:
+def score(metrics: dict, gates: Optional[GateConfig] = None) -> Scoreboard:
+    gates = gates or GateConfig()  # avoid a shared mutable default instance
     correct = metrics.get("correct_lock_rate")
     wrong_eps = metrics.get("wrong_lock_episodes")
     reacq = metrics.get("reacquire_latency_s")

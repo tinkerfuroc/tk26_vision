@@ -28,6 +28,8 @@ Pair = Tuple[GtFrame, Optional[PredFrame]]
 class MetricConfig:
     correct_radius_m: float = 0.50
     wrong_radius_m: float = 0.75
+    # Carried here for callers/tooling; alignment itself happens upstream in
+    # align_pred_to_gt, so compute_metrics does not read this field.
     align_tol_ms: float = 50.0
     sustained_s: float = 0.5
 
@@ -79,8 +81,9 @@ def _median_p95(samples: List[float]) -> dict:
 def compute_metrics(
     aligned: List[Pair],
     throughput_hz: Optional[float] = None,
-    cfg: MetricConfig = MetricConfig(),
+    cfg: Optional[MetricConfig] = None,
 ) -> dict:
+    cfg = cfg or MetricConfig()  # avoid a shared mutable default instance
     n = len(aligned)
     correct_flags = [_is_correct_lock(pair, cfg) for pair in aligned]
     wrong_flags = [_is_wrong_lock(pair, cfg) for pair in aligned]

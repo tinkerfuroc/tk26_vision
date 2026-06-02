@@ -31,7 +31,8 @@ from tinker_vision_msgs_26.msg import BoundingBox
 from tinker_vision_msgs_26.srv import SeatRecommendBbox
 from vision_util.vision_logging import VisionLogger
 
-from ._env import load_env, require_api_key
+from ._env import load_env, require_api_key, require_dashscope_api_key
+from ._seat_bbox_vlm import request_seat_bbox_chain, VlmSeatBboxError
 from ._seat_fewshot import load_fewshots
 from ._seat_vlm import VlmSeatError, request_seat
 
@@ -81,7 +82,11 @@ class SeatRecommendBboxService(Node):
         # approximately along world-up. Backrests / walls / backpack fabric
         # fail this test, so the snap search spirals outward until it hits a
         # cushion-like surface (or gives up and fails clean).
-        self.declare_parameter('snap_enabled', True)
+        # Default OFF as of 2026-06-02: bbox_select localizes the cushion via the
+        # chosen box, so the box centre is already on the seat — snap-to-horizontal
+        # adds latency and can wander. Re-enable with -p snap_enabled:=true for the
+        # legacy point path or noisy depth.
+        self.declare_parameter('snap_enabled', False)
         self.declare_parameter('snap_patch_half_px', 8)       # 17x17 plane fit
         # 200 px (was 80) — VLM pointing error is regularly >80 px on cluttered
         # scenes, so the spiral has to reach the next cushion over, not just
@@ -98,6 +103,17 @@ class SeatRecommendBboxService(Node):
         # deployments stay bit-identical until examples are curated.
         self.declare_parameter('fewshot_enabled', False)
         self.declare_parameter('max_fewshots', 3)
+        # --- VLM strategy / provider (2026-06-02: switch to Qwen bbox+select) ---
+        # 'bbox_select' (default) = one structured call returns a cushion box +
+        # occupancy per seat + the chosen empty seat (benchmark winner, S1).
+        # 'point' = legacy Gemini pointing via _seat_vlm.request_seat (rollback).
+        self.declare_parameter('vlm_strategy', 'bbox_select')
+        # Primary provider for bbox_select, then fallback. 'qwen' = DashScope
+        # qwen3-vl-plus (benchmark best); 'gemini' = OpenRouter gemini-2.5-pro.
+        self.declare_parameter('vlm_provider', 'qwen')
+        self.declare_parameter('vlm_fallback_provider', 'gemini')  # '' to disable
+        self.declare_parameter('bbox_model_qwen', 'qwen3-vl-plus')
+        self.declare_parameter('bbox_model_gemini', 'google/gemini-2.5-pro')
 
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
@@ -157,6 +173,21 @@ class SeatRecommendBboxService(Node):
         self.max_fewshots = int(
             self.get_parameter('max_fewshots').get_parameter_value().integer_value
         )
+        self.vlm_strategy = (
+            self.get_parameter('vlm_strategy').get_parameter_value().string_value
+        )
+        self.vlm_provider = (
+            self.get_parameter('vlm_provider').get_parameter_value().string_value
+        )
+        self.vlm_fallback_provider = (
+            self.get_parameter('vlm_fallback_provider').get_parameter_value().string_value
+        )
+        self.bbox_model_qwen = (
+            self.get_parameter('bbox_model_qwen').get_parameter_value().string_value
+        )
+        self.bbox_model_gemini = (
+            self.get_parameter('bbox_model_gemini').get_parameter_value().string_value
+        )
         self._vision_logger = VisionLogger(
             self,
             self.get_parameter('vision_logging_enabled')
@@ -167,9 +198,16 @@ class SeatRecommendBboxService(Node):
             .string_value,
         )
 
-        # Fail-fast on missing key — matches feature_recognition pattern so
-        # the T1 negative test (no .env) surfaces at node init.
-        require_api_key()
+        # Fail-fast on the API key(s) the configured strategy/providers need —
+        # matches feature_recognition pattern so the T1 negative test (no .env)
+        # surfaces at node init. bbox_select builds an ordered provider chain
+        # (primary required, fallback dropped-with-warning if its key is absent);
+        # the legacy point path needs OpenRouter.
+        if self.vlm_strategy == 'bbox_select':
+            self._provider_models = self._resolve_provider_chain()
+        else:
+            require_api_key()
+            self._provider_models = []
 
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.camera_cb_group = MutuallyExclusiveCallbackGroup()
@@ -224,6 +262,38 @@ class SeatRecommendBboxService(Node):
             f'snap={"on" if self.snap_enabled else "off"} '
             f'r={self.snap_search_radius_px}px min|ny|={self.snap_min_horizontality:.2f}).'
         )
+
+    def _model_for(self, provider: str) -> str:
+        return self.bbox_model_qwen if provider == 'qwen' else self.bbox_model_gemini
+
+    def _has_provider_key(self, provider: str) -> bool:
+        try:
+            (require_dashscope_api_key if provider == 'qwen' else require_api_key)()
+            return True
+        except RuntimeError:
+            return False
+
+    def _resolve_provider_chain(self) -> list:
+        """Ordered (provider, model) chain for bbox_select. Primary key is
+        required (raises at init if missing); a fallback whose key is absent is
+        dropped with a warning."""
+        primary = self.vlm_provider
+        if not self._has_provider_key(primary):
+            # Re-call to raise the descriptive RuntimeError for the missing key.
+            (require_dashscope_api_key if primary == 'qwen' else require_api_key)()
+        chain = [(primary, self._model_for(primary))]
+        fb = self.vlm_fallback_provider
+        if fb and fb != primary:
+            if self._has_provider_key(fb):
+                chain.append((fb, self._model_for(fb)))
+            else:
+                self.get_logger().warn(
+                    f'Fallback provider {fb!r} key missing; fallback disabled.'
+                )
+        self.get_logger().info(
+            f'bbox+select provider chain: {[p for p, _ in chain]}'
+        )
+        return chain
 
     def camera_info_orbbec_callback(self, info):
         self.lock_info.acquire()

@@ -1,0 +1,8 @@
+{
+  "id": "scene_007",
+  "image_wh": [1280, 720],
+  "seats": [
+    {"label": "left sofa cushion", "occupied": false, "cushion_bbox": [415, 330, 660, 440]},
+    {"label": "right sofa cushion", "occupied": false, "cushion_bbox": [660, 330, 890, 440]}
+  ]
+}

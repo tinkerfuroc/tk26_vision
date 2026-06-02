@@ -1,0 +1,9 @@
+{
+  "id": "scene_021",
+  "image_wh": [1280, 720],
+  "seats": [
+    {"label": "left stool", "occupied": true, "cushion_bbox": [285, 455, 495, 580]},
+    {"label": "front middle stool", "occupied": true, "cushion_bbox": [480, 450, 690, 575]},
+    {"label": "right stool", "occupied": false, "cushion_bbox": [675, 425, 875, 535]}
+  ]
+}

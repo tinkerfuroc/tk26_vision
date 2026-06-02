@@ -1,0 +1,11 @@
+{
+  "names": [
+    "John",
+    "lucy"
+  ],
+  "features": [
+    "He is male, he is approximately twenty years-old, he has black hair and short hair without glasses. He is wearing a light green t-shirt and a black strap bag.",
+    "He is male, he is approximately twenty years-old, he has black hair and short hair. He is wearing a white t-shirt and light-colored pants."
+  ],
+  "known_seats": []
+}

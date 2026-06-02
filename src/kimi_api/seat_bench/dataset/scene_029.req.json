@@ -1,0 +1,13 @@
+{
+  "names": [
+    "John"
+  ],
+  "features": [
+    "She is a girl with blond hair and black jacket"
+  ],
+  "known_seats": [
+    "leftmost chair",
+    "middlemost chair",
+    "rightmost chair"
+  ]
+}

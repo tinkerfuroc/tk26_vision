@@ -1,0 +1,516 @@
+[
+  {
+    "id": "scene_000",
+    "src": "/home/tinker/tk25_ws/vision_log/20260501_122705 copy/seat_recommend_bbox_service_1777635721_seat_recommend_bbox_orig_20260501_195639_843.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and short hair with glasses. He is wearing a beige t-shirt, blue jeans, grey and white sneakers, and a watch."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_001",
+    "src": "/home/tinker/tk25_ws/vision_log/20260501_122705 copy/seat_recommend_bbox_service_1777635721_seat_recommend_bbox_orig_20260501_195826_842.jpg",
+    "names": [
+      "John",
+      "lily"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and short hair with glasses. He is wearing a beige t-shirt, blue jeans, grey and white sneakers, and a watch.",
+      "She is female, she is approximately twenty years-old, she has red hair and has short hair without glasses. She is wearing a beige t-shirt with a logo, blue lanyards with badges, and several bracelets."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_002",
+    "src": "/home/tinker/tk25_ws/vision_log/20260501_122705 copy/seat_recommend_bbox_service_1777684648_seat_recommend_bbox_orig_20260502_092432_066.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately thirty years-old, he has black hair and short hair. He is wearing a black coat and a white shirt."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_003",
+    "src": "/home/tinker/tk25_ws/vision_log/20260501_122705 copy/seat_recommend_bbox_service_1777684648_seat_recommend_bbox_orig_20260502_092810_298.jpg",
+    "names": [
+      "John",
+      "linda"
+    ],
+    "features": [
+      "He is male, he is approximately thirty years-old, he has black hair and short hair. He is wearing a black coat and a white shirt.",
+      "He is male, he is approximately twenty years-old, he has dark hair and short hair, without glasses. He is wearing a red jacket and black pants."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_004",
+    "src": "/home/tinker/tk25_ws/vision_log/20260501_122705 copy/seat_recommend_bbox_service_1777685958_seat_recommend_bbox_orig_20260502_094226_445.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "They are female, she is approximately twenty years-old, she has black hair and long hair. She is wearing a dark hoodie and dark pants."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_005",
+    "src": "/home/tinker/tk25_ws/vision_log/20260501_122705 copy/seat_recommend_bbox_service_1777685958_seat_recommend_bbox_orig_20260502_094556_137.jpg",
+    "names": [
+      "John",
+      "lily"
+    ],
+    "features": [
+      "They are female, she is approximately twenty years-old, she has black hair and long hair. She is wearing a dark hoodie and dark pants.",
+      "She is female, she is approximately twenty years-old, she has black hair and long hair. She is wearing a white coat and blue pants."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_006",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_172005/seat_recommend_bbox_service_1777713612_seat_recommend_bbox_orig_20260502_172440_443.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately thirty years-old, he has black hair and short hair. He is wearing a black long-sleeve shirt and black pants."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_007",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_172736/seat_recommend_bbox_service_1777714064_seat_recommend_bbox_orig_20260502_173143_133.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately fifteen years-old, he has black hair and short hair. He is wearing a grey hoodie, dark grey pants, and black-and-white athletic shoes."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_008",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_172736/seat_recommend_bbox_service_1777714064_seat_recommend_bbox_orig_20260502_173557_621.jpg",
+    "names": [
+      "John",
+      "lily"
+    ],
+    "features": [
+      "He is male, he is approximately fifteen years-old, he has black hair and short hair. He is wearing a grey hoodie, dark grey pants, and black-and-white athletic shoes.",
+      "He is male, he is approximately twenty years-old, he has black hair and short hair with glasses. He is wearing a black jacket with a small print on the left side, and a blue lanyard."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_009",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_174141/seat_recommend_bbox_service_1777714904_seat_recommend_bbox_orig_20260502_174428_498.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is female, she is approximately twenty years-old, she has brown hair and has medium-length hair without glasses. She is wearing a black jacket, a blue lanyard, and light-colored pants."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_010",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_174141/seat_recommend_bbox_service_1777714904_seat_recommend_bbox_orig_20260502_174830_331.jpg",
+    "names": [
+      "John",
+      "linda"
+    ],
+    "features": [
+      "She is female, she is approximately twenty years-old, she has brown hair and has medium-length hair without glasses. She is wearing a black jacket, a blue lanyard, and light-colored pants.",
+      "He is male, he is approximately twenty years-old, he has dark hair and short hair. He is wearing a light-colored long-sleeve shirt and blue jeans."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_011",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_175907/seat_recommend_bbox_service_1777715961_seat_recommend_bbox_orig_20260502_180652_117.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and is wearing glasses. He is wearing a dark blue t-shirt and black jeans."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_012",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_192215 copy/seat_recommend_bbox_service_1777720942_seat_recommend_bbox_orig_20260502_193051_965.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and short hair, without glasses. He is wearing a navy blue T-shirt, black pants, a blue lanyard, white sneakers, and a face mask hanging from his lanyard."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_013",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_192215 copy/seat_recommend_bbox_service_1777721531_seat_recommend_bbox_orig_20260502_193400_236.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is female, she is approximately twenty years-old, she has reddish-brown hair and long hair without glasses. She is wearing a black jacket, light blue jeans, a black top, a blue lanyard with a badge, and white shoes."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_014",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_192215 copy/seat_recommend_bbox_service_1777721531_seat_recommend_bbox_orig_20260502_193601_866.jpg",
+    "names": [
+      "John",
+      "richard"
+    ],
+    "features": [
+      "She is female, she is approximately twenty years-old, she has reddish-brown hair and long hair without glasses. She is wearing a black jacket, light blue jeans, a black top, a blue lanyard with a badge, and white shoes.",
+      "He is male, he is approximately twenty years-old, he has black hair and no glasses. He is wearing a black jacket, a light-colored graphic t-shirt, a blue lanyard with a badge, and earphones around his neck."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_015",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_192215 copy/seat_recommend_bbox_service_1777726993_seat_recommend_bbox_orig_20260502_210600_463.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and wears glasses. He is wearing a white jacket, a red and purple shirt, black pants with white stripes, and white shoes."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_016",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_192215 copy/seat_recommend_bbox_service_1777726993_seat_recommend_bbox_orig_20260502_210709_211.jpg",
+    "names": [
+      "John",
+      "lily"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and wears glasses. He is wearing a white jacket, a red and purple shirt, black pants with white stripes, and white shoes.",
+      "He is male, he is approximately sixteen years-old, he has black hair and wears glasses. He is wearing a black jacket, a white t-shirt, and a blue lanyard."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_017",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_192215 copy/seat_recommend_bbox_service_1777727589_seat_recommend_bbox_orig_20260502_211457_371.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and short hair without glasses. He is wearing a light green t-shirt and a black strap bag."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_018",
+    "src": "/home/tinker/tk25_ws/vision_log/20260502_192215 copy/seat_recommend_bbox_service_1777727589_seat_recommend_bbox_orig_20260502_211617_268.jpg",
+    "names": [
+      "John",
+      "lucy"
+    ],
+    "features": [
+      "He is male, he is approximately twenty years-old, he has black hair and short hair without glasses. He is wearing a light green t-shirt and a black strap bag.",
+      "He is male, he is approximately twenty years-old, he has black hair and short hair. He is wearing a white t-shirt and light-colored pants."
+    ],
+    "known_seats": []
+  },
+  {
+    "id": "scene_019",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777777631_seat_recommend_bbox_orig_20260503_111155_687.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "left stool",
+      "front middle stool",
+      "right stool",
+      "left spot on sofa",
+      "middle spot on sofa",
+      "right spot on sofa"
+    ]
+  },
+  {
+    "id": "scene_020",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777777631_seat_recommend_bbox_orig_20260503_111338_022.jpg",
+    "names": [
+      "John",
+      "linda"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "She is female, she is approximately twenty years-old, she has dark brown hair and no glasses. She is wearing a black jacket and a white tank top."
+    ],
+    "known_seats": [
+      "left stool",
+      "front middle stool",
+      "right stool",
+      "left spot on sofa",
+      "middle spot on sofa",
+      "right spot on sofa"
+    ]
+  },
+  {
+    "id": "scene_021",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777779664_seat_recommend_bbox_orig_20260503_114733_321.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "left stool",
+      "front middle stool",
+      "right stool",
+      "left spot on sofa",
+      "middle spot on sofa",
+      "right spot on sofa"
+    ]
+  },
+  {
+    "id": "scene_022",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777779664_seat_recommend_bbox_orig_20260503_114851_215.jpg",
+    "names": [
+      "John",
+      "richard"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "She is female, she is approximately twenty years-old, she has black hair and is wearing glasses. She is wearing a light purple zip-up jacket and a blue lanyard with an identification card."
+    ],
+    "known_seats": [
+      "left stool",
+      "front middle stool",
+      "right stool",
+      "left spot on sofa",
+      "middle spot on sofa",
+      "right spot on sofa"
+    ]
+  },
+  {
+    "id": "scene_023",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777780887_seat_recommend_bbox_orig_20260503_120307_499.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_024",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777780887_seat_recommend_bbox_orig_20260503_120414_420.jpg",
+    "names": [
+      "John",
+      "richard"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "She is female, she is approximately twenty years-old, she has black hair and long hair with glasses. She is wearing a grey jacket and a blue lanyard."
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_025",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777781493_seat_recommend_bbox_orig_20260503_121601_035.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_026",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777781493_seat_recommend_bbox_orig_20260503_121754_213.jpg",
+    "names": [
+      "John",
+      "mike"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "He is male, he is approximately twenty years-old, he has short black hair and glasses. He is wearing a grey and purple jacket."
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_027",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777782408_seat_recommend_bbox_orig_20260503_122834_026.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_028",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777782408_seat_recommend_bbox_orig_20260503_122952_550.jpg",
+    "names": [
+      "John",
+      "allen"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "She is female, she is approximately twenty years-old, she has black hair and is wearing glasses. She is wearing a light purple jacket and a necklace."
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_029",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777783129_seat_recommend_bbox_orig_20260503_124329_848.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_030",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777783129_seat_recommend_bbox_orig_20260503_124525_366.jpg",
+    "names": [
+      "John",
+      "richard"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "He is male, he is approximately in his twenties, he has short black hair and no glasses. He is wearing a white dress shirt and dark pants."
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_031",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777783646_seat_recommend_bbox_orig_20260503_125003_500.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_032",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777783646_seat_recommend_bbox_orig_20260503_125509_266.jpg",
+    "names": [
+      "John",
+      "richard"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "She is female, she is approximately thirty years-old, she has black hair and no glasses. She is wearing a brown shirt and a black coat."
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_033",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777785272_seat_recommend_bbox_orig_20260503_131831_805.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "leftmost chair",
+      "middlemost chair",
+      "rightmost chair"
+    ]
+  },
+  {
+    "id": "scene_034",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777788146_seat_recommend_bbox_orig_20260503_140938_721.jpg",
+    "names": [
+      "John"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket"
+    ],
+    "known_seats": [
+      "left stool",
+      "front middle stool",
+      "right stool",
+      "left spot on sofa",
+      "middle spot on sofa",
+      "right spot on sofa"
+    ]
+  },
+  {
+    "id": "scene_035",
+    "src": "/home/tinker/tk25_ws/vision_log/20260503_110136 copy/seat_recommend_bbox_service_1777788146_seat_recommend_bbox_orig_20260503_141123_248.jpg",
+    "names": [
+      "John",
+      "lily"
+    ],
+    "features": [
+      "She is a girl with blond hair and black jacket",
+      "He is male, he is approximately twenty years-old, he has short black hair and no glasses. He is wearing a dark t-shirt and dark pants."
+    ],
+    "known_seats": [
+      "left stool",
+      "front middle stool",
+      "right stool",
+      "left spot on sofa",
+      "middle spot on sofa",
+      "right spot on sofa"
+    ]
+  }
+]

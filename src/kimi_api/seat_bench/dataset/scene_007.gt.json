@@ -1,8 +1,60 @@
 {
   "id": "scene_007",
-  "image_wh": [1280, 720],
+  "image_wh": [
+    1280,
+    720
+  ],
   "seats": [
-    {"label": "left sofa cushion", "occupied": false, "cushion_bbox": [415, 330, 660, 440]},
-    {"label": "right sofa cushion", "occupied": false, "cushion_bbox": [660, 330, 890, 440]}
-  ]
+    {
+      "label": "sofa-left",
+      "occupied": false,
+      "cushion_bbox": [
+        408,
+        240,
+        586,
+        343
+      ]
+    },
+    {
+      "label": "sofa-right",
+      "occupied": false,
+      "cushion_bbox": [
+        586,
+        240,
+        819,
+        347
+      ]
+    },
+    {
+      "label": "stool-left",
+      "occupied": true,
+      "cushion_bbox": [
+        182,
+        396,
+        361,
+        540
+      ]
+    },
+    {
+      "label": "stool-center",
+      "occupied": true,
+      "cushion_bbox": [
+        553,
+        494,
+        730,
+        717
+      ]
+    },
+    {
+      "label": "stool-right",
+      "occupied": false,
+      "cushion_bbox": [
+        886,
+        392,
+        1059,
+        547
+      ]
+    }
+  ],
+  "gt_source": "s1_qwen (user-verified 2026-06-02)"
 }

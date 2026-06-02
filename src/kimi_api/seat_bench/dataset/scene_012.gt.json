@@ -1,9 +1,40 @@
 {
   "id": "scene_012",
-  "image_wh": [1280, 720],
+  "image_wh": [
+    1280,
+    720
+  ],
   "seats": [
-    {"label": "left chair", "occupied": false, "cushion_bbox": [330, 390, 490, 475]},
-    {"label": "middle chair", "occupied": true, "cushion_bbox": [490, 390, 660, 490]},
-    {"label": "right chair", "occupied": false, "cushion_bbox": [660, 390, 810, 475]}
-  ]
+    {
+      "label": "left chair",
+      "occupied": true,
+      "cushion_bbox": [
+        347,
+        230,
+        518,
+        550
+      ]
+    },
+    {
+      "label": "middle chair",
+      "occupied": true,
+      "cushion_bbox": [
+        522,
+        230,
+        664,
+        543
+      ]
+    },
+    {
+      "label": "right chair",
+      "occupied": false,
+      "cushion_bbox": [
+        676,
+        226,
+        832,
+        518
+      ]
+    }
+  ],
+  "gt_source": "s1_qwen (user-verified 2026-06-02)"
 }

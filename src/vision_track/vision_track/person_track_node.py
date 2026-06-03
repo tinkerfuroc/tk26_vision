@@ -194,17 +194,11 @@ class PersonTrackNode(Node):
             max_frames_allowed = max(max_frames_allowed, int(self.max_frames_lost))
             
             if self.reid_mode == 'native':
-                # Use native BoT-SORT ReID from YOLO
-                from vision_track.track_yolo_native import YOLOTrackerNative
-                self.tracker = YOLOTrackerNative(
-                    model_path=str(model_file),
-                    confidence_threshold=self.confidence_threshold,
-                    appearance_thresh=0.25,  # Lower = stricter ReID matching
-                    proximity_thresh=0.5,
-                    track_buffer=60,  # 2 seconds at 30fps
+                raise NotImplementedError(
+                    "reid_mode='native' is not implemented in tk26 — "
+                    "track_yolo_native.YOLOTrackerNative does not exist. "
+                    "Use reid_mode='custom' (the default)."
                 )
-                self.tracker.max_frames_lost = max_frames_allowed
-                self.get_logger().info(f'YOLO Tracker (NATIVE ReID) initialized with model: {model_file}')
             else:
                 # Use custom ResNet50-based ReID (default)
                 self.tracker = YOLOTracker(
@@ -215,6 +209,11 @@ class PersonTrackNode(Node):
                     reid_verification_interval=int(self.reid_verification_interval)
                 )
                 self.tracker.max_frames_lost = max_frames_allowed
+                # Communicate the real loop cadence so loss/buffer timing is
+                # wall-clock-correct (ByteTrack frame_rate is wired through a
+                # project bytetrack.yaml in Phase 1; here we record it on the
+                # tracker for max_frames_lost derivation).
+                self.tracker.frame_rate = float(self.tracking_rate)
                 self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
             
             self.get_logger().info(
@@ -795,6 +794,16 @@ class PersonTrackNode(Node):
                 feedback.rgb_img = rgb_msg
 
         goal_handle.publish_feedback(feedback)
+
+        # Republish a lost-sentinel so /target_points consumers see the loss
+        # instead of a stale last-good point. NaN coords flag "no target".
+        if self.target_point_pub is not None:
+            sentinel = PointStamped()
+            sentinel.header = rgb_msg.header
+            sentinel.point.x = float('nan')
+            sentinel.point.y = float('nan')
+            sentinel.point.z = float('nan')
+            self.target_point_pub.publish(sentinel)
 
         if time_since_seen > self.lost_timeout:
             self.get_logger().warn(f'Target lost for {time_since_seen:.1f}s, aborting')

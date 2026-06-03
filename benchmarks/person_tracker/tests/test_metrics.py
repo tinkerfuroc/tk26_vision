@@ -21,11 +21,13 @@ S = 1_000_000_000  # 1 second in ns
 def g(t_s, present=True, centroid=(0.0, 0.0, 2.0)):
     """GtFrame at t_s seconds. bbox is irrelevant to metrics."""
     bbox = (0, 0, 10, 10) if present else None
+    c = centroid if present else None
     return GtFrame(
         t_ns=int(t_s * S),
         present=present,
         bbox=bbox,
-        centroid_3d=centroid if present else None,
+        centroid_field=c,
+        centroid_track=c,
     )
 
 
@@ -301,3 +303,50 @@ class TestThroughputAndEmpty:
         cfg = MetricConfig(correct_radius_m=0.3)
         m = compute_metrics(aligned, cfg=cfg)
         assert m["correct_lock_rate"] == 0.0
+
+
+class TestGatesOnField:
+    def _gt(self, t_ns, field, track, present=True):
+        from ptbench.common.schema import GtFrame
+        return GtFrame(
+            t_ns=t_ns, present=present,
+            bbox=(0, 0, 10, 10) if present else None,
+            centroid_field=field, centroid_track=track,
+        )
+
+    def _pred(self, t_ns, xyz, lost=False):
+        from ptbench.common.align import PredFrame
+        return PredFrame(t_ns=t_ns, target_lost=lost, target_track_id=1, point_xyz=xyz)
+
+    def test_correct_lock_uses_field_not_track(self):
+        from ptbench.common.metrics import compute_metrics
+        # pred matches TRACK exactly but is 1.0 m from FIELD → NOT a correct lock.
+        aligned = [(
+            self._gt(1000, field=(1.0, 0.0, 3.0), track=(0.0, 0.0, 3.0)),
+            self._pred(1000, (0.0, 0.0, 3.0)),
+        )]
+        m = compute_metrics(aligned)
+        assert m["correct_lock_rate"] == 0.0  # 1.0 m > correct_radius 0.5
+
+    def test_lateral_error_measured_against_field(self):
+        from ptbench.common.metrics import compute_metrics
+        # pred == field → correct lock with ~0 lateral error.
+        aligned = [(
+            self._gt(1000, field=(0.0, 0.0, 3.0), track=(0.3, 0.0, 3.0)),
+            self._pred(1000, (0.0, 0.0, 3.0)),
+        )]
+        m = compute_metrics(aligned)
+        assert m["correct_lock_rate"] == 1.0
+        assert m["pos_error_lateral_m"]["median"] < 1e-6
+
+    def test_centroid_track_diagnostic_present(self):
+        from ptbench.common.metrics import compute_metrics
+        aligned = [(
+            self._gt(1000, field=(0.0, 0.0, 3.0), track=(0.3, 0.0, 3.0)),
+            self._pred(1000, (0.0, 0.0, 3.0)),
+        )]
+        m = compute_metrics(aligned)
+        assert "centroid_track_diag" in m
+        diag = m["centroid_track_diag"]
+        # pred (0,0,3) vs track (0.3,0,3) → lateral ~0.3 in the diagnostic.
+        assert diag["pos_error_lateral_m"]["median"] == pytest.approx(0.3, abs=1e-6)

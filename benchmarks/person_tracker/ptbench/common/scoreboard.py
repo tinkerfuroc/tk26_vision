@@ -24,6 +24,8 @@ class GateConfig:
     reacquire_latency_warn_s: float = 2.0
     pos_error_lateral_pass_m: float = 0.25
     pos_error_lateral_warn_m: float = 0.40
+    pos_error_range_pass_m: float = 0.30
+    pos_error_range_warn_m: float = 0.50
     false_target_rate_pass: float = 0.05
     false_target_rate_warn: float = 0.10
     throughput_pass_hz: float = 12.0
@@ -104,6 +106,8 @@ def score(metrics: dict, gates: Optional[GateConfig] = None) -> Scoreboard:
     reacq_med = reacq.get("median") if isinstance(reacq, dict) else None
     pos_lat = metrics.get("pos_error_lateral_m")
     pos_lat_med = pos_lat.get("median") if isinstance(pos_lat, dict) else None
+    pos_rng = metrics.get("pos_error_range_m")
+    pos_rng_med = pos_rng.get("median") if isinstance(pos_rng, dict) else None
     false_rate = metrics.get("false_target_rate")
     throughput = metrics.get("throughput_hz")
 
@@ -136,6 +140,15 @@ def score(metrics: dict, gates: Optional[GateConfig] = None) -> Scoreboard:
                 pos_lat_med,
                 gates.pos_error_lateral_pass_m,
                 gates.pos_error_lateral_warn_m,
+            ),
+        ),
+        (
+            "pos_error_range_m",
+            _fmt_value(pos_rng_med),
+            _verdict_lower_better(
+                pos_rng_med,
+                gates.pos_error_range_pass_m,
+                gates.pos_error_range_warn_m,
             ),
         ),
         (

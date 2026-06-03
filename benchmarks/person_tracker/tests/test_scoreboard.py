@@ -213,3 +213,29 @@ class TestSerialization:
         json.dumps(d)  # still serializable with N/A present
         verdicts = {r["metric"]: r["verdict"] for r in d["rows"]}
         assert verdicts["throughput_hz"] == "N/A"
+
+
+class TestRangeGate:
+    def test_range_gate_pass(self):
+        from ptbench.common.scoreboard import score
+        board = score({"pos_error_range_m": {"median": 0.20}})
+        row = [r for r in board.rows if r[0] == "pos_error_range_m"][0]
+        assert row[2] == "PASS"
+
+    def test_range_gate_warn(self):
+        from ptbench.common.scoreboard import score
+        board = score({"pos_error_range_m": {"median": 0.45}})
+        row = [r for r in board.rows if r[0] == "pos_error_range_m"][0]
+        assert row[2] == "WARN"
+
+    def test_range_gate_fail(self):
+        from ptbench.common.scoreboard import score
+        board = score({"pos_error_range_m": {"median": 0.80}})
+        row = [r for r in board.rows if r[0] == "pos_error_range_m"][0]
+        assert row[2] == "FAIL"
+
+    def test_range_gate_default_thresholds(self):
+        from ptbench.common.scoreboard import GateConfig
+        g = GateConfig()
+        assert g.pos_error_range_pass_m == 0.30
+        assert g.pos_error_range_warn_m == 0.50

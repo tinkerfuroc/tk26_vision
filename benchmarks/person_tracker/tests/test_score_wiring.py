@@ -29,7 +29,8 @@ def _gt(t_s, present=True, centroid=(0.0, 0.0, 2.0)) -> GtFrame:
         t_ns=int(t_s * S),
         present=present,
         bbox=(0, 0, 10, 10) if present else None,
-        centroid_3d=centroid if present else None,
+        centroid_field=centroid if present else None,
+        centroid_track=centroid if present else None,
     )
 
 

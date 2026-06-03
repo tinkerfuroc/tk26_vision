@@ -64,17 +64,17 @@ def test_tier_a_full_loop_perfect_predictions_pass(tmp_path):
     clip = _clip(tmp_path, anns, depth_list, "cml_crossing")
 
     assert len(clip.frames) == 3
-    assert clip.frames[0].centroid_3d is not None
+    assert clip.frames[0].centroid_field is not None
     assert clip.frames[2].present is False
 
     # Perfect tracker: locks exactly onto each GT centroid; reports lost while
     # the operator is absent (so no false target).
     preds = []
     for f in clip.frames:
-        if f.present and f.centroid_3d is not None:
+        if f.present and f.centroid_field is not None:
             preds.append(
                 PredFrame(t_ns=f.t_ns, target_lost=False, target_track_id=7,
-                          point_xyz=tuple(f.centroid_3d))
+                          point_xyz=tuple(f.centroid_field))
             )
         else:
             preds.append(
@@ -101,7 +101,7 @@ def test_tier_a_full_loop_discriminates_wrong_lock(tmp_path):
     preds = [
         PredFrame(
             t_ns=f.t_ns, target_lost=False, target_track_id=9,
-            point_xyz=(f.centroid_3d[0] + 5.0, f.centroid_3d[1], f.centroid_3d[2]),
+            point_xyz=(f.centroid_field[0] + 5.0, f.centroid_field[1], f.centroid_field[2]),
         )
         for f in clip.frames
     ]

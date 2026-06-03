@@ -505,7 +505,7 @@ def periodic_reid_validation(
         return True, None
 
     margin = best_similarity - (current_similarity or 0.0)
-    margin_required = max(ReIDMatcher.REID_MARGIN, 0.08)
+    margin_required = max(ReIDMatcher.REID_MARGIN, 0.15)
     if best_similarity > tracker.reid_threshold and margin > margin_required:
         logger.info(
             f"Periodic ReID prefers ID {best_match.track_id} (sim={best_similarity:.3f}) "

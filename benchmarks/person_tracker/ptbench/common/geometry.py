@@ -7,8 +7,10 @@ Camera optical-frame convention (matches
     y = (v - cy) * z / fy    (down)
     z = depth                 (forward)
 
-So range = z and lateral = sqrt(x^2 + y^2). The centroid uses mean over x/y and
-**median over z** (the production node's robustness choice for depth).
+So range = z and lateral = sqrt(x^2 + y^2). The centroid uses the median over
+x/y/z with z-outlier rejection (ptbench-local ``ptbench.common.centroid.reduce_centroid``,
+a pure mirror of ``vision_track.core.centroid``) so the offline benchmark and
+the live node reduce points identically — enforced by a ROS-free parity test.
 """
 from __future__ import annotations
 
@@ -16,6 +18,8 @@ import math
 from typing import Optional, Tuple
 
 import numpy as np
+
+from ptbench.common.centroid import reduce_centroid
 
 
 def _unpack_K(K):
@@ -90,10 +94,8 @@ def centroid_from_bbox_depth(
     if obj_pts.ndim != 2 or obj_pts.shape[0] == 0:
         return None
 
-    centroid = np.mean(obj_pts, axis=0)
-    centroid[2] = np.median(obj_pts[:, 2])  # median z is more robust
-
-    return float(centroid[0]), float(centroid[1]), float(centroid[2])
+    cx_m, cy_m, cz_m = reduce_centroid(obj_pts)
+    return cx_m, cy_m, cz_m
 
 
 def dist3d(a, b) -> float:

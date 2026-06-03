@@ -19,6 +19,7 @@ from .core.tracking_pipeline import (
 )
 from .core.tracking_types import TargetAppearance, TrackerState, TrackingResult
 from .core.registry import PersonRegistry
+from .core.operator_init import select_operator_detection
 from .reid.appearance_manager import update_appearance
 from .reid.reid import AppearanceExtractor, ReIDMatcher
 from .reid.reid_search import find_best_match_reid
@@ -381,16 +382,29 @@ class YOLOTracker:
             if best_match is not None:
                 selected_result = best_match
         
-        # If target_class is provided, find first object of that class
+        # If target_class is provided, pick the best operator candidate
+        # (nearest + most central, conf tie-break) instead of results[0].
         elif target_class is not None:
-            for result in results:
-                if result.class_name.lower() == target_class.lower():
-                    selected_result = result
-                    break
-        
-        # If no specific target, track the first detected object
+            img_h, img_w = frame.shape[:2]
+            selected_result = select_operator_detection(
+                results,
+                image_wh=(img_w, img_h),
+                # No depth image at init time in this path; centeredness +
+                # confidence drive the choice. The node's depth-aware init is a
+                # Phase 2 concern — here depth is unavailable.
+                depth_lookup=lambda _bbox: None,
+                target_class=target_class,
+            )
+
+        # If no specific target, track the best central candidate of any class.
         else:
-            selected_result = results[0]
+            img_h, img_w = frame.shape[:2]
+            selected_result = select_operator_detection(
+                results,
+                image_wh=(img_w, img_h),
+                depth_lookup=lambda _bbox: None,
+                target_class=results[0].class_name,
+            ) or results[0]
         
         if selected_result is not None:
             self.target_track_id = selected_result.track_id

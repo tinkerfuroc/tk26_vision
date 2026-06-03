@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
+SUPPORTED_SCHEMA_VERSIONS = ("1.0", "1.1")
 
 
 class GtSchemaError(Exception):
@@ -25,7 +26,24 @@ class GtFrame:
     t_ns: int
     present: bool
     bbox: Optional[Tuple[float, float, float, float]]
-    centroid_3d: Optional[Tuple[float, float, float]]
+    # Best-available estimate (mask + robust median) — the gate scores this.
+    centroid_field: Optional[Tuple[float, float, float]] = None
+    # Node-identical math (no mask) — reported as a diagnostic only.
+    centroid_track: Optional[Tuple[float, float, float]] = None
+    # transitional alias (parallel-change); removed in Phase 0 cleanup once all consumers use centroid_field/centroid_track
+    centroid_3d: Optional[Tuple[float, float, float]] = None
+
+    def __post_init__(self):
+        # Keep the transitional alias in sync with the canonical fields so old
+        # GtFrame(centroid_3d=x) construction and old frame.centroid_3d reads
+        # both work during the migration.
+        if self.centroid_3d is not None:
+            if self.centroid_field is None:
+                self.centroid_field = self.centroid_3d
+            if self.centroid_track is None:
+                self.centroid_track = self.centroid_3d
+        elif self.centroid_field is not None:
+            self.centroid_3d = self.centroid_field
 
 
 @dataclass
@@ -51,10 +69,10 @@ def validate(clip: GtClip) -> None:
 
     Error messages contain the offending field name as a substring.
     """
-    if clip.schema_version != SCHEMA_VERSION:
+    if clip.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         raise GtSchemaError(
             f"unsupported schema_version {clip.schema_version!r} "
-            f"(expected {SCHEMA_VERSION!r})"
+            f"(expected one of {SUPPORTED_SCHEMA_VERSIONS!r})"
         )
 
     if not clip.frames:
@@ -84,13 +102,15 @@ def validate(clip: GtClip) -> None:
         if f.present and f.bbox is None:
             raise GtSchemaError(f"frame {i}: present=True requires a non-null bbox")
 
-        if f.centroid_3d is not None:
-            c = tuple(f.centroid_3d)
-            if len(c) != 3 or not all(_is_finite_number(v) for v in c):
-                raise GtSchemaError(
-                    f"frame {i}: centroid_3d must be 3 finite numbers, "
-                    f"got {f.centroid_3d!r}"
-                )
+        for field_name in ("centroid_field", "centroid_track"):
+            val = getattr(f, field_name)
+            if val is not None:
+                c = tuple(val)
+                if len(c) != 3 or not all(_is_finite_number(v) for v in c):
+                    raise GtSchemaError(
+                        f"frame {i}: {field_name} must be 3 finite numbers, "
+                        f"got {val!r}"
+                    )
 
 
 def _frame_to_dict(f: GtFrame) -> dict:
@@ -98,7 +118,8 @@ def _frame_to_dict(f: GtFrame) -> dict:
         "t_ns": f.t_ns,
         "present": f.present,
         "bbox": list(f.bbox) if f.bbox is not None else None,
-        "centroid_3d": list(f.centroid_3d) if f.centroid_3d is not None else None,
+        "centroid_field": list(f.centroid_field) if f.centroid_field is not None else None,
+        "centroid_track": list(f.centroid_track) if f.centroid_track is not None else None,
     }
 
 
@@ -119,12 +140,21 @@ def _clip_to_dict(clip: GtClip) -> dict:
 
 def _frame_from_dict(d: dict) -> GtFrame:
     bbox = d.get("bbox")
-    centroid = d.get("centroid_3d")
+    # 1.1 carries centroid_field/centroid_track; 1.0 carries a single
+    # centroid_3d that maps onto both.
+    if "centroid_field" in d or "centroid_track" in d:
+        cf = d.get("centroid_field")
+        ct = d.get("centroid_track")
+    else:
+        legacy = d.get("centroid_3d")
+        cf = legacy
+        ct = legacy
     return GtFrame(
         t_ns=d["t_ns"],
         present=d["present"],
         bbox=tuple(bbox) if bbox is not None else None,
-        centroid_3d=tuple(centroid) if centroid is not None else None,
+        centroid_field=tuple(cf) if cf is not None else None,
+        centroid_track=tuple(ct) if ct is not None else None,
     )
 
 

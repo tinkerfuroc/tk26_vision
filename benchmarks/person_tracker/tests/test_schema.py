@@ -24,12 +24,14 @@ def make_clip(**overrides) -> GtClip:
     frames = overrides.pop(
         "frames",
         [
-            GtFrame(t_ns=1000, present=True, bbox=(10, 20, 110, 220), centroid_3d=(0.1, 0.0, 2.5)),
-            GtFrame(t_ns=2000, present=False, bbox=None, centroid_3d=None),
+            GtFrame(t_ns=1000, present=True, bbox=(10, 20, 110, 220),
+                    centroid_field=(0.1, 0.0, 2.5), centroid_track=(0.1, 0.0, 2.5)),
+            GtFrame(t_ns=2000, present=False, bbox=None,
+                    centroid_field=None, centroid_track=None),
         ],
     )
     return GtClip(
-        schema_version=overrides.pop("schema_version", "1.0"),
+        schema_version=overrides.pop("schema_version", "1.1"),
         clip_id=overrides.pop("clip_id", "test_clip"),
         bag_path=overrides.pop("bag_path", "bags/test"),
         scenario=overrides.pop("scenario", "test_scenario"),
@@ -69,13 +71,15 @@ class TestRoundTrip:
         assert f0.t_ns == 1000
         assert f0.present is True
         assert f0.bbox == (10, 20, 110, 220)
-        assert f0.centroid_3d == (0.1, 0.0, 2.5)
+        assert f0.centroid_field == (0.1, 0.0, 2.5)
+        assert f0.centroid_track == (0.1, 0.0, 2.5)
 
         f1 = loaded.frames[1]
         assert f1.t_ns == 2000
         assert f1.present is False
         assert f1.bbox is None
-        assert f1.centroid_3d is None
+        assert f1.centroid_field is None
+        assert f1.centroid_track is None
 
     def test_canonical_json_shape(self, tmp_path):
         """JSON on disk must use arrays (not tuples), bbox/centroid null when None."""
@@ -84,29 +88,33 @@ class TestRoundTrip:
         save_gt(clip, p)
         raw = json.loads(p.read_text())
 
-        assert raw["schema_version"] == "1.0"
+        assert raw["schema_version"] == "1.1"
         assert raw["frames"][0]["bbox"] == [10, 20, 110, 220]
-        assert raw["frames"][0]["centroid_3d"] == [0.1, 0.0, 2.5]
+        assert raw["frames"][0]["centroid_field"] == [0.1, 0.0, 2.5]
+        assert raw["frames"][0]["centroid_track"] == [0.1, 0.0, 2.5]
         assert raw["frames"][1]["bbox"] is None
-        assert raw["frames"][1]["centroid_3d"] is None
+        assert raw["frames"][1]["centroid_field"] is None
+        assert raw["frames"][1]["centroid_track"] is None
 
     def test_roundtrip_full_spec_example(self, tmp_path):
         """Matches the canonical JSON shape from the spec verbatim."""
         clip = GtClip(
-            schema_version="1.0",
+            schema_version="1.1",
             clip_id="cml_crossing_01",
             bag_path="bags/cml_crossing_01",
             scenario="cml_crossing",
             frames=[
-                GtFrame(t_ns=1000, present=True, bbox=(10, 20, 110, 220), centroid_3d=(0.1, 0.0, 2.5)),
-                GtFrame(t_ns=2000, present=False, bbox=None, centroid_3d=None),
+                GtFrame(t_ns=1000, present=True, bbox=(10, 20, 110, 220),
+                        centroid_field=(0.1, 0.0, 2.5), centroid_track=(0.1, 0.0, 2.5)),
+                GtFrame(t_ns=2000, present=False, bbox=None,
+                        centroid_field=None, centroid_track=None),
             ],
         )
         p = tmp_path / "canonical.json"
         save_gt(clip, p)
         loaded = load_gt(p)
         assert loaded.clip_id == "cml_crossing_01"
-        assert loaded.frames[0].centroid_3d == (0.1, 0.0, 2.5)
+        assert loaded.frames[0].centroid_field == (0.1, 0.0, 2.5)
 
     def test_roundtrip_preserves_defaults(self, tmp_path):
         clip = make_clip()
@@ -121,12 +129,14 @@ class TestRoundTrip:
 
     def test_roundtrip_lossless_float_centroid(self, tmp_path):
         clip = make_clip(
-            frames=[GtFrame(t_ns=100, present=True, bbox=(0, 0, 10, 10), centroid_3d=(1.23456, -0.5, 3.14159))]
+            frames=[GtFrame(t_ns=100, present=True, bbox=(0, 0, 10, 10),
+                            centroid_field=(1.23456, -0.5, 3.14159),
+                            centroid_track=(1.23456, -0.5, 3.14159))]
         )
         p = tmp_path / "gt.json"
         save_gt(clip, p)
         loaded = load_gt(p)
-        cx, cy, cz = loaded.frames[0].centroid_3d
+        cx, cy, cz = loaded.frames[0].centroid_field
         assert abs(cx - 1.23456) < 1e-6
         assert abs(cy - (-0.5)) < 1e-9
         assert abs(cz - 3.14159) < 1e-5
@@ -170,8 +180,10 @@ class TestValidationErrors:
 
     def test_non_monotonic_t_ns(self, tmp_path):
         frames = [
-            GtFrame(t_ns=2000, present=False, bbox=None, centroid_3d=None),
-            GtFrame(t_ns=1000, present=False, bbox=None, centroid_3d=None),  # goes backward
+            GtFrame(t_ns=2000, present=False, bbox=None,
+                    centroid_field=None, centroid_track=None),
+            GtFrame(t_ns=1000, present=False, bbox=None,
+                    centroid_field=None, centroid_track=None),  # goes backward
         ]
         clip = make_clip(frames=frames)
         p = tmp_path / "gt.json"
@@ -283,7 +295,7 @@ class TestValidationErrors:
         }
         p = tmp_path / "gt.json"
         p.write_text(json.dumps(raw))
-        with pytest.raises(GtSchemaError, match="centroid_3d"):
+        with pytest.raises(GtSchemaError, match="centroid_field"):
             load_gt(p)
 
     def test_bad_centroid_non_finite(self, tmp_path):
@@ -299,7 +311,7 @@ class TestValidationErrors:
         }
         p = tmp_path / "gt.json"
         p.write_text(json.dumps(raw))
-        with pytest.raises(GtSchemaError, match="centroid_3d"):
+        with pytest.raises(GtSchemaError, match="centroid_field"):
             load_gt(p)
 
     def test_bad_bbox_non_finite(self, tmp_path):

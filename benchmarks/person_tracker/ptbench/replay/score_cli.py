@@ -3,7 +3,12 @@
 Usage::
 
     python -m ptbench.replay.score_cli --bag DIR --gt GT.json \
-        [--backend offline|action] [--imgsz 1280] [--conf 0.5] [--json out.json]
+        [--backend action|offline] [--imgsz 736] [--conf 0.5] [--json out.json]
+
+The default ``action`` backend replays onto a live ``/track_person`` server
+(the acceptance path); ``offline`` drives the tracker in-process and is
+APPROXIMATE — it does not replicate the live frame-dropping loop or deployed
+config, so prefer it only for fast CI smoke and threshold sweeps.
 
 Loads the GT clip, runs the chosen backend over the bag to get a prediction
 stream, aligns predictions to GT frames by timestamp, computes the scoreboard
@@ -25,6 +30,8 @@ from ..common.align import PredFrame, align_pred_to_gt
 from ..common.metrics import compute_metrics
 from ..common.schema import GtClip, GtSchemaError, load_gt
 from ..common.scoreboard import GateConfig, Scoreboard, score
+
+DEFAULT_BACKEND = "action"  # acceptance default: exercise the live server
 
 
 def score_preds(
@@ -63,9 +70,11 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--backend",
         choices=("offline", "action"),
-        default="offline",
-        help="prediction backend (default offline: drive YOLOTracker in-process; "
-        "action: replay onto a live /track_person server)",
+        default=DEFAULT_BACKEND,
+        help="prediction backend (default action: replay onto a live "
+        "/track_person server, the acceptance path; offline: drive "
+        "YOLOTracker in-process — APPROXIMATE, does not replicate the live "
+        "frame-dropping loop or deployed config)",
     )
     parser.add_argument(
         "--imgsz",

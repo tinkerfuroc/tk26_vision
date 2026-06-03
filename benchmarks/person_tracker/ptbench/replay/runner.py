@@ -48,7 +48,7 @@ def run_offline(
     bag_dir,
     gt_clip: GtClip,
     *,
-    imgsz: int = 1280,
+    imgsz: int = 736,
     conf: float = 0.5,
 ) -> Tuple[List[PredFrame], float]:
     """Run ``vision_track``'s YOLOTracker over a bag and emit a PredFrame stream.
@@ -79,6 +79,13 @@ def run_offline(
     Raises:
         ImportError: if ``vision_track`` cannot be imported (workspace not
             sourced). Raised on call, not at module import.
+
+    Note:
+        This backend is APPROXIMATE — it drives the tracker class in-process at
+        full speed and does NOT replicate the live node's frame-dropping loop,
+        ByteTrack frame_rate plumbing, or ROI-cropped depth. Use ``run_action``
+        (the CLI default) for acceptance scoring; ``run_offline`` is for fast
+        CI smoke and threshold sweeps only.
     """
     # Deferred heavy import: only when actually running.
     import cv2  # noqa: deferred — only needed at run time

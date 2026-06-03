@@ -127,6 +127,7 @@ class YOLOTracker:
         self.reid_threshold = ReIDMatcher.REID_THRESHOLD
         self.frames_lost = 0
         self.max_frames_lost = 600
+        self.frame_rate: float = 30.0
         self.frame_count = 0
         self.reid_extraction_interval = 3
         self.fast_tracking_mode = False
@@ -677,31 +678,29 @@ class YOLOTracker:
         
         return (pred_x, pred_y)
     
-    def _update_target_velocity(self, current_center: Tuple[float, float]):
-        """
-        Update target velocity estimate with smoothing.
-        
+    def _update_target_velocity(self, current_center: Tuple[float, float], dt: Optional[float] = None):
+        """Update target velocity estimate with smoothing.
+
         Args:
-            current_center: Current target center (cx, cy)
+            current_center: Current target center (cx, cy).
+            dt: Scene-time delta (s) between this and the previous center,
+                derived from frame stamps. When None, falls back to wall-clock
+                (legacy behavior) so non-stamped callers keep working.
         """
-        current_time = time.time()
-        
-        if self.last_known_center is not None and self.last_position_time > 0:
-            dt = current_time - self.last_position_time
-            if dt > 0.001:  # Avoid division by zero
-                # Raw velocity
-                vx = (current_center[0] - self.last_known_center[0]) / dt
-                vy = (current_center[1] - self.last_known_center[1]) / dt
-                
-                # Smooth with exponential moving average
-                alpha = 0.3
-                old_vx, old_vy = self.target_velocity
-                self.target_velocity = (
-                    alpha * vx + (1 - alpha) * old_vx,
-                    alpha * vy + (1 - alpha) * old_vy
-                )
-        
-        self.last_position_time = current_time
+        if dt is None:
+            current_time = time.time()
+            dt = (current_time - self.last_position_time) if self.last_position_time > 0 else 0.0
+            self.last_position_time = current_time
+
+        if self.last_known_center is not None and dt > 0.001:
+            vx = (current_center[0] - self.last_known_center[0]) / dt
+            vy = (current_center[1] - self.last_known_center[1]) / dt
+            alpha = 0.3
+            old_vx, old_vy = self.target_velocity
+            self.target_velocity = (
+                alpha * vx + (1 - alpha) * old_vx,
+                alpha * vy + (1 - alpha) * old_vy,
+            )
     
     def _register_other_persons(self, frame: np.ndarray, results: List[TrackingResult]):
         """Register other persons via the shared pipeline helper."""

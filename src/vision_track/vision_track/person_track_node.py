@@ -49,6 +49,7 @@ from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
 
 from vision_track.core.centroid import reduce_centroid
+from vision_track.core.depth_roi import roi_window
 
 
 class PersonTrackNode(Node):
@@ -123,7 +124,7 @@ class PersonTrackNode(Node):
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('enable_reid', True)
         self.declare_parameter('max_frames_lost', 600)  # ~20 seconds at 30fps
-        self.declare_parameter('inference_size', 1280)  # imgsz for YOLO; lower for speed
+        self.declare_parameter('inference_size', 736)  # imgsz for YOLO; lower for speed
         self.declare_parameter('reid_verification_interval', 5)  # periodic on-track ReID sanity check
         self.declare_parameter('allow_indefinite_recovery', True)  # if True, never abort for long-term loss
         
@@ -289,7 +290,7 @@ class PersonTrackNode(Node):
             self.recent_msg_time = self.get_clock().now()
             self.frame_seq += 1
 
-    def _depth_image_to_points(self, depth_msg: Image, intrinsic: CameraInfo) -> tuple:
+    def _depth_image_to_points(self, depth_msg: Image, intrinsic: CameraInfo, bbox: tuple = None) -> tuple:
         """
         Unproject a registered depth image (encoding 16UC1, mm) to per-pixel XYZ.
 
@@ -309,6 +310,14 @@ class PersonTrackNode(Node):
 
         valid_mask = (depth > self.min_depth) & (depth < self.max_depth)
 
+        # Only the target bbox is ever sampled by _calculate_centroid, so
+        # restrict the unproject to a padded window around it. Pixels outside
+        # the window stay zeroed and invalid.
+        x0, y0, x1, y1 = roi_window(bbox, w=w, h=h, pad=16)
+        valid_roi = np.zeros_like(valid_mask)
+        valid_roi[y0:y1, x0:x1] = valid_mask[y0:y1, x0:x1]
+        valid_mask = valid_roi
+
         # Cache meshgrid across calls at this resolution.
         cache = getattr(self, '_uv_cache', None)
         if cache is None or cache[0] != (h, w):
@@ -316,10 +325,13 @@ class PersonTrackNode(Node):
             self._uv_cache = ((h, w), u, v)
         _, u, v = self._uv_cache
 
-        z = depth
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-        points = np.stack([x, y, z], axis=-1)
+        points = np.zeros((h, w, 3), dtype=np.float32)
+        z_roi = depth[y0:y1, x0:x1]
+        u_roi = u[y0:y1, x0:x1]
+        v_roi = v[y0:y1, x0:x1]
+        points[y0:y1, x0:x1, 0] = (u_roi - cx) * z_roi / fx
+        points[y0:y1, x0:x1, 1] = (v_roi - cy) * z_roi / fy
+        points[y0:y1, x0:x1, 2] = z_roi
 
         return points, valid_mask
 
@@ -538,11 +550,8 @@ class PersonTrackNode(Node):
         last_seen_time = time.time()
         init_start_time = time.time()
         initialized = False
-        rate_period = 1.0 / self.tracking_rate
 
         while rclpy.ok():
-            loop_start = time.time()
-
             if self._handle_cancel(goal_handle, result):
                 return result
 
@@ -575,9 +584,9 @@ class PersonTrackNode(Node):
                 if self._handle_lost_frame(last_seen_time, rgb_img, rgb_msg, feedback, goal_handle, params, result):
                     return result
 
-            elapsed = time.time() - loop_start
-            if elapsed < rate_period:
-                time.sleep(rate_period - elapsed)
+            # No artificial Hz cap: frame-seq dedup in _get_latest_data gates the
+            # loop to the camera rate. A 1 ms yield keeps the GIL fair.
+            time.sleep(0.001)
 
         if goal_handle.is_active and not goal_handle.is_cancel_requested:
             result.status = 0
@@ -645,7 +654,7 @@ class PersonTrackNode(Node):
         params,
     ):
         try:
-            points, valid_mask = self._depth_image_to_points(depth_msg, intrinsic)
+            points, valid_mask = self._depth_image_to_points(depth_msg, intrinsic, bbox=track_result.bbox)
         except Exception as e:
             self.get_logger().warn(f'Failed to process pointcloud: {e}')
             points, valid_mask = None, None

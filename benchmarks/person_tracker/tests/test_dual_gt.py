@@ -140,3 +140,82 @@ class TestSchema11Validation:
         p.write_text(json.dumps(raw))
         with pytest.raises(GtSchemaError, match="centroid_track"):
             load_gt(p)
+
+
+from ptbench.labeler.label_io import FrameAnnotation, build_gt_clip
+
+
+def _pinhole_K(fx=500.0, fy=500.0, cx=320.0, cy=240.0):
+    return [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+
+
+class TestBuildGtClipDual:
+    def test_present_frame_gets_both_centroids(self):
+        H, W = 480, 640
+        K = _pinhole_K()
+        bbox = (100, 100, 200, 200)
+        depth = np.full((H, W), 2500, dtype=np.uint16)  # 2.5 m
+        ann = [FrameAnnotation(t_ns=1000, present=True, bbox=bbox, mask=None)]
+        clip = build_gt_clip(
+            ann, [(1000, depth)], K,
+            clip_id="c", bag_path="b", scenario="s",
+            color_topic="/c", depth_topic="/d", camera_info_topic="/i",
+        )
+        assert clip.schema_version == "1.1"
+        f0 = clip.frames[0]
+        assert f0.centroid_field is not None
+        assert f0.centroid_track is not None
+
+    def test_field_uses_mask_track_ignores_it(self):
+        # A mask covering only the left half shifts centroid_field left of the
+        # bbox-only centroid_track — proving field != track when a mask exists.
+        H, W = 480, 640
+        K = _pinhole_K()
+        bbox = (100, 100, 300, 200)  # 200 wide
+        depth = np.full((H, W), 2000, dtype=np.uint16)
+        mask = np.zeros((H, W), dtype=np.float32)
+        mask[100:200, 100:200] = 1.0  # left half only
+        ann = [FrameAnnotation(t_ns=1000, present=True, bbox=bbox, mask=mask)]
+        clip = build_gt_clip(
+            ann, [(1000, depth)], K,
+            clip_id="c", bag_path="b", scenario="s",
+            color_topic="/c", depth_topic="/d", camera_info_topic="/i",
+        )
+        f0 = clip.frames[0]
+        xf = f0.centroid_field[0]
+        xt = f0.centroid_track[0]
+        assert xf < xt  # masked (left half) is left of bbox-only
+
+    def test_absent_frame_has_no_centroids(self):
+        ann = [
+            FrameAnnotation(t_ns=1000, present=True, bbox=(10, 10, 50, 50), mask=None),
+            FrameAnnotation(t_ns=2000, present=False, bbox=None, mask=None),
+        ]
+        depth = np.full((480, 640), 3000, dtype=np.uint16)
+        clip = build_gt_clip(
+            ann, [(1000, depth), (2000, depth)], _pinhole_K(),
+            clip_id="c", bag_path="b", scenario="s",
+            color_topic="/c", depth_topic="/d", camera_info_topic="/i",
+        )
+        assert clip.frames[1].centroid_field is None
+        assert clip.frames[1].centroid_track is None
+
+    def test_divergence_is_measurable(self):
+        # The synthetic fixture from the spec's "Testing (now)" section: a
+        # tracker matching centroid_track EXACTLY still shows nonzero field
+        # error, so the gate (on field) is not fooled by node-identical math.
+        from ptbench.common.geometry import dist3d
+        H, W = 480, 640
+        K = _pinhole_K()
+        bbox = (100, 100, 300, 200)
+        depth = np.full((H, W), 2000, dtype=np.uint16)
+        mask = np.zeros((H, W), dtype=np.float32)
+        mask[100:200, 100:200] = 1.0
+        ann = [FrameAnnotation(t_ns=1000, present=True, bbox=bbox, mask=mask)]
+        clip = build_gt_clip(
+            ann, [(1000, depth)], K,
+            clip_id="c", bag_path="b", scenario="s",
+            color_topic="/c", depth_topic="/d", camera_info_topic="/i",
+        )
+        f0 = clip.frames[0]
+        assert dist3d(f0.centroid_track, f0.centroid_field) > 0.05

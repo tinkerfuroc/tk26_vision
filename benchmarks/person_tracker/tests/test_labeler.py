@@ -99,8 +99,8 @@ class TestBuildGtClip:
         f = clip.frames[0]
         assert f.present is True
         assert f.bbox == bbox
-        assert f.centroid_3d is not None
-        cx, cy, cz = f.centroid_3d
+        assert f.centroid_track is not None
+        cx, cy, cz = f.centroid_track
         # ROI samples u,v in [40,60); mean center = 49.5, so
         # x = (49.5-50)*2/100 = -0.01 m (and likewise y); z = median = 2.0.
         assert abs(cx - (-0.01)) < 1e-6
@@ -119,7 +119,7 @@ class TestBuildGtClip:
             clip_id="c", bag_path="b", scenario="s",
             color_topic="/c", depth_topic="/d", camera_info_topic="/i",
         )
-        cx, cy, cz = clip.frames[0].centroid_3d
+        cx, cy, cz = clip.frames[0].centroid_track
         # Mean over u in [60,80): center 69.5 -> (69.5-50)*3/100 = 0.585
         # Mean over v in [50,70): center 59.5 -> (59.5-50)*3/100 = 0.285
         assert abs(cx - 0.585) < 1e-3
@@ -137,7 +137,7 @@ class TestBuildGtClip:
         f = clip.frames[0]
         assert f.present is False
         assert f.bbox is None
-        assert f.centroid_3d is None
+        assert f.centroid_track is None
 
     def test_present_without_bbox_downgraded(self):
         """present=True + bbox=None must be downgraded so schema stays valid."""
@@ -151,7 +151,7 @@ class TestBuildGtClip:
         f = clip.frames[0]
         assert f.present is False
         assert f.bbox is None
-        assert f.centroid_3d is None
+        assert f.centroid_track is None
 
     def test_sparse_depth_present_with_none_centroid(self):
         """All-invalid depth → centroid None but present stays True with bbox."""
@@ -168,7 +168,7 @@ class TestBuildGtClip:
         f = clip.frames[0]
         assert f.present is True
         assert f.bbox == bbox
-        assert f.centroid_3d is None  # depth too sparse to sample
+        assert f.centroid_track is None  # depth too sparse to sample
 
     def test_no_depth_frames_centroid_none(self):
         """Empty depth_list → present frame keeps bbox, centroid None."""
@@ -182,7 +182,7 @@ class TestBuildGtClip:
         f = clip.frames[0]
         assert f.present is True
         assert f.bbox == bbox
-        assert f.centroid_3d is None
+        assert f.centroid_track is None
 
     def test_frames_sorted_by_t_ns(self):
         depth_list = [(1000, _constant_depth_image())]
@@ -237,7 +237,7 @@ class TestBuildGtClip:
         assert [f.t_ns for f in loaded.frames] == [1000, 2000, 3000]
         assert loaded.frames[0].present is True
         assert loaded.frames[0].bbox == (40.0, 40.0, 60.0, 60.0)
-        assert loaded.frames[0].centroid_3d is not None
+        assert loaded.frames[0].centroid_track is not None
         assert loaded.frames[1].present is False
         assert loaded.frames[1].bbox is None
         assert loaded.frames[2].present is True
@@ -257,7 +257,7 @@ class TestBuildGtClip:
         save_gt(clip, out)
         loaded = load_gt(out)  # must not raise despite centroid None
         assert loaded.frames[0].present is True
-        assert loaded.frames[0].centroid_3d is None
+        assert loaded.frames[0].centroid_track is None
 
 
 # ---------------------------------------------------------------------------

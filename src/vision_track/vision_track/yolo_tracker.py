@@ -301,6 +301,7 @@ class YOLOTracker:
             classes=classes,
             persist=persist,
             tracker="bytetrack.yaml",
+            half=True,
             verbose=False,
         )
         if self.inference_size is not None:

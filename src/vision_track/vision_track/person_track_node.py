@@ -48,6 +48,8 @@ from vision_track.track_yolo import YOLOTracker, TrackerState, TrackingResult
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
 
+from vision_track.core.centroid import reduce_centroid
+
 
 class PersonTrackNode(Node):
     """
@@ -375,16 +377,16 @@ class PersonTrackNode(Node):
         if len(obj_pts.shape) != 2 or obj_pts.shape[0] == 0:
             return None
         
-        # Calculate centroid (mean for x/y, median for depth)
-        centroid_3d = np.mean(obj_pts, axis=0)
-        centroid_3d[2] = np.median(obj_pts[:, 2])  # Use median for depth (more robust)
-        
+        # Robust reduction shared with ptbench geometry: median lateral x/y +
+        # z-outlier-rejected median z (vision_track.core.centroid.reduce_centroid).
+        cx_m, cy_m, cz_m = reduce_centroid(obj_pts)
+
         # Create Point message (Orbbec frame convention)
         point = Point()
-        point.x = float(centroid_3d[0])
-        point.y = float(centroid_3d[1])
-        point.z = float(centroid_3d[2])
-        
+        point.x = cx_m
+        point.y = cy_m
+        point.z = cz_m
+
         return point
 
     def _draw_debug_info(

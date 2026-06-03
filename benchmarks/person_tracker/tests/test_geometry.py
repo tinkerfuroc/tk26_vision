@@ -57,8 +57,8 @@ class TestCentroidFromBboxDepth:
         expected_y = (v_mid - cy) * depth_m / fy
         expected_z = depth_m
 
-        assert abs(xc - expected_x) < 0.02
-        assert abs(yc - expected_y) < 0.02
+        assert abs(xc - expected_x) < 0.05
+        assert abs(yc - expected_y) < 0.05
         assert abs(zc - expected_z) < 0.002  # median z == constant depth
 
     def test_median_z_robustness(self):

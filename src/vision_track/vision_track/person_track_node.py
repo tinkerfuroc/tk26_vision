@@ -50,6 +50,7 @@ from vision_util.weights_cache import resolve_weights
 
 from vision_track.core.centroid import reduce_centroid
 from vision_track.core.depth_roi import roi_window
+from vision_track.core.frame_diag import compute_frame_diag
 
 
 class PersonTrackNode(Node):
@@ -146,6 +147,9 @@ class PersonTrackNode(Node):
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
 
+        # Perf/quality instrumentation (default-off; zero overhead in production).
+        self.declare_parameter('perf_logging_enabled', False)
+
         self.get_logger().info('Parameters declared')
 
     def _load_parameters(self):
@@ -169,6 +173,8 @@ class PersonTrackNode(Node):
 
         self.vision_logging_enabled = self.get_parameter('vision_logging_enabled').value
         self.vision_log_folder = self.get_parameter('vision_log_folder').value
+
+        self.perf_logging_enabled = self.get_parameter('perf_logging_enabled').value
         
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Enable ReID: {self.enable_reid}')
@@ -565,6 +571,8 @@ class PersonTrackNode(Node):
             rgb_img, rgb_msg, depth_msg, intrinsic = data
             rgb_frame = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
 
+            loop_start = time.time()
+            t_track0 = time.perf_counter()
             with self.lock_tracker:
                 if not initialized:
                     initialized = self._try_initialize(rgb_frame, init_start_time, goal_handle, result)
@@ -573,7 +581,9 @@ class PersonTrackNode(Node):
                         continue
                     last_seen_time = time.time()
                 track_result = self.tracker.update(rgb_frame)
+            t_track = time.perf_counter() - t_track0
 
+            t_post0 = time.perf_counter()
             if track_result is not None:
                 last_seen_time = time.time()
                 self._handle_tracked_frame(
@@ -582,6 +592,13 @@ class PersonTrackNode(Node):
             else:
                 if self._handle_lost_frame(last_seen_time, rgb_img, rgb_msg, feedback, goal_handle, params, result):
                     return result
+            t_post = time.perf_counter() - t_post0
+
+            if self.perf_logging_enabled:
+                self.get_logger().info(
+                    f"[perf] track={t_track*1000:.1f}ms post={t_post*1000:.1f}ms "
+                    f"loop={(time.time()-loop_start)*1000:.1f}ms"
+                )
 
             # No artificial Hz cap: frame-seq dedup in _get_latest_data gates the
             # loop to the camera rate. A 1 ms yield keeps the GIL fair.
@@ -661,6 +678,16 @@ class PersonTrackNode(Node):
         position = None
         if points is not None:
             position = self._calculate_centroid(points, track_result.mask, valid_mask, track_result.bbox)
+
+        if self.perf_logging_enabled and points is not None:
+            diag = compute_frame_diag(points, track_result.mask, valid_mask, track_result.bbox)
+            self.get_logger().info(
+                f"[diag] mask_px={diag['mask_pixel_count']} "
+                f"valid_px={diag['valid_pixel_count']} used_mask={diag['used_mask']} "
+                f"z_iqr={diag['depth_z_iqr']:.3f} "
+                f"mask_c={diag['mask_centroid']} bbox_c={diag['bbox_centroid']} "
+                f"no_centroid={diag['no_centroid']}"
+            )
 
         feedback.target_lost = False
         feedback.target_track_id = track_result.track_id

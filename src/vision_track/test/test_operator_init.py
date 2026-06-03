@@ -1,6 +1,6 @@
 """Unit tests for the ROS-free operator-init heuristic."""
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 from vision_track.core.operator_init import select_operator_detection
 

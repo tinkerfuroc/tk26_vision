@@ -11,7 +11,7 @@ from ptbench.common.schema import GtFrame
 
 def gt(t_ns: int, present: bool = True) -> GtFrame:
     bbox = (10, 10, 100, 100) if present else None
-    return GtFrame(t_ns=t_ns, present=present, bbox=bbox, centroid_3d=None)
+    return GtFrame(t_ns=t_ns, present=present, bbox=bbox)
 
 
 def pred(t_ns: int, lost: bool = False, tid: int = 1, xyz=None) -> PredFrame:

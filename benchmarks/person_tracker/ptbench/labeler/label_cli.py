@@ -101,7 +101,8 @@ def _save(annotations, args, bag_dir: Path, out_path: Path) -> None:
     # When K is unknown, force centroids to None rather than garbage.
     if K is None:
         for f in clip.frames:
-            f.centroid_3d = None
+            f.centroid_field = None
+            f.centroid_track = None
     save_gt(clip, out_path)
     n_present = sum(1 for f in clip.frames if f.present)
     print(

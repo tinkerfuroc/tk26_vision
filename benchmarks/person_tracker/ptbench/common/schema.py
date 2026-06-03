@@ -30,20 +30,6 @@ class GtFrame:
     centroid_field: Optional[Tuple[float, float, float]] = None
     # Node-identical math (no mask) — reported as a diagnostic only.
     centroid_track: Optional[Tuple[float, float, float]] = None
-    # transitional alias (parallel-change); removed in Phase 0 cleanup once all consumers use centroid_field/centroid_track
-    centroid_3d: Optional[Tuple[float, float, float]] = None
-
-    def __post_init__(self):
-        # Keep the transitional alias in sync with the canonical fields so old
-        # GtFrame(centroid_3d=x) construction and old frame.centroid_3d reads
-        # both work during the migration.
-        if self.centroid_3d is not None:
-            if self.centroid_field is None:
-                self.centroid_field = self.centroid_3d
-            if self.centroid_track is None:
-                self.centroid_track = self.centroid_3d
-        elif self.centroid_field is not None:
-            self.centroid_3d = self.centroid_field
 
 
 @dataclass

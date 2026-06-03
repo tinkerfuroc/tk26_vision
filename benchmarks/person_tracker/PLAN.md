@@ -89,6 +89,12 @@ venv: `/home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main`.
 }
 ```
 
+> Schema note (v1.1): the on-disk schema is now v1.1 with **dual centroids** —
+> `centroid_field` (gated, mask + robust median; the gate scores this) and
+> `centroid_track` (node-identical diagnostic). The single `centroid_3d` shown
+> above remains accepted only as a legacy-1.0 *input* key (it maps onto both
+> new fields on load); new GT is written with the two fields.
+
 - Camera optical-frame convention (matches `PersonTrackNode._depth_image_to_points`):
   `x = (u-cx)·z/fx` (right), `y = (v-cy)·z/fy` (down), `z = depth` (forward).
   So **range = z**, **lateral = sqrt(x²+y²)**.

@@ -79,8 +79,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=1280,
-        help="tracker inference size (offline backend; default 1280)",
+        default=736,
+        help="tracker inference size (offline backend; default 736)",
     )
     parser.add_argument(
         "--conf",

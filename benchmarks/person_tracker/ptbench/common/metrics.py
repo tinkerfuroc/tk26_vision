@@ -5,7 +5,7 @@ from ``t_ns`` deltas (in seconds), so nothing assumes a fixed fps.
 
 Lock definitions (a "pred prefix" means: pred is not None AND not
 ``target_lost`` AND ``point_xyz`` is not None AND gt.present AND
-gt.centroid_3d is not None):
+gt.centroid_field is not None):
 
     correct lock : prefix AND dist3d(pred, gt) <= correct_radius_m
     wrong   lock : prefix AND dist3d(pred, gt)  > wrong_radius_m
@@ -41,7 +41,7 @@ def _has_pred_prefix(pair: Pair) -> bool:
         and not p.target_lost
         and p.point_xyz is not None
         and g.present
-        and g.centroid_3d is not None
+        and g.centroid_field is not None
     )
 
 
@@ -49,14 +49,14 @@ def _is_correct_lock(pair: Pair, cfg: MetricConfig) -> bool:
     if not _has_pred_prefix(pair):
         return False
     g, p = pair
-    return dist3d(p.point_xyz, g.centroid_3d) <= cfg.correct_radius_m
+    return dist3d(p.point_xyz, g.centroid_field) <= cfg.correct_radius_m
 
 
 def _is_wrong_lock(pair: Pair, cfg: MetricConfig) -> bool:
     if not _has_pred_prefix(pair):
         return False
     g, p = pair
-    return dist3d(p.point_xyz, g.centroid_3d) > cfg.wrong_radius_m
+    return dist3d(p.point_xyz, g.centroid_field) > cfg.wrong_radius_m
 
 
 def _median_max(samples: List[float]) -> dict:
@@ -153,7 +153,7 @@ def compute_metrics(
     for k, pair in enumerate(aligned):
         if correct_flags[k]:
             g, p = pair
-            lat, rng = lateral_range(p.point_xyz, g.centroid_3d)
+            lat, rng = lateral_range(p.point_xyz, g.centroid_field)
             lat_errs.append(lat)
             range_errs.append(rng)
     pos_error_lateral = _median_p95(lat_errs)
@@ -167,6 +167,21 @@ def compute_metrics(
     )
     false_target_rate = (n_false / n_absent) if n_absent else 0.0
 
+    # --- centroid_track diagnostic (reported, never gated) ----------------
+    diag_lat: List[float] = []
+    diag_rng: List[float] = []
+    for k, pair in enumerate(aligned):
+        if correct_flags[k]:
+            g, p = pair
+            if g.centroid_track is not None:
+                lat, rng = lateral_range(p.point_xyz, g.centroid_track)
+                diag_lat.append(lat)
+                diag_rng.append(rng)
+    centroid_track_diag = {
+        "pos_error_lateral_m": _median_p95(diag_lat),
+        "pos_error_range_m": _median_p95(diag_rng),
+    }
+
     return {
         "correct_lock_rate": correct_lock_rate,
         "wrong_lock_episodes": wrong_lock_episodes,
@@ -175,4 +190,5 @@ def compute_metrics(
         "pos_error_range_m": pos_error_range,
         "false_target_rate": false_target_rate,
         "throughput_hz": throughput_hz,
+        "centroid_track_diag": centroid_track_diag,
     }

@@ -12,8 +12,10 @@ Everything except the rosbag2 reader is framework-free and fully unit-tested:
 - :func:`propagate_default` — copy-the-box-forward default for the next frame.
 - :func:`nearest_depth` — nearest depth frame by ``|t_ns|`` (no slop limit).
 - :func:`build_gt_clip` — assemble a schema-valid :class:`GtClip` from a list of
-  per-frame annotations, sampling 3D centroids from depth via
-  :func:`ptbench.common.geometry.centroid_from_bbox_depth`.
+  per-frame annotations, sampling **both** 3D centroids from depth via
+  :func:`ptbench.common.geometry.centroid_from_bbox_depth`: a mask-aware
+  ``centroid_field`` (the gated best estimate) and a bbox-only
+  ``centroid_track`` (node-identical math, diagnostic).
 
 The rosbag2 reader (:func:`read_color_frames`, :func:`read_depth_and_info`)
 needs ``rosbag2_py`` + ``rclpy`` + ``sensor_msgs`` on the path; it is only
@@ -40,14 +42,17 @@ Bbox = Tuple[float, float, float, float]
 class FrameAnnotation:
     """One labeled color frame, before depth sampling.
 
-    ``bbox`` is ``(x1, y1, x2, y2)`` in color pixels, or ``None``. The schema
-    invariant ``present=True ⇒ bbox is not None`` is enforced by
-    :func:`build_gt_clip` (it drops the box on an inconsistent annotation).
+    ``bbox`` is ``(x1, y1, x2, y2)`` in color pixels, or ``None``. ``mask``
+    is an optional HxW operator-supplied segmentation (truthy pixels = the
+    operator) used for the mask-aware ``centroid_field``; ``None`` means the
+    field centroid falls back to bbox-only (== track). The schema invariant
+    ``present=True ⇒ bbox is not None`` is enforced by :func:`build_gt_clip`.
     """
 
     t_ns: int
     present: bool
     bbox: Optional[Bbox]
+    mask: Optional[np.ndarray] = None
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +103,20 @@ def build_gt_clip(
 ) -> GtClip:
     """Assemble a schema-valid :class:`GtClip` from per-frame annotations.
 
-    For each annotation, if it is present with a box, the 3D centroid is sampled
-    from the nearest depth frame via
-    :func:`ptbench.common.geometry.centroid_from_bbox_depth`. The centroid may
-    come back ``None`` (sparse/invalid depth); that is allowed — ``present``
-    stays ``True`` with ``centroid_3d=None`` (the schema only requires a non-null
-    bbox for present frames, not a centroid).
+    For each annotation, if it is present with a box, **two** 3D centroids are
+    sampled from the nearest depth frame via
+    :func:`ptbench.common.geometry.centroid_from_bbox_depth`:
+
+    - ``centroid_field`` — mask-aware (passes the annotation's ``mask`` when
+      present) best estimate; this is what the gate scores.
+    - ``centroid_track`` — always bbox-only (no mask), reproducing the live
+      node's exact path; reported as a diagnostic.
+
+    Either centroid may come back ``None`` (sparse/invalid depth); that is
+    allowed — ``present`` stays ``True`` with the corresponding centroid
+    ``None`` (the schema only requires a non-null bbox for present frames, not a
+    centroid). When the annotation has no ``mask``, ``centroid_field`` equals
+    ``centroid_track`` because both reduce the same bbox-only point set.
 
     To keep the result schema-valid:
 
@@ -131,23 +144,30 @@ def build_gt_clip(
             # Schema forbids present=True with a null bbox; downgrade.
             present = False
 
-        centroid = None
+        centroid_field = None
+        centroid_track = None
         if present and bbox is not None:
             depth = nearest_depth(depth_list, ann.t_ns)
             if depth is not None:
-                centroid = centroid_from_bbox_depth(depth, K, bbox)
+                # field: best estimate (mask-aware when a mask exists).
+                centroid_field = centroid_from_bbox_depth(
+                    depth, K, bbox, mask=ann.mask
+                )
+                # track: node-identical math, always bbox-only (no mask).
+                centroid_track = centroid_from_bbox_depth(depth, K, bbox)
 
         frames.append(
             GtFrame(
                 t_ns=ann.t_ns,
                 present=present,
                 bbox=tuple(bbox) if (present and bbox is not None) else None,
-                centroid_3d=tuple(centroid) if centroid is not None else None,
+                centroid_field=tuple(centroid_field) if centroid_field is not None else None,
+                centroid_track=tuple(centroid_track) if centroid_track is not None else None,
             )
         )
 
     return GtClip(
-        schema_version="1.0",
+        schema_version="1.1",
         clip_id=clip_id,
         bag_path=bag_path,
         scenario=scenario,

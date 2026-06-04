@@ -924,6 +924,8 @@ class YOLOTracker:
         # Reset frame counter
         self.frame_count = 0
         self.fast_tracking_mode = False
+        # Phase 3: drop any stale per-frame embeddings.
+        self.embedding_cache.clear()
         logger.info("Tracker reset")
     
     def get_class_names(self) -> Dict[int, str]:

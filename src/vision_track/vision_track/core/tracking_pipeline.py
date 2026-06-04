@@ -41,6 +41,11 @@ def update_tracker(tracker, frame: np.ndarray, target_id: Optional[int] = None) 
 
     _switch_target(tracker, target_id)
     tracker.frame_count += 1
+    # Phase 3: frame_count is the single source of truth for the embedding
+    # cache's frame_seq. Begin the new frame here so the cache is clean for
+    # every processed frame even if no candidate is scored this update.
+    if getattr(tracker, "embedding_cache", None) is not None:
+        tracker.embedding_cache.begin_frame(tracker.frame_count)
     # Cleared each frame; reidentify_target sets it True when it authoritatively
     # steps the FSM, telling the node not to re-step present=True for a recovery
     # frame (which would defeat the asymmetric hysteresis on a partial confirm).

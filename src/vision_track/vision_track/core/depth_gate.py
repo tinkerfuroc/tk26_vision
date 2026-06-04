@@ -55,3 +55,15 @@ def roi_median_depth(
     if valid.size == 0:
         return None
     return float(np.median(valid))
+
+
+def should_reject_candidate(
+    candidate_depth: Optional[float],
+    operator_depth: Optional[float],
+    jump_threshold: float,
+) -> bool:
+    """Convenience inverse of is_depth_consistent for the call sites.
+
+    Returns True when the candidate should be rejected as a crosser.
+    """
+    return not is_depth_consistent(candidate_depth, operator_depth, jump_threshold)

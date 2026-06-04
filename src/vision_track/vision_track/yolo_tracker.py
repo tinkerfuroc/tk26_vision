@@ -176,6 +176,13 @@ class YOLOTracker:
         self.candidate_consistency: Dict[int, List[float]] = {}
         self.CONSISTENCY_WINDOW = 5
         self.CONSISTENCY_THRESHOLD = 0.15
+        # Phase 2: operator's last known median depth (m), plumbed from the node
+        # (only the node owns the depth image). None ⇒ depth gate permissive.
+        self.operator_last_depth_m: Optional[float] = None
+        self.crosser_depth_jump_m = 0.6
+        # Per-frame map: track_id -> candidate median depth (m), set by the node
+        # before each tracker.update so the pipeline can gate ReID candidates.
+        self.candidate_depths_m: Dict[int, float] = {}
 
     def _init_occlusion_state(self) -> None:
         """Set up occlusion tracking defaults."""
@@ -905,6 +912,9 @@ class YOLOTracker:
         self.relative_positions.clear()
         # Reset candidate consistency tracking
         self.candidate_consistency.clear()
+        # Phase 2: clear depth-gate state (operator depth + per-candidate depths)
+        self.operator_last_depth_m = None
+        self.candidate_depths_m = {}
         # Reset frame counter
         self.frame_count = 0
         self.fast_tracking_mode = False

@@ -26,6 +26,33 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Filename of the validated MSMT17-trained osnet_ain_x1_0 checkpoint. Fetched by
+# scripts/fetch_reid_weights.sh into ~/.cache/torch/checkpoints/ and auto-used by
+# the tracker when present (no explicit reid_weights_path required).
+MSMT17_OSNET_AIN_X1_0 = (
+    "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_"
+    "softmax_labsmth_flip_jitter.pth"
+)
+
+
+def discover_cached_reid_weights(backbone_name: str, cache_dir: str = None) -> str:
+    """Return a cached ReID-trained checkpoint path for ``backbone_name``, or "".
+
+    Pure helper (os/pathlib only — no torch/torchreid) so it stays importable
+    without the heavy stack. For ``osnet_ain_x1_0`` it looks for the validated
+    MSMT17 checkpoint under ``cache_dir`` (default ~/.cache/torch/checkpoints)
+    and returns its path iff the file exists. Any other backbone, or a missing
+    file, returns "" (⇒ caller keeps imagenet init).
+    """
+    if backbone_name != "osnet_ain_x1_0":
+        return ""
+    if cache_dir is None:
+        cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "torch", "checkpoints"
+        )
+    candidate = os.path.join(cache_dir, MSMT17_OSNET_AIN_X1_0)
+    return candidate if os.path.isfile(candidate) else ""
+
 # torchreid input convention for person ReID: HxW = 256x128 (h>w).
 _REID_H, _REID_W = 256, 128
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -100,6 +127,19 @@ class OSNetBackbone:
             num_classes=1,
             pretrained=True,
         )
+
+        # If no explicit checkpoint was requested, auto-discover a cached
+        # ReID-trained checkpoint (e.g. the MSMT17 osnet_ain_x1_0 fetched by
+        # scripts/fetch_reid_weights.sh). An explicit reid_weights_path wins.
+        if not reid_weights_path:
+            discovered = discover_cached_reid_weights(backbone_name)
+            if discovered:
+                logger.info(
+                    "Auto-discovered cached MSMT17 ReID weights for %s at %s",
+                    backbone_name,
+                    discovered,
+                )
+                reid_weights_path = discovered
 
         # Optional upgrade: load a ReID-trained (Market/MSMT) checkpoint over the
         # imagenet init. This is the recommended path for maximal lookalike

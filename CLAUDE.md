@@ -79,6 +79,16 @@ src/tk26_vision/src/vision_track/requirements.txt` pulls it in.
   `torchreid.reid.utils.load_pretrained_weights` *after* building, overriding the
   imagenet init (config change only, no code change) for maximal lookalike
   discrimination.
+- **One-command MSMT17 upgrade (auto-used).** Run `scripts/fetch_reid_weights.sh`
+  to download the validated MSMT17-trained `osnet_ain_x1_0` checkpoint into
+  `~/.cache/torch/checkpoints/` (idempotent — skips if present). On the next
+  tracker start, `reid_backbone.discover_cached_reid_weights('osnet_ain_x1_0')`
+  finds it and loads it automatically over the imagenet init — **no
+  `reid_weights_path` needed**; the node logs which weights it picked
+  (msmt17-cached vs imagenet-init). An explicit non-empty `reid_weights_path`
+  still wins; a missing file falls back to imagenet (no error). Validated on
+  real Tinker crops: same/cross separation 0.47 → 0.57. Without the fetch the
+  tracker stays imagenet-init.
 - **Weight cache.** Pretrained OSNet weights are fetched once via torchreid's
   gdown mirror and cached under `~/.cache/torch/checkpoints/` (e.g.
   `osnet_ain_x1_0_imagenet.pth`). Pre-warm on a connected host before offline

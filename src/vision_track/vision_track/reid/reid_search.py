@@ -126,11 +126,24 @@ def _score_candidates(
     is_person: bool,
     target_reid: Optional[np.ndarray],
 ) -> List[Tuple[TrackingResult, float, Dict[str, np.ndarray], float]]:
-    """Extract features and compute similarity scores for candidates."""
+    """Extract features and compute similarity scores for candidates.
+
+    All candidate crops are embedded in a SINGLE batched deep forward pass
+    (extract_features_batch) instead of one forward per candidate — this removes
+    the multi-person ReID throughput cliff. The returned per-candidate tuples
+    (result, similarity, features, raw_cosine) are unchanged, computed exactly as
+    the old per-crop loop.
+    """
     candidate_scores: List[Tuple[TrackingResult, float, Dict[str, np.ndarray], float]] = []
 
-    for result in candidates:
-        features = tracker.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=result.class_id)
+    bboxes = [r.bbox for r in candidates]
+    masks = [r.mask for r in candidates]
+    class_ids = [r.class_id for r in candidates]
+    feature_dicts = tracker.appearance_extractor.extract_features_batch(
+        frame, bboxes, masks, class_ids
+    )
+
+    for result, features in zip(candidates, feature_dicts):
         if not features:
             logger.debug(f"ID {result.track_id}: No features extracted")
             continue

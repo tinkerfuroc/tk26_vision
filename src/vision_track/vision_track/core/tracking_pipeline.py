@@ -136,6 +136,18 @@ def _handle_occlusion_state(
                         f"(similarity={similarity:.3f} < 0.70). Treating as lost."
                     )
                     return None
+        # Phase 2: a crosser causing the occlusion must not be adopted as the
+        # target. Reject if its depth jumped toward the camera vs the operator.
+        from .depth_gate import should_reject_candidate
+        cand_depth = getattr(tracker, "candidate_depths_m", {}).get(result.track_id)
+        if should_reject_candidate(
+            cand_depth, getattr(tracker, "operator_last_depth_m", None),
+            getattr(tracker, "crosser_depth_jump_m", 0.6),
+        ):
+            logger.warning(
+                f"Depth gate reject during occlusion: ID {result.track_id} is a crosser."
+            )
+            return None
         tracker.state = TrackerState.TRACKING
         tracker.frames_lost = 0
         return tracker._with_original_id(result)
@@ -168,6 +180,22 @@ def _verify_person_candidate(
 ) -> Optional[TrackingResult]:
     features = tracker.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=0)
     if not features:
+        return None
+
+    # Phase 2: depth-gated crosser rejection. A candidate whose median depth
+    # jumps toward the camera beyond crosser_depth_jump_m (vs the operator's last
+    # depth) is geometrically a crosser between robot and operator — a cue
+    # appearance cannot spoof. Reject before trusting the appearance similarity.
+    from .depth_gate import should_reject_candidate
+    cand_depth = getattr(tracker, "candidate_depths_m", {}).get(result.track_id)
+    op_depth = getattr(tracker, "operator_last_depth_m", None)
+    jump = getattr(tracker, "crosser_depth_jump_m", 0.6)
+    if should_reject_candidate(cand_depth, op_depth, jump):
+        logger.warning(
+            f"Depth gate reject: Track ID {result.track_id} candidate depth "
+            f"{cand_depth} jumped toward camera vs operator {op_depth} "
+            f"(jump>{jump} m); treating as crosser."
+        )
         return None
 
     current_time = time.time()
@@ -348,6 +376,17 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
     num_cands = len([r for r in results if r.class_id == 0 and r.track_id >= 0])
     margin = float(getattr(tracker, "last_reid_margin", 0.0) or 0.0)
 
+    # Phase 2: real depth-consistency for the chosen recovery candidate (replaces
+    # the Task-1 hardcoded True). A toward-camera crosser is depth-inconsistent;
+    # the FSM treats it as a failed confirm so it is never surfaced as a valid
+    # provisional. None operator/candidate depth ⇒ permissive (True).
+    from .depth_gate import should_reject_candidate
+    cand_depth = getattr(tracker, "candidate_depths_m", {}).get(match_result.track_id)
+    depth_consistent = not should_reject_candidate(
+        cand_depth, getattr(tracker, "operator_last_depth_m", None),
+        getattr(tracker, "crosser_depth_jump_m", 0.6),
+    )
+
     if committed_swap:
         # A genuine id-swap committed THIS frame. Mirror it in the FSM as a
         # present frame so it reports target_lost=False — it does NOT re-decide
@@ -355,7 +394,8 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
         if fsm is not None:
             tracker.last_lock_decision = fsm.step(
                 sim_score=float(best_similarity), present=True, frames_since_loss=0,
-                num_candidates=num_cands, distinct_margin=margin, depth_consistent=True,
+                num_candidates=num_cands, distinct_margin=margin,
+                depth_consistent=depth_consistent,
             )
         return confirmed
 
@@ -363,8 +403,9 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
 
     # Partial confirm (sim>=reid_threshold but pre-commit) OR no confirm: this is
     # a PROVISIONAL recovery frame. Step the FSM present=False with the real
-    # similarity + distinctiveness margin (depth gate is Task 2; default
-    # consistent). The asymmetric high-bar + commit_frames hysteresis governs
+    # similarity + distinctiveness margin + depth-consistency (Task 2 — a
+    # toward-camera crosser is now flagged depth-inconsistent so the FSM will not
+    # promote it). The asymmetric high-bar + commit_frames hysteresis governs
     # target_lost; decision.publish gates whether we surface the provisional
     # point. A sim in [reid_threshold, high_bar) does NOT publish and does NOT
     # clear target_lost — the partial-confirm leak is closed here.
@@ -372,7 +413,7 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
         decision = fsm.step(
             sim_score=float(best_similarity), present=False,
             frames_since_loss=tracker.frames_lost, num_candidates=num_cands,
-            distinct_margin=margin, depth_consistent=True,
+            distinct_margin=margin, depth_consistent=depth_consistent,
         )
         tracker.last_lock_decision = decision
         if not decision.publish:

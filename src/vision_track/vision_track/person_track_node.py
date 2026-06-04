@@ -136,6 +136,9 @@ class PersonTrackNode(Node):
         self.declare_parameter('max_recovery_frames', 45)
         self.declare_parameter('provisional_high_bar', 0.72)
         self.declare_parameter('provisional_distinct_margin', 0.10)
+        # Phase 2: reject candidates whose median depth jumps this much (m)
+        # toward the camera vs the operator's last depth — a geometric crosser.
+        self.declare_parameter('crosser_depth_jump_m', 0.6)
 
         # ReID mode: 'custom' uses our OSNet-based ReID, 'native' uses YOLO's BoT-SORT ReID
         self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
@@ -179,6 +182,7 @@ class PersonTrackNode(Node):
         self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
         self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
         self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
+        self.crosser_depth_jump_m = self.get_parameter('crosser_depth_jump_m').value
         self.reid_mode = self.get_parameter('reid_mode').value
         self.reid_backbone = self.get_parameter('reid_backbone').value
         self.reid_weights_path = self.get_parameter('reid_weights_path').value
@@ -250,6 +254,10 @@ class PersonTrackNode(Node):
                     commit_frames=self.tracker.reid_confirmation_frames,
                     max_recovery_frames=self.tracker.max_recovery_frames,
                 )
+                # Phase 2: crosser-rejection gate threshold (m). The tracker
+                # reads operator_last_depth_m + candidate_depths_m (both plumbed
+                # from the node) and this jump to reject toward-camera crossers.
+                self.tracker.crosser_depth_jump_m = float(self.crosser_depth_jump_m)
                 self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
             
             self.get_logger().info(
@@ -610,6 +618,11 @@ class PersonTrackNode(Node):
                         time.sleep(0.1)
                         continue
                     last_seen_time = time.time()
+                # Phase 2: median depth per visible person bbox (from the last
+                # frame's results against the current depth) so the pipeline's
+                # crosser gate can reject toward-camera candidates this frame.
+                if self.tracker.last_results and depth_msg is not None:
+                    self._refresh_candidate_depths(depth_msg)
                 track_result = self.tracker.update(rgb_frame)
             t_track = time.perf_counter() - t_track0
 
@@ -675,6 +688,26 @@ class PersonTrackNode(Node):
 
         return rgb_img, rgb_msg, depth_msg, intrinsic
 
+    def _refresh_candidate_depths(self, depth_msg):
+        """Median-depth per visible person bbox, for the crosser gate.
+
+        Reads the previous frame's person results and writes the
+        track_id -> median-depth (m) map onto the tracker so the pure depth gate
+        in the pipeline can reject toward-camera crossers. The node is the sole
+        owner of the depth image; the tracker never touches ROS.
+        """
+        from vision_track.core.depth_gate import roi_median_depth
+        h, w = depth_msg.height, depth_msg.width
+        depth = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(h, w)
+        depths = {}
+        for r in self.tracker.last_results:
+            if r.class_id != 0 or r.track_id < 0:
+                continue
+            m = roi_median_depth(depth, r.bbox, self.min_depth, self.max_depth)
+            if m is not None:
+                depths[r.track_id] = m
+        self.tracker.candidate_depths_m = depths
+
     def _try_initialize(self, rgb_frame, init_start_time, goal_handle, result) -> bool:
         success = self.tracker.initialize_tracking(rgb_frame, target_class='person')
         if success:
@@ -716,6 +749,12 @@ class PersonTrackNode(Node):
         position = None
         if points is not None:
             position = self._calculate_centroid(points, track_result.mask, valid_mask, track_result.bbox)
+
+        # Phase 2: plumb the operator's last known depth (m) into the tracker so
+        # the crosser depth gate can reject toward-camera candidates next frame.
+        # z is the optical-frame forward axis (depth). Only the node owns depth.
+        if position is not None:
+            self.tracker.operator_last_depth_m = float(position.z)
 
         if self.perf_logging_enabled and points is not None:
             diag = compute_frame_diag(points, track_result.mask, valid_mask, track_result.bbox)

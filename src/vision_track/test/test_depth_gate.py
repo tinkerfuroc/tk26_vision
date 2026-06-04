@@ -1,7 +1,11 @@
 """Tests for the pure depth-consistency (crosser-rejection) predicate."""
 import numpy as np
 
-from vision_track.core.depth_gate import is_depth_consistent, roi_median_depth
+from vision_track.core.depth_gate import (
+    is_depth_consistent,
+    roi_median_depth,
+    should_reject_candidate,
+)
 
 
 class TestIsDepthConsistent:
@@ -54,3 +58,21 @@ class TestRoiMedianDepth:
         d = np.zeros((100, 100), dtype=np.uint16)
         m = roi_median_depth(d, (10, 10, 60, 60), min_depth=0.1, max_depth=10.0)
         assert m is None
+
+
+class TestShouldRejectCandidate:
+    def test_rejects_toward_camera_crosser(self):
+        # operator 3.0 m, candidate 1.0 m, threshold 0.6 → reject
+        assert should_reject_candidate(
+            candidate_depth=1.0, operator_depth=3.0, jump_threshold=0.6
+        ) is True
+
+    def test_keeps_consistent_candidate(self):
+        assert should_reject_candidate(
+            candidate_depth=2.8, operator_depth=3.0, jump_threshold=0.6
+        ) is False
+
+    def test_no_operator_depth_keeps(self):
+        assert should_reject_candidate(
+            candidate_depth=1.0, operator_depth=None, jump_threshold=0.6
+        ) is False

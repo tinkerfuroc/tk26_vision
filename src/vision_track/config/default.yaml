@@ -20,6 +20,7 @@
     max_recovery_frames: 45          # coast cap; past this → hard-lost
     provisional_high_bar: 0.72       # single-candidate fast-publish floor (reid_search.py)
     provisional_distinct_margin: 0.10  # min best-vs-second margin to publish in a crowd
+    crosser_depth_jump_m: 0.6        # reject candidates this much nearer than the operator
 
     # Camera topics
     image_topic: '/camera/color/image_raw'

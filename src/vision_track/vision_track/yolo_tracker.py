@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,6 +74,7 @@ class YOLOTracker:
         reid_verification_interval: int = 5,
         reid_backbone: str = "osnet_ain_x1_0",
         reid_weights_path: str = "",
+        yolo_track_conf: float = 0.15,
     ):
         """
         Initialize the YOLO tracker.
@@ -88,12 +90,17 @@ class YOLOTracker:
             reid_verification_interval: Run a full-frame ReID sanity check every N frames while tracking
             reid_backbone: OSNet variant for the deep ReID term ('osnet_ain_x1_0' default)
             reid_weights_path: optional ReID-trained checkpoint overriding the imagenet init
+            yolo_track_conf: LOW detection conf fed to model.track so ByteTrack's
+                two-stage (high/low) association recovery actually runs — kept
+                separate from confidence_threshold, which still gates detect()
+                calls and downstream consumers
         """
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.inference_size = inference_size
         self.reid_backbone = reid_backbone
         self.reid_weights_path = reid_weights_path
+        self.yolo_track_conf = yolo_track_conf
         self.state = TrackerState.UNINITIALIZED
         self.target_track_id: Optional[int] = None
         self.original_track_id: Optional[int] = None
@@ -111,7 +118,12 @@ class YOLOTracker:
 
         self.device = self._get_device(device)
         logger.info(f"Using device: {self.device}")
-        
+
+        # Resolve the project ByteTrack config (installed share/ path) so the
+        # high/low association thresholds + buffer are ours, not stock.
+        self.tracker_cfg = self._resolve_tracker_cfg()
+        logger.info(f"Using tracker config: {self.tracker_cfg}")
+
         # Load YOLO model
         self.model = self._load_model(model_path)
         
@@ -288,7 +300,17 @@ class YOLOTracker:
         )
         
         return self._parse_results(results[0])
-    
+
+    def _resolve_tracker_cfg(self) -> str:
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            cfg = os.path.join(get_package_share_directory("vision_track"), "config", "bytetrack.yaml")
+            if os.path.exists(cfg):
+                return cfg
+        except Exception:
+            pass
+        return "bytetrack.yaml"
+
     def track(
         self,
         frame: np.ndarray,
@@ -307,11 +329,11 @@ class YOLOTracker:
             List of TrackingResult objects with track IDs
         """
         track_kwargs = dict(
-            conf=self.confidence_threshold,
+            conf=self.yolo_track_conf,
             iou=self.iou_threshold,
             classes=classes,
             persist=persist,
-            tracker="bytetrack.yaml",
+            tracker=self.tracker_cfg,
             half=True,
             verbose=False,
         )

@@ -123,6 +123,10 @@ class PersonTrackNode(Node):
         # Prefer a stronger default model. If unavailable we will fall back at runtime.
         self.declare_parameter('model_path', 'yolo11s-seg.pt')
         self.declare_parameter('confidence_threshold', 0.5)
+        # LOW conf fed to model.track so ByteTrack's two-stage (high/low)
+        # association recovery actually runs — kept separate from
+        # confidence_threshold, which still gates detect() / downstream consumers.
+        self.declare_parameter('yolo_track_conf', 0.15)
         self.declare_parameter('enable_reid', True)
         self.declare_parameter('max_frames_lost', 600)  # ~20 seconds at 30fps
         self.declare_parameter('inference_size', 736)  # imgsz for YOLO; lower for speed
@@ -163,6 +167,7 @@ class PersonTrackNode(Node):
         """Load parameters."""
         self.model_path = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence_threshold').value
+        self.yolo_track_conf = self.get_parameter('yolo_track_conf').value
         self.enable_reid = self.get_parameter('enable_reid').value
         self.max_frames_lost = self.get_parameter('max_frames_lost').value
         self.inference_size = self.get_parameter('inference_size').value
@@ -224,6 +229,7 @@ class PersonTrackNode(Node):
                     reid_verification_interval=int(self.reid_verification_interval),
                     reid_backbone=self.reid_backbone,
                     reid_weights_path=self.reid_weights_path,
+                    yolo_track_conf=self.yolo_track_conf,
                 )
                 self.tracker.max_frames_lost = max_frames_allowed
                 # Communicate the real loop cadence so loss/buffer timing is

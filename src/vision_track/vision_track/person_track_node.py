@@ -81,6 +81,11 @@ class PersonTrackNode(Node):
         self._last_tracked_detection = None
         self._was_lost = False
 
+        # Phase 2: EMA smoother on the published 3D point; reset on loss so a
+        # re-acquired target doesn't lerp from a stale point.
+        from vision_track.core.centroid_smooth import PointEMA
+        self._point_ema = PointEMA(alpha=self.centroid_ema_alpha)
+
         self._vision_logger = VisionLogger(
             self, self.vision_logging_enabled, self.vision_log_folder,
         )
@@ -139,6 +144,11 @@ class PersonTrackNode(Node):
         # Phase 2: reject candidates whose median depth jumps this much (m)
         # toward the camera vs the operator's last depth — a geometric crosser.
         self.declare_parameter('crosser_depth_jump_m', 0.6)
+        # Phase 2: geometry robustness — torso-band sampling + EMA on the point.
+        self.declare_parameter('centroid_ema_alpha', 0.5)
+        self.declare_parameter('torso_band_enabled', True)
+        self.declare_parameter('torso_band_lo', 0.15)
+        self.declare_parameter('torso_band_hi', 0.55)
 
         # ReID mode: 'custom' uses our OSNet-based ReID, 'native' uses YOLO's BoT-SORT ReID
         self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
@@ -183,6 +193,10 @@ class PersonTrackNode(Node):
         self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
         self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
         self.crosser_depth_jump_m = self.get_parameter('crosser_depth_jump_m').value
+        self.centroid_ema_alpha = self.get_parameter('centroid_ema_alpha').value
+        self.torso_band_enabled = self.get_parameter('torso_band_enabled').value
+        self.torso_band_lo = self.get_parameter('torso_band_lo').value
+        self.torso_band_hi = self.get_parameter('torso_band_hi').value
         self.reid_mode = self.get_parameter('reid_mode').value
         self.reid_backbone = self.get_parameter('reid_backbone').value
         self.reid_weights_path = self.get_parameter('reid_weights_path').value
@@ -406,7 +420,18 @@ class PersonTrackNode(Node):
         
         if x2 <= x1 or y2 <= y1:
             return None
-        
+
+        # Phase 2: restrict to the chest band BEFORE the Phase-0 robust reduction
+        # so swinging arms/legs/head don't pull the centroid. Layers on top of the
+        # robust median-x/y + z-outlier reduction below — does not replace it.
+        from vision_track.core.centroid_smooth import torso_band_mask
+        if self.torso_band_enabled:
+            yb1, yb2 = torso_band_mask((x1, y1, x2, y2),
+                                       lo=self.torso_band_lo, hi=self.torso_band_hi)
+            y1, y2 = yb1, yb2
+            if y2 <= y1:
+                return None
+
         # Extract region of interest
         roi_points = points[y1:y2, x1:x2]
         roi_valid = valid_mask[y1:y2, x1:x2]
@@ -750,9 +775,18 @@ class PersonTrackNode(Node):
         if points is not None:
             position = self._calculate_centroid(points, track_result.mask, valid_mask, track_result.bbox)
 
+        # Phase 2: EMA-smooth the published 3D point. First sample (or first after
+        # a loss reset) passes through; later frames blend. Applied before the
+        # depth plumb / feedback so consumers and the crosser gate see the
+        # smoothed point.
+        if position is not None:
+            sx, sy, sz = self._point_ema.update((position.x, position.y, position.z))
+            position.x, position.y, position.z = float(sx), float(sy), float(sz)
+
         # Phase 2: plumb the operator's last known depth (m) into the tracker so
         # the crosser depth gate can reject toward-camera candidates next frame.
-        # z is the optical-frame forward axis (depth). Only the node owns depth.
+        # z is the optical-frame forward axis (depth). Only the node owns depth;
+        # use the smoothed z so the gate sees the same point consumers do.
         if position is not None:
             self.tracker.operator_last_depth_m = float(position.z)
 
@@ -901,6 +935,10 @@ class PersonTrackNode(Node):
                 branch='person_track',
                 extras={'event': 'lost_current', 'time_since_seen_s': float(time_since_seen)},
             )
+        # Phase 2: reset the point smoother on the TRACKING → LOST transition so a
+        # re-acquired target doesn't lerp from a stale pre-loss point.
+        if not self._was_lost:
+            self._point_ema.reset()
         self._was_lost = True
 
         feedback.target_lost = True
@@ -954,6 +992,7 @@ class PersonTrackNode(Node):
         self._last_tracked_rgb = None
         self._last_tracked_detection = None
         self._was_lost = False
+        self._point_ema.reset()
 
         if self.target_point_pub is not None:
             self.destroy_publisher(self.target_point_pub)

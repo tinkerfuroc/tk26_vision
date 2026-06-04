@@ -22,6 +22,12 @@
     provisional_distinct_margin: 0.10  # min best-vs-second margin to publish in a crowd
     crosser_depth_jump_m: 0.6        # reject candidates this much nearer than the operator
 
+    # --- Phase 2: geometry robustness ---
+    centroid_ema_alpha: 0.5          # 1.0 = no smoothing; lower = smoother
+    torso_band_enabled: true
+    torso_band_lo: 0.15              # chest band top, frac of bbox height
+    torso_band_hi: 0.55             # chest band bottom, frac of bbox height
+
     # Camera topics
     image_topic: '/camera/color/image_raw'
     depth_topic: '/camera/depth/image_raw'

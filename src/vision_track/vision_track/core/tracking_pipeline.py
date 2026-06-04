@@ -13,6 +13,26 @@ from .tracking_types import TargetAppearance, TrackerState, TrackingResult
 logger = logging.getLogger(__name__)
 
 
+def _get_or_extract_features(tracker, frame, track_id, bbox, mask, class_id):
+    """Cache-aware single-detection feature extraction.
+
+    Reuses the score-pass embedding for (track_id, frame_count) within one frame,
+    eliminating the up-to-4x/frame re-embed. track_id < 0 (unstable) is never
+    cached (it collides across detections); falls through to a direct extract.
+    """
+    cache = getattr(tracker, "embedding_cache", None)
+    seq = getattr(tracker, "frame_count", None)
+    if cache is not None and seq is not None and track_id is not None and track_id >= 0:
+        hit = cache.get(track_id, seq)
+        if hit is not None:
+            return hit
+        features = tracker.appearance_extractor.extract_features(frame, bbox, mask, class_id=class_id)
+        if features:
+            cache.put(track_id, seq, features)
+        return features
+    return tracker.appearance_extractor.extract_features(frame, bbox, mask, class_id=class_id)
+
+
 def update_tracker(tracker, frame: np.ndarray, target_id: Optional[int] = None) -> Optional[TrackingResult]:
     """Top-level tracking orchestration."""
     if tracker.state == TrackerState.UNINITIALIZED:
@@ -125,7 +145,7 @@ def _handle_occlusion_state(
             logger.warning(f"Occlusion started! Target ID {result.track_id} being occluded by ID {occluder.track_id}")
 
         if tracker.appearance_extractor is not None:
-            features = tracker.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=0)
+            features = _get_or_extract_features(tracker, frame, result.track_id, result.bbox, result.mask, 0)
             if features:
                 similarity = ReIDMatcher.compute_similarity(
                     tracker.target_appearance, features, result.bbox, current_time, is_person=True
@@ -178,7 +198,7 @@ def _verify_person_candidate(
     result: TrackingResult,
     results: List[TrackingResult],
 ) -> Optional[TrackingResult]:
-    features = tracker.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=0)
+    features = _get_or_extract_features(tracker, frame, result.track_id, result.bbox, result.mask, 0)
     if not features:
         return None
 
@@ -438,7 +458,7 @@ def _confirm_reid_candidate(
     match_similarity = best_similarity
 
     if tracker.appearance_extractor is not None:
-        features = tracker.appearance_extractor.extract_features(frame, reid_match.bbox, reid_match.mask, class_id=reid_match.class_id)
+        features = _get_or_extract_features(tracker, frame, reid_match.track_id, reid_match.bbox, reid_match.mask, reid_match.class_id)
         if features:
             match_similarity = ReIDMatcher.compute_similarity(
                 tracker.target_appearance, features, reid_match.bbox, current_time, is_person=True
@@ -598,8 +618,8 @@ def periodic_reid_validation(
         return True, None
 
     if current_similarity is None:
-        features_cur = tracker.appearance_extractor.extract_features(
-            frame, current_result.bbox, current_result.mask, class_id=current_result.class_id
+        features_cur = _get_or_extract_features(
+            tracker, frame, current_result.track_id, current_result.bbox, current_result.mask, current_result.class_id
         )
         current_similarity = (
             ReIDMatcher.compute_similarity(

@@ -70,7 +70,9 @@ class YOLOTracker:
         warmup: bool = True,
         enable_reid: bool = True,
         inference_size: Optional[int] = None,
-        reid_verification_interval: int = 5
+        reid_verification_interval: int = 5,
+        reid_backbone: str = "osnet_ain_x1_0",
+        reid_weights_path: str = "",
     ):
         """
         Initialize the YOLO tracker.
@@ -84,10 +86,14 @@ class YOLOTracker:
             enable_reid: Whether to enable re-identification features
             inference_size: Optional inference size (imgsz). Lower for speed, higher for accuracy.
             reid_verification_interval: Run a full-frame ReID sanity check every N frames while tracking
+            reid_backbone: OSNet variant for the deep ReID term ('osnet_ain_x1_0' default)
+            reid_weights_path: optional ReID-trained checkpoint overriding the imagenet init
         """
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.inference_size = inference_size
+        self.reid_backbone = reid_backbone
+        self.reid_weights_path = reid_weights_path
         self.state = TrackerState.UNINITIALIZED
         self.target_track_id: Optional[int] = None
         self.original_track_id: Optional[int] = None
@@ -111,7 +117,11 @@ class YOLOTracker:
         
         # Initialize appearance extractor for re-identification
         if self.enable_reid:
-            self.appearance_extractor = AppearanceExtractor(self.device)
+            self.appearance_extractor = AppearanceExtractor(
+                self.device,
+                reid_backbone=self.reid_backbone,
+                reid_weights_path=self.reid_weights_path,
+            )
             logger.info("Re-identification enabled")
         else:
             self.appearance_extractor = None

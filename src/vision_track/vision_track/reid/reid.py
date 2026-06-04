@@ -11,185 +11,49 @@ logger = logging.getLogger(__name__)
 
 class PersonReIDModel:
     """
-    Enhanced Person Re-Identification model.
-    
-    Uses multiple complementary feature types for robust person matching:
-    1. Deep CNN features with part-based pooling (global + horizontal parts)
-    2. Channel attention for emphasizing discriminative features
-    3. Multiple spatial scales for better robustness
-    
-    Key insight: Generic ImageNet features are NOT discriminative enough for person ReID.
-    This model applies transformations to make features more person-specific.
+    Person Re-Identification model wrapping a pluggable deep backbone.
+
+    The deep term is a genuinely pretrained OSNet (via torchreid), exposed behind
+    a stable ``extract_features(crop) -> L2-normalized np.ndarray`` interface so
+    reid_search / appearance_manager are untouched.
+
+    This replaces the legacy random-head path (a ResNet50 with untrained
+    channel_attention / bottleneck / part_bottlenecks modules — a random
+    projection of ImageNet features with no ReID checkpoint), which was the #1
+    root cause of wrong identity locks.
+
+    Weight strategy: the default backbone (osnet_ain_x1_0) is imagenet-init;
+    loading a Market/MSMT-trained checkpoint via ``reid_weights_path`` is the
+    recommended upgrade for maximal lookalike discrimination (config-only).
     """
-    
-    def __init__(self, device: str = "cpu"):
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        backbone_name: str = "osnet_ain_x1_0",
+        reid_weights_path: str = "",
+    ):
         """
         Initialize the Person ReID model.
-        
+
         Args:
-            device: Device for computation
+            device: Device for computation.
+            backbone_name: OSNet variant ('osnet_ain_x1_0' default,
+                'osnet_x0_25' alt).
+            reid_weights_path: optional ReID-trained checkpoint overriding the
+                imagenet init; empty ⇒ keep imagenet.
         """
         self.device = device
-        self.feature_dim = 512  # Output feature dimension
-        self.model = None
-        self.use_deep_features = False
-        
-        self._load_reid_model()
-    
-    def _load_reid_model(self):
-        """Load an enhanced ReID model with attention mechanisms."""
-        try:
-            from torchvision.models import resnet50, ResNet50_Weights
-            
-            # Use ResNet50 for better feature extraction (deeper = more discriminative)
-            base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-            
-            # Feature backbone (remove avgpool and fc) - outputs 2048 channels
-            self.backbone = torch.nn.Sequential(
-                *list(base_model.children())[:-2],
-            )
-            
-            # Channel attention module - helps focus on discriminative channels
-            self.channel_attention = torch.nn.Sequential(
-                torch.nn.AdaptiveAvgPool2d(1),
-                torch.nn.Flatten(),
-                torch.nn.Linear(2048, 512),
-                torch.nn.ReLU(inplace=True),
-                torch.nn.Linear(512, 2048),
-                torch.nn.Sigmoid()
-            )
-            
-            # Bottleneck to reduce to 512 dimensions (standard ReID size)
-            self.bottleneck = torch.nn.Sequential(
-                torch.nn.Linear(2048, 512),
-                torch.nn.BatchNorm1d(512),
-                torch.nn.ReLU(inplace=True)
-            )
-            
-            # Part-based bottlenecks (for 4 horizontal parts)
-            self.part_bottlenecks = torch.nn.ModuleList([
-                torch.nn.Sequential(
-                    torch.nn.Linear(2048, 128),
-                    torch.nn.BatchNorm1d(128),
-                    torch.nn.ReLU(inplace=True)
-                ) for _ in range(4)
-            ])
-            
-            # Global average pooling
-            self.gap = torch.nn.AdaptiveAvgPool2d(1)
-            
-            # Part pooling - 4 horizontal strips (head, upper body, lower body, legs)
-            self.part_pool = torch.nn.AdaptiveAvgPool2d((4, 1))
-            
-            # Move to device
-            self.backbone.to(self.device)
-            self.channel_attention.to(self.device)
-            self.bottleneck.to(self.device)
-            self.part_bottlenecks.to(self.device)
-            self.gap.to(self.device)
-            self.part_pool.to(self.device)
-            
-            # Set to eval mode
-            self.backbone.eval()
-            self.channel_attention.eval()
-            self.bottleneck.eval()
-            self.part_bottlenecks.eval()
-            
-            self.use_deep_features = True
-            self.feature_dim = 512 + 128 * 4  # global (512) + 4 parts (128 each)
-            logger.info("Loaded ResNet50-based Person ReID model with attention")
-            
-        except Exception as e:
-            logger.warning(f"Could not load enhanced ReID model: {e}")
-            self._load_fallback_model()
-    
-    def _load_fallback_model(self):
-        """Fallback to simpler model if enhanced fails."""
-        try:
-            from torchvision.models import resnet18, ResNet18_Weights
-            
-            base_model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-            self.backbone = torch.nn.Sequential(
-                *list(base_model.children())[:-2],
-            )
-            self.gap = torch.nn.AdaptiveAvgPool2d(1)
-            self.backbone.to(self.device)
-            self.gap.to(self.device)
-            self.backbone.eval()
-            
-            self.channel_attention = None
-            self.bottleneck = None
-            self.part_bottlenecks = None
-            self.part_pool = None
-            
-            self.use_deep_features = True
-            self.feature_dim = 512
-            logger.info("Loaded fallback ResNet18 ReID model")
-            
-        except Exception as e:
-            logger.warning(f"Could not load fallback model: {e}")
-            self.use_deep_features = False
-    
+        self.backbone_name = backbone_name
+        from .reid_backbone import build_reid_backbone
+        self.backbone = build_reid_backbone(
+            backbone_name, device=device, reid_weights_path=reid_weights_path
+        )
+        self.feature_dim = self.backbone.feature_dim
+
     def extract_features(self, crop: np.ndarray) -> np.ndarray:
-        """
-        Extract discriminative ReID features from a person crop.
-        
-        Args:
-            crop: Person crop (RGB), should be the full person bounding box
-            
-        Returns:
-            L2-normalized feature vector optimized for person matching
-        """
-        if not self.use_deep_features or self.backbone is None:
-            return np.zeros(self.feature_dim, dtype=np.float32)
-        
-        # Resize to standard ReID size (256x128 is standard for person ReID)
-        # Height > Width because people are taller than wide
-        crop_resized = cv2.resize(crop, (128, 256))
-        
-        # ImageNet normalization
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        crop_normalized = (crop_resized / 255.0 - mean) / std
-        
-        # Convert to tensor [1, 3, 256, 128]
-        tensor = torch.from_numpy(crop_normalized).float()
-        tensor = tensor.permute(2, 0, 1).unsqueeze(0)
-        tensor = tensor.to(self.device)
-        
-        with torch.no_grad():
-            # Get feature maps [1, 2048, 8, 4] or [1, 512, 8, 4] for ResNet18
-            features = self.backbone(tensor)
-            
-            if self.channel_attention is not None:
-                # Apply channel attention
-                attn_weights = self.channel_attention(features)
-                attn_weights = attn_weights.view(-1, features.shape[1], 1, 1)
-                features = features * attn_weights
-                
-                # Global features
-                global_feat = self.gap(features).flatten(1)  # [1, 2048]
-                global_feat = self.bottleneck(global_feat)  # [1, 512]
-                
-                # Part-based features (4 horizontal strips)
-                part_features = self.part_pool(features)  # [1, 2048, 4, 1]
-                part_feats = []
-                for i in range(4):
-                    part_i = part_features[:, :, i, :].flatten(1)  # [1, 2048]
-                    part_i = self.part_bottlenecks[i](part_i)  # [1, 128]
-                    part_feats.append(part_i)
-                part_feat = torch.cat(part_feats, dim=1)  # [1, 512]
-                
-                # Concatenate global + parts
-                combined = torch.cat([global_feat, part_feat], dim=1)  # [1, 1024]
-            else:
-                # Simple fallback
-                combined = self.gap(features).flatten(1)  # [1, 512]
-            
-            # L2 normalize - CRITICAL for cosine similarity to work properly
-            combined = torch.nn.functional.normalize(combined, p=2, dim=1)
-        
-        return combined.cpu().numpy().flatten()
+        """Extract an L2-normalized ReID embedding from a person crop (RGB)."""
+        return self.backbone.extract_features(crop)
 
 
 class AppearanceExtractor:
@@ -205,17 +69,27 @@ class AppearanceExtractor:
     # COCO class ID for person
     PERSON_CLASS_ID = 0
     
-    def __init__(self, device: str = "cpu"):
+    def __init__(
+        self,
+        device: str = "cpu",
+        reid_backbone: str = "osnet_ain_x1_0",
+        reid_weights_path: str = "",
+    ):
         """
         Initialize the appearance extractor.
-        
+
         Args:
-            device: Device to use for computation
+            device: Device to use for computation.
+            reid_backbone: OSNet variant for the person ReID deep term.
+            reid_weights_path: optional ReID-trained checkpoint overriding the
+                imagenet init.
         """
         self.device = device
-        
+
         # Person-specific ReID model
-        self.person_reid = PersonReIDModel(device)
+        self.person_reid = PersonReIDModel(
+            device, backbone_name=reid_backbone, reid_weights_path=reid_weights_path
+        )
         
         # General feature extractor for non-person objects
         self._load_general_feature_extractor()

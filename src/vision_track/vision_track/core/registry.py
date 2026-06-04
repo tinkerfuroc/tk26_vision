@@ -20,7 +20,7 @@ class PersonRegistry:
 
     def __init__(self):
         self.known_persons: Dict[int, TargetAppearance] = {}
-        self.distinctiveness_threshold = 0.03
+        self.distinctiveness_threshold = 0.10
 
     def register_person(self, display_id: int, appearance: TargetAppearance):
         """Register a person with their appearance features."""

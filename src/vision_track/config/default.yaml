@@ -5,12 +5,13 @@
     confidence_threshold: 0.5     # detection conf for non-tracking detect() calls / downstream gates
     yolo_track_conf: 0.15         # LOW conf into model.track so ByteTrack low-conf recovery runs
     enable_reid: true
-    inference_size: 1280
+    inference_size: 736           # imgsz for YOLO (Phase-0 throughput quick-win; was 1280)
     reid_verification_interval: 5
 
     # ReID backbone (Phase 1)
     reid_backbone: 'osnet_ain_x1_0'   # alt: 'osnet_x0_25'
     reid_mode: 'custom'               # 'custom' or 'native' (native loud-guarded in Phase 0)
+    reid_fp16: true                   # half-precision ReID forward (CUDA only; no-op on CPU)
 
     # Loss / recovery
     max_frames_lost: 600

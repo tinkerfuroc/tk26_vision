@@ -27,7 +27,7 @@ cd /path/to/tk26_vision
 # Launch cameras in separate terminals first
 ./scripts/tests/t2_live.sh         # ~3 min
 ./scripts/tests/t3_interaction.sh  # ~1 min
-./scripts/tests/t4_hardware.sh [servo_motion|servo_tracking|shelf_scene|person|all]
+./scripts/tests/t4_hardware.sh [servo_motion|servo_tracking|shelf_scene|person|person_phase2|follow_regression|all]
 ```
 
 All scripts source the venv + ROS setup internally. You don't need to pre-source.

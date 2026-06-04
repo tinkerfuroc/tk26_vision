@@ -75,6 +75,7 @@ class YOLOTracker:
         reid_verification_interval: int = 5,
         reid_backbone: str = "osnet_ain_x1_0",
         reid_weights_path: str = "",
+        reid_fp16: bool = True,
         yolo_track_conf: float = 0.15,
     ):
         """
@@ -91,6 +92,8 @@ class YOLOTracker:
             reid_verification_interval: Run a full-frame ReID sanity check every N frames while tracking
             reid_backbone: OSNet variant for the deep ReID term ('osnet_ain_x1_0' default)
             reid_weights_path: optional ReID-trained checkpoint overriding the imagenet init
+            reid_fp16: run the ReID deep forward in half precision (CUDA only;
+                no-op on CPU). Default True for throughput in multi-person scenes.
             yolo_track_conf: LOW detection conf fed to model.track so ByteTrack's
                 two-stage (high/low) association recovery actually runs — kept
                 separate from confidence_threshold, which still gates detect()
@@ -101,6 +104,7 @@ class YOLOTracker:
         self.inference_size = inference_size
         self.reid_backbone = reid_backbone
         self.reid_weights_path = reid_weights_path
+        self.reid_fp16 = reid_fp16
         self.yolo_track_conf = yolo_track_conf
         self.state = TrackerState.UNINITIALIZED
         self.target_track_id: Optional[int] = None
@@ -134,6 +138,7 @@ class YOLOTracker:
                 self.device,
                 reid_backbone=self.reid_backbone,
                 reid_weights_path=self.reid_weights_path,
+                reid_fp16=self.reid_fp16,
             )
             logger.info("Re-identification enabled")
         else:

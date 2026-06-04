@@ -159,7 +159,11 @@ class PersonTrackNode(Node):
         # (overrides imagenet init — config change only).
         self.declare_parameter('reid_backbone', 'osnet_ain_x1_0')
         self.declare_parameter('reid_weights_path', '')
-        
+        # Half-precision ReID forward (CUDA only; silent no-op on CPU). Default
+        # True for throughput in multi-person re-ID scenes — output stays
+        # float32 + L2-normalized so identity gating is unaffected.
+        self.declare_parameter('reid_fp16', True)
+
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
@@ -200,6 +204,7 @@ class PersonTrackNode(Node):
         self.reid_mode = self.get_parameter('reid_mode').value
         self.reid_backbone = self.get_parameter('reid_backbone').value
         self.reid_weights_path = self.get_parameter('reid_weights_path').value
+        self.reid_fp16 = self.get_parameter('reid_fp16').value
 
         self.image_topic = self.get_parameter('image_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
@@ -250,6 +255,7 @@ class PersonTrackNode(Node):
                     reid_verification_interval=int(self.reid_verification_interval),
                     reid_backbone=self.reid_backbone,
                     reid_weights_path=self.reid_weights_path,
+                    reid_fp16=self.reid_fp16,
                     yolo_track_conf=self.yolo_track_conf,
                 )
                 self.tracker.max_frames_lost = max_frames_allowed

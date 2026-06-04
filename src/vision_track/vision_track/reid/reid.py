@@ -50,10 +50,78 @@ class PersonReIDModel:
             backbone_name, device=device, reid_weights_path=reid_weights_path
         )
         self.feature_dim = self.backbone.feature_dim
+        # True iff a real deep backbone is available. Lets call sites (and the
+        # batch path) cheaply short-circuit to zero vectors when it isn't.
+        self.use_deep_features = self.backbone is not None
 
     def extract_features(self, crop: np.ndarray) -> np.ndarray:
         """Extract an L2-normalized ReID embedding from a person crop (RGB)."""
         return self.backbone.extract_features(crop)
+
+    @staticmethod
+    def _stack_crops(crops: list) -> "torch.Tensor":
+        """Resize + ImageNet-normalize K crops into one [K,3,256,128] CPU tensor.
+
+        Numerically identical preprocessing to the OSNet backbone's per-crop
+        ``extract_features`` (resize to (W,H)=(128,256), /255, ImageNet
+        normalize, permute to CHW). Empty list -> a real [0,3,256,128] tensor so
+        downstream stacking/forward is well-defined.
+        """
+        from .reid_backbone import (
+            _IMAGENET_MEAN,
+            _IMAGENET_STD,
+            _REID_H,
+            _REID_W,
+        )
+        if not crops:
+            return torch.zeros((0, 3, _REID_H, _REID_W), dtype=torch.float32)
+        batch = np.empty((len(crops), _REID_H, _REID_W, 3), dtype=np.float32)
+        for i, crop in enumerate(crops):
+            resized = cv2.resize(crop, (_REID_W, _REID_H))
+            batch[i] = (resized.astype(np.float32) / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
+        tensor = torch.from_numpy(batch).permute(0, 3, 1, 2).contiguous()
+        return tensor
+
+    def extract_features_batch(self, crops: list) -> np.ndarray:
+        """Embed K crops in ONE forward pass. Row i == extract_features(crops[i]).
+
+        Returns [K, feature_dim] float32, each row L2-normalized. Empty -> [0, dim].
+
+        Degenerate crops (None / empty / <2px on a side) are handled exactly as
+        the per-crop path: their row is a zero vector and they do NOT consume a
+        deep forward slot, so the batched output stays row-equivalent to looping
+        ``extract_features``.
+        """
+        if not self.use_deep_features or self.backbone is None:
+            return np.zeros((len(crops), self.feature_dim), dtype=np.float32)
+        if not crops:
+            return np.zeros((0, self.feature_dim), dtype=np.float32)
+
+        out = np.zeros((len(crops), self.feature_dim), dtype=np.float32)
+        valid_idx = []
+        valid_crops = []
+        for i, crop in enumerate(crops):
+            if (
+                crop is None
+                or crop.size == 0
+                or crop.shape[0] < 2
+                or crop.shape[1] < 2
+            ):
+                continue  # leave zero row (mirrors OSNetBackbone.extract_features)
+            valid_idx.append(i)
+            valid_crops.append(crop)
+
+        if not valid_crops:
+            return out
+
+        tensor = self._stack_crops(valid_crops).to(self.device)
+        with torch.no_grad():
+            feats = self.backbone.model(tensor)            # [P, feature_dim]
+            feats = torch.nn.functional.normalize(feats, p=2, dim=1)
+        feats = feats.cpu().numpy().astype(np.float32)
+        for slot, i in enumerate(valid_idx):
+            out[i] = feats[slot]
+        return out
 
 
 class AppearanceExtractor:
@@ -192,9 +260,49 @@ class AppearanceExtractor:
         if mask_crop is not None and mask_crop.size > 0:
             area_ratio = float(np.sum(mask_crop) / max(mask_crop.size, 1))
             features['mask_coverage'] = np.array([area_ratio], dtype=np.float32)
-        
+
         return features
-    
+
+    def extract_features_batch(self, frame, bboxes, masks, class_ids) -> list:
+        """Vectorize the deep ReID forward across N detections.
+
+        Returns list[dict] aligned to ``bboxes``; each dict == ``extract_features``
+        for that detection. The per-detection color/size dicts are built exactly
+        as the single-crop path (byte-identical), and ONLY the ``'reid'`` deep
+        vector is recomputed via one batched forward — collapsing K deep passes
+        into one while preserving full row-equivalence. Non-person / invalid-bbox
+        entries are left as the per-crop path produced them (no batch slot used).
+        """
+        n = len(bboxes)
+        masks = masks if masks is not None else [None] * n
+        class_ids = class_ids if class_ids is not None else [-1] * n
+
+        # Build per-detection dicts (incl. color/size) with the existing per-crop
+        # path, and collect the person crops that need a deep embedding.
+        out = [None] * n
+        person_idx = []
+        person_crops = []
+        for i in range(n):
+            d = self.extract_features(frame, bboxes[i], masks[i], class_ids[i])
+            out[i] = d
+            if class_ids[i] == self.PERSON_CLASS_ID and d:
+                # Recompute the same clamped crop used inside extract_features
+                # (cheap numpy slice) so the batch forward sees identical pixels.
+                x1, y1, x2, y2 = bboxes[i]
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    person_idx.append(i)
+                    person_crops.append(frame[y1:y2, x1:x2].copy())
+
+        if person_crops:
+            deep = self.person_reid.extract_features_batch(person_crops)  # [P, dim]
+            for slot, i in enumerate(person_idx):
+                if out[i] is not None and "reid" in out[i]:
+                    out[i]["reid"] = deep[slot]
+        return out
+
     def _extract_body_part_colors(
         self,
         crop: np.ndarray,

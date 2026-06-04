@@ -46,3 +46,31 @@ def test_clear():
     c.put(track_id=1, frame_seq=1, features={"x": 0})
     c.clear()
     assert c.get(track_id=1, frame_seq=1) is None
+
+
+class _CountingExtractor:
+    def __init__(self):
+        self.calls = 0
+
+    def extract_features(self, frame, bbox, mask, class_id):
+        self.calls += 1
+        return {"reid": [0.0], "body_color": [0.0]}
+
+
+def test_cached_features_skip_reembed():
+    from vision_track.reid.embedding_cache import FrameEmbeddingCache
+    from vision_track.core.tracking_pipeline import _get_or_extract_features
+
+    cache = FrameEmbeddingCache(max_entries=8)
+    ex = _CountingExtractor()
+
+    class _T:  # duck-typed tracker
+        frame_count = 42
+        embedding_cache = cache
+        appearance_extractor = ex
+
+    t = _T()
+    f1 = _get_or_extract_features(t, frame=None, track_id=7, bbox=(0, 0, 1, 1), mask=None, class_id=0)
+    f2 = _get_or_extract_features(t, frame=None, track_id=7, bbox=(0, 0, 1, 1), mask=None, class_id=0)
+    assert ex.calls == 1            # second call served from cache
+    assert f1 == f2

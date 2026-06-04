@@ -196,7 +196,20 @@ class YOLOTracker:
         self.pending_reid_match: Optional[Tuple[int, float]] = None
         self.reid_fit_streak = 0
         self.reid_fit_id: Optional[int] = None
-    
+        # Phase 2: asymmetric-hysteresis recovery policy params (defaults;
+        # the node overrides from ROS params). Pure FSM lives in core/.
+        self.max_recovery_frames = 45
+        self.provisional_high_bar = 0.72
+        self.provisional_distinct_margin = 0.10
+        self.lock_state_machine = None  # set by node after construction
+        self.last_lock_decision = None  # latest FSM verdict for the node to read
+        self.last_reid_margin = 0.0  # best-vs-second margin from reid_search
+        # True when the recovery path (reidentify_target) authoritatively
+        # stepped the FSM this frame. The node defers to last_lock_decision
+        # then instead of re-stepping present=True (which would defeat the
+        # asymmetric hysteresis on a partial-confirm recovery frame).
+        self.last_frame_recovery = False
+
     def _get_device(self, device: Optional[str]) -> str:
         """
         Determine the best available device.
@@ -867,6 +880,14 @@ class YOLOTracker:
         self.pending_reid_match = None
         self.reid_fit_streak = 0
         self.reid_fit_id = None
+        # dead: original_track_id already None here (cleared above), so this
+        # start() never fires on reset(). The FSM is (re)started on the next
+        # initialize_tracking() commit instead; kept for symmetry/intent.
+        if self.lock_state_machine is not None and self.original_track_id is not None:
+            self.lock_state_machine.start(self.original_track_id)
+        self.last_lock_decision = None
+        self.last_reid_margin = 0.0
+        self.last_frame_recovery = False
         # Clear the person registry
         self.person_registry.clear()
         # Reset camera motion detection

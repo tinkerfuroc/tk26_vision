@@ -21,6 +21,10 @@ def update_tracker(tracker, frame: np.ndarray, target_id: Optional[int] = None) 
 
     _switch_target(tracker, target_id)
     tracker.frame_count += 1
+    # Cleared each frame; reidentify_target sets it True when it authoritatively
+    # steps the FSM, telling the node not to re-step present=True for a recovery
+    # frame (which would defeat the asymmetric hysteresis on a partial confirm).
+    tracker.last_frame_recovery = False
 
     results = tracker.track(frame, persist=True)
     tracker.last_results = results or []
@@ -284,6 +288,30 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
 
     tracker.state = TrackerState.REIDENTIFYING
 
+    # Phase 2: the lock FSM is the publish/target_lost authority for the recovery
+    # path. It is stepped EXACTLY ONCE per frame here with the real per-frame
+    # inputs — never twice — because the asymmetric hysteresis relies on a
+    # monotone provisional streak; a no-op "seed" step at sim 0.0 would reset
+    # that streak every frame and the high-bar commit would never accumulate. The
+    # early-return branches below therefore each step the FSM themselves (coast),
+    # and the match path steps it once with the resolved similarity. The pipeline
+    # remains the identity-swap authority — the FSM never touches target_track_id.
+    fsm = getattr(tracker, "lock_state_machine", None)
+    # This frame is decided by the recovery path; the node must defer to the
+    # last_lock_decision produced here rather than re-step present=True.
+    tracker.last_frame_recovery = True
+
+    def _step_coast() -> None:
+        """Step the FSM as an absent/unconfirmed coast frame (no provisional)."""
+        if fsm is None:
+            return
+        present = any(r.track_id == tracker.target_track_id for r in results)
+        cands = len([r for r in results if r.class_id == 0 and r.track_id >= 0])
+        tracker.last_lock_decision = fsm.step(
+            sim_score=0.0, present=present, frames_since_loss=tracker.frames_lost,
+            num_candidates=cands, distinct_margin=0.0, depth_consistent=True,
+        )
+
     if len(results) > 1:
         register_other_persons(tracker, frame, results)
 
@@ -299,18 +327,62 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
             tracker.consecutive_reid_frames = 0
         if tracker.frames_lost > tracker.max_frames_lost:
             tracker.state = TrackerState.LOST
+        _step_coast()
         return None
 
     match_result, best_similarity = reid_match
     if match_result.track_id < 0:
         logger.warning(f"ReID returned invalid track ID {match_result.track_id}, ignoring")
+        _step_coast()
         return None
 
+    # _confirm_reid_candidate is the SOLE writer of target_track_id (the id-swap
+    # at its ~:397). It also returns non-None on PARTIAL confirms (pending /
+    # sim>=reid_threshold pre-commit), so a non-None return does NOT imply a
+    # commit. The committed-vs-provisional signal is target_track_id changing
+    # across the call: only the real id-swap mutates it. Capture before/after.
+    prev_target_id = tracker.target_track_id
     confirmed = _confirm_reid_candidate(tracker, frame, match_result, best_similarity)
-    if confirmed is not None:
+    committed_swap = confirmed is not None and tracker.target_track_id != prev_target_id
+
+    num_cands = len([r for r in results if r.class_id == 0 and r.track_id >= 0])
+    margin = float(getattr(tracker, "last_reid_margin", 0.0) or 0.0)
+
+    if committed_swap:
+        # A genuine id-swap committed THIS frame. Mirror it in the FSM as a
+        # present frame so it reports target_lost=False — it does NOT re-decide
+        # the id (the pipeline owns that). Always publishes the committed point.
+        if fsm is not None:
+            tracker.last_lock_decision = fsm.step(
+                sim_score=float(best_similarity), present=True, frames_since_loss=0,
+                num_candidates=num_cands, distinct_margin=margin, depth_consistent=True,
+            )
         return confirmed
 
     tracker.state = TrackerState.REIDENTIFYING
+
+    # Partial confirm (sim>=reid_threshold but pre-commit) OR no confirm: this is
+    # a PROVISIONAL recovery frame. Step the FSM present=False with the real
+    # similarity + distinctiveness margin (depth gate is Task 2; default
+    # consistent). The asymmetric high-bar + commit_frames hysteresis governs
+    # target_lost; decision.publish gates whether we surface the provisional
+    # point. A sim in [reid_threshold, high_bar) does NOT publish and does NOT
+    # clear target_lost — the partial-confirm leak is closed here.
+    if fsm is not None:
+        decision = fsm.step(
+            sim_score=float(best_similarity), present=False,
+            frames_since_loss=tracker.frames_lost, num_candidates=num_cands,
+            distinct_margin=margin, depth_consistent=True,
+        )
+        tracker.last_lock_decision = decision
+        if not decision.publish:
+            return None
+
+    # Provisional publish allowed (cleared the high bar). Reuse the partial
+    # confirm's result if present (already original-id-stamped); otherwise stamp
+    # the raw match.
+    if confirmed is not None:
+        return confirmed
     return tracker._with_original_id(match_result)
 
 

@@ -131,8 +131,12 @@ class PersonTrackNode(Node):
         self.declare_parameter('max_frames_lost', 600)  # ~20 seconds at 30fps
         self.declare_parameter('inference_size', 736)  # imgsz for YOLO; lower for speed
         self.declare_parameter('reid_verification_interval', 5)  # periodic on-track ReID sanity check
-        self.declare_parameter('allow_indefinite_recovery', True)  # if True, never abort for long-term loss
-        
+        # Phase 2: bound recovery so the tracker eventually declares hard-lost.
+        # Replaces the effectively-infinite allow_indefinite_recovery coast.
+        self.declare_parameter('max_recovery_frames', 45)
+        self.declare_parameter('provisional_high_bar', 0.72)
+        self.declare_parameter('provisional_distinct_margin', 0.10)
+
         # ReID mode: 'custom' uses our OSNet-based ReID, 'native' uses YOLO's BoT-SORT ReID
         self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
 
@@ -172,7 +176,9 @@ class PersonTrackNode(Node):
         self.max_frames_lost = self.get_parameter('max_frames_lost').value
         self.inference_size = self.get_parameter('inference_size').value
         self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
-        self.allow_indefinite_recovery = self.get_parameter('allow_indefinite_recovery').value
+        self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
+        self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
+        self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
         self.reid_mode = self.get_parameter('reid_mode').value
         self.reid_backbone = self.get_parameter('reid_backbone').value
         self.reid_weights_path = self.get_parameter('reid_weights_path').value
@@ -195,7 +201,7 @@ class PersonTrackNode(Node):
         self.get_logger().info(f'ReID mode: {self.reid_mode}')
         self.get_logger().info(f'Inference size (imgsz): {self.inference_size}')
         self.get_logger().info(f'ReID verification interval: {self.reid_verification_interval}')
-        self.get_logger().info(f'Allow indefinite recovery: {self.allow_indefinite_recovery}')
+        self.get_logger().info(f'Max recovery frames: {self.max_recovery_frames}')
         self.get_logger().info(f'Tracking rate: {self.tracking_rate} Hz')
 
     def _init_tracker(self):
@@ -206,12 +212,9 @@ class PersonTrackNode(Node):
             model_file = resolve_weights(self.model_path)
             # Allow loss duration to be governed by time, not fixed frames.
             # Use whichever is larger: explicit max_frames_lost or rate * lost_timeout.
-            max_frames_allowed = (
-                int(self.tracking_rate * self.lost_timeout)
-                if not self.allow_indefinite_recovery
-                else int(1e12)  # effectively infinite
-            )
-            max_frames_allowed = max(max_frames_allowed, int(self.max_frames_lost))
+            # Bounded by max_recovery_frames; max_frames_lost remains the
+            # ByteTrack buffer ceiling. The lock FSM owns hard-lost timing.
+            max_frames_allowed = max(int(self.max_frames_lost), int(self.max_recovery_frames))
             
             if self.reid_mode == 'native':
                 raise NotImplementedError(
@@ -237,6 +240,16 @@ class PersonTrackNode(Node):
                 # project bytetrack.yaml in Phase 1; here we record it on the
                 # tracker for max_frames_lost derivation).
                 self.tracker.frame_rate = float(self.tracking_rate)
+                from vision_track.core.lock_state_machine import LockStateMachine
+                self.tracker.max_recovery_frames = int(self.max_recovery_frames)
+                self.tracker.provisional_high_bar = float(self.provisional_high_bar)
+                self.tracker.provisional_distinct_margin = float(self.provisional_distinct_margin)
+                self.tracker.lock_state_machine = LockStateMachine(
+                    high_bar=self.tracker.provisional_high_bar,
+                    distinct_margin=self.tracker.provisional_distinct_margin,
+                    commit_frames=self.tracker.reid_confirmation_frames,
+                    max_recovery_frames=self.tracker.max_recovery_frames,
+                )
                 self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
             
             self.get_logger().info(
@@ -665,6 +678,14 @@ class PersonTrackNode(Node):
     def _try_initialize(self, rgb_frame, init_start_time, goal_handle, result) -> bool:
         success = self.tracker.initialize_tracking(rgb_frame, target_class='person')
         if success:
+            # Phase 2: arm the lock FSM on the freshly committed id. Without
+            # this the FSM stays in 'lost' and step() short-circuits, so no
+            # recovery decision (provisional/commit/hard-lost) is ever made.
+            if (
+                getattr(self.tracker, 'lock_state_machine', None) is not None
+                and self.tracker.original_track_id is not None
+            ):
+                self.tracker.lock_state_machine.start(self.tracker.original_track_id)
             self.get_logger().info(f'Tracking initialized on person (ID: {self.tracker.original_track_id})')
             return True
 
@@ -706,7 +727,32 @@ class PersonTrackNode(Node):
                 f"no_centroid={diag['no_centroid']}"
             )
 
-        feedback.target_lost = False
+        # The FSM is the publish/target_lost authority. A tracked frame here
+        # means the committed id was matched (Stage 1) or a recovery candidate
+        # was surfaced (Stage 2). The recovery path (reidentify_target) already
+        # stepped the FSM authoritatively and set last_frame_recovery=True; in
+        # that case the node MUST defer to last_lock_decision and not re-step
+        # present=True — doing so on a partial-confirm recovery frame would flip
+        # target_lost=False below the high bar and defeat the asymmetric
+        # hysteresis. Only a genuine Stage-1 present-by-id hold (not a recovery
+        # frame) re-steps present=True here. The pipeline remains the
+        # identity-swap authority — this only drives the publish/target_lost gate.
+        fsm = getattr(self.tracker, 'lock_state_machine', None)
+        decision = getattr(self.tracker, 'last_lock_decision', None)
+        recovery_frame = bool(getattr(self.tracker, 'last_frame_recovery', False))
+        target_present = (
+            not recovery_frame
+            and self.tracker.target_track_id is not None
+            and track_result.track_id == self.tracker.original_track_id
+            and getattr(self.tracker, 'frames_lost', 0) == 0
+        )
+        if fsm is not None and target_present:
+            decision = fsm.step(
+                sim_score=1.0, present=True, frames_since_loss=0,
+                num_candidates=1, distinct_margin=float('inf'), depth_consistent=True,
+            )
+            self.tracker.last_lock_decision = decision
+        feedback.target_lost = bool(decision.target_lost) if decision is not None else False
         feedback.target_track_id = track_result.track_id
         feedback.target_position = PointStamped()
         feedback.is_transformation_successful = False
@@ -849,11 +895,14 @@ class PersonTrackNode(Node):
             sentinel.point.z = float('nan')
             self.target_point_pub.publish(sentinel)
 
-        if time_since_seen > self.lost_timeout:
-            self.get_logger().warn(f'Target lost for {time_since_seen:.1f}s, aborting')
+        decision = getattr(self.tracker, 'last_lock_decision', None)
+        hard_lost = decision is not None and decision.state == 'lost'
+        if hard_lost or time_since_seen > self.lost_timeout:
+            reason = 'hard-lost (recovery cap)' if hard_lost else f'lost for {time_since_seen:.1f}s'
+            self.get_logger().warn(f'Target {reason}, aborting')
             goal_handle.abort()
             result.status = 1
-            result.message = f'Target lost for {time_since_seen:.1f} seconds'
+            result.message = f'Target {reason}'
             return True
         return False
 

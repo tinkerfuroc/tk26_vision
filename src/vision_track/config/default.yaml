@@ -14,8 +14,12 @@
 
     # Loss / recovery
     max_frames_lost: 600
-    allow_indefinite_recovery: true
     lost_timeout: 300.0
+
+    # --- Phase 2: recovery policy (asymmetric hysteresis) ---
+    max_recovery_frames: 45          # coast cap; past this → hard-lost
+    provisional_high_bar: 0.72       # single-candidate fast-publish floor (reid_search.py)
+    provisional_distinct_margin: 0.10  # min best-vs-second margin to publish in a crowd
 
     # Camera topics
     image_topic: '/camera/color/image_raw'

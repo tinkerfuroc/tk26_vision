@@ -1,6 +1,4 @@
 """Tests for the pure asymmetric-hysteresis lock-state machine."""
-import pytest
-
 from vision_track.core.lock_state_machine import LockStateMachine
 from vision_track.core.tracking_types import LockDecision
 

@@ -48,6 +48,13 @@ def find_best_match_reid(
         return None
 
     candidate_scores.sort(key=lambda x: x[1], reverse=True)
+    # Phase 2: surface the best-vs-second similarity margin for the lock FSM's
+    # distinctiveness gate (inf when a single candidate). The pipeline reads
+    # tracker.last_reid_margin after this call.
+    if len(candidate_scores) > 1:
+        tracker.last_reid_margin = float(candidate_scores[0][1] - candidate_scores[1][1])
+    else:
+        tracker.last_reid_margin = float("inf")
     logger.info(
         f"ReID candidates (threshold={tracker.reid_threshold}): "
         f"{[(r.track_id, f'{s:.3f}') for r, s, _, _ in candidate_scores]}"

@@ -12,7 +12,68 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 | Node startup, interface advertisement, clean SIGTERM | `scripts/tests/t1_startup.sh` | ✅ passing |
 | Live-camera single-call per node (empty scene) | `scripts/tests/t2_live.sh` | ✅ passing (with skips — see below) |
 | Cross-node interaction (client ↔ server) | `scripts/tests/t3_interaction.sh` | ✅ passing |
-| Hardware-in-the-loop with staged scenes | `scripts/tests/t4_hardware.sh` | ⏳ **not yet run** (needs operator) |
+| Hardware-in-the-loop with staged scenes | `scripts/tests/t4_hardware.sh` | ⏳ **not yet run** (needs operator) — incl. new `person_phase2` scenario |
+
+---
+
+## 2026-06-04 — Person-tracker Phase 2 (recovery hysteresis + crosser reject + geometry) — build/structure verified, T3/T4 deferred
+
+Phase 2 of the person-tracker overhaul (asymmetric-hysteresis lock FSM, depth-gated
+crosser rejection, torso-band + EMA geometry smoothing) on branch
+`feat/person-tracker-overhaul`. Tasks 1-3 landed the pure modules + node wiring; this
+entry is Task 4 — the build + manual-integration verification step.
+
+- Plan: `docs/superpowers/plans/2026-06-03-person-tracker-phase2-recovery-geometry.md`
+- Spec: `docs/superpowers/specs/2026-06-03-person-tracker-overhaul-design.md` (§7, Phase 2)
+
+### Verified in the dev sandbox (no cameras / no servo / no live colcon)
+
+- `py_compile` clean on all 7 new/edited modules: `core/{lock_state_machine,depth_gate,centroid_smooth,tracking_pipeline,tracking_types}.py`, `yolo_tracker.py`, `person_track_node.py`.
+- Import hygiene: `from vision_track.core.{lock_state_machine,depth_gate,centroid_smooth}` + `LockDecision` import cleanly and **do not pull `rclpy` into `sys.modules`** (the package `__init__` still pulls torch/cv2/ultralytics, as the plan documents — that's expected and not a violation; the constraint is "no `rclpy`/no node import" for the pure suite).
+- Config-install sanity: `setup.py` `find_packages(exclude=['test'])` discovers `vision_track.core`; `glob('config/*.yaml')` installs `config/default.yaml` (Phase-2 params present) to `share/vision_track/config/` — the exact path the plan's T1 step references via `$(ros2 pkg prefix vision_track)/share/...`. Entry point `person_track_server` matches `ros2 run vision_track person_track_server`.
+- `default.yaml` carries the Phase-2 params: `max_recovery_frames: 45`, `provisional_high_bar: 0.72`, `provisional_distinct_margin: 0.10`, `crosser_depth_jump_m: 0.6`, `centroid_ema_alpha: 0.5`, `torso_band_{enabled,lo,hi}`.
+- Node init log strings the T1/T4 manual steps grep for are real: `Person Track Node initialized successfully` (L124), `Max recovery frames: {n}` (L222), abort reason `hard-lost (recovery cap)` (L978); **no** `allow_indefinite_recovery` line is emitted (replaced — see L140 comment).
+- Pure unit suites GREEN: `pytest test/test_lock_state_machine.py test/test_depth_gate.py test/test_centroid_smooth.py` → **30 passed**. Full vision_track functional tests: **89 passed, 1 skipped** (`pytest test/`).
+- ptbench offline harness still GREEN: `pytest benchmarks/person_tracker/tests/` → **200 passed**.
+
+### NOT executed here (operator-in-the-loop / hardware required)
+
+- **Live colcon build** (`./src/tk26_vision/scripts/build.sh --packages-select vision_track`): NOT run — this sandbox cannot run a full-workspace colcon build. py_compile + find_packages/glob sanity above is the feasible proxy; the live build + shebang-points-at-venv check (plan Step 1) is still required on the robot workstation.
+- **T1 startup with the installed params** (plan Step 2) and **T3/T4 staged scenes** (plan Steps 3-5): NOT run — no cameras, no operator. Captured as a repeatable interactive harness instead (below).
+
+### Manual harness authored (repeatable, self-documenting)
+
+New `t4_hardware.sh person_phase2` subcommand (`scripts/tests/t4_hardware.sh`), mirroring
+plan Task 4 Steps 2-5:
+- **T4.6.0** boots the node with the installed `default.yaml`, asserts `Max recovery frames: 45` + the init line + absence of any indefinite-recovery coast line.
+- **T4.6.1** occlusion re-entry: asserts the feedback stream shows a coast (`target_lost:true`) then a re-lock (`target_lost:false`); flags the re-lock-≤1 s and provisional-window behavior as visual.
+- **T4.6.2** crosser: asserts the committed `target_track_id` stayed stable across a bystander crossing nearer to the camera; the green-box-stays-on-operator check is visual + authoritative.
+- **T4.6.3** hard-lost: asserts the action aborts with `hard-lost (recovery cap)` after the recovery bound (no infinite coast).
+- **T4.6.4** lateral accuracy: captures a `/target_points` stream for the operator to compare x/y against a tape-measured offset and eyeball EMA jitter reduction.
+
+**Behavior nuance worth knowing (corrects a slight imprecision in the plan text):** the plan's
+Step 3 says `/target_points` "stays silent through the coast." It does **not** — the node
+publishes a **NaN-coordinate `PointStamped` sentinel** each lost frame
+(`person_track_node.py` ~L967) so consumers see "no target" rather than a stale last-good
+point. The real invariant (and what the harness checks) is **no FINITE point is published
+during the coast**, not topic silence. Operators echoing `/target_points` during occlusion
+will see a stream of `nan` points — that is correct, not a bug.
+
+### Deferred to a live operator session (record results back here)
+
+- Plan Step 1 live build + shebang check.
+- Plan Steps 2-5 via `t4_hardware.sh person_phase2` on the robot with Orbbec + RealSense up (see `CAMERA_BRINGUP.md`) and a moving operator.
+- Plan Step 5 lateral-accuracy numbers (measured offset vs observed `/target_points` x/y, jitter qualitative).
+- Arena-deferred acceptance gates (`reacquire_latency_s` ≤ 1.0, `false_target_rate` ≤ 0.05, `pos_error_lateral_m` ≤ 0.25, no new `wrong_lock_episodes`) require labeled Orbbec arena bags through `t4_hardware.sh follow_regression`; per `person-tracker-benchmark-strategy`, academic ReID/MOT sets are tuning knobs, never gates.
+
+### Lint baseline note (not a Phase-2 regression)
+
+`pytest test/` also runs the ament scaffolding checks `test_flake8` / `test_pep257`, which
+FAIL repo-wide (553 flake8 errors). These are **pre-existing**: the top contributors are
+`reid/reid.py` (157, untouched in Phase 2) and `yolo_tracker.py` (148, only +33 Phase-2
+lines). The **three new pure source modules** (`lock_state_machine.py`, `depth_gate.py`,
+`centroid_smooth.py`) are flake8-clean. The plan's acceptance scopes the "pure suite" to the
+three `test_<name>.py` files, all green; the style scaffolding is out of Phase-2 scope.
 
 ---
 

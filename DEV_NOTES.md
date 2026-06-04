@@ -16,6 +16,72 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-04 — Person-tracker Phase 3 Task 4 — OPTIONAL TensorRT YOLO export (best-effort, manual)
+
+Phase 3 Task 4 of the person-tracker overhaul on branch `feat/person-tracker-overhaul`.
+The top-end YOLO speedup: a scripted FP16 TensorRT engine export plus a documented
+`.engine` load path. **OPTIONAL and best-effort** — TensorRT engines are
+resolution/batch-locked and hardware-specific, so there is **no hard unit test**;
+the build + throughput verification is a MANUAL operator-in-the-loop step.
+
+- Plan: `docs/superpowers/plans/2026-06-03-person-tracker-phase3-throughput.md` (§Task 4)
+
+### Executed in the dev sandbox (no cameras, no GPU build, `tensorrt` absent)
+
+- `scripts/export_yolo_trt.py` added (standalone CLI, no ROS). `--help` parses + exits 0.
+- Clear-error preflight: with `tensorrt` absent from `.venv-vision-main` (it lives in
+  `.venv-fs`), running the export without `--help` prints an explicit "tensorrt not
+  importable" message and exits 2 — it does **not** attempt an engine build. So in this
+  sandbox the export is a clean no-op-with-explanation, and the `.pt` path is unaffected.
+- `yolo_tracker._load_model` now logs a warning when `model_path` ends in `.engine`
+  (resolution/batch-locked reminder). Import smoke `from vision_track import yolo_tracker`
+  → `OK`. No `.engine` exists ⇒ default `.pt` load path is unchanged and the node/tracker
+  still constructs.
+- Regression: full ptbench **200 passed**; `vision_track` torch-gated + pure suites green
+  (batch/fp16/cache).
+
+### NOT executed here (operator-in-the-loop / hardware required)
+
+- **No TensorRT engine was built or verified.** The sandbox has no GPU, no `tensorrt`,
+  no `.pt` export run. The throughput claim below is the Phase-3 *target*, not a measured
+  number.
+
+### Manual hardware export + verify (run on the deployment box, record results back here)
+
+1. Provision `tensorrt` for the box's CUDA version (Ultralytics pulls a matching build,
+   or install manually). `.venv-vision-main` does NOT ship it.
+2. Export the FP16 imgsz-locked engine:
+   ```
+   cd src/vision_track
+   /home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/python \
+       scripts/export_yolo_trt.py --model yolo11s-seg.pt --imgsz 736
+   ```
+   (Takes minutes; produces `yolo11s-seg.engine` for THIS GPU/TensorRT version only.)
+3. Run the tracker against the engine with a **matching** imgsz:
+   ```
+   ros2 run vision_track person_track_server --ros-args \
+       -p model_path:=/abs/path/yolo11s-seg.engine -p inference_size:=736
+   ```
+   Confirm detections appear (a mismatched `inference_size` silently corrupts output —
+   `_load_model` emits the resolution-locked warning).
+4. Measure `throughput_hz` before (`.pt`) vs after (`.engine`) via the Phase-0
+   `perf_logging_enabled` per-stage timers in a 3–4-person scene. Phase-3 PASS target is
+   ≥12 Hz (WARN ≥8) — batching + cache + fp16 may already clear it without the engine, so
+   the engine is a best-effort extra, not required. **Record the before/after Hz here.**
+
+> Engine re-export is required per deployment box (different GPU / TensorRT version).
+> The `.pt` model is always the default/fallback; the engine is purely additive.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `src/vision_track/scripts/export_yolo_trt.py` | NEW — standalone FP16 TensorRT export CLI with clear-error preflight |
+| `src/vision_track/vision_track/yolo_tracker.py` | `_load_model` warns on `.engine` load (resolution/batch-locked) |
+| `CLAUDE.md` | new `vision_track/person_track_server` Configuration bullet (params + optional engine path) |
+
+---
+
 ## 2026-06-04 — Person-tracker Phase 2 (recovery hysteresis + crosser reject + geometry) — build/structure verified, T3/T4 deferred
 
 Phase 2 of the person-tracker overhaul (asymmetric-hysteresis lock FSM, depth-gated

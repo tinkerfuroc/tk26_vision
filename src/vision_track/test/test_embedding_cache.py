@@ -1,5 +1,3 @@
-import pytest
-
 from vision_track.reid.embedding_cache import FrameEmbeddingCache
 
 

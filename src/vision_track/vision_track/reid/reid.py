@@ -458,14 +458,14 @@ class ReIDMatcher:
     Deep features capture body shape/pose, color features capture clothing.
     """
     
-    # Weights for PERSON re-identification
-    # Deep features are most discriminative when trained properly
-    # Body color is critical as a backup and for clothing-based discrimination
-    WEIGHT_REID = 0.55        # Person ReID deep features (ResNet50)
-    WEIGHT_BODY_COLOR = 0.28  # Body part colors (clothing)
-    WEIGHT_COLOR = 0.08       # General color histogram
-    WEIGHT_UPPER = 0.05       # Upper-body color signature
-    WEIGHT_LOWER = 0.04       # Lower-body color signature
+    # Weights for PERSON re-identification.
+    # Phase 1: the deep term is now a genuinely pretrained OSNet (not the old
+    # untrained random head), so it dominates; color is demoted to a backup cue.
+    WEIGHT_REID = 0.75        # Person ReID deep features (trained OSNet)
+    WEIGHT_BODY_COLOR = 0.13  # Body part colors (clothing backup)
+    WEIGHT_COLOR = 0.05       # General color histogram
+    WEIGHT_UPPER = 0.04       # Upper-body color signature
+    WEIGHT_LOWER = 0.03       # Lower-body color signature
     WEIGHT_SIZE = 0.0         # De-emphasize size/shape (unreliable across people)
     
     # Weights for NON-PERSON objects
@@ -473,28 +473,28 @@ class ReIDMatcher:
     WEIGHT_COLOR_GENERAL = 0.40
     WEIGHT_SIZE_GENERAL = 0.10
     
-    # Thresholds - balanced for accuracy vs pose variation tolerance
-    # Analysis from logs shows:
-    #   - Same person continuous tracking: reid ~0.85-0.98, body ~0.80-0.97
-    #   - Same person with pose change: reid ~0.70-0.80, body ~0.70-0.85
-    #   - Different person (WRONG match): reid ~0.55-0.70, body ~0.60-0.75
-    # Setting thresholds to accept pose variation but reject different people
-    REID_THRESHOLD = 0.68     # Minimum COMBINED similarity for re-identification
+    # Thresholds — recalibrated for the trained OSNet operating point.
+    # OSNet's combined-score distribution shifts vs the old random head, so the
+    # combined floor is lowered. Starting points; final values via the offline
+    # Occluded-REID ROC (Step 1.5/Step 5, an informing knob, not a CI gate) or
+    # arena tuning. See person-tracker-benchmark-strategy.
+    REID_THRESHOLD = 0.55     # Minimum COMBINED similarity for re-identification
     REID_MARGIN = 0.15        # Best match must be clearly better than second-best
     TIME_DECAY_FACTOR = 1.0   # NO time decay - features should be stable over time
     MAX_REID_TIME = 600.0     # 10 minutes max search time
-    
-    # CRITICAL: Minimum RAW reid similarity
-    # Same person with pose change: ~0.70-0.80
-    # Different person: ~0.55-0.70
-    # Set floor at 0.55 to allow pose variation while rejecting most wrong matches
-    MIN_REID_SIMILARITY_RAW = 0.60  # Raw cosine similarity floor
-    
-    # Minimum body color similarity - more tolerant for lighting variation
-    # Same person: ~0.70-0.95, Different person: ~0.60-0.75  
-    MIN_BODY_COLOR_SIMILARITY = 0.60  # Reject if body colors are too different
-    MIN_UPPER_SIMILARITY = 0.55
-    MIN_LOWER_SIMILARITY = 0.55
+
+    # Minimum RAW reid cosine similarity floor.
+    # Trained OSNet's same/different cosine gap is wide, so the raw floor is
+    # lowered from the legacy 0.60 to its same/different operating point
+    # (retune in Step 5).
+    MIN_REID_SIMILARITY_RAW = 0.40  # Raw cosine similarity floor (OSNet)
+
+    # Color hard floors — now a BACKUP cue, not a gate. Relaxed so they no
+    # longer hard-reject a true match on lighting/clothing variation; the
+    # trained deep term carries the discrimination.
+    MIN_BODY_COLOR_SIMILARITY = 0.40
+    MIN_UPPER_SIMILARITY = 0.40
+    MIN_LOWER_SIMILARITY = 0.40
     
     # Legacy threshold for backward compatibility
     MIN_REID_SIMILARITY = 0.40  # Transformed similarity minimum

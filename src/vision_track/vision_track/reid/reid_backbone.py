@@ -18,7 +18,7 @@ building, overriding the imagenet init. Empty path ⇒ keep imagenet.
 """
 import logging
 import os
-from typing import Optional, Protocol
+from typing import Protocol
 
 import cv2
 import numpy as np

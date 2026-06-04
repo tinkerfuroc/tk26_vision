@@ -18,3 +18,13 @@ ultralytics>=8.0.0
 
 # For ByteTrack
 lap>=0.4.0
+
+# Person ReID backbone (OSNet) — pretrained weights via torchreid.
+# The PyPI 'torchreid' wheel is 0.2.5 (namespaces models/utils under
+# torchreid.reid.*); gdown pulls OSNet weights, and tensorboard is a runtime
+# import dep of torchreid's __init__ (it loads the training engine). All three
+# installed additively into .venv-vision-main with zero version churn
+# (numpy stayed 1.26.4, torch stayed 2.11.0+cu128). See src/tk26_vision/CLAUDE.md.
+torchreid==0.2.5
+gdown>=4.0.0
+tensorboard>=2.0.0

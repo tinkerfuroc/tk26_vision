@@ -1,0 +1,32 @@
+/**:
+  ros__parameters:
+    # Model
+    model_path: 'yolo11s-seg.pt'
+    confidence_threshold: 0.5     # detection conf for non-tracking detect() calls / downstream gates
+    yolo_track_conf: 0.15         # LOW conf into model.track so ByteTrack low-conf recovery runs
+    enable_reid: true
+    inference_size: 1280
+    reid_verification_interval: 5
+
+    # ReID backbone (Phase 1)
+    reid_backbone: 'osnet_ain_x1_0'   # alt: 'osnet_x0_25'
+    reid_mode: 'custom'               # 'custom' or 'native' (native loud-guarded in Phase 0)
+
+    # Loss / recovery
+    max_frames_lost: 600
+    allow_indefinite_recovery: true
+    lost_timeout: 300.0
+
+    # Camera topics
+    image_topic: '/camera/color/image_raw'
+    depth_topic: '/camera/depth/image_raw'
+    camera_info_topic: '/camera/color/camera_info'
+
+    # Loop / output
+    tracking_rate: 15.0
+    target_point_topic: '/target_points'
+
+    # Logging
+    vision_logging_enabled: true
+    vision_log_folder: 'vision_log'
+    perf_logging_enabled: false       # introduced in Phase 0

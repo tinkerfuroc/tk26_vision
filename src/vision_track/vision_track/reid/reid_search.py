@@ -5,6 +5,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .reid import ReIDMatcher
+from .identity_gate import (
+    deep_ratio_ambiguous,
+    spatial_switch_allowed,
+    DEFAULT_RATIO_MAX,
+    DEFAULT_DEEP_SWITCH_MARGIN,
+)
 from ..core.tracking_types import TargetAppearance, TrackingResult
 
 logger = logging.getLogger(__name__)
@@ -44,10 +50,10 @@ def find_best_match_reid(
     candidate_scores.sort(key=lambda x: x[1], reverse=True)
     logger.info(
         f"ReID candidates (threshold={tracker.reid_threshold}): "
-        f"{[(r.track_id, f'{s:.3f}') for r, s, _ in candidate_scores]}"
+        f"{[(r.track_id, f'{s:.3f}') for r, s, _, _ in candidate_scores]}"
     )
 
-    best_match, best_similarity, best_features = candidate_scores[0]
+    best_match, best_similarity, best_features, best_deep = candidate_scores[0]
     if best_similarity <= tracker.reid_threshold:
         logger.info(
             f"ReID FAILED: Best similarity {best_similarity:.3f} <= threshold {tracker.reid_threshold} "
@@ -112,9 +118,9 @@ def _score_candidates(
     current_time: float,
     is_person: bool,
     target_reid: Optional[np.ndarray],
-) -> List[Tuple[TrackingResult, float, Dict[str, np.ndarray]]]:
+) -> List[Tuple[TrackingResult, float, Dict[str, np.ndarray], float]]:
     """Extract features and compute similarity scores for candidates."""
-    candidate_scores: List[Tuple[TrackingResult, float, Dict[str, np.ndarray]]] = []
+    candidate_scores: List[Tuple[TrackingResult, float, Dict[str, np.ndarray], float]] = []
 
     for result in candidates:
         features = tracker.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=result.class_id)
@@ -122,6 +128,7 @@ def _score_candidates(
             logger.debug(f"ID {result.track_id}: No features extracted")
             continue
 
+        raw_cosine = 0.0
         if is_person and "reid" in features and target_reid is not None:
             if target_reid.shape[0] == features["reid"].shape[0]:
                 raw_cosine = ReIDMatcher._cosine_similarity(target_reid, features["reid"])
@@ -144,7 +151,7 @@ def _score_candidates(
             current_time,
             is_person=is_person,
         )
-        candidate_scores.append((result, similarity, features))
+        candidate_scores.append((result, similarity, features, raw_cosine))
 
     return candidate_scores
 
@@ -163,8 +170,18 @@ def _resolve_ambiguity(
     if len(candidate_scores) == 1:
         return best_match, best_similarity, best_features
 
-    second_best_match, second_best_similarity, _ = candidate_scores[1]
+    second_best_match, second_best_similarity, _, second_deep = candidate_scores[1]
+    best_deep = candidate_scores[0][3]
     margin = best_similarity - second_best_similarity
+
+    # Lowe-style ratio test on the DEEP term: if the runner-up is deep-
+    # indistinguishable from the best, the identities are not separable.
+    if deep_ratio_ambiguous(best_deep, second_deep, ratio_max=DEFAULT_RATIO_MAX):
+        logger.info(
+            f"ReID FAILED (deep ratio): best_deep={best_deep:.3f} second_deep={second_deep:.3f} "
+            f"ratio>{DEFAULT_RATIO_MAX} — identities not separable"
+        )
+        return None, 0.0, {}
 
     if margin >= ReIDMatcher.REID_MARGIN:
         return best_match, best_similarity, best_features
@@ -178,6 +195,8 @@ def _resolve_ambiguity(
             second_best_match,
             second_best_similarity,
             results,
+            best_deep,
+            second_deep,
         )
         if resolved is None:
             return None, 0.0, {}
@@ -191,6 +210,8 @@ def _resolve_ambiguity(
             best_features,
             second_best_match,
             second_best_similarity,
+            best_deep,
+            second_deep,
         )
         if resolved is None:
             return None, 0.0, {}
@@ -211,6 +232,8 @@ def _resolve_with_camera_motion(
     second_best_match,
     second_best_similarity,
     results,
+    best_deep,
+    second_deep,
 ):
     """Use velocity and relative position cues to resolve ambiguous matches during camera motion."""
     logger.info("Camera motion detected - using advanced disambiguation")
@@ -231,7 +254,11 @@ def _resolve_with_camera_motion(
             f"Second ID {second_best_match.track_id} dist={dist_second:.0f}px"
         )
         prediction_threshold = 80.0
-        if dist_second < dist_best - prediction_threshold and second_best_similarity > tracker.reid_threshold:
+        if (
+            dist_second < dist_best - prediction_threshold
+            and second_best_similarity > tracker.reid_threshold
+            and spatial_switch_allowed(best_deep, second_deep, margin=DEFAULT_DEEP_SWITCH_MARGIN)
+        ):
             best_match, best_similarity, best_features = second_best_match, second_best_similarity, None
         elif dist_best > dist_second + prediction_threshold:
             logger.info(f"Velocity prediction confirms Best ID {best_match.track_id}")
@@ -242,12 +269,21 @@ def _resolve_with_camera_motion(
         f"Relative position consistency: Best ID {best_match.track_id}={best_rel_score:.2f}, "
         f"Second ID {second_best_match.track_id}={second_rel_score:.2f}"
     )
-    if second_rel_score > best_rel_score + 0.3 and second_best_similarity > tracker.reid_threshold:
+    if (
+        second_rel_score > best_rel_score + 0.3
+        and second_best_similarity > tracker.reid_threshold
+        and spatial_switch_allowed(best_deep, second_deep, margin=DEFAULT_DEEP_SWITCH_MARGIN)
+    ):
         best_match, best_similarity, best_features = second_best_match, second_best_similarity, None
 
     best_consistency = tracker._get_candidate_consistency_score(best_match.track_id)
     second_consistency = tracker._get_candidate_consistency_score(second_best_match.track_id)
-    if best_consistency < 0.3 and second_consistency > 0.6 and second_best_similarity > tracker.reid_threshold:
+    if (
+        best_consistency < 0.3
+        and second_consistency > 0.6
+        and second_best_similarity > tracker.reid_threshold
+        and spatial_switch_allowed(best_deep, second_deep, margin=DEFAULT_DEEP_SWITCH_MARGIN)
+    ):
         logger.info(
             f"Consistency check: Best ID {best_match.track_id} is erratic ({best_consistency:.2f}), "
             f"Second ID {second_best_match.track_id} is stable ({second_consistency:.2f})"
@@ -268,6 +304,8 @@ def _resolve_with_spatial_gate(
     best_features,
     second_best_match,
     second_best_similarity,
+    best_deep,
+    second_deep,
 ):
     """Use spatial continuity when the camera is stable."""
     def get_distance_to_last(result: TrackingResult) -> float:
@@ -283,10 +321,14 @@ def _resolve_with_spatial_gate(
         f"Second ID {second_best_match.track_id} dist={dist_second:.1f}px"
     )
     spatial_threshold = 100.0
-    if dist_second < dist_best - spatial_threshold and second_best_similarity > tracker.reid_threshold:
+    if (
+        dist_second < dist_best - spatial_threshold
+        and second_best_similarity > tracker.reid_threshold
+        and spatial_switch_allowed(best_deep, second_deep, margin=DEFAULT_DEEP_SWITCH_MARGIN)
+    ):
         logger.info(
             f"Spatial tiebreaker: preferring closer ID {second_best_match.track_id} "
-            f"(dist={dist_second:.1f}px vs {dist_best:.1f}px)"
+            f"(dist={dist_second:.1f}px vs {dist_best:.1f}px, deep-gated)"
         )
         return second_best_match, second_best_similarity, None
     if dist_best < dist_second - spatial_threshold:
@@ -352,5 +394,5 @@ def _single_candidate_guard(is_person: bool, candidate_scores, best_similarity: 
 
 def _update_candidate_consistency(tracker, candidates):
     """Update consistency tracking for the top candidates."""
-    for match, similarity, _ in candidates:
+    for match, similarity, _, _ in candidates:
         tracker._update_candidate_consistency(match.track_id, similarity)

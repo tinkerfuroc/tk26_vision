@@ -3,7 +3,10 @@ import pytest
 
 torchreid = pytest.importorskip("torchreid")  # skip offline / if not installed
 
-from vision_track.reid.reid_backbone import OSNetBackbone, build_reid_backbone
+from vision_track.reid.reid_backbone import (  # noqa: E402  (after importorskip)
+    OSNetBackbone,
+    build_reid_backbone,
+)
 
 
 # osnet_ain_x1_0 is the production default and the only variant pre-cached in

@@ -51,6 +51,51 @@ pip install -r src/tk26_vision/src/pan_tilt/requirements.txt
 pip install -r src/tk26_vision/src/vision_track/requirements.txt
 ```
 
+### ReID backbone (torchreid OSNet) — `.venv-vision-main`
+
+`vision_track`'s person ReID deep term is now a genuinely-pretrained **OSNet**
+via `torchreid` (the old ResNet50 "deep" head was an *untrained* random
+projection — the #1 wrong-lock root cause, now deleted). `pip install -r
+src/tk26_vision/src/vision_track/requirements.txt` pulls it in.
+
+- **Additive install, zero version churn.** `torchreid==0.2.5` (PyPI wheel),
+  `gdown==6.1.0`, and `tensorboard==2.20.0` (+ chain) installed into the shared
+  `.venv-vision-main` with **no** numpy/torch downgrade — `numpy` stayed
+  `1.26.4`, `torch` stayed `2.11.0+cu128`. `tensorboard` is a *runtime import*
+  dep of torchreid's `__init__` (it loads the training engine), so it's required
+  even though we only do inference. No `--no-deps` deviation was needed.
+- **Wheel namespacing.** The 0.2.5 wheel puts the API under `torchreid.reid.*`:
+  `build_model` is at `torchreid.reid.models` (also re-exported as the attribute
+  `torchreid.models.build_model`, which is *not* an importable submodule);
+  `load_pretrained_weights` is at `torchreid.reid.utils`. `reid_backbone.py`'s
+  resolvers try both layouts.
+- **Weight strategy (important).** `build_model(pretrained=True)` loads only
+  **imagenet**-init weights — the 0.2.5 wheel embeds no ReID-trained
+  (Market/MSMT) download URLs. Imagenet-OSNet already removes the random-head
+  defect (the real win) but is not ReID-discriminatively trained. The current
+  default (`reid_backbone='osnet_ain_x1_0'`, `reid_weights_path=''`) is therefore
+  **imagenet-init**. **Recommended upgrade:** point the `reid_weights_path` ROS
+  param at a Market/MSMT-trained `osnet_ain_x1_0` checkpoint — it's loaded via
+  `torchreid.reid.utils.load_pretrained_weights` *after* building, overriding the
+  imagenet init (config change only, no code change) for maximal lookalike
+  discrimination.
+- **Weight cache.** Pretrained OSNet weights are fetched once via torchreid's
+  gdown mirror and cached under `~/.cache/torch/checkpoints/` (e.g.
+  `osnet_ain_x1_0_imagenet.pth`). Pre-warm on a connected host before offline
+  runs — `drive.google.com` is unreachable from sandboxed CI, so only
+  already-cached variants build offline (`osnet_ain_x1_0` is cached here;
+  `osnet_x0_25` would need a download).
+- **Freeze-lock.** `.venv-vision-main/freeze.lock.txt` (git-ignored, same
+  convention as `.venv-da3/freeze.lock.txt`) is the diff-target for future
+  installs into this venv.
+- **Threshold retune is arena-deferred.** The fusion re-weight
+  (`WEIGHT_REID=0.75` dominates; color demoted to backup) and recalibrated
+  floors (`REID_THRESHOLD=0.55`, `MIN_REID_SIMILARITY_RAW=0.40`, color floors
+  `0.40`) are OSNet **starting points**. The offline Occluded-REID ROC that would
+  finalize them is an informing knob (never a CI gate) and was not reachable in
+  this environment; finalize against arena rosbags per
+  `person-tracker-benchmark-strategy`.
+
 ### Second venv: `.venv-da3` for `monocular_depth`
 
 `depth_anything_3` (vendored at `thirdparty/depth-anything-3/`) pins `numpy<2`, so `monocular_depth` runs under a separate venv at `src/tk26_vision/.venv-da3/`. Provision once:

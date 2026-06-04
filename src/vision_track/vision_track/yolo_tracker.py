@@ -22,6 +22,7 @@ from .core.tracking_types import TargetAppearance, TrackerState, TrackingResult
 from .core.registry import PersonRegistry
 from .core.operator_init import select_operator_detection
 from .reid.appearance_manager import update_appearance
+from .reid.embedding_cache import FrameEmbeddingCache
 from .reid.reid import AppearanceExtractor, ReIDMatcher
 from .reid.reid_search import find_best_match_reid
 
@@ -155,6 +156,11 @@ class YOLOTracker:
         self.fast_tracking_mode = False
         self.reid_verification_interval = max(0, reid_verification_interval)
         self.feature_refresh_interval = 1.5
+        # Phase 3: per-frame embedding cache so the four ReID embed call sites
+        # within one update() reuse the score-pass feature dict instead of
+        # re-embedding the same crop up to 4x/frame. Keyed by (track_id,
+        # frame_count); a new frame_count drops the previous frame's entries.
+        self.embedding_cache = FrameEmbeddingCache(max_entries=32)
 
     def _init_motion_tracking(self) -> None:
         """Initialize spatial continuity and motion tracking state."""

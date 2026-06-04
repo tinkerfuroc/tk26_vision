@@ -136,6 +136,12 @@ def _score_candidates(
     """
     candidate_scores: List[Tuple[TrackingResult, float, Dict[str, np.ndarray], float]] = []
 
+    # Phase 3: prime the per-frame embedding cache so the downstream verify /
+    # confirm / periodic-validation call sites reuse this score-pass feature dict
+    # instead of re-embedding the same crop. begin_frame is defensive — put()
+    # also auto-begins.
+    tracker.embedding_cache.begin_frame(tracker.frame_count)
+
     bboxes = [r.bbox for r in candidates]
     masks = [r.mask for r in candidates]
     class_ids = [r.class_id for r in candidates]
@@ -147,6 +153,10 @@ def _score_candidates(
         if not features:
             logger.debug(f"ID {result.track_id}: No features extracted")
             continue
+
+        # Cache only stable ByteTrack ids (>= 0); negative temp ids collide.
+        if result.track_id >= 0:
+            tracker.embedding_cache.put(result.track_id, tracker.frame_count, features)
 
         raw_cosine = 0.0
         if is_person and "reid" in features and target_reid is not None:

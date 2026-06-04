@@ -1,9 +1,11 @@
 import logging
 import time
+import cv2
 import numpy as np
 from typing import Optional
 
 from ..core.tracking_types import TargetAppearance, TrackingResult
+from .quality import crop_quality_ok, DEFAULT_GATE
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,40 @@ def update_appearance(
             or current_time - tracker.target_appearance.last_refresh_time > tracker.feature_refresh_interval
         )
     )
+
+    # --- gallery hygiene: skip poisoning inserts ---------------------------------
+    x1, y1, x2, y2 = result.bbox
+    crop_h, crop_w = max(0, y2 - y1), max(0, x2 - x1)
+    aspect_ratio = crop_w / max(crop_h, 1e-6)
+    mask_coverage = None
+    if "mask_coverage" in features and features["mask_coverage"].size:
+        mask_coverage = float(features["mask_coverage"][0])
+    blur_var = 0.0
+    h, w = frame.shape[:2]
+    cx1, cy1, cx2, cy2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    if cx2 > cx1 and cy2 > cy1:
+        gray = cv2.cvtColor(frame[cy1:cy2, cx1:cx2], cv2.COLOR_RGB2GRAY)
+        blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    if tracker.target_appearance is not None and not crop_quality_ok(
+        crop_h=crop_h, crop_w=crop_w, mask_coverage=mask_coverage,
+        blur_var=blur_var, aspect_ratio=aspect_ratio, **DEFAULT_GATE,
+    ):
+        logger.debug(
+            f"Gallery insert skipped (low quality): h={crop_h} cov={mask_coverage} "
+            f"blur={blur_var:.0f} ar={aspect_ratio:.2f}"
+        )
+        # still refresh motion so velocity/last_seen stay current
+        _update_motion(
+            appearance=tracker.target_appearance,
+            result=result,
+            current_time=current_time,
+        )
+        if tracker.original_track_id is not None and result.class_id == 0:
+            tracker.person_registry.update_person(
+                tracker.original_track_id, tracker.target_appearance
+            )
+        return
 
     if tracker.target_appearance is None:
         tracker.target_appearance = TargetAppearance(class_id=result.class_id, class_name=result.class_name)

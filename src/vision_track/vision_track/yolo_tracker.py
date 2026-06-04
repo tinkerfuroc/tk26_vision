@@ -262,6 +262,15 @@ class YOLOTracker:
             from ultralytics import YOLO
             
             logger.info(f"Loading YOLO model: {model_path}")
+            if str(model_path).endswith(".engine"):
+                # Optional best-effort TensorRT top-end (Phase 3 Task 4).
+                # Ultralytics loads .engine transparently; the engine is
+                # resolution/batch-locked, so the runtime imgsz MUST match the
+                # export imgsz or detections will be silently wrong.
+                logger.warning(
+                    "Loading a TensorRT engine — runtime imgsz MUST match the "
+                    "export imgsz (resolution/batch-locked)."
+                )
             model = YOLO(model_path)
             model.to(self.device)
             

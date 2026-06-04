@@ -32,6 +32,7 @@ class PersonReIDModel:
         device: str = "cpu",
         backbone_name: str = "osnet_ain_x1_0",
         reid_weights_path: str = "",
+        fp16: bool = False,
     ):
         """
         Initialize the Person ReID model.
@@ -42,12 +43,21 @@ class PersonReIDModel:
                 'osnet_x0_25' alt).
             reid_weights_path: optional ReID-trained checkpoint overriding the
                 imagenet init; empty ⇒ keep imagenet.
+            fp16: run the deep forward in half precision (CUDA only). On CPU it
+                is a silent no-op (torch half on CPU is unsupported/slow), so the
+                effective flag is gated on ``device == "cuda"``. Output stays
+                float32 + L2-normalized regardless.
         """
         self.device = device
         self.backbone_name = backbone_name
+        # CUDA-gated: fp16 only takes effect on cuda; CPU stays float32.
+        self.fp16 = bool(fp16) and str(device) == "cuda"
         from .reid_backbone import build_reid_backbone
         self.backbone = build_reid_backbone(
-            backbone_name, device=device, reid_weights_path=reid_weights_path
+            backbone_name,
+            device=device,
+            reid_weights_path=reid_weights_path,
+            fp16=self.fp16,
         )
         self.feature_dim = self.backbone.feature_dim
         # True iff a real deep backbone is available. Lets call sites (and the
@@ -115,8 +125,11 @@ class PersonReIDModel:
             return out
 
         tensor = self._stack_crops(valid_crops).to(self.device)
+        if self.fp16:
+            tensor = tensor.half()
         with torch.no_grad():
             feats = self.backbone.model(tensor)            # [P, feature_dim]
+            feats = feats.float()                          # upcast before normalize
             feats = torch.nn.functional.normalize(feats, p=2, dim=1)
         feats = feats.cpu().numpy().astype(np.float32)
         for slot, i in enumerate(valid_idx):
@@ -142,6 +155,7 @@ class AppearanceExtractor:
         device: str = "cpu",
         reid_backbone: str = "osnet_ain_x1_0",
         reid_weights_path: str = "",
+        reid_fp16: bool = False,
     ):
         """
         Initialize the appearance extractor.
@@ -151,12 +165,17 @@ class AppearanceExtractor:
             reid_backbone: OSNet variant for the person ReID deep term.
             reid_weights_path: optional ReID-trained checkpoint overriding the
                 imagenet init.
+            reid_fp16: run the person ReID deep forward in half precision
+                (CUDA only; silent no-op on CPU).
         """
         self.device = device
 
         # Person-specific ReID model
         self.person_reid = PersonReIDModel(
-            device, backbone_name=reid_backbone, reid_weights_path=reid_weights_path
+            device,
+            backbone_name=reid_backbone,
+            reid_weights_path=reid_weights_path,
+            fp16=reid_fp16,
         )
         
         # General feature extractor for non-person objects

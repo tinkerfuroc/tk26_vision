@@ -108,6 +108,7 @@ class OSNetBackbone:
         backbone_name: str,
         device: str = "cpu",
         reid_weights_path: str = "",
+        fp16: bool = False,
     ):
         if backbone_name not in _OSNET_DIMS:
             raise ValueError(
@@ -117,6 +118,10 @@ class OSNetBackbone:
         self.backbone_name = backbone_name
         self.device = device
         self.feature_dim = _OSNET_DIMS[backbone_name]
+        # fp16 forward is CUDA-only — torch half on CPU is unsupported/slow for
+        # several conv/BN ops, so gate strictly on cuda. On CPU this is a no-op
+        # and the model stays float32.
+        self.fp16 = bool(fp16) and str(device) == "cuda"
 
         build_model = _resolve_build_model()
         # num_classes is irrelevant for feature extraction; pretrained=True
@@ -167,6 +172,12 @@ class OSNetBackbone:
 
         model.eval()
         model.to(self.device)
+        # Half-precision forward (CUDA only). Done once at build so every forward
+        # — single and batched — runs in fp16. Output is upcast to float32 before
+        # L2-normalize so the returned embedding stays float32 + unit-norm.
+        if self.fp16:
+            model.half()
+            logger.info("OSNet %s running fp16 forward (CUDA)", backbone_name)
         self.model = model
 
     def extract_features(self, crop: np.ndarray) -> np.ndarray:
@@ -176,9 +187,12 @@ class OSNetBackbone:
         resized = cv2.resize(crop, (_REID_W, _REID_H))
         norm = (resized.astype(np.float32) / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
         tensor = torch.from_numpy(norm).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        if self.fp16:
+            tensor = tensor.half()
 
         with torch.no_grad():
             feat = self.model(tensor)            # [1, feature_dim]
+            feat = feat.float()                  # upcast before normalize/return
             feat = torch.nn.functional.normalize(feat, p=2, dim=1)
         return feat.cpu().numpy().flatten().astype(np.float32)
 
@@ -187,6 +201,7 @@ def build_reid_backbone(
     backbone_name: str,
     device: str = "cpu",
     reid_weights_path: str = "",
+    fp16: bool = False,
 ) -> "ReIDBackbone":
     """Factory for the configured ReID backbone. Currently OSNet only.
 
@@ -195,7 +210,11 @@ def build_reid_backbone(
         device: torch device string.
         reid_weights_path: optional path to a ReID-trained checkpoint that
             overrides the imagenet init; empty ⇒ keep imagenet.
+        fp16: run the deep forward in half precision (CUDA only; no-op on CPU).
     """
     return OSNetBackbone(
-        backbone_name, device=device, reid_weights_path=reid_weights_path
+        backbone_name,
+        device=device,
+        reid_weights_path=reid_weights_path,
+        fp16=fp16,
     )

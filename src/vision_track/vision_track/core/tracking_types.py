@@ -43,6 +43,23 @@ class TrackingResult:
 
 
 @dataclass
+class LockDecision:
+    """Output of LockStateMachine.step — what the node should do this frame.
+
+    Attributes:
+        publish: emit the 3D point this frame (provisional or committed).
+        target_lost: feedback flag; True during any coast (asymmetric hysteresis).
+        committed_id: stable original track id, or None once hard-lost.
+        state: one of 'tracking' | 'reidentifying' | 'lost'.
+    """
+
+    publish: bool
+    target_lost: bool
+    committed_id: Optional[int]
+    state: str
+
+
+@dataclass
 class TargetAppearance:
     """
     Stores appearance features for re-identification.

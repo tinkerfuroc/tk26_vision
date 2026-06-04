@@ -129,8 +129,15 @@ class PersonTrackNode(Node):
         self.declare_parameter('reid_verification_interval', 5)  # periodic on-track ReID sanity check
         self.declare_parameter('allow_indefinite_recovery', True)  # if True, never abort for long-term loss
         
-        # ReID mode: 'custom' uses our ResNet50-based ReID, 'native' uses YOLO's BoT-SORT ReID
+        # ReID mode: 'custom' uses our OSNet-based ReID, 'native' uses YOLO's BoT-SORT ReID
         self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
+
+        # ReID deep backbone (torchreid OSNet). Default is imagenet-init
+        # osnet_ain_x1_0; 'osnet_x0_25' is the lighter alt. To upgrade to a
+        # Market/MSMT ReID-trained checkpoint, point reid_weights_path at it
+        # (overrides imagenet init — config change only).
+        self.declare_parameter('reid_backbone', 'osnet_ain_x1_0')
+        self.declare_parameter('reid_weights_path', '')
         
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')
@@ -162,7 +169,9 @@ class PersonTrackNode(Node):
         self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
         self.allow_indefinite_recovery = self.get_parameter('allow_indefinite_recovery').value
         self.reid_mode = self.get_parameter('reid_mode').value
-        
+        self.reid_backbone = self.get_parameter('reid_backbone').value
+        self.reid_weights_path = self.get_parameter('reid_weights_path').value
+
         self.image_topic = self.get_parameter('image_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
         self.camera_info_topic = self.get_parameter('camera_info_topic').value
@@ -206,13 +215,15 @@ class PersonTrackNode(Node):
                     "Use reid_mode='custom' (the default)."
                 )
             else:
-                # Use custom ResNet50-based ReID (default)
+                # Use custom OSNet-based ReID (default)
                 self.tracker = YOLOTracker(
                     model_path=str(model_file),
                     confidence_threshold=self.confidence_threshold,
                     enable_reid=self.enable_reid,
                     inference_size=self.inference_size,
-                    reid_verification_interval=int(self.reid_verification_interval)
+                    reid_verification_interval=int(self.reid_verification_interval),
+                    reid_backbone=self.reid_backbone,
+                    reid_weights_path=self.reid_weights_path,
                 )
                 self.tracker.max_frames_lost = max_frames_allowed
                 # Communicate the real loop cadence so loss/buffer timing is

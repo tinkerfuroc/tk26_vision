@@ -1,126 +1,128 @@
-# TPT-Bench — dataset & offline scorer
+# Offline person-tracking scorer — TPT-Bench (intended) / LaSOT `person` (realized)
 
-**TPT-Bench** is a large-scale, long-term, robot-egocentric dataset for
-benchmarking *target person tracking* (single target, follow-the-person), with
-exhaustively annotated 2D bounding boxes of the target across 48 indoor/outdoor
-sequences featuring frequent occlusions and crowds.
+This sub-package (`ptbench.tpt_bench`) is an **offline scorer**: it runs Tinker's
+`vision_track` YOLO tracker against a downloaded LaSOT-style single-target
+sequence and reports tracking precision / recall / F-score / AO / AMR. It is an
+**external regression smoke-test**, not a Tinker integration test.
 
-- Project page: <https://medlartea.github.io/tpt-bench/>
-- Paper: arXiv **2505.07446** — *"TPT-Bench: A Large-Scale, Long-Term and
-  Robot-Egocentric Dataset for Benchmarking Target Person Tracking"*
-- Code/repo: <https://github.com/MedlarTea/TPT-Bench>
+## Reality check (2026-06-05): TPT-Bench is download-blocked → use LaSOT `person`
 
-This sub-package (`ptbench.tpt_bench`) is an **offline scorer**: it runs
-Tinker's `vision_track` YOLO tracker against a downloaded TPT-Bench sequence and
-reports tracking precision / recall / F-score / AO / AMR. It is an **external
-regression smoke-test**, not a Tinker integration test.
+The originally-intended Tier-B set was **TPT-Bench** (arXiv **2505.07446**,
+robot-egocentric target-person tracking). Its data is published **only** on
+OneDrive (pw `rcvtptbench`) and Baidu (pw `pf25`) — both browser/password-gated;
+the `1drv.ms` link returns HTTP 403 under `curl`, so it is **not scriptable**
+from the workstation. The real release layout is also `panoramic_images/<seq>/` +
+`GTs/<seq>.json`, **not** the LaSOT `img/`+`groundtruth.txt` this loader expects.
 
-> **Sensor caveat.** TPT-Bench RGB-D frames were collected with a **ZED2 stereo
-> camera** (plus a RICOH Theta Z1 panoramic camera for the primary annotated
-> stream). Tinker's robot uses an **Orbbec** depth camera, so absolute numbers
-> here measure the tracker's *appearance-tracking generalisation*, not its
-> on-robot performance. Treat scores as relative regression signal across code
-> changes, not as a hardware claim.
+So the **realized** external benchmark is **LaSOT's `person` category** — 20
+single-target person sequences, directly downloadable from HuggingFace (no auth),
+and a genuine drop-in for this scorer. The two are interchangeable for our
+purpose (single-target, first-frame-seeded, LaSOT annotation standard); LaSOT is
+3rd-person web video rather than robot-egocentric, so treat the numbers as an
+**appearance-tracking / ReID + occlusion-recovery regression signal**, not an
+on-robot (Orbbec) performance claim.
 
-## Annotation format (confirmed from the paper, Sec. 4)
+> **What the offline scorer does and does NOT exercise.** The runner constructs
+> `YOLOTracker` directly, so it measures the **tracker core** (YOLO + ByteTrack +
+> OSNet-AIN/MSMT17 ReID + identity gates). The node-level `LockStateMachine`
+> recovery FSM and the depth-gated crosser rejection are attached/driven by
+> `person_track_node` and are **depth-dependent** (the node only publishes a
+> target when depth yields a 3D position), so they are NOT in this RGB-only
+> path. `run_lasot_person_benchmark.py --fsm` attaches the FSM for an ablation
+> (depth permissive); fully testing the depth half needs Tier-A Orbbec bags.
 
-TPT-Bench uses the **LaSOT** single-target annotation standard:
+## How to obtain the data (LaSOT `person`)
 
-- If the target appears in a frame, the box is the tightest up-right rectangle
-  around any visible part of the target.
-- Bounding boxes are stored as **`[u, v, w, h]`** — upper-left corner `(u, v)`
-  plus `(width, height)`, one box per frame.
-- When the target is **absent**, the box is written as `0,0,0,0` (LaSOT-style
-  absent label).
+Directly downloadable from the HuggingFace mirror `l-lt/LaSOT` (no login, no
+EULA). The whole `person` category is one zip (4.29 GB, all 20 sequences):
 
-The paper's evaluation metrics (Sec. 4.1), reproduced in `metrics.py`:
+```bash
+mkdir -p ~/datasets/lasot && cd ~/datasets/lasot
+curl -L -o person.zip \
+  "https://huggingface.co/datasets/l-lt/LaSOT/resolve/main/person.zip?download=true"
+unzip -q person.zip          # -> person-1/ ... person-20/
+```
 
-- **Tracking Precision** = correct predictions ÷ frames with a prediction
-  (`N_p`). A box on an absent-GT frame is a false positive.
-- **Tracking Recall** = correct predictions ÷ frames where the target exists
-  (`N_g`).
-- **F-score** = harmonic mean of precision and recall.
-- **AO** (Average Overlap) = mean IoU over target-present frames at overlap
-  threshold `tau_Omega = 0` (pred absent ⇒ IoU 0).
-- **AMR** (Average Max Recall) = max recall achievable while precision stays at
-  100%, averaged over IoU thresholds. Our tracker emits only a coarse per-frame
-  confidence, so the scorer approximates AMR at a single IoU threshold by
-  sweeping the confidence threshold and taking the max recall among thresholds
-  that keep precision == 1.0 (see `metrics.py` docstring).
+The official Protocol-II **test** split for this category is
+`person-1`, `person-5`, `person-10`, `person-12`.
 
-## Directory layout the loader expects
+## Annotation format (VERIFIED against the real LaSOT release)
 
-The loader (`dataset.load_sequence`) is tolerant of the common LaSOT-derived
-release variants. Per **sequence** directory:
+Per **sequence** directory:
 
 ```
 <seq_dir>/
-  img/                 # frames, sorted lexically (zero-padded names)
-    00000001.jpg       #   *.jpg / *.jpeg / *.png / *.bmp accepted
-    00000002.jpg
-    ...
-  groundtruth.txt      # one "x,y,w,h" per line (comma OR whitespace delimited)
-  absent.txt           # OPTIONAL: one 0/1 flag per line (1 = target absent)
+  img/                 # frames 00000001.jpg ...  (sorted lexically, zero-padded)
+  groundtruth.txt      # one "x,y,w,h" per line (comma-delimited)
+  full_occlusion.txt   # absence flags — SINGLE comma-separated line of 0/1
+  out_of_view.txt      # absence flags — SINGLE comma-separated line of 0/1
+  nlp.txt              # natural-language description (ignored)
 ```
 
-Variants handled automatically:
+Real-format details the loader handles (confirmed by inspecting `person-*`):
 
-- Frames may live directly under `<seq_dir>` if there is no `img/` subdir.
-- Ground-truth file may be `groundtruth.txt` or `groundtruth_rect.txt`.
-- The absence-flag file may be `absent.txt`, `out_of_view.txt`, or
-  `full_occlusion.txt` (optional; when present its line count must match the
-  ground-truth line count).
-- Delimiters may be commas or whitespace.
-- An absent frame is recognised either from a set absence flag **or** a
-  `0,0,0,0` / zero-area / empty ground-truth line.
+- **Absence flag files are a single comma-separated line** of 0/1 (one per
+  frame), NOT one flag per line. LaSOT ships **both** `out_of_view.txt` and
+  `full_occlusion.txt`; a frame is "absent" if **either** is set — the loader
+  unions every flag file that exists. (`_read_flags` + the union loop in
+  `dataset.py`.)
+- In this release, fully-occluded frames also carry a `0,0,0,0` ground-truth
+  box, which the loader independently maps to absent (zero-area ⇒ `None`).
+- The loader is also tolerant of variants: frames directly under `<seq_dir>`,
+  `groundtruth_rect.txt`, comma OR whitespace delimiters, one-flag-per-line.
+
+Metrics (paper Sec. 4.1, implemented in `metrics.py`): **Precision** = correct ÷
+predicted frames; **Recall** = correct ÷ target-present frames; **F-score** =
+their harmonic mean; **AO** = mean IoU over present frames (pred absent ⇒ 0);
+**AMR** = max recall while precision stays 1.0 (swept over the per-frame score).
 
 The loader raises `TptDatasetError` on missing files, unparseable lines, or
 line/frame count mismatches.
 
-### Format assumptions not verified online
-
-The paper and project page confirm the LaSOT-style `[u,v,w,h]` convention and
-the `0,0,0,0` absent label, but do **not** publish the exact on-disk *file
-names* for every release split. The file-name variants above
-(`groundtruth_rect.txt`, `out_of_view.txt`, `full_occlusion.txt`, optional
-`img/` subdir) are implemented defensively from LaSOT precedent. If a real
-download uses different names, extend `_GT_NAMES` / `_ABSENT_NAMES` /
-`_IMAGE_EXTS` in `dataset.py`.
-
-## How to obtain the data
-
-**Do not auto-download** — TPT-Bench is multi-GB. Follow the download
-instructions on the project page and clone/extract sequences manually:
-
-- <https://medlartea.github.io/tpt-bench/>
-- <https://github.com/MedlarTea/TPT-Bench>
-
-Extract one or more sequence directories somewhere local, e.g.
-`~/datasets/tpt-bench/<seq_name>/`.
-
 ## Running the scorer
 
-The runner imports the heavy `vision_track` tracker, so source the workspace
-first (the tracker lives at
-`/home/tinker/tk25_ws/src/tk26_vision/src/vision_track`):
+The runner imports the heavy `vision_track` tracker. The reproducible driver
+derives all paths from its own location (no workspace sourcing needed) and runs
+with **production-faithful** settings (imgsz=736, conf=0.5; OSNet-AIN/MSMT17 +
+fp16 + yolo_track_conf=0.15 are `YOLOTracker` defaults):
 
 ```bash
-source /home/tinker/tk25_ws/install/setup.bash
-cd /home/tinker/tk25_ws/src/tk26_vision/benchmarks/person_tracker
+VENV=/home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/python
 
-python -m ptbench.tpt_bench.score_cli \
-    --seq ~/datasets/tpt-bench/<seq_name> \
-    --iou 0.5 --imgsz 1280 \
-    --json /tmp/tpt_<seq_name>.json
+# all 20 person sequences (tracker core):
+$VENV benchmarks/person_tracker/demo/run_lasot_person_benchmark.py --json /tmp/lasot.json
+# just the Protocol-II test split:
+$VENV benchmarks/person_tracker/demo/run_lasot_person_benchmark.py \
+    --seqs person-1 person-5 person-10 person-12
+# FSM ablation (attach node LockStateMachine; depth permissive on RGB):
+$VENV benchmarks/person_tracker/demo/run_lasot_person_benchmark.py --fsm \
+    --seqs person-1 person-5 person-10 person-12
 ```
 
-This prints an ASCII metrics table (precision / recall / f_score / ao / amr)
-and, with `--json`, dumps the metrics plus run config.
-
-The pure-logic modules (`dataset.py`, `metrics.py`) are unit-tested with
-synthetic fixtures and need **no** dataset or model:
+Or score a single sequence with the lower-level CLI (note `--imgsz 736`):
 
 ```bash
+cd benchmarks/person_tracker
+$VENV -m ptbench.tpt_bench.score_cli --seq ~/datasets/lasot/person-1 \
+    --iou 0.5 --imgsz 736 --json /tmp/person-1.json
+```
+
+## Latest run (2026-06-05, all 20 person sequences, tracker core)
+
+Mean **P=0.928 · R=0.490 · F=0.559 · AO=0.422 · AMR=0.279 @ ~29 Hz**. Bimodal:
+8/20 excellent (F≥0.9), 9/20 poor (F<0.4). Of the 9 poor, **7 are
+"lost-conservative"** (P≥0.85, very low recall — loses the target and refuses to
+re-lock, ~0 false targets) and **only 2 are wrong-lock** (P≈0.5). Headline:
+**precision 0.93 with only 2/20 wrong-lock** validates the overhaul's primary
+goal (kill wrong-locks); the open frontier is **reacquisition recall (0.49)**.
+FSM ablation: cuts wrong-locks (person-12 precision 0.50→0.61) but does not fix
+the conservative reacquire (driven by the distinctiveness gate upstream of the
+FSM). See `../../demo/lasot_benchmark_contact_sheet.png` for GT-vs-pred frames.
+
+## Pure-logic unit tests (no dataset / model needed)
+
+```bash
+cd benchmarks/person_tracker
 /home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/python \
     -m pytest tests/test_tpt_dataset.py tests/test_tpt_metrics.py -q
 ```

@@ -120,6 +120,37 @@ def test_alt_absent_filename_out_of_view(tmp_path):
     assert frames[1].gt_bbox is not None
 
 
+def test_comma_single_line_absence_flags(tmp_path):
+    # Real LaSOT out_of_view.txt / full_occlusion.txt are ONE comma-separated
+    # line of 0/1 flags, not one-per-line. The loader must flatten them.
+    gt = "1,1,2,2\n3,3,4,4\n5,5,6,6\n"
+    seq = _make_seq(
+        tmp_path,
+        gt_text=gt,
+        n_frames=3,
+        absent_text="0,1,0",  # single comma line, 3 flags, trailing newline-free
+        absent_name="out_of_view.txt",
+    )
+    frames = load_sequence(seq)
+    assert frames[0].gt_bbox is not None
+    assert frames[1].gt_bbox is None  # flagged absent via single-line flags
+    assert frames[2].gt_bbox is not None
+
+
+def test_absence_is_union_of_all_flag_files(tmp_path):
+    # LaSOT ships BOTH out_of_view.txt and full_occlusion.txt; a frame is
+    # absent if EITHER flag is set (union), not just the first file found.
+    gt = "1,1,2,2\n3,3,4,4\n5,5,6,6\n7,7,8,8\n"
+    seq = _make_seq(tmp_path, gt_text=gt, n_frames=4)  # no absence file yet
+    _write(os.path.join(seq, "out_of_view.txt"), "0,1,0,0")
+    _write(os.path.join(seq, "full_occlusion.txt"), "0,0,1,0")
+    frames = load_sequence(seq)
+    assert frames[0].gt_bbox is not None
+    assert frames[1].gt_bbox is None  # out_of_view
+    assert frames[2].gt_bbox is None  # full_occlusion
+    assert frames[3].gt_bbox is not None
+
+
 def test_frame_count_mismatch_raises(tmp_path):
     gt = "1,1,2,2\n3,3,4,4\n5,5,6,6\n"  # 3 gt lines
     seq = _make_seq(tmp_path, gt_text=gt, n_frames=2)  # only 2 images

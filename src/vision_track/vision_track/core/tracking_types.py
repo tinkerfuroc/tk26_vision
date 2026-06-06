@@ -124,7 +124,7 @@ class TargetAppearance:
         self.gallery.configure(enabled=enabled, size=size,
                                novelty_max=novelty_max, score_mode=score_mode)
 
-    def deep_score(self, candidate_reid):
+    def deep_score(self, candidate_reid: Optional[np.ndarray]) -> Optional[float]:
         """Deep-ReID similarity of a candidate to this target's appearance.
 
         Uses the multi-view gallery (max over diverse views) when enabled and
@@ -132,7 +132,7 @@ class TargetAppearance:
         back to the legacy max(average, anchor) cosine. Returns a raw cosine in
         [-1, 1], or None when no usable target feature exists.
         """
-        if candidate_reid is None:
+        if candidate_reid is None or not np.all(np.isfinite(candidate_reid)):
             return None
         dim = candidate_reid.shape[0]
         if self.gallery.enabled and len(self.gallery) > 0:

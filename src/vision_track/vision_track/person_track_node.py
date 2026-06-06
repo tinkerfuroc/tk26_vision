@@ -163,6 +163,14 @@ class PersonTrackNode(Node):
         # True for throughput in multi-person re-ID scenes — output stays
         # float32 + L2-normalized so identity gating is unaffected.
         self.declare_parameter('reid_fp16', True)
+        # Multi-view reacquisition gallery (Phase 3). enabled is the kill-switch
+        # (False restores exact legacy single-anchor scoring); size = K diverse
+        # views kept; novelty_max = max cosine to existing views to admit a new
+        # one; score_mode = 'max' | 'top2_mean' (precision fallback).
+        self.declare_parameter('reid_gallery_enabled', True)
+        self.declare_parameter('reid_gallery_size', 6)
+        self.declare_parameter('reid_gallery_novelty_max', 0.85)
+        self.declare_parameter('reid_gallery_score_mode', 'max')
 
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')
@@ -205,6 +213,10 @@ class PersonTrackNode(Node):
         self.reid_backbone = self.get_parameter('reid_backbone').value
         self.reid_weights_path = self.get_parameter('reid_weights_path').value
         self.reid_fp16 = self.get_parameter('reid_fp16').value
+        self.reid_gallery_enabled = self.get_parameter('reid_gallery_enabled').value
+        self.reid_gallery_size = self.get_parameter('reid_gallery_size').value
+        self.reid_gallery_novelty_max = self.get_parameter('reid_gallery_novelty_max').value
+        self.reid_gallery_score_mode = self.get_parameter('reid_gallery_score_mode').value
 
         self.image_topic = self.get_parameter('image_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
@@ -256,6 +268,10 @@ class PersonTrackNode(Node):
                     reid_backbone=self.reid_backbone,
                     reid_weights_path=self.reid_weights_path,
                     reid_fp16=self.reid_fp16,
+                    reid_gallery_enabled=self.reid_gallery_enabled,
+                    reid_gallery_size=int(self.reid_gallery_size),
+                    reid_gallery_novelty_max=float(self.reid_gallery_novelty_max),
+                    reid_gallery_score_mode=self.reid_gallery_score_mode,
                     yolo_track_conf=self.yolo_track_conf,
                 )
                 self.tracker.max_frames_lost = max_frames_allowed

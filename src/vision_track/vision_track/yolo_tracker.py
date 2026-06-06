@@ -76,6 +76,10 @@ class YOLOTracker:
         reid_backbone: str = "osnet_ain_x1_0",
         reid_weights_path: str = "",
         reid_fp16: bool = True,
+        reid_gallery_enabled: bool = True,
+        reid_gallery_size: int = 6,
+        reid_gallery_novelty_max: float = 0.85,
+        reid_gallery_score_mode: str = "max",
         yolo_track_conf: float = 0.15,
     ):
         """
@@ -94,6 +98,12 @@ class YOLOTracker:
             reid_weights_path: optional ReID-trained checkpoint overriding the imagenet init
             reid_fp16: run the ReID deep forward in half precision (CUDA only;
                 no-op on CPU). Default True for throughput in multi-person scenes.
+            reid_gallery_enabled: enable the multi-view reacquisition gallery on
+                the target appearance (kill-switch; False restores legacy behavior)
+            reid_gallery_size: K diverse views kept in the gallery
+            reid_gallery_novelty_max: admit a view only if its cosine to existing
+                views is below this threshold
+            reid_gallery_score_mode: gallery scoring mode ('max' | 'top2_mean')
             yolo_track_conf: LOW detection conf fed to model.track so ByteTrack's
                 two-stage (high/low) association recovery actually runs — kept
                 separate from confidence_threshold, which still gates detect()
@@ -105,6 +115,10 @@ class YOLOTracker:
         self.reid_backbone = reid_backbone
         self.reid_weights_path = reid_weights_path
         self.reid_fp16 = reid_fp16
+        self.reid_gallery_enabled = reid_gallery_enabled
+        self.reid_gallery_size = reid_gallery_size
+        self.reid_gallery_novelty_max = reid_gallery_novelty_max
+        self.reid_gallery_score_mode = reid_gallery_score_mode
         self.yolo_track_conf = yolo_track_conf
         self.state = TrackerState.UNINITIALIZED
         self.target_track_id: Optional[int] = None
@@ -147,6 +161,15 @@ class YOLOTracker:
         # Warm up the model if requested
         if warmup:
             self._warmup_model()
+
+    def _configure_gallery(self, appearance) -> None:
+        """Apply this tracker's gallery ROS params to a TargetAppearance."""
+        appearance.configure_gallery(
+            enabled=self.reid_gallery_enabled,
+            size=self.reid_gallery_size,
+            novelty_max=self.reid_gallery_novelty_max,
+            score_mode=self.reid_gallery_score_mode,
+        )
 
     def _init_reid_settings(self, enable_reid: bool, reid_verification_interval: int) -> None:
         """Initialize ReID and tracking thresholds."""

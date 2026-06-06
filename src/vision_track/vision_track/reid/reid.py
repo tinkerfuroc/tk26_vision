@@ -636,33 +636,39 @@ class ReIDMatcher:
         candidate_features: Dict[str, np.ndarray],
         candidate_bbox: Tuple[int, int, int, int],
         current_time: float,
-        is_person: bool = False
+        is_person: bool = False,
+        use_gallery: bool = True
     ) -> float:
         """
         Compute similarity between stored target and a candidate detection.
-        
+
         Args:
             target: Stored target appearance
             candidate_features: Features extracted from candidate
             candidate_bbox: Bounding box of candidate
             current_time: Current timestamp
             is_person: Whether the target is a person (uses specialized matching)
-            
+            use_gallery: Whether the deep term may use the multi-view gallery.
+                When False, the deep term forces the legacy max(average, anchor)
+                path (used in multi-candidate scenes so best-vs-second margins
+                aren't compressed). Non-person matching ignores this flag.
+
         Returns:
             Similarity score between 0 and 1
         """
         scores = []
         weights = []
-        
+
         # Time decay - reduce confidence for older appearances
         time_since_seen = current_time - target.last_seen_time
         if time_since_seen > cls.MAX_REID_TIME:
             return 0.0
         time_decay = cls.TIME_DECAY_FACTOR ** time_since_seen
-        
+
         if is_person:
             # Use person-specific ReID matching
-            return cls._compute_person_similarity(target, candidate_features, time_decay)
+            return cls._compute_person_similarity(
+                target, candidate_features, time_decay, use_gallery=use_gallery)
         else:
             # Use general object matching
             return cls._compute_general_similarity(target, candidate_features, time_decay)
@@ -672,7 +678,8 @@ class ReIDMatcher:
         cls,
         target: TargetAppearance,
         candidate_features: Dict[str, np.ndarray],
-        time_decay: float
+        time_decay: float,
+        use_gallery: bool = True
     ) -> float:
         """
         Compute similarity for person re-identification.
@@ -704,7 +711,7 @@ class ReIDMatcher:
             # already unions the pinned anchor. The raw-cosine hard-reject floor
             # is preserved below.
             candidate_reid = candidate_features['reid']
-            reid_sim_raw = target.deep_score(candidate_reid)
+            reid_sim_raw = target.deep_score(candidate_reid, use_gallery=use_gallery)
             if reid_sim_raw is not None:
                 # Hard rejection: RAW reid similarity must be above floor
                 # Set conservatively to allow pose variation

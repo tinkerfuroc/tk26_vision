@@ -80,6 +80,7 @@ def update_appearance(
 
     if tracker.target_appearance is None:
         tracker.target_appearance = TargetAppearance(class_id=result.class_id, class_name=result.class_name)
+        tracker._configure_gallery(tracker.target_appearance)
 
     _update_feature_history(tracker, features, similarity, current_time, refresh_allowed)
     _update_color_histories(tracker, features, similarity, refresh_allowed)

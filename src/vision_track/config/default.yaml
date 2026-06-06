@@ -12,6 +12,10 @@
     reid_backbone: 'osnet_ain_x1_0'   # alt: 'osnet_x0_25'
     reid_mode: 'custom'               # 'custom' or 'native' (native loud-guarded in Phase 0)
     reid_fp16: true                   # half-precision ReID forward (CUDA only; no-op on CPU)
+    reid_gallery_enabled: true        # multi-view reacquisition gallery (kill-switch)
+    reid_gallery_size: 6              # K diverse views kept
+    reid_gallery_novelty_max: 0.85    # admit a view only if < this cosine to existing
+    reid_gallery_score_mode: 'max'    # 'max' | 'top2_mean' (precision fallback)
 
     # Loss / recovery
     max_frames_lost: 600

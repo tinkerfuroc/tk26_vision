@@ -690,7 +690,6 @@ class ReIDMatcher:
         If features don't show this separation, they're not discriminative enough.
         """
         reid_sim_raw = None
-        reid_anchor_sim = None
         body_color_sim = None
         body_color_anchor_sim = None
         color_sim = None
@@ -701,27 +700,19 @@ class ReIDMatcher:
         
         # 1. Person ReID features (most important) - use raw cosine similarity
         if 'reid' in candidate_features:
-            target_reid = target.get_average_feature()
-            if target_reid is not None:
-                candidate_reid = candidate_features['reid']
-                # Check dimension compatibility
-                if target_reid.shape[0] == candidate_reid.shape[0]:
-                    # Raw cosine similarity for L2-normalized vectors is in [-1, 1]
-                    # From logs: Same person ~0.70-0.98 (pose dependent), Different person ~0.55-0.70
-                    reid_sim_raw = cls._cosine_similarity(target_reid, candidate_reid)
-                    
-                    # Anchor feature comparison (helps with drift against similar stature people)
-                    if target.anchor_feature is not None and target.anchor_feature.shape[0] == candidate_reid.shape[0]:
-                        reid_anchor_sim = cls._cosine_similarity(target.anchor_feature, candidate_reid)
-                        reid_sim_raw = max(reid_sim_raw, reid_anchor_sim)
-                    
-                    # Hard rejection: RAW reid similarity must be above floor
-                    # Set conservatively to allow pose variation
-                    if reid_sim_raw < cls.MIN_REID_SIMILARITY_RAW:
-                        logger.info(f"HARD REJECT: ReID raw similarity {reid_sim_raw:.3f} < {cls.MIN_REID_SIMILARITY_RAW}")
-                        return 0.0
-                else:
-                    logger.debug(f"ReID dimension mismatch: {target_reid.shape[0]} vs {candidate_reid.shape[0]}")
+            # Deep term flows through the multi-view gallery (deep_score), which
+            # already unions the pinned anchor. The raw-cosine hard-reject floor
+            # is preserved below.
+            candidate_reid = candidate_features['reid']
+            reid_sim_raw = target.deep_score(candidate_reid)
+            if reid_sim_raw is not None:
+                # Hard rejection: RAW reid similarity must be above floor
+                # Set conservatively to allow pose variation
+                if reid_sim_raw < cls.MIN_REID_SIMILARITY_RAW:
+                    logger.info(f"HARD REJECT: ReID raw similarity {reid_sim_raw:.3f} < {cls.MIN_REID_SIMILARITY_RAW}")
+                    return 0.0
+            else:
+                logger.debug("ReID deep term unavailable (no matching target feature)")
         
         # 2. Body part color similarity - use histogram intersection (stricter than Bhattacharyya)
         if 'body_color' in candidate_features:

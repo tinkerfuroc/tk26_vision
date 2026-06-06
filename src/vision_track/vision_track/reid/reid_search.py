@@ -41,8 +41,7 @@ def find_best_match_reid(
         return None
 
     is_person = tracker.target_appearance.class_id == 0
-    target_reid = tracker.target_appearance.get_average_feature()
-    candidate_scores = _score_candidates(tracker, frame, candidates, current_time, is_person, target_reid)
+    candidate_scores = _score_candidates(tracker, frame, candidates, current_time, is_person)
     if not candidate_scores:
         logger.debug("No candidates with valid features")
         return None
@@ -124,7 +123,6 @@ def _score_candidates(
     candidates: List[TrackingResult],
     current_time: float,
     is_person: bool,
-    target_reid: Optional[np.ndarray],
 ) -> List[Tuple[TrackingResult, float, Dict[str, np.ndarray], float]]:
     """Extract features and compute similarity scores for candidates.
 
@@ -159,14 +157,11 @@ def _score_candidates(
             tracker.embedding_cache.put(result.track_id, tracker.frame_count, features)
 
         raw_cosine = 0.0
-        if is_person and "reid" in features and target_reid is not None:
-            if target_reid.shape[0] == features["reid"].shape[0]:
-                raw_cosine = ReIDMatcher._cosine_similarity(target_reid, features["reid"])
-                logger.debug(f"ID {result.track_id}: raw ReID cosine={raw_cosine:.3f}")
-            else:
-                logger.debug(
-                    f"ID {result.track_id}: feature dim mismatch ({target_reid.shape[0]} vs {features['reid'].shape[0]})"
-                )
+        if is_person and "reid" in features:
+            ds = tracker.target_appearance.deep_score(features["reid"])
+            if ds is not None:
+                raw_cosine = ds
+                logger.debug(f"ID {result.track_id}: gallery deep score={raw_cosine:.3f}")
 
         if is_person and "body_color" in features:
             target_body = tracker.target_appearance.get_body_color()

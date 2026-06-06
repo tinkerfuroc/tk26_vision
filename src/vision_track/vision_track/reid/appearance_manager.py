@@ -104,6 +104,7 @@ def _update_feature_history(tracker, features, similarity, current_time, refresh
             tracker.target_appearance.feature_history.clear()
 
     tracker.target_appearance.feature_history.append(new_feature)
+    tracker.target_appearance.gallery.maybe_add(new_feature)
     if tracker.target_appearance.anchor_feature is None:
         tracker.target_appearance.anchor_feature = new_feature
         tracker.target_appearance.best_similarity = similarity if similarity is not None else 0.0

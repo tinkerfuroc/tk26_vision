@@ -134,6 +134,11 @@ def _score_candidates(
     """
     candidate_scores: List[Tuple[TrackingResult, float, Dict[str, np.ndarray], float]] = []
 
+    # Gallery max-over-views scoring only when the operator is alone — in
+    # multi-candidate scenes it compresses best-vs-second margins, so fall back
+    # to the legacy avg/anchor deep term to preserve crowd disambiguation.
+    use_gallery = len(candidates) == 1
+
     # Phase 3: prime the per-frame embedding cache so the downstream verify /
     # confirm / periodic-validation call sites reuse this score-pass feature dict
     # instead of re-embedding the same crop. begin_frame is defensive — put()
@@ -158,7 +163,7 @@ def _score_candidates(
 
         raw_cosine = 0.0
         if is_person and "reid" in features:
-            ds = tracker.target_appearance.deep_score(features["reid"])
+            ds = tracker.target_appearance.deep_score(features["reid"], use_gallery=use_gallery)
             if ds is not None:
                 raw_cosine = ds
                 logger.debug(f"ID {result.track_id}: gallery deep score={raw_cosine:.3f}")
@@ -175,6 +180,7 @@ def _score_candidates(
             result.bbox,
             current_time,
             is_person=is_person,
+            use_gallery=use_gallery,
         )
         candidate_scores.append((result, similarity, features, raw_cosine))
 

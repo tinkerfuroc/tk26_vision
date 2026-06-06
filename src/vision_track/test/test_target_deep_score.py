@@ -53,3 +53,14 @@ def test_non_finite_candidate_returns_none():
     t.feature_history.append(_v(1, 0))
     t.configure_gallery(enabled=True, size=6, novelty_max=0.85, score_mode="max")
     assert t.deep_score(_v(float("nan"), 0)) is None
+
+
+def test_use_gallery_false_ignores_populated_gallery():
+    t = TargetAppearance(class_id=0, class_name="person")
+    t.feature_history.append(_v(1, 0))          # legacy avg = [1,0]
+    t.configure_gallery(enabled=True, size=6, novelty_max=0.99, score_mode="max")
+    t.gallery.maybe_add(_v(0, 1))               # gallery has an orthogonal view
+    # use_gallery=False -> must use legacy avg only -> cosine([1,0],[0,1]) ~0
+    assert abs(t.deep_score(_v(0, 1), use_gallery=False)) < 0.05
+    # use_gallery=True -> gallery view matches -> ~1.0
+    assert t.deep_score(_v(0, 1), use_gallery=True) > 0.99

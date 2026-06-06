@@ -6,7 +6,18 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .reid_gallery import ReIDGallery
+
 logger = logging.getLogger(__name__)
+
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity of two vectors (0.0 on near-zero norm)."""
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na <= 1e-12 or nb <= 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
 
 
 class TrackerState(Enum):
@@ -69,6 +80,7 @@ class TargetAppearance:
     """
 
     feature_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
+    gallery: ReIDGallery = field(default_factory=ReIDGallery)
     color_hist_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
     upper_color_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
     lower_color_history: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=30))
@@ -105,6 +117,39 @@ class TargetAppearance:
             return np.mean(np.array(matching_features), axis=0)
         except Exception:
             return self.feature_history[-1] if self.feature_history else None
+
+    def configure_gallery(self, *, enabled: bool, size: int,
+                          novelty_max: float, score_mode: str) -> None:
+        """Apply gallery config (from ROS params) to this target's gallery."""
+        self.gallery.configure(enabled=enabled, size=size,
+                               novelty_max=novelty_max, score_mode=score_mode)
+
+    def deep_score(self, candidate_reid):
+        """Deep-ReID similarity of a candidate to this target's appearance.
+
+        Uses the multi-view gallery (max over diverse views) when enabled and
+        populated, never doing worse than the pinned anchor; otherwise falls
+        back to the legacy max(average, anchor) cosine. Returns a raw cosine in
+        [-1, 1], or None when no usable target feature exists.
+        """
+        if candidate_reid is None:
+            return None
+        dim = candidate_reid.shape[0]
+        if self.gallery.enabled and len(self.gallery) > 0:
+            g = self.gallery.score(candidate_reid)
+            if g is not None:
+                if (self.anchor_feature is not None
+                        and self.anchor_feature.shape[0] == dim):
+                    return max(g, _cosine(self.anchor_feature, candidate_reid))
+                return g
+        best = None
+        avg = self.get_average_feature()
+        if avg is not None and avg.shape[0] == dim:
+            best = _cosine(avg, candidate_reid)
+        if self.anchor_feature is not None and self.anchor_feature.shape[0] == dim:
+            a = _cosine(self.anchor_feature, candidate_reid)
+            best = a if best is None else max(best, a)
+        return best
 
     def get_average_color_hist(self) -> Optional[np.ndarray]:
         """Get averaged color histogram from history."""

@@ -63,3 +63,10 @@ def test_dim_mismatch_is_skipped_not_crash():
     g = ReIDGallery(size=6, novelty_max=0.99)
     g.maybe_add(np.array([1.0, 0.0], dtype=np.float32))
     assert g.score(np.array([1.0, 0.0, 0.0], dtype=np.float32)) is None
+
+
+def test_non_finite_feature_rejected():
+    g = ReIDGallery(size=6)
+    assert g.maybe_add(np.array([np.nan, 1.0], dtype=np.float32)) is False
+    assert g.maybe_add(np.array([np.inf, 1.0], dtype=np.float32)) is False
+    assert len(g) == 0

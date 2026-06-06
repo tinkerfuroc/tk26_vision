@@ -34,7 +34,7 @@ class ReIDGallery:
         self.enabled = bool(enabled)
         self.size = max(1, int(size))
         self.novelty_max = float(novelty_max)
-        self.score_mode = str(score_mode)
+        self.score_mode = score_mode if score_mode in ("max", "top2_mean") else "max"
         self._views: List[np.ndarray] = []
 
     def configure(self, *, enabled: bool, size: int, novelty_max: float,
@@ -43,7 +43,7 @@ class ReIDGallery:
         self.enabled = bool(enabled)
         self.size = max(1, int(size))
         self.novelty_max = float(novelty_max)
-        self.score_mode = str(score_mode)
+        self.score_mode = score_mode if score_mode in ("max", "top2_mean") else "max"
 
     def __len__(self) -> int:
         """Number of stored views."""
@@ -59,11 +59,11 @@ class ReIDGallery:
 
     def maybe_add(self, feature: Optional[np.ndarray]) -> bool:
         """Admit an (already quality-gated) feature if novel. Return admitted."""
-        if feature is None or feature.ndim != 1:
+        if feature is None or feature.ndim != 1 or not np.all(np.isfinite(feature)):
             return False
         f = _l2norm(feature.astype(np.float32))
         if not self._views:
-            self._views.append(f)
+            self._views.append(f)  # anchor, pinned at index 0
             return True
         same = self._matching(f.shape[0])
         if same and max(_cos(f, v) for v in same) >= self.novelty_max:

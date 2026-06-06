@@ -24,3 +24,14 @@ def test_compute_similarity_uses_gallery_max_view():
         t, cand, candidate_bbox=(0, 0, 10, 20), current_time=1.0, is_person=True
     )
     assert sim > 0.0                                # gallery max view matches -> not hard-rejected
+
+
+def test_empty_gallery_still_hard_rejects_dissimilar():
+    t = TargetAppearance(class_id=0, class_name="person")
+    t.last_seen_time = 0.0
+    t.configure_gallery(enabled=False, size=6, novelty_max=0.99, score_mode="max")
+    t.anchor_feature = _v(1, 0)            # gallery off -> legacy anchor path
+    cand = {"reid": _v(0, 5)}              # orthogonal to anchor -> below the 0.40 floor
+    sim = ReIDMatcher.compute_similarity(
+        t, cand, candidate_bbox=(0, 0, 10, 20), current_time=1.0, is_person=True)
+    assert sim == 0.0                       # hard-reject preserved with gallery off

@@ -35,6 +35,9 @@ from tf2_geometry_msgs import do_transform_point
 # Action definition
 from tinker_vision_msgs_26.action import TrackPerson
 
+# Service definition (active re-ID / re-seed)
+from tinker_vision_msgs_26.srv import ReseedTarget
+
 # Message filters for synchronization
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
@@ -358,6 +361,60 @@ class PersonTrackNode(Node):
             callback_group=ReentrantCallbackGroup()
         )
         self.get_logger().info('Action server created: track_person')
+
+        # Active re-ID: re-lock the tracker on an externally-confirmed bbox
+        # (e.g. raise-hand operator) without wiping the multi-view gallery.
+        self.reseed_srv = self.create_service(
+            ReseedTarget, '~/reseed_target', self._reseed_callback,
+            callback_group=ReentrantCallbackGroup())
+        self.get_logger().info('Service created: ~/reseed_target')
+
+    def _reseed_callback(self, request, response):
+        """Re-lock the tracker on request.bbox, preserving the gallery.
+
+        Runs under lock_tracker (serialized with the tracking loop's
+        tracker.update). Uses the latest cached color frame to match the bbox.
+        """
+        roi = request.bbox
+        bbox = (int(roi.x_offset), int(roi.y_offset),
+                int(roi.x_offset + roi.width), int(roi.y_offset + roi.height))
+        self.get_logger().info(
+            f'Reseed requested: bbox={bbox} frame_id={request.frame_id!r}')
+        # _get_latest_data() returns (rgb_img, rgb_msg, depth_msg, intrinsic) on
+        # success, or one of two falsy sentinels: None (no msg / no intrinsic /
+        # decode fail) and False (frame-seq dedup, i.e. nothing new). A success
+        # is a 4-tuple (always truthy), so `not data` covers both sentinels.
+        data = self._get_latest_data()
+        if not data:
+            self.get_logger().warn('Reseed failed: no camera frame available')
+            response.success = False
+            response.target_track_id = -1
+            response.message = 'no camera frame available'
+            return response
+        rgb_img = data[0]
+        # Mirror the live tracking loop: it feeds the tracker a BGR->RGB frame
+        # (see _run_tracking_loop). reseed_target must get the SAME convention
+        # or detection/ReID degrades. Do NOT pass the raw bgr8 buffer here.
+        rgb_frame = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+        # A raising service callback propagates out of the MultiThreadedExecutor
+        # and crashes the node; the YOLO/ReID work inside reseed_target can throw
+        # on a bad frame / CUDA OOM, so guard it (mirrors _execute_callback).
+        try:
+            with self.lock_tracker:
+                tid = self.tracker.reseed_target(rgb_frame, bbox, target_class='person')
+        except Exception as exc:  # service must never crash the node
+            self.get_logger().error(f'Reseed errored: {exc}')
+            response.success = False
+            response.target_track_id = -1
+            response.message = f'reseed error: {exc}'
+            return response
+        response.success = tid >= 0
+        response.target_track_id = int(tid)
+        response.message = 'reseeded' if tid >= 0 else 'no detection matched bbox'
+        self.get_logger().info(
+            f'Reseed result: success={response.success} '
+            f'track_id={response.target_track_id} ({response.message})')
+        return response
 
     def _camera_info_callback(self, msg: CameraInfo):
         """Store camera intrinsic parameters."""

@@ -36,6 +36,13 @@ class ReIDGallery:
         self.novelty_max = float(novelty_max)
         self.score_mode = score_mode if score_mode in ("max", "top2_mean") else "max"
         self._views: List[np.ndarray] = []
+        self._thumbs: List[object] = []
+        self.version: int = 0
+
+    @property
+    def thumbs(self) -> List[object]:
+        """Per-view thumbnail payloads (opaque; index-aligned with views)."""
+        return list(self._thumbs)
 
     def configure(self, *, enabled: bool, size: int, novelty_max: float,
                   score_mode: str) -> None:
@@ -51,32 +58,48 @@ class ReIDGallery:
 
     def clear(self) -> None:
         """Drop all views (e.g. on tracker reset)."""
+        if self._views:
+            self.version += 1
         self._views = []
+        self._thumbs = []
 
     def _matching(self, dim: int) -> List[np.ndarray]:
         """Views whose dimension matches ``dim`` (guards backbone swaps)."""
         return [v for v in self._views if v.shape[0] == dim]
 
-    def maybe_add(self, feature: Optional[np.ndarray]) -> bool:
-        """Admit an (already quality-gated) feature if novel. Return admitted."""
+    def maybe_add(self, feature: Optional[np.ndarray], thumb: object = None) -> bool:
+        """Admit an (already quality-gated) feature if novel. Return admitted.
+
+        ``thumb`` is an opaque per-view payload (e.g. an RGB crop) stored in
+        lockstep with the view: same index, same eviction. ``version``
+        increments once per accepted add (an add that also evicts still
+        counts once) and per non-empty clear, so publishers can cheaply
+        detect change.
+        """
         if feature is None or feature.ndim != 1 or not np.all(np.isfinite(feature)):
             return False
         f = _l2norm(feature.astype(np.float32))
         if not self._views:
             self._views.append(f)  # anchor, pinned at index 0
+            self._thumbs.append(thumb)
+            self.version += 1
             return True
         same = self._matching(f.shape[0])
         if same and max(_cos(f, v) for v in same) >= self.novelty_max:
             return False
         self._views.append(f)
+        self._thumbs.append(thumb)
         if len(self._views) > self.size:
-            self._evict_most_redundant()
+            drop = self._evict_most_redundant()
+            if drop is not None:
+                self._thumbs.pop(drop)
+        self.version += 1
         return True
 
-    def _evict_most_redundant(self) -> None:
-        """Drop the most-redundant non-anchor view (keep diversity)."""
+    def _evict_most_redundant(self) -> Optional[int]:
+        """Drop the most-redundant non-anchor view; return its index."""
         if len(self._views) <= 1:
-            return
+            return None
         non_anchor = list(range(1, len(self._views)))
 
         def redundancy(idx: int) -> float:
@@ -87,6 +110,7 @@ class ReIDGallery:
 
         drop = max(non_anchor, key=redundancy)
         self._views.pop(drop)
+        return drop
 
     def score(self, feature: Optional[np.ndarray]) -> Optional[float]:
         """Max cosine over matching views (or top2_mean). None if unusable."""

@@ -54,6 +54,7 @@ from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
 
 from vision_track.core.centroid import reduce_centroid
+from vision_track.core.color_decode import decode_color_msg
 from vision_track.core.depth_roi import roi_window
 from vision_track.core.frame_diag import compute_frame_diag
 from vision_track.core.reacq_state import reacq_state
@@ -111,6 +112,15 @@ class PersonTrackNode(Node):
         self.debug_gallery_pub = self.create_publisher(String, '~/debug_gallery', gallery_qos)
         self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 1)
         self._last_gallery_version = -1
+
+        # Idle telemetry: between goals the tracking loop isn't running, so a
+        # light timer keeps the dashboard alive (camera preview + 'idle' state)
+        # when the debug params are on. The tick reads the frame cache WITHOUT
+        # consuming it (never touches last_processed_seq) so it cannot race
+        # the tracking loop.
+        self._idle_last_seq = -1
+        if self.debug_state_enabled or self.debug_image_enabled:
+            self.idle_debug_timer = self.create_timer(0.1, self._idle_debug_tick)
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -764,7 +774,8 @@ class PersonTrackNode(Node):
                         # Dashboard UX: without this the track_web stale banner
                         # ("NO DATA") shows for the whole init search right
                         # after the operator presses Start.
-                        self._publish_init_debug_state()
+                        self._publish_phase_debug_state('initializing')
+                        self._publish_raw_debug_image(rgb_img)
                         time.sleep(0.1)
                         continue
                     last_seen_time = time.time()
@@ -828,13 +839,14 @@ class PersonTrackNode(Node):
         if intrinsic is None:
             return None
 
-        try:
-            # Avoid CvBridge's extra copy; image is already bgr8 on the wire.
-            rgb_img = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
-                rgb_msg.height, rgb_msg.width, 3
-            )
-        except Exception as e:
-            self.get_logger().warn(f'Failed to convert RGB image: {e}')
+        # Normalize the wire format (Orbbec = rgb8, others = bgr8) to BGR once,
+        # here — every downstream consumer (tracker feed via BGR2RGB, debug
+        # draw/publish, vision logger) assumes BGR. Zero-copy for bgr8 (the
+        # returned view is read-only; all writers copy first).
+        rgb_img, err = decode_color_msg(rgb_msg)
+        if rgb_img is None:
+            self.get_logger().warn(f'color frame dropped: {err}',
+                                   throttle_duration_sec=5.0)
             return None
 
         return rgb_img, rgb_msg, depth_msg, intrinsic
@@ -1142,11 +1154,12 @@ class PersonTrackNode(Node):
             return True
         return False
 
-    def _publish_init_debug_state(self):
-        """Init-phase telemetry tick: 'searching for a target, nothing locked'.
+    def _publish_phase_debug_state(self, phase: str):
+        """Out-of-tracking telemetry tick: 'initializing' during goal init,
+        'idle' between goals.
 
-        Published while _try_initialize hasn't succeeded yet so the dashboard
-        shows an initializing state instead of the NO-DATA stale banner.
+        Published while the tracking loop isn't producing live telemetry so the
+        dashboard shows the current phase instead of the NO-DATA stale banner.
         Param-gated; must never raise into the loop.
         """
         if not self.debug_state_enabled:
@@ -1159,11 +1172,47 @@ class PersonTrackNode(Node):
                 time_since_seen=0.0, awaiting_help=False,
                 active_help_after_frames=self.active_help_after_frames,
                 active_help_timeout_sec=self.active_help_timeout_sec)
-            state["fsm_state"] = "initializing"
+            state["fsm_state"] = phase
+            state["candidates"] = []      # may be stale from a previous goal;
+            state["best_sim"] = None      # no live click targets outside the
+            state["second_sim"] = None    # tracking loop
             self.debug_state_pub.publish(String(data=json.dumps(state)))
         except Exception as exc:
-            self.get_logger().warn(f'init debug state failed: {exc}',
+            self.get_logger().warn(f'{phase} debug state failed: {exc}',
                                    throttle_duration_sec=5.0)
+
+    def _publish_raw_debug_image(self, rgb_img):
+        """Un-annotated BGR camera frame for the dashboard outside TRACKING."""
+        if not (self.debug_image_enabled
+                and self.debug_image_pub.get_subscription_count() > 0):
+            return
+        try:
+            self.debug_image_pub.publish(
+                self.bridge.cv2_to_imgmsg(rgb_img, encoding='bgr8'))
+        except Exception as exc:
+            self.get_logger().warn(f'raw debug image failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _idle_debug_tick(self):
+        """Dashboard telemetry while NO goal is active (loop not running)."""
+        if self.tracking_active:
+            return  # the tracking loop owns telemetry during a goal
+        self._publish_phase_debug_state('idle')
+        if not (self.debug_image_enabled
+                and self.debug_image_pub.get_subscription_count() > 0):
+            return
+        with self.lock_msg:
+            pair = self.recent_sync_msg
+            seq = self.frame_seq
+        if pair is None or seq == self._idle_last_seq:
+            return
+        rgb_img, err = decode_color_msg(pair[0])
+        if rgb_img is None:
+            self.get_logger().warn(f'idle frame dropped: {err}',
+                                   throttle_duration_sec=5.0)
+            return
+        self._idle_last_seq = seq
+        self._publish_raw_debug_image(rgb_img)
 
     def _publish_debug_outputs(self, rgb_img, track_result, feedback, last_seen_time):
         """Param-gated dashboard telemetry; must never raise into the loop."""

@@ -51,6 +51,7 @@ from vision_util.weights_cache import resolve_weights
 from vision_track.core.centroid import reduce_centroid
 from vision_track.core.depth_roi import roi_window
 from vision_track.core.frame_diag import compute_frame_diag
+from vision_track.core.reacq_state import reacq_state
 
 
 class PersonTrackNode(Node):
@@ -139,6 +140,9 @@ class PersonTrackNode(Node):
         # Phase 2: bound recovery so the tracker eventually declares hard-lost.
         # Replaces the effectively-infinite allow_indefinite_recovery coast.
         self.declare_parameter('max_recovery_frames', 45)
+        # Spec B: consecutive frames lost before the published reacquisition_state
+        # escalates to NEEDS_HELP, so a BT can debounce active (call-out) re-ID.
+        self.declare_parameter('active_help_after_frames', 45)
         self.declare_parameter('provisional_high_bar', 0.72)
         self.declare_parameter('provisional_distinct_margin', 0.10)
         # Phase 2: reject candidates whose median depth jumps this much (m)
@@ -202,6 +206,7 @@ class PersonTrackNode(Node):
         self.inference_size = self.get_parameter('inference_size').value
         self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
         self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
+        self.active_help_after_frames = int(self.get_parameter('active_help_after_frames').value)
         self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
         self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
         self.crosser_depth_jump_m = self.get_parameter('crosser_depth_jump_m').value
@@ -904,6 +909,8 @@ class PersonTrackNode(Node):
             feedback.segment_img = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
             feedback.segment_img.header = rgb_msg.header
 
+        feedback.reacquisition_state = reacq_state(
+            tracked=True, frames_lost=0, help_after=self.active_help_after_frames)
         goal_handle.publish_feedback(feedback)
 
         # Cache the latest good frame for the lost-transition dump, and emit
@@ -982,6 +989,9 @@ class PersonTrackNode(Node):
             else:
                 feedback.rgb_img = rgb_msg
 
+        feedback.reacquisition_state = reacq_state(
+            tracked=False, frames_lost=int(getattr(self.tracker, 'frames_lost', 0)),
+            help_after=self.active_help_after_frames)
         goal_handle.publish_feedback(feedback)
 
         # Republish a lost-sentinel so /target_points consumers see the loss

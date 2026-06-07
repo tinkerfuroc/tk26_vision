@@ -23,6 +23,7 @@
 
     # --- Phase 2: recovery policy (asymmetric hysteresis) ---
     max_recovery_frames: 45          # coast cap; past this → hard-lost
+    active_help_after_frames: 45     # consecutive frames lost before TrackPerson feedback reacquisition_state escalates to NEEDS_HELP (active call-out)
     provisional_high_bar: 0.72       # single-candidate fast-publish floor (reid_search.py)
     provisional_distinct_margin: 0.10  # min best-vs-second margin to publish in a crowd
     crosser_depth_jump_m: 0.6        # reject candidates this much nearer than the operator

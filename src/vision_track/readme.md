@@ -45,6 +45,12 @@ It runs `person_track_server` with the three `debug_*` flags forced ON, the
 (`bind` default `0.0.0.0`, `port` default `8766`). Cameras are deliberately not
 included — start them first per `src/tk26_vision/CAMERA_BRINGUP.md`.
 
+With the bench launch up, the dashboard now shows the live camera image even
+before any goal is sent (badge `IDLE`) and during the goal's init search (badge
+`INITIALIZING`); the annotated tracker overlay replaces the raw frame once the
+tracker locks. So you get a live preview to frame your shot / confirm the camera
+is up without first starting a goal.
+
 ### Enabling the tracker-side telemetry
 
 The dashboard consumes three publishers that the tracker only emits when
@@ -102,3 +108,10 @@ ros2 run vision_track person_track_server --ros-args \
 - **2026-06-07** — added `track_web_bench.launch.py`: one-command bench bringup
   (tracker w/ telemetry ON + waving server + dashboard), `bind`/`port`/
   `with_waving` launch args; cameras separate per CAMERA_BRINGUP.md.
+- **2026-06-07** — idle/init camera preview in the dashboard (`IDLE` /
+  `INITIALIZING` badge; live raw frame before a goal + during init search,
+  replaced by the overlay on lock) + `rgb8`→BGR color normalization at the
+  tracker's single decode point. The live Orbbec publishes `rgb8`, not the
+  assumed `bgr8`, so colors were red/blue-swapped before — including the
+  tracker feed, gallery thumbs, debug overlay/feedback, and the on-disk
+  `vision_log` images.

@@ -20,10 +20,15 @@ function renderState(s) {
   const prev = lastState;
   lastState = s;
   lastStateAt = Date.now();
-  const [label, cls] = REACQ[s.reacquisition_state] || ["?", ""];
   const badge = $("reacq-badge");
-  badge.textContent = label;
-  badge.className = "reacq " + cls;
+  if (s.fsm_state === "idle" || s.fsm_state === "initializing") {
+    badge.textContent = s.fsm_state.toUpperCase();
+    badge.className = "reacq";                       // neutral gray
+  } else {
+    const [label, cls] = REACQ[s.reacquisition_state] || ["?", ""];
+    badge.textContent = label;
+    badge.className = "reacq " + cls;
+  }
   $("fsm").textContent = s.fsm_state ?? "—";
   $("lost").textContent = s.target_lost;
   $("ids").textContent = `${s.target_track_id ?? "—"} (orig ${s.original_track_id ?? "—"})`;

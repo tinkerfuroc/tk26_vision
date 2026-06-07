@@ -169,3 +169,18 @@ True}]` (yaml first, bench overrides win); ② `waving_person_server`, gated by
 sequence). Launch-time resolution via `FindPackageShare` substitutions keeps
 `generate_launch_description()` pure (unit-testable unsourced); `port` passes
 through `ParameterValue(value_type=int)`. Installed via a `data_files` glob.
+
+## §8 Idle/init preview + color normalization (addendum, 2026-06-07)
+
+Between goals a 10 Hz idle timer publishes an `'idle'` phase `debug_state`
+(candidates blanked) and the raw camera frame on `~/debug_image` (non-consuming
+read of the frame cache — never advances `last_processed_seq`); during the goal
+init search the loop publishes an `'initializing'` phase state + raw frames.
+The UI renders both phases as a neutral badge. Motivated fix: the live Orbbec
+publishes **rgb8** (probe-verified), not the assumed bgr8 — `core/color_decode.py`
+`decode_color_msg()` now normalizes rgb8/bgr8→BGR at the node's single decode
+point (padded/foreign encodings rejected with a reason), so the tracker gets
+true RGB (matching the validated offline benchmarks) and every published/logged
+image is true BGR. Same-assumption audit of the other raw-color consumers
+(waving server, object_detection_*, kimi_api, follow_head) is a flagged
+follow-up in DEV_NOTES.

@@ -16,6 +16,70 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-07 — Orbbec publishes rgb8, not bgr8 — tracker ran channel-swapped on-robot; fixed at the decode point (+ idle/init dashboard preview)
+
+The `person_track_node` color path assumed the wire was already `bgr8` ("already
+bgr8 on the wire" comment, now removed). A live probe of the running camera
+disproved that.
+
+### Live probe evidence (2026-06-07)
+
+- The Orbbec color topic publishes `encoding: rgb8`, `step == width*3` (tightly
+  packed, no row padding).
+- Rate is ~30 Hz **only** with the `CAMERA_BRINGUP.md` FastDDS profile
+  (`FASTRTPS_DEFAULT_PROFILES_FILE=config/fastdds_shm.xml`); the bare vendored
+  launch measured ~2 Hz on this workstation.
+
+### Before / after consequence
+
+| Consumer | BEFORE (assumed bgr8, no swap) | AFTER (decode normalizes rgb8→BGR) |
+|---|---|---|
+| Tracker ReID feed | channel-swapped — on-robot ≠ the validated-offline runs | true RGB into the model |
+| Reseed path | swapped crop | correct |
+| Debug overlay / `feedback.rgb_img` | R/B-swapped | true BGR |
+| Gallery thumbs | R/B-swapped | correct |
+| `vision_logging.py` `cv2.imwrite` (lines ~215/289, expects BGR) | silently wrote R/B-swapped jpgs to disk | true BGR — **silent bonus fix** |
+
+The offline LaSOT / ReID benchmarks always fed **true RGB**, so on-robot
+behaviour diverged from what was validated offline. With the fix the on-robot
+tracker feed matches the validated-offline behaviour.
+
+### What landed
+
+- New `core/color_decode.py` `decode_color_msg(msg) -> (bgr|None, reason|None)`:
+  `bgr8` passthrough, `rgb8` channel-swap, padded-step / short-buffer / foreign
+  encodings rejected with a reason. 5 unit tests in `test/test_color_decode.py`.
+  Wired in as the node's single decode point (`_get_latest_data` normalized) so
+  every downstream consumer (tracker, reseed, overlay/feedback, gallery, vision
+  log) gets the right channel order from one place.
+- **Idle/init dashboard preview.** A 10 Hz idle timer publishes an `'idle'`
+  phase `debug_state` (candidates blanked) + the raw camera frame on
+  `~/debug_image` between goals; the goal init-search loop publishes an
+  `'initializing'` phase state + raw frames. The idle read of the frame cache is
+  non-consuming (never advances `last_processed_seq`). The dashboard renders both
+  phases as a neutral `IDLE`/`INITIALIZING` badge and shows the live preview
+  before any goal / during init; the annotated overlay replaces it on lock.
+
+### Flagged follow-up — same-assumption audit (NOT fixed here)
+
+Other nodes subscribing to the raw color topic likely carry the same `bgr8`
+assumption and need the same audit + normalizer:
+
+- `waving_person_server` — MediaPipe pose input + VLM crops
+- `object_detection_new`
+- `object_detection_generalist`
+- `kimi_api` feature crops
+- `follow_head`
+
+Only `vision_track` is fixed in this change.
+
+### To verify next bench session (operator)
+
+Live color correctness is unconfirmed on a real scene — hold a known-red object
+in view and confirm the dashboard / vision_log render it red (not blue).
+
+---
+
 ## 2026-06-07 — track_web dashboard + active-reID test bench — shipped at unit+install level, live verification deferred
 
 Browser dashboard for `person_track_server`: live MJPEG of the tracker debug

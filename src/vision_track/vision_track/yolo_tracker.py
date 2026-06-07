@@ -522,7 +522,53 @@ class YOLOTracker:
         
         self.state = TrackerState.LOST
         return False
-    
+
+    def _apply_reseed(self, selected_result, fresh_reid_feature) -> int:
+        """Re-lock onto an externally-confirmed detection, preserving identity.
+
+        Unlike initialize_tracking (which resets appearance), this keeps the
+        multi-view gallery + person registry (same operator, self-identified),
+        appends the fresh confirmed view, re-locks the ids, clears the lost
+        counter, and re-arms the lock FSM. Returns the locked track id, or -1
+        if selected_result is None.
+        """
+        if selected_result is None:
+            return -1
+        self.target_track_id = selected_result.track_id
+        self.original_track_id = selected_result.track_id
+        self.target_class_id = selected_result.class_id
+        self.target_class_name = selected_result.class_name
+        self.frames_lost = 0
+        self.state = TrackerState.TRACKING
+        if self.target_appearance is not None and fresh_reid_feature is not None:
+            self.target_appearance.gallery.maybe_add(fresh_reid_feature)
+        if self.lock_state_machine is not None and self.original_track_id is not None:
+            self.lock_state_machine.start(self.original_track_id)
+        return self.target_track_id
+
+    def reseed_target(self, frame, bbox, target_class: str = "person") -> int:
+        """Detect on `frame`, match `bbox`, and re-lock preserving the gallery.
+
+        Returns the locked track id, or -1 if no detection matches the bbox.
+        """
+        results = self.track(frame, persist=True)
+        if not results:
+            return -1
+        candidates = [r for r in results
+                      if target_class is None or r.class_name.lower() == target_class.lower()]
+        if not candidates:
+            candidates = results
+        best = self._find_best_match_iou(candidates, bbox)
+        if best is None:
+            return -1
+        fresh = None
+        if self.appearance_extractor is not None:
+            feats = self.appearance_extractor.extract_features_batch(
+                frame, [best.bbox], [best.mask], [best.class_id])
+            if feats and feats[0] and "reid" in feats[0]:
+                fresh = feats[0]["reid"]
+        return self._apply_reseed(best, fresh)
+
     def _update_appearance(
         self,
         frame: np.ndarray,

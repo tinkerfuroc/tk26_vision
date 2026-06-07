@@ -145,3 +145,13 @@ def test_mjpeg_stream_ends_on_client_disconnect():
         return [chunk async for chunk in resp.body_iterator]
 
     assert asyncio.run(_consume()) == []   # generator exits without yielding
+
+
+def test_webui_served_from_dir(tmp_path):
+    (tmp_path / "index.html").write_text("<html>ok</html>")
+    (tmp_path / "style.css").write_text("body{}")
+    (tmp_path / "app.js").write_text("'use strict';")
+    b = FakeBridge()
+    c = TestClient(create_app(b, webui_dir=tmp_path))
+    assert c.get("/").status_code == 200
+    assert "javascript" in c.get("/app.js").headers["content-type"]

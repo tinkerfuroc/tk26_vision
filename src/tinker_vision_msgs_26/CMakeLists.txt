@@ -39,6 +39,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ObjectMatchAll.srv"
   "srv/PlacingLocation.srv"
   "srv/PointDirection.srv"
+  "srv/ReseedTarget.srv"
   "srv/SetTorque.srv"
   "srv/SetZero.srv"
   "srv/SeatRecommendation.srv"

@@ -16,6 +16,59 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-07 — track_web dashboard + active-reID test bench — shipped at unit+install level, live verification deferred
+
+Browser dashboard for `person_track_server`: live MJPEG of the tracker debug
+frame, WebSocket target/candidate state + scores, re-ID gallery thumbnails, and
+a click-to-reseed human-as-BT loop for validating the Spec B active re-ID path
+without a real behaviour tree.
+
+- Spec: `docs/superpowers/specs/2026-06-07-track-web-dashboard-design.md`
+- Plan: `docs/superpowers/plans/2026-06-07-track-web-dashboard.md`
+
+### What shipped (Tasks 1-7)
+
+- **Gallery thumbs + version** — `ReIDGallery` now carries `version` + `thumbs`
+  so the dashboard can diff and render per-identity crops.
+- **`build_debug_state`** — `core/debug_state.py` snapshots target/candidate
+  state + match scores into the JSON the WebSocket serves.
+- **Tracker score/thumb plumbing** — scores and crop thumbnails threaded through
+  the tracker into the debug state / gallery.
+- **Node publishers** — `~/debug_state`, `~/debug_gallery`, `~/debug_image`,
+  gated by params `debug_state_enabled` / `gallery_keep_crops` /
+  `debug_image_enabled`, **all default OFF** → zero impact on a normal run.
+- **`track_web_app.py`** — FastAPI core (HTTP routes, MJPEG stream, WebSocket
+  fan-out, reseed/waving proxy), pure-Python testable (8 TestClient tests).
+- **`track_web.py`** — ROS bridge node wrapping the app, `track_web` entry point,
+  `webui/` shipped via `data_files`.
+- **`webui/`** — `index.html` / `style.css` / `app.js` (live view, gallery,
+  bench Start/Stop, click-to-reseed, 👋 DetectWaving).
+
+### Verified here
+
+- **tkbuild** `tk26_vision --packages-select vision_track` clean (benign
+  `tests_require` / setuptools warnings only).
+- **Install tree** — `track_web` + `track_web_app` import; `ReIDGallery` exposes
+  `version`/`thumbs`; entry point `install/vision_track/lib/vision_track/track_web`
+  present with venv-python shebang; `webui/{index.html,app.js,style.css}` present
+  in the install share dir (tkbuild copies, not symlinks).
+- **Unit + TestClient** — full suite `151 passed, 4 skipped` (Tasks 1-7 added
+  ~16 tests over the 139 baseline).
+
+### Deferred to a camera/operator session (record results back here)
+
+Everything that needs a live tracker + camera + a person in frame is **not yet
+exercised**:
+
+- Real `~/debug_image` MJPEG + `~/debug_state` WebSocket rendering under a
+  running `person_track_server` (with the three telemetry params on).
+- Click-to-reseed end-to-end (browser click → `~/reseed_target` → tracker
+  re-lock), including the 👋 DetectWaving → click-a-wave-box human-as-BT loop.
+- Observer mode vs a real BT holding the `track_person` goal (dashboard drops to
+  read-only, doesn't fight the consumer for the action).
+
+---
+
 ## 2026-06-07 — Active re-ID interface (Spec B) — vision-side capability shipped, active end-to-end deferred to on-robot
 
 Spec B of the active re-ID work on branch `feat/person-tracker-overhaul`. Tasks 1-6

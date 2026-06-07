@@ -761,6 +761,10 @@ class PersonTrackNode(Node):
                 if not initialized:
                     initialized = self._try_initialize(rgb_frame, init_start_time, goal_handle, result)
                     if not initialized:
+                        # Dashboard UX: without this the track_web stale banner
+                        # ("NO DATA") shows for the whole init search right
+                        # after the operator presses Start.
+                        self._publish_init_debug_state()
                         time.sleep(0.1)
                         continue
                     last_seen_time = time.time()
@@ -1137,6 +1141,29 @@ class PersonTrackNode(Node):
             result.message = f'Target {reason}'
             return True
         return False
+
+    def _publish_init_debug_state(self):
+        """Init-phase telemetry tick: 'searching for a target, nothing locked'.
+
+        Published while _try_initialize hasn't succeeded yet so the dashboard
+        shows an initializing state instead of the NO-DATA stale banner.
+        Param-gated; must never raise into the loop.
+        """
+        if not self.debug_state_enabled:
+            return
+        try:
+            state = build_debug_state(
+                self.tracker, ts=time.time(),
+                target_lost=True,
+                reacquisition_state=1,  # REACQ_PASSIVE: searching, not locked
+                time_since_seen=0.0, awaiting_help=False,
+                active_help_after_frames=self.active_help_after_frames,
+                active_help_timeout_sec=self.active_help_timeout_sec)
+            state["fsm_state"] = "initializing"
+            self.debug_state_pub.publish(String(data=json.dumps(state)))
+        except Exception as exc:
+            self.get_logger().warn(f'init debug state failed: {exc}',
+                                   throttle_duration_sec=5.0)
 
     def _publish_debug_outputs(self, rgb_img, track_result, feedback, last_seen_time):
         """Param-gated dashboard telemetry; must never raise into the loop."""

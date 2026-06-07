@@ -7,6 +7,7 @@ const $ = (id) => document.getElementById(id);
 let lastState = null;
 let lastStateAt = 0;
 let waveBoxes = [];
+let lastMode = "—";   // bench | observer | idle (from the /api/status poll)
 
 function log(msg) {
   const li = document.createElement("li");
@@ -91,7 +92,15 @@ async function post(url, body) {
 
 async function reseed(bbox, label) {
   const r = await post("/api/reseed", {bbox: bbox.map(Math.round)});
-  log(`reseed(${label}) → ${r.success ? "OK id=" + r.target_track_id : "FAIL"} (${r.message})`);
+  if (r.success && lastMode === "idle") {
+    // The tracker accepted the re-lock but no goal is active anywhere —
+    // typically the active-help hold expired and the goal aborted (gallery
+    // reset) while the operator was mid-interaction.
+    log(`reseed(${label}) → accepted (id=${r.target_track_id}) but NO ACTIVE ` +
+        `GOAL — did the hold expire? Start a goal and retry.`);
+  } else {
+    log(`reseed(${label}) → ${r.success ? "OK id=" + r.target_track_id : "FAIL"} (${r.message})`);
+  }
   clearOverlays();
 }
 
@@ -150,6 +159,7 @@ setInterval(async () => {
   try {
     const st = await (await fetch("/api/status")).json();
     const m = st.goal.held ? ["bench", "on"] : st.goal.observer ? ["observer", "on"] : ["idle", "off"];
+    lastMode = m[0];
     $("mode").textContent = m[0];
     $("mode").className = "badge " + m[1];
   } catch (e) { /* status poll is best-effort */ }

@@ -70,6 +70,44 @@ here. The consumer contract for that BT author is documented at
   is preserved (old view kept, fresh view appended; no growth when no fresh
   feature) and a non-matching bbox fails with `-1`.
 
+### Lifecycle remediation (post-holistic-review, Task 8)
+
+A final whole-feature review caught an integration defect the per-task reviews
+structurally could not: with stock config the tracker **hard-aborted and
+`tracker.reset()` wiped the gallery ~1 frame after `NEEDS_HELP` first appeared**
+(`active_help_after_frames` 45 == `max_recovery_frames` 45; FSM hard-lost at 46 →
+`goal_handle.abort()` → `_cleanup_tracking()` → `target_appearance=None`), so the
+loop could never complete and "gallery-preserving" was defeated. Fixed in commit
+on `feat/person-tracker-overhaul`:
+
+- **Active-help hold.** While `reacquisition_state == NEEDS_HELP`,
+  `_handle_lost_frame` now coasts (publishes feedback every frame, **no
+  abort/reset**) for up to `active_help_timeout_sec` (new param, default
+  **20.0 s**, `config/default.yaml`) so the BT can call `ReseedTarget` with the
+  gallery intact. After the window the action aborts as before;
+  `active_help_timeout_sec: 0.0` disables the hold (legacy fast-abort).
+  **Caveat:** because the two frame knobs are equal, this changes give-up timing
+  for **all** `TrackPerson` callers (not just active-reID) — every loss now coasts
+  up to ~20 s before aborting (was ~1.5–3 s). Documented in `docs/active_reid.md`.
+- **Re-seed is gallery-additive only (user decision: "precision is sacred").**
+  `reseed_target` appends the fresh view to the deep gallery but **does not
+  overwrite the colour/identity anchors** — the re-seed match is IoU-only, so
+  anchor promotion could poison identity on a wrong-overlap box. Tradeoff: under
+  heavy appearance drift the colour reject-floors may re-drop the operator after a
+  re-seed; the deep gallery's max-over-views partially covers it, full drift
+  recovery is a non-goal (repeat call-out is the fallback).
+- **Signal honesty.** Tracked-path `reacquisition_state` now derives from
+  `feedback.target_lost` (not hardcoded TRACKING), so a provisional-recovery coast
+  no longer reports TRACKING while `target_lost=True`.
+- **Minors:** `_reseed_callback` warns (not rejects) on `bbox` `frame_id` mismatch
+  vs the camera frame; `_apply_reseed` clears `is_occluded` / `pre_occlusion_appearance`.
+
+**Known follow-up (deferred):** `PersonRegistry` has no staleness eviction, so a
+long coast in a crowd (now up to ~20 s) grows it and the per-frame recovery cost
+with it — bounded (not a leak), pre-existing, amplified by the longer coast. Add
+stale-temp-ID eviction if arena perf shows it; watch loop `[perf]` during a busy
+coast.
+
 ### Deferred to a live operator session (record results back here)
 
 - **Active end-to-end validation** (call-out → operator raises hand →

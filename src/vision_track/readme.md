@@ -75,8 +75,8 @@ ros2 run vision_track person_track_server --ros-args \
 |---|---|---|
 | `bind` | `127.0.0.1` | HTTP/WS bind address (`0.0.0.0` to reach from another host) |
 | `port` | `8766` | HTTP/WS port |
-| `tracker_node_name` | `person_track_node` | node name the bridge resolves `~/debug_*`, `~/reseed_target` and the `track_person` action against |
-| `waving_service` | `/detect_waving_persons` | DetectWaving service the 👋 button calls |
+| `tracker_node_name` | `person_track_node` | node name (optionally `ns/node`) the bridge resolves the `debug_*` topics and `reseed_target` service against; the `track_person` action client stays relative and is unaffected |
+| `waving_service` | `detect_waving_persons` | DetectWaving service the 👋 button calls |
 
 ## Changelog
 

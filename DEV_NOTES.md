@@ -16,6 +16,70 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-07 — Active re-ID interface (Spec B) — vision-side capability shipped, active end-to-end deferred to on-robot
+
+Spec B of the active re-ID work on branch `feat/person-tracker-overhaul`. Tasks 1-6
+landed the interfaces + node wiring; this entry (Task 7, docs-only) records what
+shipped on the vision side and what is deferred.
+
+- Spec: `docs/superpowers/specs/2026-06-06-active-reid-interface-design.md`
+- Plan: `docs/superpowers/plans/2026-06-07-active-reid-interface.md`
+
+### Vision-side capability shipped
+
+- **Reacquisition-state feedback signal.** `TrackPerson` action feedback now
+  carries `uint8 reacquisition_state` (`REACQ_TRACKING=0`, `REACQ_PASSIVE=1`,
+  `REACQ_NEEDS_HELP=2`). It is pure hysteresis over `(tracked?, frames_lost)`
+  (`vision_track/core/reacq_state.py`) published from `_handle_tracked_frame`
+  (→ TRACKING) and `_handle_lost_frame` (→ PASSIVE / NEEDS_HELP). Escalation to
+  NEEDS_HELP debounces on `active_help_after_frames` (default **45**,
+  `config/default.yaml`) consecutive lost frames.
+- **Gallery-preserving `ReseedTarget` service.** Registered at `~/reseed_target`
+  (private name → resolves to `/person_track_node/reseed_target` under the
+  default node name; remap-aware). Request: `sensor_msgs/RegionOfInterest bbox`
+  + `string frame_id`. Response: `bool success`, `int32 target_track_id`
+  (`-1` on failure), `string message`. The re-lock (`yolo_tracker._apply_reseed`)
+  **preserves the Spec-A multi-view gallery** — same self-identified operator, so
+  the accumulated appearance is kept and the fresh confirmed view appended (not
+  reset), then ids re-lock, lost counter clears, lock FSM re-arms.
+- **`DetectWaving.waving_boxes` seam.** `DetectWaving.srv` response now has
+  `sensor_msgs/RegionOfInterest[] waving_boxes` 1:1 with the existing
+  `geometry_msgs/PointStamped[] waving_persons`, so the raise-hand detector's
+  image-space box can feed `ReseedTarget` directly.
+- **Precision-safety rationale.** Re-seed is safe because the operator
+  self-identifies (raise-hand), so it cannot lock onto the wrong person the way an
+  automatic re-acquire might — the only way to recover the "hard half" of loss
+  without lowering match thresholds. The BT trades a points penalty for a
+  guaranteed-correct re-lock.
+
+### Out of scope (tk25_decision)
+
+The **BT policy** — when to escalate, how to phrase the call-out, and accepting
+the RoboCup points penalty — lives in `tk25_decision` and is **not** implemented
+here. The consumer contract for that BT author is documented at
+`src/vision_track/docs/active_reid.md` (linked from the package readme).
+
+### Verified now (unit / import level)
+
+- Pure reacq-state hysteresis + gallery-preserving `_apply_reseed` re-lock state
+  logic + interface generation + node/server import-construction with the new
+  wiring: `pytest test/test_reacq_state.py test/test_reseed_target.py test/test_active_reid_interfaces.py`
+  → **10 passed** (`.venv-vision-main`). The interface test asserts the three
+  `REACQ_*` constant values, the `ReseedTarget` request/response shape, and that
+  `DetectWaving.Response` has `waving_boxes`; the reseed test asserts the gallery
+  is preserved (old view kept, fresh view appended; no growth when no fresh
+  feature) and a non-matching bbox fails with `-1`.
+
+### Deferred to a live operator session (record results back here)
+
+- **Active end-to-end validation** (call-out → operator raises hand →
+  `DetectWaving` → `ReseedTarget` re-lock → `reacquisition_state` returns to
+  TRACKING) needs an operator **plus** the tk25_decision BT **plus** the robot —
+  it is **not** exercisable in this sandbox and is deferred to on-robot
+  acceptance. Capture latency and correct-operator re-lock results here once run.
+
+---
+
 ## 2026-06-04 — Person-tracker Phase 3 Task 4 — OPTIONAL TensorRT YOLO export (best-effort, manual)
 
 Phase 3 Task 4 of the person-tracker overhaul on branch `feat/person-tracker-overhaul`.

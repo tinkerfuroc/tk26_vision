@@ -84,6 +84,9 @@ class PersonTrackNode(Node):
         self._last_tracked_rgb = None
         self._last_tracked_detection = None
         self._was_lost = False
+        # Active re-ID hold: throttle the "awaiting help" log to once per lost
+        # episode (reset on re-track and on cleanup).
+        self._active_help_logged = False
 
         # Phase 2: EMA smoother on the published 3D point; reset on loss so a
         # re-acquired target doesn't lerp from a stale point.
@@ -146,6 +149,10 @@ class PersonTrackNode(Node):
         # Spec B: consecutive frames lost before the published reacquisition_state
         # escalates to NEEDS_HELP, so a BT can debounce active (call-out) re-ID.
         self.declare_parameter('active_help_after_frames', 45)
+        # Spec B remediation: while reacquisition_state==NEEDS_HELP, keep the
+        # tracker+gallery alive (coast, no abort/reset) this long so the BT can
+        # reseed the raise-hand operator; <=0 disables the hold (legacy abort).
+        self.declare_parameter('active_help_timeout_sec', 20.0)
         self.declare_parameter('provisional_high_bar', 0.72)
         self.declare_parameter('provisional_distinct_margin', 0.10)
         # Phase 2: reject candidates whose median depth jumps this much (m)
@@ -210,6 +217,7 @@ class PersonTrackNode(Node):
         self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
         self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
         self.active_help_after_frames = int(self.get_parameter('active_help_after_frames').value)
+        self.active_help_timeout_sec = float(self.get_parameter('active_help_timeout_sec').value)
         self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
         self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
         self.crosser_depth_jump_m = self.get_parameter('crosser_depth_jump_m').value
@@ -392,6 +400,11 @@ class PersonTrackNode(Node):
             response.message = 'no camera frame available'
             return response
         rgb_img = data[0]
+        rgb_msg = data[1]
+        if request.frame_id and request.frame_id != rgb_msg.header.frame_id:
+            self.get_logger().warn(
+                f'Reseed bbox frame_id {request.frame_id!r} != camera frame '
+                f'{rgb_msg.header.frame_id!r}; matching against the camera frame anyway')
         # Mirror the live tracking loop: it feeds the tracker a BGR->RGB frame
         # (see _run_tracking_loop). reseed_target must get the SAME convention
         # or detection/ReID degrades. Do NOT pass the raw bgr8 buffer here.
@@ -966,8 +979,14 @@ class PersonTrackNode(Node):
             feedback.segment_img = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
             feedback.segment_img.header = rgb_msg.header
 
+        # Derive from the real status: during a provisional-recovery coast
+        # track_result is not None but feedback.target_lost is True, so a hardcoded
+        # REACQ_TRACKING would contradict target_lost. Report PASSIVE/NEEDS_HELP
+        # honestly in that window and REACQ_TRACKING only when fully held.
         feedback.reacquisition_state = reacq_state(
-            tracked=True, frames_lost=0, help_after=self.active_help_after_frames)
+            tracked=not feedback.target_lost,
+            frames_lost=int(getattr(self.tracker, 'frames_lost', 0)),
+            help_after=self.active_help_after_frames)
         goal_handle.publish_feedback(feedback)
 
         # Cache the latest good frame for the lost-transition dump, and emit
@@ -991,6 +1010,9 @@ class PersonTrackNode(Node):
                 extras={'event': 'reclaimed'},
             )
         self._was_lost = False
+        # Re-tracking ends the lost episode: re-arm the active-help log throttle
+        # so the next loss logs the hold entry again.
+        self._active_help_logged = False
 
     def _handle_lost_frame(
         self,
@@ -1063,6 +1085,25 @@ class PersonTrackNode(Node):
 
         decision = getattr(self.tracker, 'last_lock_decision', None)
         hard_lost = decision is not None and decision.state == 'lost'
+        # Active re-ID hold: once escalated to NEEDS_ACTIVE_HELP, keep the tracker
+        # + multi-view gallery alive (coast, no abort/reset) so the BT can call
+        # ~/reseed_target and re-lock the self-identified operator preserving
+        # identity. Bounded by active_help_timeout_sec; lost_timeout stays the
+        # absolute ceiling. Set active_help_timeout_sec<=0 to disable (legacy abort).
+        frames_lost = int(getattr(self.tracker, 'frames_lost', 0))
+        awaiting_help = (
+            self.active_help_timeout_sec > 0.0
+            and self.active_help_after_frames > 0
+            and frames_lost >= self.active_help_after_frames
+            and time_since_seen <= self.active_help_timeout_sec
+        )
+        if awaiting_help:
+            if not self._active_help_logged:
+                self.get_logger().warn(
+                    f'Target lost {frames_lost}f; awaiting active re-ID help '
+                    f'(holding up to {self.active_help_timeout_sec:.0f}s for ~/reseed_target)')
+                self._active_help_logged = True
+            return False
         if hard_lost or time_since_seen > self.lost_timeout:
             reason = 'hard-lost (recovery cap)' if hard_lost else f'lost for {time_since_seen:.1f}s'
             self.get_logger().warn(f'Target {reason}, aborting')
@@ -1081,6 +1122,7 @@ class PersonTrackNode(Node):
         self._last_tracked_rgb = None
         self._last_tracked_detection = None
         self._was_lost = False
+        self._active_help_logged = False
         self._point_ema.reset()
 
         if self.target_point_pub is not None:

@@ -44,6 +44,9 @@ def _bare_tracker():
     t.frames_lost = 40
     t.state = TrackerState.REIDENTIFYING
     t.lock_state_machine = _Lsm()
+    # __init__ is bypassed, so seed occlusion state explicitly (D2 clears it).
+    t.is_occluded = True
+    t.pre_occlusion_appearance = object()
     return t
 
 
@@ -61,6 +64,9 @@ def test_apply_reseed_preserves_gallery_and_relocks():
     assert len(t.target_appearance.gallery) == 2
     # FSM re-armed on the new id
     assert t.lock_state_machine.started == 9
+    # D2: occlusion bookkeeping cleared on re-lock
+    assert t.is_occluded is False
+    assert t.pre_occlusion_appearance is None
 
 
 def test_apply_reseed_none_detection_fails():

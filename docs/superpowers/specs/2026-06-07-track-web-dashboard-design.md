@@ -157,3 +157,15 @@ remains the production consumer; this bench only emulates it).
    result; reacq badge transitions TRACKING → PASSIVE → NEEDS_HELP → (reseed) →
    TRACKING.
 3. All pure-unit + server tests green; no NEW flake8 (99-char) errors.
+
+## §7 Bench launch file (addendum, 2026-06-07)
+
+`launch/track_web_bench.launch.py` — one-command bench bringup: ①
+`person_track_server` with `parameters=[<share>/config/default.yaml,
+{debug_state_enabled: True, gallery_keep_crops: True, debug_image_enabled:
+True}]` (yaml first, bench overrides win); ② `waving_person_server`, gated by
+`with_waving` (default true); ③ `track_web` with `bind`/`port` launch args
+(defaults `0.0.0.0`/`8766`). Cameras deliberately excluded (CAMERA_BRINGUP.md
+sequence). Launch-time resolution via `FindPackageShare` substitutions keeps
+`generate_launch_description()` pure (unit-testable unsourced); `port` passes
+through `ParameterValue(value_type=int)`. Installed via a `data_files` glob.

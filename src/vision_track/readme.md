@@ -31,6 +31,20 @@ ros2 run vision_track track_web --ros-args -p bind:=0.0.0.0 -p port:=8766
 
 then open `http://<robot>:8766/`.
 
+### Bench bringup (one command)
+
+To start the whole bench stack — tracker (with telemetry ON), waving server, and
+dashboard — in a single command:
+
+```bash
+ros2 launch vision_track track_web_bench.launch.py [bind:=… port:=… with_waving:=…]
+```
+
+It runs `person_track_server` with the three `debug_*` flags forced ON, the
+`waving_person_server` (gated by `with_waving`, default `true`), and `track_web`
+(`bind` default `0.0.0.0`, `port` default `8766`). Cameras are deliberately not
+included — start them first per `src/tk26_vision/CAMERA_BRINGUP.md`.
+
 ### Enabling the tracker-side telemetry
 
 The dashboard consumes three publishers that the tracker only emits when
@@ -85,3 +99,6 @@ ros2 run vision_track person_track_server --ros-args \
   click-to-reseed (incl. the 👋 DetectWaving human-as-BT loop). Backed by
   param-gated tracker telemetry (`debug_state_enabled`, `gallery_keep_crops`,
   `debug_image_enabled`) — **all default off, no production-run impact**.
+- **2026-06-07** — added `track_web_bench.launch.py`: one-command bench bringup
+  (tracker w/ telemetry ON + waving server + dashboard), `bind`/`port`/
+  `with_waving` launch args; cameras separate per CAMERA_BRINGUP.md.

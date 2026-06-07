@@ -80,6 +80,7 @@ class YOLOTracker:
         reid_gallery_size: int = 6,
         reid_gallery_novelty_max: float = 0.85,
         reid_gallery_score_mode: str = "max",
+        keep_gallery_thumbs: bool = False,
         yolo_track_conf: float = 0.15,
     ):
         """
@@ -104,6 +105,9 @@ class YOLOTracker:
             reid_gallery_novelty_max: admit a view only if its cosine to existing
                 views is below this threshold
             reid_gallery_score_mode: gallery scoring mode ('max' | 'top2_mean')
+            keep_gallery_thumbs: stash an RGB view crop alongside each admitted
+                gallery feature for the track_web dashboard (off by default;
+                pure visualization, never feeds scoring)
             yolo_track_conf: LOW detection conf fed to model.track so ByteTrack's
                 two-stage (high/low) association recovery actually runs — kept
                 separate from confidence_threshold, which still gates detect()
@@ -119,6 +123,7 @@ class YOLOTracker:
         self.reid_gallery_size = reid_gallery_size
         self.reid_gallery_novelty_max = reid_gallery_novelty_max
         self.reid_gallery_score_mode = reid_gallery_score_mode
+        self.keep_gallery_thumbs = keep_gallery_thumbs
         self.yolo_track_conf = yolo_track_conf
         self.state = TrackerState.UNINITIALIZED
         self.target_track_id: Optional[int] = None
@@ -189,6 +194,10 @@ class YOLOTracker:
         # re-embedding the same crop up to 4x/frame. Keyed by (track_id,
         # frame_count); a new frame_count drops the previous frame's entries.
         self.embedding_cache = FrameEmbeddingCache(max_entries=32)
+        # Dashboard telemetry: latest per-candidate ReID similarities
+        # {track_id: similarity}, refreshed by the scoring/periodic-validation
+        # paths and consumed by build_debug_state for the track_web overlay.
+        self.last_debug_scores: dict = {}
 
     def _init_motion_tracking(self) -> None:
         """Initialize spatial continuity and motion tracking state."""
@@ -1019,6 +1028,8 @@ class YOLOTracker:
         self.fast_tracking_mode = False
         # Phase 3: drop any stale per-frame embeddings.
         self.embedding_cache.clear()
+        # Dashboard telemetry: clear stale per-candidate similarities.
+        self.last_debug_scores = {}
         logger.info("Tracker reset")
     
     def get_class_names(self) -> Dict[int, str]:

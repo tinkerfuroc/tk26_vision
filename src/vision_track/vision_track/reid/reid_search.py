@@ -42,6 +42,10 @@ def find_best_match_reid(
 
     is_person = tracker.target_appearance.class_id == 0
     candidate_scores = _score_candidates(tracker, frame, candidates, current_time, is_person)
+    # Dashboard telemetry: latest per-candidate similarities (plain assignment).
+    tracker.last_debug_scores = {
+        int(r.track_id): float(s) for r, s, _, _ in candidate_scores
+    }
     if not candidate_scores:
         logger.debug("No candidates with valid features")
         return None

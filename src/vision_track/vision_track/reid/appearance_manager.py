@@ -10,6 +10,22 @@ from .quality import crop_quality_ok, DEFAULT_GATE
 logger = logging.getLogger(__name__)
 
 
+def _make_thumb(frame, bbox, max_h: int = 192):
+    """Clamped, aspect-preserving crop of ``bbox`` (same channel order as
+    ``frame`` — RGB in this pipeline) for gallery visualization; None when
+    the bbox is degenerate."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    if crop.shape[0] > max_h:
+        new_w = max(1, round(crop.shape[1] * max_h / crop.shape[0]))
+        crop = cv2.resize(crop, (new_w, max_h), interpolation=cv2.INTER_AREA)
+    return crop.copy()
+
+
 def update_appearance(
     tracker,
     frame: np.ndarray,
@@ -82,7 +98,10 @@ def update_appearance(
         tracker.target_appearance = TargetAppearance(class_id=result.class_id, class_name=result.class_name)
         tracker._configure_gallery(tracker.target_appearance)
 
-    _update_feature_history(tracker, features, similarity, current_time, refresh_allowed)
+    thumb = None
+    if getattr(tracker, "keep_gallery_thumbs", False):
+        thumb = _make_thumb(frame, result.bbox)
+    _update_feature_history(tracker, features, similarity, current_time, refresh_allowed, thumb)
     _update_color_histories(tracker, features, similarity, refresh_allowed)
     _update_motion(appearance=tracker.target_appearance, result=result, current_time=current_time)
 
@@ -90,7 +109,9 @@ def update_appearance(
         tracker.person_registry.update_person(tracker.original_track_id, tracker.target_appearance)
 
 
-def _update_feature_history(tracker, features, similarity, current_time, refresh_allowed):
+def _update_feature_history(
+    tracker, features, similarity, current_time, refresh_allowed, thumb=None
+):
     """Update feature embeddings and anchors."""
     feature_key = "reid" if "reid" in features else "cnn" if "cnn" in features else None
     if not feature_key:
@@ -105,7 +126,7 @@ def _update_feature_history(tracker, features, similarity, current_time, refresh
             tracker.target_appearance.feature_history.clear()
 
     tracker.target_appearance.feature_history.append(new_feature)
-    tracker.target_appearance.gallery.maybe_add(new_feature)
+    tracker.target_appearance.gallery.maybe_add(new_feature, thumb=thumb)
     if tracker.target_appearance.anchor_feature is None:
         tracker.target_appearance.anchor_feature = new_feature
         tracker.target_appearance.best_similarity = similarity if similarity is not None else 0.0

@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from tinker_vision_msgs_26.srv import DetectWaving
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 import cv2
@@ -806,6 +806,21 @@ class DetectWavingPersonsNode(Node):
                 timings={'detect_waving': time.perf_counter() - _t0},
             )
 
+        # Build image-space boxes 1:1 with the (sorted) centroid list so the
+        # consumer (re-seed) can pick a waver and recover its 2D box. Both the
+        # MediaPipe and VLM-fallback paths populate waving_annotations in the
+        # same index order as waving_persons_centroids, and the sort above keeps
+        # them aligned -- so iterating waving_annotations is alignment-safe.
+        waving_boxes = []
+        for x1, y1, x2, y2, _lm in waving_annotations:
+            roi = RegionOfInterest()
+            roi.x_offset = max(0, int(x1))
+            roi.y_offset = max(0, int(y1))
+            roi.width = max(0, int(x2) - int(x1))
+            roi.height = max(0, int(y2) - int(y1))
+            roi.do_rectify = False
+            waving_boxes.append(roi)
+
         if request.target_frame and waving_persons_centroids:
             if request.target_frame != header.frame_id:
                 try:
@@ -814,6 +829,7 @@ class DetectWavingPersonsNode(Node):
                         transformed_points.append(
                             tf2_geometry_msgs.do_transform_point(point, transform))
                     response.waving_persons = transformed_points
+                    response.waving_boxes = waving_boxes
                 except (tf2_ros.LookupException,
                         tf2_ros.ConnectivityException,
                         tf2_ros.ExtrapolationException) as e:
@@ -834,8 +850,10 @@ class DetectWavingPersonsNode(Node):
                     return response
             else:
                 response.waving_persons = waving_persons_centroids
+                response.waving_boxes = waving_boxes
         else:
             response.waving_persons = waving_persons_centroids
+            response.waving_boxes = waving_boxes
 
         if response.waving_persons:
             response.status = 0

@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'webui'), glob('webui/*')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         # Include model files
         ('share/' + package_name + '/models', glob('*.pt')),
     ],

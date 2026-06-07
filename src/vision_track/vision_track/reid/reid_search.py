@@ -137,6 +137,12 @@ def _score_candidates(
     # Gallery max-over-views scoring only when the operator is alone — in
     # multi-candidate scenes it compresses best-vs-second margins, so fall back
     # to the legacy avg/anchor deep term to preserve crowd disambiguation.
+    # Gallery scoring is gated to the lone-operator case: max-over-views would
+    # compress best-vs-second margins in crowds and make the distinctiveness/
+    # ratio gates over-reject (see DOWNLOAD.md). Keyed off the FILTERED candidate
+    # count by design — if a 2nd candidate later yields no features and drops out,
+    # we stay legacy-scored (recall-conservative, never a multi-candidate gallery
+    # use), which is the precision-safe direction.
     use_gallery = len(candidates) == 1
 
     # Phase 3: prime the per-frame embedding cache so the downstream verify /
@@ -163,6 +169,11 @@ def _score_candidates(
 
         raw_cosine = 0.0
         if is_person and "reid" in features:
+            # NOTE: with the gallery disabled, deep_score still returns max(avg,anchor)
+            # (anchor-unioned), matching the fused-similarity deep term — so the
+            # ratio/spatial-switch gates see a consistent anchor-unioned cosine, not
+            # the pre-gallery avg-only value. Precision-safe; not byte-identical to
+            # pre-feature legacy for those two gates.
             ds = tracker.target_appearance.deep_score(features["reid"], use_gallery=use_gallery)
             if ds is not None:
                 raw_cosine = ds

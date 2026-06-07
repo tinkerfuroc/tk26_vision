@@ -119,6 +119,39 @@ FSM ablation: cuts wrong-locks (person-12 precision 0.50→0.61) but does not fi
 the conservative reacquire (driven by the distinctiveness gate upstream of the
 FSM). See `../../demo/lasot_benchmark_contact_sheet.png` for GT-vs-pred frames.
 
+## Multi-view ReID gallery (Spec A) — validation result (2026-06-06/07)
+
+Reproduce with `run_lasot_person_benchmark.py` (`--no-gallery` = legacy control):
+
+| metric (mean, 20 seq) | legacy OFF | gallery v1 (all-cand) | gallery v2 (single-cand) |
+|---|---|---|---|
+| precision | 0.926 | 0.933 (+0.007) | **0.938 (+0.011)** |
+| recall | 0.493 | 0.466 (**−0.027**) | **0.490 (−0.003)** |
+| f_score | 0.560 | 0.530 | 0.558 |
+
+**v1 (gallery max-over-views on ALL candidates) FAILED** the acceptance gate: it
+inflated every candidate's deep score, compressing best-vs-second margins so the
+distinctiveness/ambiguity gates over-rejected the real operator (recall −0.027;
+person-19 recall 0.455→0.036 with precision held; person-20 precision −0.157).
+It is a precision tool, not a recall tool — the biggest precision gains landed on
+the wrong-lock sequences (person-15 +0.225, person-12 +0.038).
+
+**v2 (gallery scoring gated to the single-candidate case)** fixes that: in
+multi-candidate scenes it scores exactly like legacy (margins preserved), so the
+gallery max-over-views only applies when the operator is alone. Result:
+**precision +0.011, recall flat (−0.003, within noise), worst per-seq precision
+drop −0.010 (within the −0.02 limit), person-15 keeps +0.226.** No regression.
+
+Caveat — recall is **flat, not up**, on this proxy: LaSOT's recall gaps are
+dominated by *multi-candidate lookalike/crowd* cases (which v2 deliberately
+leaves to legacy scoring to protect precision) and genuine long absences. The
+single-candidate "operator alone but drifted" frames where v2 helps are common
+in real first-person follow but under-represented in LaSOT. So v2 is **safe
+(no harm + slight precision gain) on the proxy; its recall benefit is deferred
+to on-robot validation** (where distractors are distinguishable and depth +
+active call-out — Spec B — are the larger recall levers). Kill-switch:
+`reid_gallery_enabled` (default true).
+
 ## Pure-logic unit tests (no dataset / model needed)
 
 ```bash

@@ -50,7 +50,7 @@ def _rgb(path: str):
     return cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
 
 
-def _make_tracker(use_fsm: bool):
+def _make_tracker(use_fsm: bool, no_gallery: bool = False):
     """Build a YOLOTracker; optionally attach the node's LockStateMachine.
 
     The plain offline path leaves lock_state_machine=None (tracker core only).
@@ -59,7 +59,8 @@ def _make_tracker(use_fsm: bool):
     the crosser-rejection gate), so this isolates the FSM's hysteresis effect.
     """
     from vision_track.track_yolo import YOLOTracker
-    trk = YOLOTracker(confidence_threshold=CONF, inference_size=IMGSZ)
+    trk = YOLOTracker(confidence_threshold=CONF, inference_size=IMGSZ,
+                      reid_gallery_enabled=not no_gallery)
     if use_fsm:
         from vision_track.core.lock_state_machine import LockStateMachine
         trk.max_frames_lost = 600
@@ -74,8 +75,8 @@ def _make_tracker(use_fsm: bool):
     return trk
 
 
-def run_sequence(frames, use_fsm: bool):
-    trk = _make_tracker(use_fsm)
+def run_sequence(frames, use_fsm: bool, no_gallery: bool = False):
+    trk = _make_tracker(use_fsm, no_gallery=no_gallery)
     preds, scores = [], []
     initialized = False
     for f in frames:
@@ -124,6 +125,8 @@ def main(argv=None) -> int:
     ap.add_argument("--seqs", nargs="*", default=None,
                     help="sequence names (default: all person-* found)")
     ap.add_argument("--fsm", action="store_true", help="attach the node LockStateMachine")
+    ap.add_argument("--no-gallery", dest="no_gallery", action="store_true",
+                    help="disable the multi-view ReID gallery (legacy avg/anchor scoring)")
     ap.add_argument("--json", dest="json_out", default=None, help="dump results JSON")
     args = ap.parse_args(argv)
 
@@ -142,7 +145,7 @@ def main(argv=None) -> int:
     for s in seqs:
         fr = load_sequence(os.path.join(args.data, s))
         t = time.time()
-        pred, sc = run_sequence(fr, args.fsm)
+        pred, sc = run_sequence(fr, args.fsm, no_gallery=args.no_gallery)
         dt = time.time() - t
         m = compute_tpt_metrics([f.gt_bbox for f in fr], pred, iou_thr=IOU, scores=sc)
         m["frames"] = len(fr); m["throughput_hz"] = len(fr) / dt
@@ -153,10 +156,12 @@ def main(argv=None) -> int:
 
     keys = ["precision", "recall", "f_score", "ao", "amr", "throughput_hz"]
     mean = {k: st.mean(results[s][k] for s in seqs) for k in keys}
-    print(f"MEAN ({len(seqs)} seq, fsm={args.fsm}):", {k: round(v, 3) for k, v in mean.items()})
+    print(f"MEAN ({len(seqs)} seq, fsm={args.fsm}, gallery={not args.no_gallery}):",
+          {k: round(v, 3) for k, v in mean.items()})
     if args.json_out:
         json.dump({"per_seq": results, "mean": mean,
-                   "config": {"imgsz": IMGSZ, "conf": CONF, "iou": IOU, "fsm": args.fsm}},
+                   "config": {"imgsz": IMGSZ, "conf": CONF, "iou": IOU, "fsm": args.fsm,
+                              "gallery": not args.no_gallery}},
                   open(args.json_out, "w"), indent=2)
         print("wrote", args.json_out)
     return 0

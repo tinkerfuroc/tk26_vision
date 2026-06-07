@@ -72,9 +72,22 @@ for a more eager one.
    (`-1` on failure, with a human-readable `message`).
 5. **Resume.** The node re-locks the tracker on that box **preserving the
    multi-view gallery** (Spec A) — same operator, so the accumulated appearance
-   is kept and the fresh confirmed view is appended rather than reset (see
-   `yolo_tracker._apply_reseed`). Tracking resumes and `reacquisition_state`
-   returns to `REACQ_TRACKING` (0) on the next held frame.
+   is kept and the fresh confirmed view is **appended to the deep gallery**
+   rather than reset (see `yolo_tracker._apply_reseed` / `reseed_target`).
+   Tracking resumes and `reacquisition_state` returns to `REACQ_TRACKING` (0)
+   on the next held frame.
+
+   **Re-seed is gallery-additive only (precision-first).** The re-seed match is
+   geometric (IoU) — there is no appearance verification of the supplied box, by
+   design (the operator self-identified). For that reason the re-seed appends the
+   fresh view to the deep ReID gallery but **does not overwrite the colour /
+   identity anchors**: promoting an IoU-only-matched crop to the anchor would let
+   a wrong-overlap box poison identity, which "precision is sacred" forbids. The
+   consequence to know: under **heavy appearance drift** (e.g. the operator
+   removed a jacket) the colour reject-floors keyed on the *old* anchors may
+   re-drop the operator shortly after a successful re-seed. The deep gallery's
+   max-over-views partially covers this, but full drift recovery is a deliberate
+   non-goal here — a repeat call-out/re-seed is the fallback.
 
 ```
 TrackPerson feedback ──▶ reacquisition_state
@@ -90,6 +103,32 @@ TrackPerson feedback ──▶ reacquisition_state
                          ▼
             gallery-preserving re-lock ─▶ back to TRACKING
 ```
+
+## The hold — keeping the tracker alive for the handoff
+
+The call-out → raise-hand → `DetectWaving` → `ReseedTarget` round-trip takes
+*seconds*; the passive-recovery cap (`max_recovery_frames`, default 45 ≈
+1.5–3 s) is far too short to span it. Without intervention the action would
+hard-abort and `tracker.reset()` would **wipe the gallery** ~1 frame after
+`NEEDS_HELP` first appears, so the re-seed would have nothing left to preserve.
+
+The node therefore **holds**: once `reacquisition_state == REACQ_NEEDS_HELP`, it
+keeps coasting (publishing `NEEDS_HELP` feedback every frame, tracker + gallery
+intact, **no abort/reset**) for up to `active_help_timeout_sec`
+(default **20.0 s**, `config/default.yaml`). A successful `ReseedTarget` within
+that window re-locks and returns to `REACQ_TRACKING`; if the window expires with
+no re-seed, the action aborts (gives up) as before. Set
+`active_help_timeout_sec: 0.0` to disable the hold entirely (legacy fast-abort).
+
+> **Give-up timing changed for *all* `TrackPerson` callers, not just active-reID.**
+> Because `active_help_after_frames` (45) equals `max_recovery_frames` (45), the
+> hold engages on **every** hard loss. A caller that is *not* running an
+> active-reID BT (the target genuinely left) now sees the action stay alive up to
+> `active_help_timeout_sec` (~20 s) before it aborts, versus ~1.5–3 s previously.
+> If a caller needs the old fast failure, lower `active_help_timeout_sec` or set
+> it to `0.0` for that node. (Note: a *provisional* re-match resets the
+> lost-frame clock, so in a crowd the effective hold can extend toward the
+> `lost_timeout` ceiling, default 300 s, before final give-up.)
 
 ## Interfaces (exact)
 

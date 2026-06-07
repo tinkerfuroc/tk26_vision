@@ -634,6 +634,13 @@ def periodic_reid_validation(
             else 0.0
         )
 
+    # Dashboard telemetry: the periodic re-verification of the currently-tracked
+    # target's similarity. _find_best_match_reid below overwrites this with the
+    # full per-candidate map when there are valid candidates, but stashing here
+    # guarantees the tracked target's own score surfaces even when the search
+    # returns no candidates.
+    tracker.last_debug_scores = {int(current_result.track_id): float(current_similarity)}
+
     match = tracker._find_best_match_reid(frame, results)
     if match is None:
         return True, None

@@ -24,6 +24,7 @@
     # --- Phase 2: recovery policy (asymmetric hysteresis) ---
     max_recovery_frames: 45          # coast cap; past this → hard-lost
     active_help_after_frames: 45     # consecutive frames lost before TrackPerson feedback reacquisition_state escalates to NEEDS_HELP (active call-out)
+    active_help_timeout_sec: 20.0    # while reacquisition_state==NEEDS_HELP, keep the tracker+gallery alive (no abort/reset) this long so the BT can reseed the raise-hand operator; 0 disables the hold
     provisional_high_bar: 0.72       # single-candidate fast-publish floor (reid_search.py)
     provisional_distinct_margin: 0.10  # min best-vs-second margin to publish in a crowd
     crosser_depth_jump_m: 0.6        # reject candidates this much nearer than the operator

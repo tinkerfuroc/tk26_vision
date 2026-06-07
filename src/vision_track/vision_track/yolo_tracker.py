@@ -540,6 +540,10 @@ class YOLOTracker:
         self.target_class_name = selected_result.class_name
         self.frames_lost = 0
         self.state = TrackerState.TRACKING
+        # Re-lock onto a confirmed view: clear stale occlusion bookkeeping so a
+        # mid-occlusion reseed doesn't carry a pre-occlusion appearance snapshot.
+        self.is_occluded = False
+        self.pre_occlusion_appearance = None
         if self.target_appearance is not None and fresh_reid_feature is not None:
             self.target_appearance.gallery.maybe_add(fresh_reid_feature)
         if self.lock_state_machine is not None and self.original_track_id is not None:
@@ -567,6 +571,12 @@ class YOLOTracker:
                 frame, [best.bbox], [best.mask], [best.class_id])
             if feats and feats[0] and "reid" in feats[0]:
                 fresh = feats[0]["reid"]
+        # Gallery-additive only: append the fresh view to the multi-view deep
+        # gallery (via _apply_reseed) but deliberately do NOT overwrite the
+        # color/identity anchors. The reseed match is geometric (IoU) only, so
+        # promoting the crop to the anchor would let a wrong-overlap box poison
+        # identity -- precision is sacred. The deep gallery's max-over-views
+        # still helps recognise the new appearance under drift.
         return self._apply_reseed(best, fresh)
 
     def _update_appearance(

@@ -15,20 +15,22 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.duration import Duration
 
 import numpy as np
 import cv2
 import threading
 import time
+import json
+import base64
 from pathlib import Path
 import os
 
 # ROS2 messages
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped, Point
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_point
 
@@ -55,6 +57,7 @@ from vision_track.core.centroid import reduce_centroid
 from vision_track.core.depth_roi import roi_window
 from vision_track.core.frame_diag import compute_frame_diag
 from vision_track.core.reacq_state import reacq_state
+from vision_track.core.debug_state import build_debug_state
 
 
 class PersonTrackNode(Node):
@@ -97,6 +100,18 @@ class PersonTrackNode(Node):
             self, self.vision_logging_enabled, self.vision_log_folder,
         )
         self.target_point_pub = None
+
+        # track_web dashboard telemetry publishers (param-gated; see
+        # _publish_debug_outputs). Created unconditionally — they cost nothing
+        # until something publishes / subscribes, and the per-frame work is
+        # guarded by the (default-False) debug_* flags.
+        self.debug_state_pub = self.create_publisher(String, '~/debug_state', 10)
+        gallery_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.debug_gallery_pub = self.create_publisher(String, '~/debug_gallery', gallery_qos)
+        self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 1)
+        self._last_gallery_version = -1
+
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
@@ -153,6 +168,11 @@ class PersonTrackNode(Node):
         # tracker+gallery alive (coast, no abort/reset) this long so the BT can
         # reseed the raise-hand operator; <=0 disables the hold (legacy abort).
         self.declare_parameter('active_help_timeout_sec', 20.0)
+        # track_web dashboard telemetry (all default OFF; byte-identical to
+        # legacy behavior with defaults).
+        self.declare_parameter('debug_state_enabled', False)
+        self.declare_parameter('gallery_keep_crops', False)
+        self.declare_parameter('debug_image_enabled', False)
         self.declare_parameter('provisional_high_bar', 0.72)
         self.declare_parameter('provisional_distinct_margin', 0.10)
         # Phase 2: reject candidates whose median depth jumps this much (m)
@@ -218,6 +238,9 @@ class PersonTrackNode(Node):
         self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
         self.active_help_after_frames = int(self.get_parameter('active_help_after_frames').value)
         self.active_help_timeout_sec = float(self.get_parameter('active_help_timeout_sec').value)
+        self.debug_state_enabled = bool(self.get_parameter('debug_state_enabled').value)
+        self.gallery_keep_crops = bool(self.get_parameter('gallery_keep_crops').value)
+        self.debug_image_enabled = bool(self.get_parameter('debug_image_enabled').value)
         self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
         self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
         self.crosser_depth_jump_m = self.get_parameter('crosser_depth_jump_m').value
@@ -288,6 +311,7 @@ class PersonTrackNode(Node):
                     reid_gallery_size=int(self.reid_gallery_size),
                     reid_gallery_novelty_max=float(self.reid_gallery_novelty_max),
                     reid_gallery_score_mode=self.reid_gallery_score_mode,
+                    keep_gallery_thumbs=self.gallery_keep_crops,
                     yolo_track_conf=self.yolo_track_conf,
                 )
                 self.tracker.max_frames_lost = max_frames_allowed
@@ -757,6 +781,7 @@ class PersonTrackNode(Node):
             else:
                 if self._handle_lost_frame(last_seen_time, rgb_img, rgb_msg, feedback, goal_handle, params, result):
                     return result
+            self._publish_debug_outputs(rgb_img, track_result, feedback, last_seen_time)
             t_post = time.perf_counter() - t_post0
 
             if self.perf_logging_enabled:
@@ -1112,6 +1137,62 @@ class PersonTrackNode(Node):
             result.message = f'Target {reason}'
             return True
         return False
+
+    def _publish_debug_outputs(self, rgb_img, track_result, feedback, last_seen_time):
+        """Param-gated dashboard telemetry; must never raise into the loop."""
+        try:
+            if self.debug_state_enabled:
+                tss = time.time() - last_seen_time
+                frames_lost = int(getattr(self.tracker, 'frames_lost', 0))
+                awaiting = (self.active_help_timeout_sec > 0.0
+                            and self.active_help_after_frames > 0
+                            and frames_lost >= self.active_help_after_frames
+                            and tss <= self.active_help_timeout_sec
+                            and bool(feedback.target_lost))
+                state = build_debug_state(
+                    self.tracker, ts=time.time(),
+                    target_lost=bool(feedback.target_lost),
+                    reacquisition_state=int(feedback.reacquisition_state),
+                    time_since_seen=tss, awaiting_help=awaiting,
+                    active_help_after_frames=self.active_help_after_frames,
+                    active_help_timeout_sec=self.active_help_timeout_sec)
+                self.debug_state_pub.publish(String(data=json.dumps(state)))
+                if self.gallery_keep_crops:
+                    self._maybe_publish_gallery(state["gallery_version"])
+            if self.debug_image_enabled and self.debug_image_pub.get_subscription_count() > 0:
+                annotated = self._draw_debug_info(
+                    rgb_img, self.tracker.last_results, track_result,
+                    self.tracker.target_track_id)
+                self.debug_image_pub.publish(
+                    self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8'))
+        except Exception as exc:  # telemetry must never kill tracking
+            self.get_logger().warn(f'debug output failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _maybe_publish_gallery(self, version: int):
+        if version == self._last_gallery_version:
+            return
+        app = getattr(self.tracker, 'target_appearance', None)
+        thumbs = list(getattr(getattr(app, 'gallery', None), 'thumbs', []) or []) if app else []
+        encoded = []
+        for t in thumbs:
+            # Per-thumb fault tolerance: one bad crop degrades to a None slot
+            # instead of raising — which would leave _last_gallery_version
+            # stale and retry (and re-warn) every frame until the gallery
+            # changes again.
+            enc = None
+            if t is not None:
+                try:
+                    ok, buf = cv2.imencode('.jpg', cv2.cvtColor(t, cv2.COLOR_RGB2BGR),
+                                           [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ok:
+                        enc = base64.b64encode(buf).decode('ascii')
+                except Exception:
+                    enc = None
+            encoded.append(enc)
+        self.debug_gallery_pub.publish(String(data=json.dumps(
+            {'version': version, 'thumbs': encoded})))
+        self._last_gallery_version = version
 
     def _cleanup_tracking(self):
         """Clean up tracking state."""

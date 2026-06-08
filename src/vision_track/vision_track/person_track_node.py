@@ -24,6 +24,7 @@ import threading
 import time
 import json
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
 
@@ -100,6 +101,13 @@ class PersonTrackNode(Node):
         self._vision_logger = VisionLogger(
             self, self.vision_logging_enabled, self.vision_log_folder,
         )
+        # Off-loop vision-log writer: the synchronous disk IO on a lost/reclaim
+        # transition (esp. the first write of a session, which resolves a large
+        # log tree) otherwise stalls the action loop and freezes the dashboard
+        # video the moment the target is lost. Single worker keeps writes ordered
+        # and avoids racing VisionLogger's lazy run_dir init.
+        self._log_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='vlog')
         self.target_point_pub = None
 
         # track_web dashboard telemetry publishers (param-gated; see
@@ -1072,7 +1080,7 @@ class PersonTrackNode(Node):
             'track_id': int(track_result.track_id),
         }
         if self._was_lost and self._vision_logger.enabled:
-            self._vision_logger.write(
+            self._log_async(
                 rgb_img, [self._last_tracked_detection],
                 request_ctx={'target_frame': params.get('target_frame')},
                 branch='person_track',
@@ -1082,6 +1090,15 @@ class PersonTrackNode(Node):
         # Re-tracking ends the lost episode: re-arm the active-help log throttle
         # so the next loss logs the hold entry again.
         self._active_help_logged = False
+
+    def _log_async(self, *args, **kwargs):
+        """Submit a vision-log write to the off-loop writer (never blocks the
+        tracking loop / never raises into it)."""
+        try:
+            self._log_executor.submit(self._vision_logger.write, *args, **kwargs)
+        except Exception as exc:  # e.g. executor shutting down
+            self.get_logger().warn(f'vision-log submit failed: {exc}',
+                                   throttle_duration_sec=5.0)
 
     def _is_awaiting_help(self, frames_lost, time_since_seen):
         """True while coasting (holding) for active re-ID help — wave to resume.
@@ -1116,13 +1133,13 @@ class PersonTrackNode(Node):
         # log, so a long occlusion produces exactly two artifacts.
         if (not self._was_lost) and self._vision_logger.enabled:
             if self._last_tracked_rgb is not None and self._last_tracked_detection is not None:
-                self._vision_logger.write(
+                self._log_async(
                     self._last_tracked_rgb, [self._last_tracked_detection],
                     request_ctx={'target_frame': params.get('target_frame')},
                     branch='person_track',
                     extras={'event': 'lost', 'time_since_seen_s': float(time_since_seen)},
                 )
-            self._vision_logger.write(
+            self._log_async(
                 rgb_img, None,
                 request_ctx={'target_frame': params.get('target_frame')},
                 branch='person_track',
@@ -1344,6 +1361,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info('Shutting down...')
     finally:
+        node._log_executor.shutdown(wait=False)
         node.destroy_node()
         rclpy.shutdown()
 

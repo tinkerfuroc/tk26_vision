@@ -22,6 +22,7 @@ def generate_launch_description():
     bind = LaunchConfiguration('bind')
     port = LaunchConfiguration('port')
     with_waving = LaunchConfiguration('with_waving')
+    perf_logging = LaunchConfiguration('perf_logging')
 
     # Resolved at LAUNCH time (substitutions), keeping generate_launch_description
     # pure and unit-testable without a sourced workspace.
@@ -37,6 +38,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'with_waving', default_value='true',
             description='also start waving_person_server (the 👋 button backend)'),
+        DeclareLaunchArgument(
+            'perf_logging', default_value='false',
+            description='log per-frame [perf] track/post/loop timings on the tracker'),
         # Tracker: production config first, bench telemetry overrides after —
         # the three debug flags are default-OFF in code/yaml; the bench is the
         # one place they are deliberately ON.
@@ -47,7 +51,9 @@ def generate_launch_description():
                 tracker_params,
                 {'debug_state_enabled': True,
                  'gallery_keep_crops': True,
-                 'debug_image_enabled': True},
+                 'debug_image_enabled': True,
+                 'perf_logging_enabled': ParameterValue(
+                     perf_logging, value_type=bool)},
             ]),
         Node(
             package='tk_vision_specialized', executable='waving_person_server',

@@ -100,6 +100,13 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-08** — harden the RGB+depth synchronizer (reduce stall frequency).
+  The two `message_filters` subscribers now use QoS history `depth=5` (was 1) and
+  a dedicated `ReentrantCallbackGroup` so RGB and depth are delivered
+  concurrently instead of serialized on the node default group — both shrink the
+  window in which one half of a pair is dropped and the `ApproximateTimeSynchronizer`
+  stalls. `BEST_EFFORT` is kept (the camera publishes BEST_EFFORT). Pairs with the
+  frame-starvation watchdog below as defense-in-depth.
 - **2026-06-08** — frame-starvation watchdog. The tracking loop's only frame
   source is the RGB+depth `ApproximateTimeSynchronizer`; when it stops emitting
   matched pairs (a sync stall — root cause of "stopped getting new camera frames"

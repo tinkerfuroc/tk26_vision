@@ -387,17 +387,31 @@ class PersonTrackNode(Node):
 
     def _init_subscribers(self):
         """Initialize camera subscribers with synchronization."""
+        # depth=5 (was 1): a depth-1 history drops a frame whenever the executor
+        # is briefly busy as the next one arrives; if RGB and depth drop
+        # asymmetrically the ApproximateTimeSynchronizer can no longer match
+        # pairs and stalls (the trigger behind the frame-starvation freeze). A
+        # small buffer absorbs that jitter. BEST_EFFORT is kept deliberately —
+        # the camera publishes BEST_EFFORT, and a RELIABLE reader would fail to
+        # match it and receive nothing.
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=5
         )
 
         cb_group = MutuallyExclusiveCallbackGroup()
+        # Dedicated reentrant group for the two synchronized image streams so RGB
+        # and depth can be DELIVERED concurrently by the MultiThreadedExecutor.
+        # On the node default (mutually-exclusive) group they serialize, widening
+        # the window in which a history overwrite drops one half of a pair.
+        sync_group = ReentrantCallbackGroup()
 
         # Synchronized RGB and depth subscribers
-        image_sub = Subscriber(self, Image, self.image_topic, qos_profile=qos_profile)
-        depth_sub = Subscriber(self, Image, self.depth_topic, qos_profile=qos_profile)
+        image_sub = Subscriber(self, Image, self.image_topic,
+                               qos_profile=qos_profile, callback_group=sync_group)
+        depth_sub = Subscriber(self, Image, self.depth_topic,
+                               qos_profile=qos_profile, callback_group=sync_group)
         
         sync = ApproximateTimeSynchronizer(
             [image_sub, depth_sub],

@@ -465,11 +465,16 @@ class PersonTrackNode(Node):
                 int(roi.x_offset + roi.width), int(roi.y_offset + roi.height))
         self.get_logger().info(
             f'Reseed requested: bbox={bbox} frame_id={request.frame_id!r}')
-        # _get_latest_data() returns (rgb_img, rgb_msg, depth_msg, intrinsic) on
-        # success, or one of two falsy sentinels: None (no msg / no intrinsic /
-        # decode fail) and False (frame-seq dedup, i.e. nothing new). A success
-        # is a 4-tuple (always truthy), so `not data` covers both sentinels.
-        data = self._get_latest_data()
+        # Non-consuming read (consume=False): the reseed runs off the tracking
+        # loop and must NOT race it on the frame-seq token. The loop consumes
+        # nearly every frame via the shared last_processed_seq, so a consuming
+        # read here would almost always hit the dedup and return False even though
+        # a frame is cached — wrongly rejecting the reseed. With consume=False,
+        # _get_latest_data returns the latest cached frame regardless of seq and
+        # never returns False; it still returns None (no msg / no intrinsic /
+        # decode fail). A success is a 4-tuple (always truthy), so `not data`
+        # covers only the None sentinel now.
+        data = self._get_latest_data(consume=False)
         if not data:
             self.get_logger().warn('Reseed failed: no camera frame available')
             response.success = False
@@ -908,15 +913,33 @@ class PersonTrackNode(Node):
         result.message = 'Tracking canceled by request'
         return True
 
-    def _get_latest_data(self):
+    def _get_latest_data(self, consume: bool = True):
+        """Fetch the latest decoded color frame + depth/intrinsic bundle.
+
+        Returns (rgb_img, rgb_msg, depth_msg, intrinsic) on success, or a falsy
+        sentinel: None (no msg yet / no intrinsic / color decode failure) or, when
+        ``consume`` is True, False (frame-seq dedup — nothing new since the last
+        consume).
+
+        With ``consume=True`` (the tracking loop) the call performs the frame-seq
+        dedup check and advances ``last_processed_seq``, gating the loop to the
+        camera rate.
+
+        With ``consume=False`` it returns the latest cached frame WITHOUT the
+        frame-seq dedup and WITHOUT advancing ``last_processed_seq`` — so off-loop
+        callers (the reseed service) never race the tracking loop's seq token, and
+        it NEVER returns False. This mirrors the idle telemetry tick's
+        non-consuming read.
+        """
         with self.lock_msg:
             if self.recent_sync_msg is None:
                 return None
             current_seq = self.frame_seq
-            if current_seq == self.last_processed_seq:
-                return False
+            if consume:
+                if current_seq == self.last_processed_seq:
+                    return False
+                self.last_processed_seq = current_seq
             rgb_msg, depth_msg = self.recent_sync_msg
-            self.last_processed_seq = current_seq
 
         with self.lock_info:
             intrinsic = self.camera_intrinsic

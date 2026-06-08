@@ -100,6 +100,14 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-08** — fix single-waver auto-reseed failing with "no camera frame
+  available". `_reseed_callback` fetched the frame with the consuming
+  `_get_latest_data()`, which returns the `False` dedup sentinel when the
+  concurrent tracking loop has already claimed the current frame-seq (a race on
+  the shared `last_processed_seq`) — so the reseed was rejected despite a cached
+  frame. `_get_latest_data` now takes `consume=False`; the reseed reads the
+  latest cached frame non-consuming (mirrors the idle telemetry tick) and never
+  races the loop. The 👋 wave→reseed loop now re-locks reliably.
 - **2026-06-08** — passive reacquisition is now always-on during the help hold.
   Previously, once the lock FSM latched terminal `'lost'` (operator gone >
   `max_recovery_frames`), a reappearing operator could only re-lock via a wave —

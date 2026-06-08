@@ -34,7 +34,9 @@ function renderState(s) {
   $("ids").textContent = `${s.target_track_id ?? "—"} (orig ${s.original_track_id ?? "—"})`;
   $("frames").textContent = s.frames_lost;
   $("hold").textContent = s.awaiting_help
-    ? `${Math.max(0, s.active_help_timeout_sec - s.time_since_seen).toFixed(1)}s`
+    ? (s.active_help_timeout_sec > 0
+        ? `${Math.max(0, s.active_help_timeout_sec - s.time_since_seen).toFixed(1)}s`
+        : "∞ (waving)")
     : "—";
   const f = (x) => (x == null ? "—" : x.toFixed(3));
   $("sims").textContent = `${f(s.best_sim)} / ${f(s.second_sim)}`;

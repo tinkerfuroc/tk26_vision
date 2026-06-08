@@ -18,6 +18,14 @@ class PersonRegistry:
     3. Requiring candidates to be distinctively closer to the target than to others
     """
 
+    # An "other person" whose similarity to the candidate reaches this level is
+    # not a distinct person — it is a self-ghost of the candidate's own track
+    # (e.g. the returning target was registered from its own crop a frame
+    # earlier). Two genuinely different people never fuse this high (cross-person
+    # OSNet cosine ~0.5), so excluding it costs nothing and prevents the
+    # self-match from masquerading as a competing identity.
+    SELF_MATCH_CUTOFF = 0.98
+
     def __init__(self):
         self.known_persons: Dict[int, TargetAppearance] = {}
         self.distinctiveness_threshold = 0.10
@@ -75,6 +83,13 @@ class PersonRegistry:
 
             try:
                 similarity = similarity_func(appearance, best_features)
+                if similarity >= self.SELF_MATCH_CUTOFF:
+                    # Self-ghost of the candidate's own track, not a real rival.
+                    logger.debug(
+                        f"Ignoring near-self-match other ID {pid} "
+                        f"(sim {similarity:.3f} >= {self.SELF_MATCH_CUTOFF})"
+                    )
+                    continue
                 max_other_similarity = max(max_other_similarity, similarity)
             except Exception as exc:
                 logger.debug(f"Distinctiveness check failed for ID {pid}: {exc}")

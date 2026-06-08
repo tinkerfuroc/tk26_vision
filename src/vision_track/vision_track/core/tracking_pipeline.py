@@ -12,6 +12,12 @@ from .tracking_types import TargetAppearance, TrackerState, TrackingResult
 
 logger = logging.getLogger(__name__)
 
+# A detection scoring at/above this similarity to the target could BE the target,
+# so it must never be cemented as an "other person" distractor. Reuses the
+# single-person reacquisition acceptance bar (reid_search._single_candidate_guard)
+# — below it the candidate is confidently a different person worth registering.
+OTHER_PERSON_MAX_TARGET_SIM = 0.72
+
 
 def _get_or_extract_features(tracker, frame, track_id, bbox, mask, class_id):
     """Cache-aware single-detection feature extraction.
@@ -546,6 +552,26 @@ def register_other_persons(tracker, frame: np.ndarray, results: List[TrackingRes
         features = tracker.appearance_extractor.extract_features(frame, result.bbox, result.mask, class_id=result.class_id)
         if not features:
             continue
+
+        # Never cement a plausible TARGET as an "other person". After a transient
+        # detection gap ByteTrack re-emits the lone operator under a fresh id, so
+        # `target_track_id` (the stale pre-loss id) no longer excludes it above.
+        # If the candidate matches the target above the acceptance bar it could BE
+        # the operator — registering it would make it fail its own distinctiveness
+        # check against its self-ghost forever (a self-poisoning deadlock, since
+        # the confirmed-swap that would clear() the registry is gated behind that
+        # very check). Skip it; genuine distractors score well below the bar.
+        target_app = getattr(tracker, "target_appearance", None)
+        if target_app is not None:
+            sim_to_target = ReIDMatcher.compute_similarity(
+                target_app, features, result.bbox, time.time(), is_person=True)
+            if sim_to_target >= OTHER_PERSON_MAX_TARGET_SIM:
+                logger.debug(
+                    f"Not registering ID {result.track_id} as other-person: "
+                    f"sim_to_target {sim_to_target:.3f} >= {OTHER_PERSON_MAX_TARGET_SIM} "
+                    "(likely the returning target)"
+                )
+                continue
 
         other = TargetAppearance(class_id=result.class_id, class_name=result.class_name)
         if "reid" in features:

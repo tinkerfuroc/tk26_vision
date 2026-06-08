@@ -174,10 +174,13 @@ class PersonTrackNode(Node):
         # Spec B: consecutive frames lost before the published reacquisition_state
         # escalates to NEEDS_HELP, so a BT can debounce active (call-out) re-ID.
         self.declare_parameter('active_help_after_frames', 45)
-        # Spec B remediation: while reacquisition_state==NEEDS_HELP, keep the
-        # tracker+gallery alive (coast, no abort/reset) this long so the BT can
-        # reseed the raise-hand operator; <=0 disables the hold (legacy abort).
-        self.declare_parameter('active_help_timeout_sec', 20.0)
+        # While reacquisition_state==NEEDS_HELP, keep the tracker+gallery alive
+        # (coast, no abort/reset) so the operator can wave and be reseeded.
+        # <=0 (default) holds INDEFINITELY — only a successful reseed or a cancel
+        # ends the hold; a positive value bounds it to that many seconds. Disable
+        # active help entirely with active_help_after_frames<=0 (legacy abort on
+        # hard-lost).
+        self.declare_parameter('active_help_timeout_sec', 0.0)
         # track_web dashboard telemetry (all default OFF; byte-identical to
         # legacy behavior with defaults).
         self.declare_parameter('debug_state_enabled', False)
@@ -1080,6 +1083,22 @@ class PersonTrackNode(Node):
         # so the next loss logs the hold entry again.
         self._active_help_logged = False
 
+    def _is_awaiting_help(self, frames_lost, time_since_seen):
+        """True while coasting (holding) for active re-ID help — wave to resume.
+
+        Escalates after ``active_help_after_frames`` consecutive lost frames,
+        then holds INDEFINITELY when ``active_help_timeout_sec <= 0`` (default —
+        only a successful reseed or a goal cancel ends it), or up to that many
+        seconds otherwise. ``active_help_after_frames <= 0`` disables active help
+        (legacy abort on hard-lost).
+        """
+        if (self.active_help_after_frames <= 0
+                or frames_lost < self.active_help_after_frames):
+            return False
+        if self.active_help_timeout_sec <= 0.0:
+            return True
+        return time_since_seen <= self.active_help_timeout_sec
+
     def _handle_lost_frame(
         self,
         last_seen_time: float,
@@ -1157,17 +1176,13 @@ class PersonTrackNode(Node):
         # identity. Bounded by active_help_timeout_sec; lost_timeout stays the
         # absolute ceiling. Set active_help_timeout_sec<=0 to disable (legacy abort).
         frames_lost = int(getattr(self.tracker, 'frames_lost', 0))
-        awaiting_help = (
-            self.active_help_timeout_sec > 0.0
-            and self.active_help_after_frames > 0
-            and frames_lost >= self.active_help_after_frames
-            and time_since_seen <= self.active_help_timeout_sec
-        )
-        if awaiting_help:
+        if self._is_awaiting_help(frames_lost, time_since_seen):
             if not self._active_help_logged:
+                bound = ('indefinitely' if self.active_help_timeout_sec <= 0.0
+                         else f'up to {self.active_help_timeout_sec:.0f}s')
                 self.get_logger().warn(
                     f'Target lost {frames_lost}f; awaiting active re-ID help '
-                    f'(holding up to {self.active_help_timeout_sec:.0f}s for ~/reseed_target)')
+                    f'(holding {bound} for ~/reseed_target — wave to resume)')
                 self._active_help_logged = True
             return False
         if hard_lost or time_since_seen > self.lost_timeout:
@@ -1245,11 +1260,8 @@ class PersonTrackNode(Node):
             if self.debug_state_enabled:
                 tss = time.time() - last_seen_time
                 frames_lost = int(getattr(self.tracker, 'frames_lost', 0))
-                awaiting = (self.active_help_timeout_sec > 0.0
-                            and self.active_help_after_frames > 0
-                            and frames_lost >= self.active_help_after_frames
-                            and tss <= self.active_help_timeout_sec
-                            and bool(feedback.target_lost))
+                awaiting = (bool(feedback.target_lost)
+                            and self._is_awaiting_help(frames_lost, tss))
                 state = build_debug_state(
                     self.tracker, ts=time.time(),
                     target_lost=bool(feedback.target_lost),

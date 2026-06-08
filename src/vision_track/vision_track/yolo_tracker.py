@@ -321,25 +321,40 @@ class YOLOTracker:
     def _warmup_model(self, warmup_iterations: int = 3):
         """
         Warm up the model by running inference on dummy data.
-        
+
+        Warms the REAL hot path: ``model.track()`` at the configured
+        ``inference_size`` on a camera-sized frame, not just ``predict`` on a
+        640x640 dummy. The first live ``track()`` call otherwise pays cuDNN
+        autotune + ByteTrack init (~700 ms) — a freeze that lands right after
+        lock, drops the track, and triggers an immediate, unrecoverable loss.
+        Moving that cost here (a zeros frame yields no detections, so ByteTrack
+        state stays clean) keeps the first tracked frame fast. Also warms the
+        batched ReID scoring path used during reacquisition.
+
         Args:
             warmup_iterations: Number of warmup iterations
         """
         logger.info("Warming up model...")
-        
-        # Create dummy input
-        dummy_input = np.zeros((640, 640, 3), dtype=np.uint8)
-        
-        for i in range(warmup_iterations):
-            _ = self.model(dummy_input, verbose=False)
-            
-        # Warmup appearance extractor if enabled
+
+        # Camera-sized dummy so cuDNN autotunes the real letterbox/imgsz shapes.
+        dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        for _ in range(warmup_iterations):
+            _ = self.detect(dummy)               # predict path (init/detect)
+            _ = self.track(dummy, persist=True)  # track path (tracking loop)
+
+        # Warmup appearance extractor if enabled (single + batched ReID forward).
         if self.enable_reid and self.appearance_extractor is not None:
-            dummy_crop = np.zeros((100, 100, 3), dtype=np.uint8)
             _ = self.appearance_extractor.extract_features(
-                dummy_input, (0, 0, 100, 100), None
+                dummy, (0, 0, 100, 100), None
             )
-            
+            batch = getattr(self.appearance_extractor, "extract_features_batch", None)
+            if batch is not None:
+                try:
+                    _ = batch(dummy, [(0, 0, 100, 100)], [None], [0])
+                except Exception:
+                    pass
+
         logger.info("Model warmup complete")
     
     def detect(
@@ -443,8 +458,12 @@ class YOLOTracker:
         Returns:
             True if initialization successful, False otherwise
         """
-        # Reset tracker state
-        self.model.predictor = None  # Reset predictor to clear tracking state
+        # Reset tracker state. Clear ByteTrack history WITHOUT nulling the
+        # predictor: dropping model.predictor discards the cuDNN-autotuned graphs
+        # built during warmup, forcing a ~2s re-autotune on the next track() —
+        # a freeze right at lock that drops the just-acquired target into an
+        # immediate false loss (see _reset_bytetrack_state).
+        self._reset_bytetrack_state()
         self.target_track_id = None
         self.original_track_id = None  # Reset original ID
         self.target_class_id = None
@@ -978,9 +997,28 @@ class YOLOTracker:
         """
         return self.tracked_results
     
+    def _reset_bytetrack_state(self):
+        """Clear ByteTrack track history while keeping the autotuned predictor.
+
+        Nulling ``self.model.predictor`` (the old approach) also discards the
+        cuDNN graphs warmed in ``_warmup_model``, so the next ``track()`` pays a
+        full ~2s re-autotune — a freeze that lands right after lock and drops the
+        target. Resetting the tracker objects in place clears the id/track state
+        without that cost. Falls back to a no-op if the ultralytics tracker has
+        no ``reset`` (continued ids are harmless — the pipeline maps every match
+        back to ``original_track_id``).
+        """
+        pred = getattr(self.model, 'predictor', None)
+        trackers = getattr(pred, 'trackers', None) if pred is not None else None
+        for trk in (trackers or []):
+            try:
+                trk.reset()
+            except Exception:  # noqa: BLE001 — best-effort; keep the predictor
+                pass
+
     def reset(self):
         """Reset the tracker state."""
-        self.model.predictor = None
+        self._reset_bytetrack_state()
         self.target_track_id = None
         self.original_track_id = None
         self.target_class_id = None

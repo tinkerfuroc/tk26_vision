@@ -800,8 +800,12 @@ class PersonTrackNode(Node):
             t_post = time.perf_counter() - t_post0
 
             if self.perf_logging_enabled:
+                tk = self.tracker
                 self.get_logger().info(
-                    f"[perf] track={t_track*1000:.1f}ms post={t_post*1000:.1f}ms "
+                    f"[perf] track={t_track*1000:.1f}ms "
+                    f"(yolo={getattr(tk, '_t_yolo_ms', 0.0):.1f} "
+                    f"pipe={getattr(tk, '_t_pipeline_ms', 0.0):.1f}) "
+                    f"post={t_post*1000:.1f}ms "
                     f"loop={(time.time()-loop_start)*1000:.1f}ms"
                 )
 

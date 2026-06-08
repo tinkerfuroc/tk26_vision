@@ -16,6 +16,42 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-08 (cont.) — always-on passive reacquisition + single-waver reseed fix
+
+Two bench-found fixes (spec: `src/vision_track/docs/specs/2026-06-08-passive-reacq-and-reseed-fix.md`).
+Operator decisions baked in: passive reacquire **always on** even while awaiting
+help; **no thresholds changed** (precision sacred). Systematic debug via two
+parallel investigation agents; both root causes verified against source.
+
+- **Passive reacquire never fired during the hold (`f76e6ad`).** The lock FSM
+  (`core/lock_state_machine.py`) latches terminal `'lost'` after
+  `max_recovery_frames`=45 and `step()` then short-circuits `'lost'` every frame.
+  The gallery re-ID search keeps running the whole hold (gated at
+  `max_frames_lost`=600) and `_confirm_reid_candidate` still commits an id-swap
+  when the operator reappears — but the committed-swap FSM step ran while still
+  `'lost'`, squashing the re-lock to `target_lost=True`. So only a wave→reseed
+  worked (reseed alone called `lock_state_machine.start()`). Fix: re-arm the FSM
+  (`fsm.start(target_track_id)`) on a committed passive swap, mirroring reseed.
+  Operator walking back in now auto-re-locks after the existing 12-frame ReID
+  confirmation. Also fixed a latent bug: FSM `committed_id` was never re-synced
+  after any id-swap. Test: `test_passive_reacq.py`.
+- **Single-waver reseed failed "no camera frame available" (`9910381`).**
+  `_reseed_callback` used the consuming `_get_latest_data()`, which returns the
+  `False` dedup sentinel when the concurrent tracking loop has already claimed the
+  current `frame_seq` (race on the shared `last_processed_seq`). The reseed was
+  rejected despite a cached frame (the bbox/IoU path was fine — IoU ≈ 0.36 > 0.3).
+  Fix: `_get_latest_data(consume=False)` — non-consuming read for off-loop callers
+  (mirrors the idle telemetry tick). Test: `test_get_latest_data_consume.py`.
+
+Implemented via subagent-driven development (one implementer subagent per fix,
+disjoint files; controller did spec+quality review, git, build). Suite **186
+passed / 1 skip** (flake8 baseline 534 unchanged). Deployed to
+`/home/tinker/tk25_ws/install` via `tkbuild tk26_vision`. **Operator check still
+needed on-robot:** (1) lose operator > 2 s then walk back in → auto re-lock within
+~1 s, no wave; (2) lose operator, single wave → auto-reseed re-locks.
+
+---
+
 ## 2026-06-08 (cont.) — camera-frame starvation freeze: "stops getting new frames" mid-track
 
 Reported: tracking works, then **at some point stops getting new camera frames**

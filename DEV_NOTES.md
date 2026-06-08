@@ -16,6 +16,45 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-09 — help-hold latch saga + verified multi-reclaim on the bag
+
+Code review of the two prior fixes (passive-reacquire + reseed) came back APPROVE
+(no thresholds changed, real regression tests). Bag-replay testing then exposed a
+deeper bug that made auto-reclaim impossible, fixed in two more commits:
+
+- **Hold aborted mid-reappearance (`3022719`).** When the operator reappears,
+  `_confirm_reid_candidate` resets `frames_lost=0` on every pre-commit frame
+  (before the ~12-frame re-lock). `_handle_lost_frame`'s hold/abort gate keyed on
+  the instantaneous `frames_lost`, so the reset flipped `_is_awaiting_help` False
+  and — FSM still `'lost'` (`hard_lost`) — fired the abort before the reclaim
+  could commit. Fix: `_is_awaiting_help` **latches** the escalation
+  (`_help_latched`).
+- **Latch cleared on provisional frames (`11fd2b6`).** First bag `--loop` test
+  still aborted ~3s in. The latch predicate was correct in isolation (empirically
+  `(45)→True` then `(0)→True`), so something cleared it: `_handle_tracked_frame`
+  cleared `_help_latched` UNCONDITIONALLY, but during a hold a provisional/partial
+  recovery frame surfaces there with `target_lost` STILL True (FSM `'lost'`) — not
+  a real re-lock. Fix: clear the latch only when `feedback.target_lost` is False
+  (a true re-lock) or on cleanup.
+
+Full chain for "reacquire always on": `f76e6ad` (re-arm FSM on committed swap) +
+`3022719` (latch) + `11fd2b6` (clear-on-true-re-lock).
+
+**Verification — multi-reclaim on the recorded bag.** Replayed
+`track_20260608_205842` with `ros2 bag play --loop` (operator present at start,
+leaves near the end → >45-frame loss/hold, bag loops to frame 0 → operator
+reappears → reclaim). Result over ~180 s (~4 loops): **RECLAIMS (Confirmed ReID)
+= 4, Aborts = 0**, holds entered = 30, sync-stalls = 0, no tracebacks. The goal
+survived every loss and reclaimed the operator on each loop. (The raw bag has
+only one natural loss late in the clip — `--loop` is what manufactures repeated
+loss→reclaim cycles.) Unit: full suite 189 passed / 1 skip; flake8 baseline 534
+unchanged. Deployed to `/home/tinker/tk25_ws/install` via `tkbuild tk26_vision`.
+
+**Operator check still pending on-robot:** live leave/re-enter (no wave) should
+auto-reclaim within ~1 s; repeat several times.
+
+---
+
 ## 2026-06-08 (cont.) — always-on passive reacquisition + single-waver reseed fix
 
 Two bench-found fixes (spec: `src/vision_track/docs/specs/2026-06-08-passive-reacq-and-reseed-fix.md`).

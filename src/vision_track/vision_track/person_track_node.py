@@ -750,6 +750,27 @@ class PersonTrackNode(Node):
         init_start_time = time.time()
         initialized = False
 
+        # Warm CUDA on THIS executor thread before the lock loop. The __init__
+        # warmup ran on the main thread; the first cuDNN call on an action-worker
+        # thread pays a ~0.5s one-time init that would otherwise land on the first
+        # tracked frame — a freeze right at lock that, under load, drops the
+        # just-acquired target into a false loss. Paid here (during init search,
+        # before any lock) it is invisible. ByteTrack state is reset after.
+        try:
+            with self.lock_tracker:
+                tk = self.tracker
+                dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
+                tk.track(dummy, persist=True)            # warm YOLO on this thread
+                tk._reset_bytetrack_state()
+                ext = getattr(tk, 'appearance_extractor', None)
+                if ext is not None:                      # warm OSNet ReID too
+                    ext.extract_features(dummy, (0, 0, 100, 100), None)
+                    batch = getattr(ext, 'extract_features_batch', None)
+                    if batch is not None:
+                        batch(dummy, [(0, 0, 100, 100)], [None], [0])
+        except Exception as warm_exc:  # never block tracking on a warmup hiccup
+            self.get_logger().debug(f'action-thread warmup skipped: {warm_exc}')
+
         while rclpy.ok():
             if self._handle_cancel(goal_handle, result):
                 return result

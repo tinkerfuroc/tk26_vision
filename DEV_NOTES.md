@@ -16,6 +16,31 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-08 (cont.) — loss/recovery UX: frozen dashboard on loss + wave never resumed tracking
+
+Two follow-on fixes after single-person tracking was confirmed robust. Operator
+decisions: hold **truly forever** once help is requested; **auto-reseed on a
+single waver**.
+
+- **Wave never resumed tracking (`bc95702` + `f55e29a`).** Root cause: the
+  NEEDS_ACTIVE_HELP hold coasted only for `active_help_timeout_sec` (20s) then
+  aborted the goal (the lock FSM is already `hard_lost` by ~1.5s), so a
+  wave→ReseedTarget that landed after 20s hit a dead goal. Fix: `active_help_
+  timeout_sec` now defaults to **0 = hold indefinitely** (only a reseed or cancel
+  ends it); centralized in `_is_awaiting_help()`. And `track_web.wave()` now
+  **auto-reseeds when exactly one waver is detected** (multiple stay manual).
+  Tests: `test_active_help_hold.py`, `test_wave_auto_reseed.py`.
+- **Dashboard image froze on loss (`bc95702` + `09dd553`).** Two parts: (a) the
+  indefinite hold keeps the action loop publishing `debug_image` during the loss
+  (it no longer aborts → stops); (b) the `/stream.mjpg` generator now re-emits the
+  last frame on a ~0.5s **heartbeat** so a quiet multipart stream can't latch the
+  browser `<img>` on the last frame.
+
+Dashboard shows `∞ (waving)` for the unbounded hold. Suite 170 passed / 1 skipped;
+tkbuild green. **Operator confirmation still needed on-robot:** lose the person,
+wait >20s, wave → should resume; video should stay live throughout (incl. the
+BT-driven wave→reseed path, which is separate from the dashboard auto-reseed).
+
 ## 2026-06-08 — "extremely laggy + loses target" — three stacked first-frame/recovery bugs (systematic debugging, validated via a synthetic camera, no human)
 
 Operator reported the tracker locked then instantly lost a lone person and felt

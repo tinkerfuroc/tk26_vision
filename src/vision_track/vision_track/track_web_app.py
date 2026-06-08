@@ -23,6 +23,7 @@ object (the ROS node in production, a fake in tests). The bridge contract:
     start_goal() / stop_goal() -> dict      # {ok: bool, message: str}
     reseed(bbox:[x1,y1,x2,y2]) -> dict      # ReseedTarget response fields
     wave() -> dict                          # DetectWaving boxes/points or error
+    record_start() / record_stop() -> dict  # ros2 bag record control (offline replay)
 
 All bridge methods must be thread-safe; handlers poll (no cross-thread asyncio).
 """
@@ -104,6 +105,14 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
     @app.post("/api/wave")
     def wave():
         return bridge.wave()
+
+    @app.post("/api/record/start")
+    def record_start():
+        return bridge.record_start()
+
+    @app.post("/api/record/stop")
+    def record_stop():
+        return bridge.record_stop()
 
     @app.websocket("/ws/state")
     async def ws_state(ws: WebSocket):

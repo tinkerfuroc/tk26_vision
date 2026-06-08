@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -66,6 +68,17 @@ class TrackWebNode(Node):
         self.bind_port = int(self.get_parameter("port").value)
         tracker = str(self.get_parameter("tracker_node_name").value)
         waving = str(self.get_parameter("waving_service").value)
+        # Rosbag recording: capture the tracker's INPUT topics (so a session can
+        # be replayed offline into the tracker) plus its decisions for reference.
+        self.declare_parameter("record_dir", "~/tk25_ws/rosbags")
+        self.declare_parameter("record_topics", [
+            "/camera/color/image_raw", "/camera/depth/image_raw",
+            "/camera/color/camera_info", f"/{tracker}/debug_state",
+            "/target_points"])
+        self.record_dir = os.path.expanduser(
+            str(self.get_parameter("record_dir").value))
+        self.record_topics = [t for t in self.get_parameter("record_topics").value
+                              if t]
 
         self._lock = threading.Lock()
         self._state = None          # latest debug_state dict
@@ -75,6 +88,8 @@ class TrackWebNode(Node):
         self._jpeg = None           # latest annotated frame as JPEG bytes
         self._jpeg_seq = 0
         self._goal_handle = None    # our bench goal (None = not held by us)
+        self._rec_proc = None       # `ros2 bag record` subprocess (None = idle)
+        self._rec_path = None       # output dir of the active/last recording
 
         cb = ReentrantCallbackGroup()
         self.create_subscription(
@@ -146,8 +161,11 @@ class TrackWebNode(Node):
             held = self._goal_handle is not None
             observer = (not held and self._state is not None
                         and age is not None and age < _STALE_S)
+            rec_active = (self._rec_proc is not None
+                          and self._rec_proc.poll() is None)
             return {"state": self._state, "state_age_s": age,
                     "goal": {"held": held, "observer": observer},
+                    "recording": {"active": rec_active, "path": self._rec_path},
                     "gallery_version": (self._gallery or {}).get("version", -1)}
 
     def latest_state(self):
@@ -249,6 +267,55 @@ class TrackWebNode(Node):
             out["auto_reseeded"] = bool(out["reseed"].get("success"))
         return out
 
+    def record_start(self):
+        with self._lock:
+            if self._rec_proc is not None and self._rec_proc.poll() is None:
+                return {"ok": False, "message": "already recording",
+                        "path": self._rec_path}
+        if not self.record_topics:
+            return {"ok": False, "message": "no record_topics configured",
+                    "path": ""}
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        path = os.path.join(self.record_dir, f"track_{stamp}")
+        cmd = ["ros2", "bag", "record", "-o", path, *self.record_topics]
+        try:
+            os.makedirs(self.record_dir, exist_ok=True)
+            # start_new_session: a SIGINT we send on stop reaches the recorder,
+            # and a Ctrl-C in the launching terminal won't tear the bag mid-write.
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except Exception as exc:  # never crash the node on a spawn failure
+            self.get_logger().error(f"rosbag record failed to start: {exc}")
+            return {"ok": False, "message": f"failed to start: {exc}", "path": ""}
+        with self._lock:
+            self._rec_proc = proc
+            self._rec_path = path
+        self.get_logger().info(
+            f"rosbag recording -> {path}  topics={self.record_topics}")
+        return {"ok": True, "message": f"recording to {path}", "path": path,
+                "topics": self.record_topics}
+
+    def record_stop(self):
+        with self._lock:
+            proc = self._rec_proc
+            path = self._rec_path
+            self._rec_proc = None
+        if proc is None or proc.poll() is not None:
+            return {"ok": False, "message": "not recording", "path": path or ""}
+        # SIGINT lets `ros2 bag record` finalize metadata/index cleanly; escalate
+        # to kill if it doesn't exit promptly.
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self.get_logger().info(f"rosbag recording stopped -> {path}")
+        return {"ok": True, "message": f"saved {path}", "path": path or ""}
+
 
 def main():
     # Mirror calib_web: avoid the SHM-discovery stall on a live robot.
@@ -282,6 +349,7 @@ def main():
         pass
     finally:
         server.should_exit = True
+        node.record_stop()  # finalize any in-progress bag before teardown
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

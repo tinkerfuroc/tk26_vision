@@ -425,10 +425,17 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
     )
 
     if committed_swap:
-        # A genuine id-swap committed THIS frame. Mirror it in the FSM as a
-        # present frame so it reports target_lost=False — it does NOT re-decide
-        # the id (the pipeline owns that). Always publishes the committed point.
+        # A genuine id-swap committed THIS frame (passive re-ID re-locked the
+        # operator after the full reid_confirmation window). Re-arm the FSM the
+        # same way reseed does (yolo_tracker._apply_reseed) BEFORE stepping it:
+        # otherwise, if the FSM had latched terminal 'lost' (operator was gone
+        # > max_recovery_frames), step() short-circuits 'lost' and the re-lock
+        # never surfaces (target_lost stuck True, waiting for a wave). start()
+        # also re-syncs the FSM's committed_id to the new id. Then mirror the
+        # swap as a present frame so it reports target_lost=False. The pipeline
+        # remains the identity-swap authority; the FSM only drives publish/lost.
         if fsm is not None:
+            fsm.start(tracker.target_track_id)
             tracker.last_lock_decision = fsm.step(
                 sim_score=float(best_similarity), present=True, frames_since_loss=0,
                 num_candidates=num_cands, distinct_margin=margin,

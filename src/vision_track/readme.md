@@ -100,6 +100,14 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-08** — passive reacquisition is now always-on during the help hold.
+  Previously, once the lock FSM latched terminal `'lost'` (operator gone >
+  `max_recovery_frames`), a reappearing operator could only re-lock via a wave —
+  the FSM short-circuited `'lost'` and squashed even a committed passive ReID
+  re-lock to `target_lost=True`. Now a committed passive swap re-arms the FSM
+  (`fsm.start`, mirroring reseed), so the operator walking back into frame
+  auto-re-locks after the normal 12-frame ReID confirmation, no wave needed.
+  No thresholds changed; wave/reseed remains the manual fallback.
 - **2026-06-08** — harden the RGB+depth synchronizer (reduce stall frequency).
   The two `message_filters` subscribers now use QoS history `depth=5` (was 1) and
   a dedicated `ReentrantCallbackGroup` so RGB and depth are delivered

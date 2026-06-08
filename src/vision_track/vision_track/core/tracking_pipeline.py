@@ -543,6 +543,16 @@ def register_other_persons(tracker, frame: np.ndarray, results: List[TrackingRes
     if tracker.fast_tracking_mode and tracker.frame_count % tracker.reid_extraction_interval != 0:
         return
 
+    # Refresh the distractor set from THIS frame. Temp "other" entries (negative
+    # ids) otherwise accumulate for the whole goal — including stale views of the
+    # operator captured during a pose change — and a stale operator-self-view
+    # (scoring ~0.82 to the live operator, above the genuine-distractor range)
+    # then out-scores the drifted target model in check_distinctiveness and
+    # rejects the real operator every frame. Clearing keeps distinctiveness
+    # comparing only against currently-visible distractors (the target, a
+    # positive-id registry entry, is preserved). Re-populated below.
+    tracker.person_registry.clear_temporary_ids()
+
     registered = 0
     for result in results:
         if registered >= 2:

@@ -8,6 +8,7 @@ let lastState = null;
 let lastStateAt = 0;
 let waveBoxes = [];
 let lastMode = "—";   // bench | observer | idle (from the /api/status poll)
+let recording = false;  // rosbag record state (from the /api/status poll)
 
 function log(msg) {
   const li = document.createElement("li");
@@ -168,7 +169,12 @@ $("btn-wave").onclick = async () => {
   renderWaveBoxes();
 };
 
-/* Stale banner + observer/bench mode chip. */
+$("btn-record").onclick = async () => {
+  const r = await post(recording ? "/api/record/stop" : "/api/record/start");
+  log(`record ${recording ? "stop" : "start"} → ${r.message || (r.ok ? "ok" : "failed")}`);
+};
+
+/* Stale banner + observer/bench mode chip + record state. */
 setInterval(async () => {
   $("stale-banner").classList.toggle("hidden", Date.now() - lastStateAt < 1000);
   try {
@@ -177,6 +183,12 @@ setInterval(async () => {
     lastMode = m[0];
     $("mode").textContent = m[0];
     $("mode").className = "badge " + m[1];
+    recording = !!(st.recording && st.recording.active);
+    const rb = $("btn-record");
+    if (rb) {
+      rb.textContent = recording ? "⏹ Stop recording" : "⏺ Record bag";
+      rb.classList.toggle("rec-on", recording);
+    }
   } catch (e) { /* status poll is best-effort */ }
 }, 1000);
 

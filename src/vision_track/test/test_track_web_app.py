@@ -55,6 +55,14 @@ class FakeBridge:
         self.calls.append("wave")
         return {"status": 0, "boxes": [[1, 2, 3, 4]], "points": [[0.5, 0.1, 2.0]]}
 
+    def record_start(self):
+        self.calls.append("record_start")
+        return {"ok": True, "message": "recording to /tmp/bag", "path": "/tmp/bag"}
+
+    def record_stop(self):
+        self.calls.append("record_stop")
+        return {"ok": True, "message": "saved /tmp/bag", "path": "/tmp/bag"}
+
 
 def _client():
     b = FakeBridge()
@@ -73,6 +81,13 @@ def test_goal_and_wave_roundtrip():
     assert c.post("/api/goal/stop").json()["ok"] is True
     assert c.post("/api/wave").json()["boxes"] == [[1, 2, 3, 4]]
     assert b.calls[:3] == ["start", "stop", "wave"]
+
+
+def test_record_start_stop():
+    b, c = _client()
+    assert c.post("/api/record/start").json()["ok"] is True
+    assert c.post("/api/record/stop").json()["path"] == "/tmp/bag"
+    assert b.calls[-2:] == ["record_start", "record_stop"]
 
 
 def test_reseed_validates_bbox():

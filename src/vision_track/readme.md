@@ -100,6 +100,15 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-08** — frame-starvation watchdog. The tracking loop's only frame
+  source is the RGB+depth `ApproximateTimeSynchronizer`; when it stops emitting
+  matched pairs (a sync stall — root cause of "stopped getting new camera frames"
+  while the camera still publishes at 30 Hz) the loop used to busy-wait forever
+  with a frozen dashboard, no loss handling, and no log. Now, after
+  `frame_stall_warn_sec` (0.5 s) it warns + keeps the dashboard alive
+  (`camera_stalled` banner + last good frame); after `frame_stall_lost_sec`
+  (1.5 s) it engages the existing loss/recovery FSM (forever-hold + wave/reseed)
+  so a camera stall recovers like a person-lost.
 - **2026-06-07** — `track_web` dashboard + active-reID test bench shipped: live
   MJPEG/WebSocket tracking view, re-ID gallery thumbnails, bench/observer modes,
   click-to-reseed (incl. the 👋 DetectWaving human-as-BT loop). Backed by

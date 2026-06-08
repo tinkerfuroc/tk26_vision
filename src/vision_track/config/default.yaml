@@ -25,6 +25,9 @@
     max_recovery_frames: 45          # coast cap; past this → hard-lost
     active_help_after_frames: 45     # consecutive frames lost before TrackPerson feedback reacquisition_state escalates to NEEDS_HELP (active call-out)
     active_help_timeout_sec: 0.0     # while reacquisition_state==NEEDS_HELP, keep the tracker+gallery alive (no abort/reset) for reseed/wave-to-resume. 0 = hold INDEFINITELY (only a reseed or cancel ends it); a positive value bounds the hold to that many seconds. Disable active help entirely with active_help_after_frames<=0.
+    # --- Frame-starvation watchdog (RGB+depth synchronizer stall) ---
+    frame_stall_warn_sec: 0.5        # no new synchronized frame for this long -> warn + keep dashboard alive (stall banner + last frame). Must exceed the camera inter-frame gap (~33 ms @ 30 Hz).
+    frame_stall_lost_sec: 1.5        # no new synchronized frame for this long -> engage the loss/recovery FSM (forever-hold + wave/reseed) so a camera stall recovers like a person-lost.
     # --- track_web dashboard telemetry (all default OFF; zero production impact) ---
     debug_state_enabled: false       # ~/debug_state JSON per frame
     gallery_keep_crops: false        # retain + publish gallery view thumbnails (~/debug_gallery)

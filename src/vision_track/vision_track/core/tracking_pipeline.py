@@ -57,18 +57,24 @@ def update_tracker(tracker, frame: np.ndarray, target_id: Optional[int] = None) 
     # frame (which would defeat the asymmetric hysteresis on a partial confirm).
     tracker.last_frame_recovery = False
 
+    _t_yolo = time.perf_counter()
     results = tracker.track(frame, persist=True)
+    tracker._t_yolo_ms = (time.perf_counter() - _t_yolo) * 1000.0
     tracker.last_results = results or []
 
     if results:
         update_scene_motion(tracker, results, frame)
         _log_detections(tracker, results)
 
+    _t_pipe = time.perf_counter()
     match = track_by_id(tracker, frame, results)
     if match is not None:
+        tracker._t_pipeline_ms = (time.perf_counter() - _t_pipe) * 1000.0
         return match
 
-    return reidentify_target(tracker, frame, results)
+    out = reidentify_target(tracker, frame, results)
+    tracker._t_pipeline_ms = (time.perf_counter() - _t_pipe) * 1000.0
+    return out
 
 
 def _switch_target(tracker, target_id: Optional[int]) -> None:

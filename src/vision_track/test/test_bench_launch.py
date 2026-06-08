@@ -38,9 +38,10 @@ def test_generates_expected_entities():
     ld = _load_ld()
     args = [e for e in ld.entities if isinstance(e, DeclareLaunchArgument)]
     nodes = [e for e in ld.entities if isinstance(e, Node)]
-    assert {a.name for a in args} == {"bind", "port", "with_waving"}
+    assert {a.name for a in args} == {"bind", "port", "with_waving", "perf_logging"}
     defaults = {a.name: "".join(s.text for s in a.default_value) for a in args}
-    assert defaults == {"bind": "0.0.0.0", "port": "8766", "with_waving": "true"}
+    assert defaults == {"bind": "0.0.0.0", "port": "8766", "with_waving": "true",
+                        "perf_logging": "false"}
     assert len(nodes) == 3
     # exactly one node (the waving server) is conditional
     assert sum(1 for n in nodes if n.condition is not None) == 1

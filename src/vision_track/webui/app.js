@@ -155,6 +155,14 @@ $("btn-wave").onclick = async () => {
   // -1 (or transport error) = genuine failure.
   if (r.error || r.status === -1) { log(`wave FAIL (${r.error || "status " + r.status})`); return; }
   if (r.status === 1 || !r.boxes.length) { log("wave → no wavers detected"); return; }
+  if (r.auto_reseeded !== undefined) {
+    // single waver → auto-reseed (wave-to-resume), no click needed
+    const rs = r.reseed || {};
+    log(`wave → single waver, auto-reseed ${r.auto_reseeded
+        ? "OK id=" + rs.target_track_id : "FAILED (" + (rs.message || "?") + ")"}`);
+    clearOverlays();
+    return;
+  }
   waveBoxes = r.boxes;
   log(`wave → ${r.boxes.length} box(es); click one to re-seed`);
   renderWaveBoxes();

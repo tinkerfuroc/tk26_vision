@@ -88,6 +88,12 @@ class PersonTrackNode(Node):
         # Track-state cache for lost/reclaim logging (last successful frame)
         self._last_tracked_rgb = None
         self._last_tracked_detection = None
+        # Last good RGB message, fed to the loss FSM when the camera stalls (no
+        # live frame to hand it). Its header re-stamps the stall feedback/sentinels.
+        self._last_tracked_msg = None
+        # Frame-stall watchdog: throttles stall telemetry to a few Hz so a hard
+        # freeze doesn't spam the log / feedback at loop rate.
+        self._last_stall_tick = 0.0
         self._was_lost = False
         # Active re-ID hold: throttle the "awaiting help" log to once per lost
         # episode (reset on re-track and on cleanup).
@@ -189,6 +195,16 @@ class PersonTrackNode(Node):
         # active help entirely with active_help_after_frames<=0 (legacy abort on
         # hard-lost).
         self.declare_parameter('active_help_timeout_sec', 0.0)
+        # Frame-starvation watchdog. The loop's only frame source is the
+        # ApproximateTimeSynchronizer (RGB+depth); if it stops emitting matched
+        # pairs (e.g. RGB/depth desync) frame_seq freezes and the loop would
+        # otherwise busy-wait forever — frozen dashboard, no loss handling, no
+        # diagnostics. After warn_sec of no new frame: log + keep the dashboard
+        # alive. After lost_sec: engage the loss/recovery FSM (forever-hold +
+        # wave/reseed). Both must sit well above the camera inter-frame gap
+        # (~33 ms @ 30 Hz) to avoid false positives.
+        self.declare_parameter('frame_stall_warn_sec', 0.5)
+        self.declare_parameter('frame_stall_lost_sec', 1.5)
         # track_web dashboard telemetry (all default OFF; byte-identical to
         # legacy behavior with defaults).
         self.declare_parameter('debug_state_enabled', False)
@@ -259,6 +275,8 @@ class PersonTrackNode(Node):
         self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
         self.active_help_after_frames = int(self.get_parameter('active_help_after_frames').value)
         self.active_help_timeout_sec = float(self.get_parameter('active_help_timeout_sec').value)
+        self.frame_stall_warn_sec = float(self.get_parameter('frame_stall_warn_sec').value)
+        self.frame_stall_lost_sec = float(self.get_parameter('frame_stall_lost_sec').value)
         self.debug_state_enabled = bool(self.get_parameter('debug_state_enabled').value)
         self.gallery_keep_crops = bool(self.get_parameter('gallery_keep_crops').value)
         self.debug_image_enabled = bool(self.get_parameter('debug_image_enabled').value)
@@ -759,6 +777,9 @@ class PersonTrackNode(Node):
     def _run_tracking_loop(self, goal_handle, feedback, result, params):
         last_seen_time = time.time()
         init_start_time = time.time()
+        # Wall-time of the last *new* synchronized frame; drives the
+        # frame-starvation watchdog (the `data is False` branch below).
+        last_frame_time = time.time()
         initialized = False
 
         # Warm CUDA on THIS executor thread before the lock loop. The __init__
@@ -791,10 +812,23 @@ class PersonTrackNode(Node):
                 time.sleep(0.01)
                 continue
             if data is False:
+                # No new synchronized pair. Normally this is just the sub-frame
+                # gap at camera rate; but if it persists, the synchronizer has
+                # stalled — run the watchdog (rate-limited) instead of silently
+                # busy-waiting forever with a frozen dashboard and no recovery.
+                now = time.time()
+                if (now - last_frame_time >= self.frame_stall_warn_sec
+                        and now - self._last_stall_tick >= 0.2):
+                    self._last_stall_tick = now
+                    if self._handle_frame_stall(
+                            now - last_frame_time, last_seen_time,
+                            feedback, goal_handle, params, result):
+                        return result
                 time.sleep(0.005)
                 continue
 
             rgb_img, rgb_msg, depth_msg, intrinsic = data
+            last_frame_time = time.time()
             rgb_frame = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
 
             loop_start = time.time()
@@ -1069,6 +1103,7 @@ class PersonTrackNode(Node):
         # Cache the latest good frame for the lost-transition dump, and emit
         # a 'reclaimed' artifact if we're just coming back from a lost state.
         self._last_tracked_rgb = rgb_img.copy()
+        self._last_tracked_msg = rgb_msg
         self._last_tracked_detection = {
             'bbox': list(track_result.bbox) if track_result.bbox is not None else None,
             'mask': track_result.mask,
@@ -1211,6 +1246,59 @@ class PersonTrackNode(Node):
             return True
         return False
 
+    def _classify_frame_stall(self, stall_sec: float) -> str:
+        """Severity of a camera-frame gap: 'ok' | 'warn' | 'lost'.
+
+        ``stall_sec`` is wall-time since the last *new* synchronized RGB+depth
+        pair. The thresholds (frame_stall_warn_sec / frame_stall_lost_sec) sit
+        well above the camera inter-frame gap (~33 ms @ 30 Hz), so normal
+        operation never trips it — only a genuine synchronizer stall does.
+        """
+        if stall_sec >= self.frame_stall_lost_sec:
+            return 'lost'
+        if stall_sec >= self.frame_stall_warn_sec:
+            return 'warn'
+        return 'ok'
+
+    def _handle_frame_stall(self, stall_sec, last_seen_time, feedback,
+                            goal_handle, params, result) -> bool:
+        """React to a camera-frame stall (synchronizer stopped emitting pairs).
+
+        The diagnosed root cause of "stopped getting new camera frames": when
+        frame_seq freezes the loop would otherwise busy-wait forever with a
+        frozen dashboard, no loss handling, and no diagnostics.
+
+        - 'warn': log (throttled) + keep the dashboard alive (distinct
+          ``camera_stalled`` phase + re-emit the last good frame) instead of a
+          silent frozen video.
+        - 'lost': additionally drive the existing loss/recovery FSM so
+          forever-hold + wave/reseed applies and the operator sees NEEDS_HELP;
+          the live frame is gone, so feed it the last good frame/msg.
+
+        Returns True only if the loss FSM aborts the goal. Caller rate-limits
+        invocation (``_last_stall_tick``), so the per-call work is cheap.
+        """
+        level = self._classify_frame_stall(stall_sec)
+        if level == 'ok':
+            return False
+        self.get_logger().warn(
+            f'No new synchronized camera frame for {stall_sec:.1f}s — RGB/depth '
+            f'sync stalled (camera may still be publishing)',
+            throttle_duration_sec=2.0)
+        # Keep the dashboard advancing instead of hard-freezing on the last frame.
+        self._publish_phase_debug_state('camera_stalled')
+        if self._last_tracked_rgb is not None:
+            self._publish_raw_debug_image(self._last_tracked_rgb)
+        if (level == 'lost' and self._last_tracked_rgb is not None
+                and self._last_tracked_msg is not None):
+            # Distinct warning already logged above; reuse the loss FSM for the
+            # actual hold/abort policy so a camera stall and a person-lost share
+            # one recovery path (forever-hold + wave/reseed).
+            return self._handle_lost_frame(
+                last_seen_time, self._last_tracked_rgb, self._last_tracked_msg,
+                feedback, goal_handle, params, result)
+        return False
+
     def _publish_phase_debug_state(self, phase: str):
         """Out-of-tracking telemetry tick: 'initializing' during goal init,
         'idle' between goals.
@@ -1332,6 +1420,8 @@ class PersonTrackNode(Node):
 
         self._last_tracked_rgb = None
         self._last_tracked_detection = None
+        self._last_tracked_msg = None
+        self._last_stall_tick = 0.0
         self._was_lost = False
         self._active_help_logged = False
         self._point_ema.reset()

@@ -16,6 +16,68 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-08 — "extremely laggy + loses target" — three stacked first-frame/recovery bugs (systematic debugging, validated via a synthetic camera, no human)
+
+Operator reported the tracker locked then instantly lost a lone person and felt
+"extremely laggy". Worked the four-phase scientific method; ruled out the obvious
+with measurements (camera **30 Hz**, GPU RTX 5070 Ti **idle/8%**, YOLO-seg
+**4 ms**, full `update()` offline **17 ms**). The lag/loss was three stacked
+one-time costs + a registry deadlock, not steady compute:
+
+1. **Registry self-poisoning** (reacquisition permanently blocked). A lone
+   operator returning under a fresh ByteTrack id was registered as its own
+   "other person" distractor, then rejected by `check_distinctiveness` against
+   that self-ghost (`best 0.861, max other 1.000, margin -0.139`) every frame —
+   permanently, since the confirmed-swap that clears the registry is gated behind
+   the very check the ghost breaks. Fix (commit `89907c0`): `register_other_persons`
+   skips a candidate scoring ≥0.72 to the target; `check_distinctiveness` ignores
+   an "other" matching the candidate ≥0.98 (a self-ghost). Guarded by
+   `test/test_registry_self_poison.py`.
+2. **Predictor nulled on lock** (~2 s freeze). `initialize_tracking()`/`reset()`
+   did `self.model.predictor = None` to clear ByteTrack state, which also discards
+   the cuDNN-autotuned graphs → full re-autotune on the next `track()`. Offline
+   `initialize_tracking` 2033 ms → **21 ms** after fix (commit `ca192e8`):
+   `_reset_bytetrack_state()` resets the tracker objects in place, keeping the
+   predictor. `_warmup_model` also now warms the real `track()` path + batched ReID.
+3. **First CUDA call on the action-executor thread** (~0.5 s lock freeze). The
+   `__init__` warmup runs on the main thread; the first YOLO+OSNet calls on the
+   action-server worker thread pay a one-time init that landed in
+   `initialize_tracking()` on the first tracked frame (`track=516 ms`, of which
+   yolo+pipe were only ~27 ms). Fix (commit `5184ca4`): `_run_tracking_loop` warms
+   `track()` + the ReID extractor on the action thread during init-search, before
+   any lock. First tracked frame **516 ms → 47 ms**.
+
+Under load (1)+(2)+(3) compounded: the freeze made the loop fall behind, ByteTrack
+dropped the just-locked id, and (1) then blocked recovery → "locks then instantly
+loses" + "laggy".
+
+### Autonomous validation (no human) — `/tmp/sim_camera.py` + `run_sim_test.sh`
+
+Built a synthetic camera that **republishes the real depth+camera_info** and swaps
+color between a saved person frame and a blank frame on a schedule, remapping the
+tracker to `/sim/*`. Reproducible lock→loss→reacquire with no operator. Result
+after all fixes: **first frame 47 ms, sustained ~27 ms (~30 Hz), 1 spike / 606
+frames, sustains the lock through blank gaps and reacquires.** Also added a
+`perf_logging` arg to `track_web_bench.launch.py` (commit `4507b46`) and a per-phase
+`yolo`/`pipe` split in the tracker `[perf]` line.
+
+### Still open / not changed
+
+- **Reacquisition of a lone operator after a *genuine* loss with appearance
+  drift.** Live, a same-person re-entry scored fused ~0.61 < the 0.72 single-person
+  bar and was rejected. Root contributor was the empty multi-view gallery (tracking
+  never sustained pre-fix, so no views built). With (2)+(3) fixed, tracking sustains
+  and the gallery builds during tracking, so reacquisition reid should be higher
+  naturally — **precision-sacred 0.72 bar left untouched.** A spatial-continuity-
+  gated lower bar (accept ≥~0.55 only when the candidate returns near the last-known
+  location) is the proposed extra-robustness knob if needed; deferred pending an
+  operator decision (precision tradeoff). Cannot be cleanly validated in the static
+  sim (identical frames → novelty gate keeps gallery_len=1; arbitrary loss-capture
+  frames hard-reject at 0.0, which is correct precision, not the 0.61 case).
+- **Bench auxiliary load.** The bench runs `waving_person_server` (MediaPipe +
+  spawns an `rqt_image_view` GUI) by default; lean tracking (without it) measured
+  smooth ~30 Hz. Making waving opt-in on the bench is a candidate de-lag.
+
 ## 2026-06-07 — Orbbec publishes rgb8, not bgr8 — tracker ran channel-swapped on-robot; fixed at the decode point (+ idle/init dashboard preview)
 
 The `person_track_node` color path assumed the wire was already `bgr8` ("already

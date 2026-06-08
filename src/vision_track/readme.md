@@ -100,6 +100,16 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — latch the help-hold so auto-reclaim isn't aborted
+  mid-reappearance. Found while bag-testing the passive-reacquire fix: when the
+  operator reappears, the pre-commit re-ID resets `frames_lost` to 0 on every
+  confirmation frame (before the ~12-frame re-lock commits). The hold/abort
+  decision keyed on the instantaneous `frames_lost`, so that reset flipped
+  `_is_awaiting_help` False and the hard-lost abort fired — killing the goal
+  before the reclaim could complete. `_is_awaiting_help` now **latches** the
+  escalation (`_help_latched`); the latch clears only on a successful re-lock or
+  goal cleanup, so each loss→reclaim cycle gets a fresh hold and repeated
+  reclaims work. Bounded-timeout mode still honors its time limit.
 - **2026-06-08** — fix single-waver auto-reseed failing with "no camera frame
   available". `_reseed_callback` fetched the frame with the consuming
   `_get_latest_data()`, which returns the `False` dedup sentinel when the

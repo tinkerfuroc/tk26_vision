@@ -52,3 +52,31 @@ def test_bounded_hold_expires():
 def test_active_help_disabled():
     cfg = _cfg(0, 0.0)                          # after_frames<=0 disables help
     assert _awaiting(cfg, 999, 0.0) is False
+
+
+def test_hold_latches_through_frames_lost_reset():
+    # The reappearing operator's pre-commit re-ID resets frames_lost to 0 before
+    # the re-lock commits; the latch must keep holding so the hard-lost abort
+    # does NOT fire mid-reappearance (the bug that made auto-reclaim impossible).
+    cfg = _cfg(45, 0.0)                         # forever
+    assert _awaiting(cfg, 50, 5.0) is True      # escalated -> latched
+    assert _awaiting(cfg, 0, 6.0) is True       # frames_lost reset, still held
+    assert _awaiting(cfg, 3, 7.0) is True       # any sub-threshold value: still held
+
+
+def test_bounded_hold_latches_but_still_respects_timeout():
+    cfg = _cfg(45, 20.0)                        # bounded
+    assert _awaiting(cfg, 50, 5.0) is True      # escalated -> latched
+    assert _awaiting(cfg, 0, 10.0) is True      # frames_lost reset, within window
+    assert _awaiting(cfg, 0, 25.0) is False     # latched but past the time bound
+
+
+def test_latch_release_enables_next_cycle():
+    # On a successful re-lock the node clears _help_latched (see
+    # _handle_tracked_frame); a subsequent loss must escalate + hold afresh,
+    # so repeated loss->reclaim cycles each get their own hold.
+    cfg = _cfg(45, 0.0)
+    assert _awaiting(cfg, 50, 5.0) is True      # cycle 1: escalate + latch
+    cfg._help_latched = False                   # re-lock clears the latch
+    assert _awaiting(cfg, 10, 6.0) is False     # back to tracking-ish, not held
+    assert _awaiting(cfg, 50, 7.0) is True      # cycle 2: escalate + latch again

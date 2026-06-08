@@ -98,6 +98,11 @@ class PersonTrackNode(Node):
         # Active re-ID hold: throttle the "awaiting help" log to once per lost
         # episode (reset on re-track and on cleanup).
         self._active_help_logged = False
+        # Latched once we escalate to the help/hold regime; survives the
+        # frames_lost resets a pre-commit re-ID match causes, so the hold isn't
+        # aborted mid-reappearance. Cleared on re-lock + cleanup. See
+        # _is_awaiting_help.
+        self._help_latched = False
 
         # Phase 2: EMA smoother on the published 3D point; reset on loss so a
         # re-acquired target doesn't lerp from a stale point.
@@ -1160,8 +1165,11 @@ class PersonTrackNode(Node):
             )
         self._was_lost = False
         # Re-tracking ends the lost episode: re-arm the active-help log throttle
-        # so the next loss logs the hold entry again.
+        # so the next loss logs the hold entry again, and release the hold latch
+        # so the NEXT loss→reclaim cycle gets a fresh hold (enables repeated
+        # reclaims).
         self._active_help_logged = False
+        self._help_latched = False
 
     def _log_async(self, *args, **kwargs):
         """Submit a vision-log write to the off-loop writer (never blocks the
@@ -1173,16 +1181,30 @@ class PersonTrackNode(Node):
                                    throttle_duration_sec=5.0)
 
     def _is_awaiting_help(self, frames_lost, time_since_seen):
-        """True while coasting (holding) for active re-ID help — wave to resume.
+        """True while coasting (holding) for re-ID recovery — auto-reclaim or wave.
 
-        Escalates after ``active_help_after_frames`` consecutive lost frames,
-        then holds INDEFINITELY when ``active_help_timeout_sec <= 0`` (default —
-        only a successful reseed or a goal cancel ends it), or up to that many
-        seconds otherwise. ``active_help_after_frames <= 0`` disables active help
-        (legacy abort on hard-lost).
+        Escalates after ``active_help_after_frames`` consecutive lost frames and
+        then LATCHES (``_help_latched``). The latch is essential: when the
+        operator reappears, the passive re-ID path resets ``frames_lost`` to 0 on
+        every pre-commit confirmation frame (see _confirm_reid_candidate) — well
+        before the ~12-frame re-lock commits. Without the latch that reset would
+        drop ``frames_lost`` below the escalation threshold, flip this predicate
+        False, and let the hard-lost abort fire mid-reappearance — killing the
+        goal before the auto-reclaim can complete. The latch clears only on a
+        successful re-lock (_handle_tracked_frame) or goal cleanup, so each
+        loss→reclaim cycle gets a fresh hold.
+
+        Once latched, holds INDEFINITELY when ``active_help_timeout_sec <= 0``
+        (default — only a reseed, re-lock, or cancel ends it), or up to that many
+        seconds measured from the last CONFIRMED sighting (a pre-commit match does
+        not refresh ``time_since_seen``). ``active_help_after_frames <= 0``
+        disables active help (legacy abort on hard-lost).
         """
-        if (self.active_help_after_frames <= 0
-                or frames_lost < self.active_help_after_frames):
+        if self.active_help_after_frames <= 0:
+            return False
+        if frames_lost >= self.active_help_after_frames:
+            self._help_latched = True
+        if not getattr(self, '_help_latched', False):
             return False
         if self.active_help_timeout_sec <= 0.0:
             return True
@@ -1461,6 +1483,7 @@ class PersonTrackNode(Node):
         self._last_stall_tick = 0.0
         self._was_lost = False
         self._active_help_logged = False
+        self._help_latched = False
         self._point_ema.reset()
 
         if self.target_point_pub is not None:

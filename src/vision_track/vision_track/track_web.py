@@ -240,7 +240,14 @@ class TrackWebNode(Node):
                  for b in resp.waving_boxes]
         points = [[float(p.point.x), float(p.point.y), float(p.point.z)]
                   for p in resp.waving_persons]
-        return {"status": int(resp.status), "boxes": boxes, "points": points}
+        out = {"status": int(resp.status), "boxes": boxes, "points": points}
+        # Wave-to-resume: an UNAMBIGUOUS single waver auto-reseeds (no click) so a
+        # raise-hand resumes tracking on its own. Multiple wavers stay manual
+        # (the operator picks the box) to keep the re-lock precise.
+        if int(resp.status) == 0 and len(boxes) == 1:
+            out["reseed"] = self.reseed(boxes[0])
+            out["auto_reseeded"] = bool(out["reseed"].get("success"))
+        return out
 
 
 def main():

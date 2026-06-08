@@ -16,6 +16,54 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-08 (cont.) — camera-frame starvation freeze: "stops getting new frames" mid-track
+
+Reported: tracking works, then **at some point stops getting new camera frames**
+(web image frozen, no recovery, had to Ctrl-C). Systematic debug — checked every
+component boundary before any fix:
+
+- **Camera is NOT the cause.** Live `ros2 topic hz`: color **and** depth both
+  steady at 30 Hz; kernel log shows no xHCI death / USB disconnect (unlike the
+  earlier warm-reboot incident); `/dev/shm` 1%. The camera kept publishing — the
+  tracker stopped *consuming*. Subscriber-side root cause.
+- **Root cause (proven from code).** The loop's only frame source is the RGB+depth
+  `ApproximateTimeSynchronizer`; `frame_seq` advances only on a matched pair. When
+  the synchronizer stops emitting pairs, `_get_latest_data()` returns `False` and
+  the loop's False branch **busy-waited forever** — no `tracker.update`, no
+  `_handle_lost_frame` (so forever-hold/wave-to-resume never engaged), no debug
+  publish (frozen dashboard), no log. All prior loss/recovery work lives in the
+  `track_result is None` branch, which a frame-starvation stall never reaches.
+- **Trigger.** Synchronizer stops matching: QoS history `depth=1` + both image
+  subs on the node default mutually-exclusive group → one half of a pair is
+  dropped under executor jitter and pairs stop matching (doesn't self-heal).
+
+Fixes (operator chose both layers + reuse the loss FSM):
+- **Watchdog (`2e6fda6`).** Time-since-last-new-frame: ≥`frame_stall_warn_sec`
+  (0.5 s) warn + keep dashboard alive (`camera_stalled` banner + last frame);
+  ≥`frame_stall_lost_sec` (1.5 s) engage the existing loss/recovery FSM off the
+  last good frame. Pure classifier + handler unit-tested (`test_frame_stall_watchdog.py`).
+- **Synchronizer hardening (`7927066`).** QoS `depth=1→5`; dedicate a
+  `ReentrantCallbackGroup` to the two image streams (concurrent delivery).
+  BEST_EFFORT kept (RELIABLE reader wouldn't match the camera → zero data).
+
+**Build-tree gotcha (cost real time — record for next time).** The live env
+resolves `vision_track` to **`/home/tinker/tk25_ws/install`** (built by
+`tkbuild tk26_vision`, a plain copy with venv shebangs). `scripts/build.sh`
+installs to `src/tk26_vision/install`, which is **NOT on the live
+AMENT_PREFIX_PATH** — building there is a no-op for the running robot. Always
+`tkbuild <sub-ws>` and verify the `install/<pkg>/.../` copy actually changed.
+Confirmed machine truth via `/proc/<camera-pid>/environ`.
+
+Verification: full suite **179 passed / 1 skip** (flake8 baseline 534 unchanged);
+live smoke on the real camera — locked on a person, **177 frames at ~27 Hz, 0
+false stall warnings**, no errors; synthetic end-to-end stall — frames flow → 0
+warnings, frames stop → first warning at exactly **0.5 s**, keeps reporting (not
+silent). **Operator confirmation still needed on-robot:** reproduce the original
+mid-track stall on the bench and confirm the dashboard shows the `camera_stalled`
+banner + auto-recovers when frames resume.
+
+---
+
 ## 2026-06-08 (cont.) — loss/recovery UX: frozen dashboard on loss + wave never resumed tracking
 
 Two follow-on fixes after single-person tracking was confirmed robust. Operator

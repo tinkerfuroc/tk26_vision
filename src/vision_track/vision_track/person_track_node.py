@@ -1165,11 +1165,18 @@ class PersonTrackNode(Node):
             )
         self._was_lost = False
         # Re-tracking ends the lost episode: re-arm the active-help log throttle
-        # so the next loss logs the hold entry again, and release the hold latch
-        # so the NEXT loss→reclaim cycle gets a fresh hold (enables repeated
-        # reclaims).
+        # so the next loss logs the hold entry again.
         self._active_help_logged = False
-        self._help_latched = False
+        # Release the hold latch ONLY on a TRUE re-lock (target_lost False) — a
+        # new loss→reclaim cycle then gets a fresh hold (enables repeated
+        # reclaims). Do NOT clear it on a provisional/partial recovery frame:
+        # those surface here with target_lost STILL True while the FSM is 'lost',
+        # and clearing the latch then would let a subsequent frames_lost reset
+        # (a pre-commit re-ID) drop _is_awaiting_help to False and fire the
+        # hard-lost abort mid-reacquire — exactly the bag-test abort. See
+        # _is_awaiting_help.
+        if not feedback.target_lost:
+            self._help_latched = False
 
     def _log_async(self, *args, **kwargs):
         """Submit a vision-log write to the off-loop writer (never blocks the

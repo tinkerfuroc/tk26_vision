@@ -107,9 +107,12 @@ ros2 run vision_track person_track_server --ros-args \
   decision keyed on the instantaneous `frames_lost`, so that reset flipped
   `_is_awaiting_help` False and the hard-lost abort fired — killing the goal
   before the reclaim could complete. `_is_awaiting_help` now **latches** the
-  escalation (`_help_latched`); the latch clears only on a successful re-lock or
-  goal cleanup, so each loss→reclaim cycle gets a fresh hold and repeated
-  reclaims work. Bounded-timeout mode still honors its time limit.
+  escalation (`_help_latched`); the latch clears only on a **true re-lock**
+  (`target_lost` False) or goal cleanup — NOT on a provisional/partial recovery
+  frame, which surfaces with `target_lost` still True while the FSM is `'lost'`
+  (clearing it there would re-open the abort). So each loss→reclaim cycle gets a
+  fresh hold and repeated reclaims work. Bounded-timeout mode still honors its
+  time limit.
 - **2026-06-08** — fix single-waver auto-reseed failing with "no camera frame
   available". `_reseed_callback` fetched the frame with the consuming
   `_get_latest_data()`, which returns the `False` dedup sentinel when the

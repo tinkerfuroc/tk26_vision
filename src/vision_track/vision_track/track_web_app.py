@@ -130,13 +130,22 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
         # exit is the HTTP client going away. NOTE: Starlette's TestClient
         # buffers responses to completion and so cannot consume this endpoint —
         # tests drive this generator directly instead (see test_track_web_app).
+        # Re-emit the last frame on a heartbeat (~every 0.5s) even when the source
+        # seq is unchanged. A multipart <img> stream that goes quiet (target lost,
+        # goal idle) otherwise latches the browser on the last frame and won't
+        # resume when frames return; the heartbeat keeps the stream flowing.
+        heartbeat_polls = max(1, int(0.5 / _MJPEG_POLL_S))
         last_seq = -1
+        idle_polls = 0
         while True:
             if await request.is_disconnected():
                 return
             seq, jpeg = bridge.latest_jpeg()
-            if jpeg is not None and seq != last_seq:
+            idle_polls += 1
+            fresh = jpeg is not None and seq != last_seq
+            if jpeg is not None and (fresh or idle_polls >= heartbeat_polls):
                 last_seq = seq
+                idle_polls = 0
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
                        + jpeg + b"\r\n")

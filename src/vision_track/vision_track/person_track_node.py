@@ -319,6 +319,16 @@ class PersonTrackNode(Node):
         self.declare_parameter('reid_gallery_size', 6)
         self.declare_parameter('reid_gallery_novelty_max', 0.85)
         self.declare_parameter('reid_gallery_score_mode', 'max')
+        # Issue 3: gate gallery admission on MASK-FILL (mask_pixels / bbox_area),
+        # not bbox aspect ratio. A clean upright operator view fills its box even
+        # when occlusion/clipping makes the bbox square-ish; a merged/garbage box
+        # has the operator mask as a thin slice (low fill -> reject).
+        #  - gallery_min_mask_fill: min mask-fill to admit (strict <=); None
+        #    coverage (no seg mask that frame) is never rejected on fill.
+        #  - gallery_max_aspect_ratio: relaxed w/h backstop catching only very
+        #    wide degenerate boxes (square-but-clean now passes).
+        self.declare_parameter('gallery_min_mask_fill', 0.35)
+        self.declare_parameter('gallery_max_aspect_ratio', 2.0)
 
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')
@@ -394,6 +404,10 @@ class PersonTrackNode(Node):
         self.reid_gallery_size = self.get_parameter('reid_gallery_size').value
         self.reid_gallery_novelty_max = self.get_parameter('reid_gallery_novelty_max').value
         self.reid_gallery_score_mode = self.get_parameter('reid_gallery_score_mode').value
+        # Issue 3: mask-fill gallery-admission gate.
+        self.gallery_min_mask_fill = float(self.get_parameter('gallery_min_mask_fill').value)
+        self.gallery_max_aspect_ratio = float(
+            self.get_parameter('gallery_max_aspect_ratio').value)
 
         self.image_topic = self.get_parameter('image_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
@@ -493,6 +507,10 @@ class PersonTrackNode(Node):
                 # reads operator_last_depth_m + candidate_depths_m (both plumbed
                 # from the node) and this jump to reject toward-camera crossers.
                 self.tracker.crosser_depth_jump_m = float(self.crosser_depth_jump_m)
+                # Issue 3: mask-fill gallery-admission gate (relaxes the aspect
+                # reject so square-but-clean operator views enrich the gallery).
+                self.tracker.gallery_min_mask_fill = float(self.gallery_min_mask_fill)
+                self.tracker.gallery_max_aspect_ratio = float(self.gallery_max_aspect_ratio)
                 self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
             
             self.get_logger().info(

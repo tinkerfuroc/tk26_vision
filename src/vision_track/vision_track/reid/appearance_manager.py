@@ -115,9 +115,22 @@ def update_appearance(
         gray = cv2.cvtColor(frame[cy1:cy2, cx1:cx2], cv2.COLOR_RGB2GRAY)
         blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
+    # Issue 3: gate gallery admission on MASK-FILL (mask_coverage), not bbox
+    # aspect ratio. The operator stands throughout, so pose uprightness is
+    # guaranteed by behaviour, not box shape — occlusion/clipping makes a clean
+    # upright operator's bbox square-ish (w/h ~= 1.0), which the old 0.9 aspect
+    # reject wrongly dropped. Gate on mask-fill (default 0.35, configurable at
+    # launch) and relax the aspect to a wide degenerate backstop. Untouched keys
+    # fall back to DEFAULT_GATE.
+    gate = dict(DEFAULT_GATE)
+    gate["min_mask_coverage"] = float(
+        getattr(tracker, "gallery_min_mask_fill", DEFAULT_GATE["min_mask_coverage"]))
+    gate["max_aspect_ratio"] = float(
+        getattr(tracker, "gallery_max_aspect_ratio", DEFAULT_GATE["max_aspect_ratio"]))
+
     if tracker.target_appearance is not None and not crop_quality_ok(
         crop_h=crop_h, crop_w=crop_w, mask_coverage=mask_coverage,
-        blur_var=blur_var, aspect_ratio=aspect_ratio, **DEFAULT_GATE,
+        blur_var=blur_var, aspect_ratio=aspect_ratio, **gate,
     ):
         logger.debug(
             f"Gallery insert skipped (low quality): h={crop_h} cov={mask_coverage} "

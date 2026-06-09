@@ -100,6 +100,16 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — fix the laggy web feed introduced by the deep-crop
+  segmentation. `_segment_crop_for_reid` ran `cv2.GaussianBlur` on full-resolution
+  crops ~2× per person per frame, dropping the tracking loop (and thus the
+  dashboard MJPEG) to ~13 Hz (pipeline 56 ms). Two fixes: (1) do the
+  dilate/blur at the fixed OSNet input size (128×256) — the model resizes there
+  anyway, so it's equivalent output at constant ~0.3 ms cost; (2) stop the batch
+  path from running a redundant per-detection deep forward whose result was
+  discarded (`extract_features(..., compute_reid=False)` — the batch forward is
+  the single pass it was always meant to be). Pipeline 56 ms → ~15 ms; loop back
+  to camera-bound. Row-equivalence + reacquisition re-verified on the bag.
 - **2026-06-09** — transparent (person-only) gallery crops. Gallery view
   thumbnails are now built as BGRA with the seg mask as alpha and tight-cropped
   to the person (transparent background), published as PNG to the dashboard

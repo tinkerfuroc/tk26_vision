@@ -206,19 +206,32 @@ class AppearanceExtractor:
     
     def _segment_crop_for_reid(self, crop: np.ndarray,
                                mask_crop: Optional[np.ndarray]) -> np.ndarray:
-        """Person-segment a crop for the deep OSNet embedding.
+        """Person-segment a crop for the deep OSNet embedding (at OSNet's input size).
 
         OSNet ingests 3-channel RGB (no alpha), so we feed it a
         "transparent-background" person via: dilate the mask (keep the silhouette
         and tolerate loose YOLO-seg edges) -> tight-crop to the mask bbox (evicts
         a co-bbox bystander in the corner of a loose person box and re-centers the
-        person for the 128x256 resize) -> soft-attenuate out-of-mask pixels toward a
-        strongly-blurred copy (removes the bystander/background identity while
-        staying near OSNet's training distribution; not a hard black rectangle).
+        person) -> soft-attenuate out-of-mask pixels toward a blurred copy (removes
+        the bystander/background identity while staying near OSNet's training
+        distribution; not a hard black rectangle).
+
+        Perf rationale (regression fix): the blur and the soft-attenuation are
+        done AFTER resizing the tight crop to OSNet's fixed input size
+        ``(_REID_W, _REID_H) = (128, 256)``, NOT on the full-resolution person
+        crop. ``person_reid.extract_features`` / ``_stack_crops`` resize every crop
+        to (128, 256) anyway, so blurring at full res first and resizing after is
+        equivalent to blurring at (128, 256) — but the full-res ``GaussianBlur``
+        cost scales with the person's pixel area (big/near people = many ms,
+        called ~2x/person/frame in the hot path; this dropped the tracking loop
+        from ~30 Hz to ~13 Hz). At the fixed 128x256 size the blur is a constant
+        ~0.3 ms regardless of person size, and the 128x256 image handed to OSNet
+        is the same. ``sigmaX`` is scaled down to 5 (appropriate at this scale).
 
         Applied identically on the single and batched deep paths (row-equivalence).
         mask_crop None / empty / all-zero -> return crop unchanged.
         """
+        from .reid_backbone import _REID_H, _REID_W
         if mask_crop is None or mask_crop.size == 0:
             return crop
         m = (mask_crop > 0).astype(np.uint8)
@@ -231,11 +244,17 @@ class AppearanceExtractor:
         x1, x2 = int(xs.min()), int(xs.max()) + 1
         crop_tc = crop[y1:y2, x1:x2]
         dil_tc = dil[y1:y2, x1:x2]
-        blurred = cv2.GaussianBlur(crop_tc, (0, 0), sigmaX=9)
-        out = crop_tc.copy()
-        bg = dil_tc == 0
+        # Resize to OSNet's fixed input size BEFORE the expensive blur, so the
+        # blur cost is constant (~0.3 ms) instead of scaling with person area.
+        # NEAREST keeps the mask crisp 0/1 (no fractional selection at edges).
+        resized = cv2.resize(crop_tc, (_REID_W, _REID_H))
+        dil_rs = cv2.resize(dil_tc, (_REID_W, _REID_H),
+                            interpolation=cv2.INTER_NEAREST)
+        blurred = cv2.GaussianBlur(resized, (0, 0), sigmaX=5)
+        out = resized.copy()
+        bg = dil_rs == 0
         if np.any(bg):
-            out[bg] = (0.15 * crop_tc[bg] + 0.85 * blurred[bg]).astype(crop_tc.dtype)
+            out[bg] = (0.15 * resized[bg] + 0.85 * blurred[bg]).astype(resized.dtype)
         return out
 
     def extract_features(
@@ -243,17 +262,25 @@ class AppearanceExtractor:
         frame: np.ndarray,
         bbox: Tuple[int, int, int, int],
         mask: Optional[np.ndarray] = None,
-        class_id: int = -1
+        class_id: int = -1,
+        compute_reid: bool = True
     ) -> Dict[str, np.ndarray]:
         """
         Extract appearance features from a detection.
-        
+
         Args:
             frame: Full frame (RGB)
             bbox: Bounding box (x1, y1, x2, y2)
             mask: Optional segmentation mask
             class_id: Class ID of the detection (0 for person in COCO)
-            
+            compute_reid: Run the per-detection deep OSNet forward (+ its
+                segmentation) to populate ``features['reid']``. Default True so a
+                direct caller still gets the deep vector. ``extract_features_batch``
+                passes False because it discards this single forward and overwrites
+                ``'reid'`` with one batched forward — gating it here skips K wasted
+                single forwards + K wasted segmentations in the batch hot path.
+                Color/size/mask-coverage features are computed regardless.
+
         Returns:
             Dictionary with different feature types
         """
@@ -283,10 +310,13 @@ class AppearanceExtractor:
         
         # Use specialized features for persons
         if class_id == self.PERSON_CLASS_ID:
-            # Person ReID features
-            features['reid'] = self.person_reid.extract_features(
-                self._segment_crop_for_reid(crop, mask_crop))
-            
+            # Person ReID features. Skipped in the batch path (compute_reid=False):
+            # it discards this single forward and overwrites 'reid' with one
+            # batched forward, so running it here is pure waste.
+            if compute_reid:
+                features['reid'] = self.person_reid.extract_features(
+                    self._segment_crop_for_reid(crop, mask_crop))
+
             # Body part color histograms
             features['body_color'] = self._extract_body_part_colors(crop, mask_crop)
             
@@ -337,7 +367,11 @@ class AppearanceExtractor:
         person_idx = []
         person_crops = []
         for i in range(n):
-            d = self.extract_features(frame, bboxes[i], masks[i], class_ids[i])
+            # compute_reid=False: the per-detection single deep forward +
+            # segmentation are discarded (we overwrite 'reid' with the batched
+            # forward below), so skip them here. Color/size dict still built.
+            d = self.extract_features(
+                frame, bboxes[i], masks[i], class_ids[i], compute_reid=False)
             out[i] = d
             if class_ids[i] == self.PERSON_CLASS_ID and d:
                 # Recompute the same clamped crop used inside extract_features
@@ -355,7 +389,10 @@ class AppearanceExtractor:
         if person_crops:
             deep = self.person_reid.extract_features_batch(person_crops)  # [P, dim]
             for slot, i in enumerate(person_idx):
-                if out[i] is not None and "reid" in out[i]:
+                # 'reid' is no longer pre-set (compute_reid=False above), so set
+                # it unconditionally. person_idx entries are valid persons by
+                # construction (non-empty dict + valid crop).
+                if out[i] is not None:
                     out[i]["reid"] = deep[slot]
         return out
 

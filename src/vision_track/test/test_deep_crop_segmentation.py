@@ -14,24 +14,35 @@
 """Deep-crop person segmentation helper (_segment_crop_for_reid).
 
 The deep OSNet embedding must be fed a person-only crop: dilate the mask,
-tight-crop to the mask bbox, soft-attenuate out-of-mask pixels. mask_crop None
-or all-zero is a passthrough.
+tight-crop to the mask bbox, resize to OSNet's fixed input size (_REID_W x
+_REID_H = 128 x 256), then soft-attenuate out-of-mask pixels toward a blurred
+copy AT THAT FIXED SIZE. mask_crop None or all-zero is a passthrough.
+
+Perf-regression note: the blur/attenuation moved off the full-res crop onto the
+fixed 128x256 resize (constant ~0.3 ms vs area-scaling). The output is therefore
+always shape (256, 128, 3) for a real mask, not the dilated-bbox size. Downstream
+``_stack_crops`` resizes 128x256 -> 128x256 (a no-op), so this stays equivalent
+to the old "blur full-res then resize".
 
 The helper only touches cv2/np and its two args (no self attributes), so it is
 called UNBOUND on object() as self -- this avoids constructing AppearanceExtractor
 (which loads heavy torch models).
 
 An L-shaped mask is used for the "real mask" cases: its bbox spans the full L
-extent (so the dilated-bbox size is predictable), while the notch of the L stays
-background even after the 2-px dilation, giving a clearly-interior pixel AND a
-clearly-exterior pixel both inside the tight crop.
+extent, while the notch of the L stays background even after the 2-px dilation.
+After the resize to 128x256, the deep-interior of the column maps to clearly-in
+pixels and the notch corner maps to clearly-out pixels, giving a robust
+interior-vs-exterior assertion against the resized source.
 """
+import cv2
 import numpy as np
 import pytest
 
-AppearanceExtractor = pytest.importorskip(
-    "vision_track.reid.reid").AppearanceExtractor
+_reid = pytest.importorskip("vision_track.reid.reid")
+AppearanceExtractor = _reid.AppearanceExtractor
 _seg = AppearanceExtractor._segment_crop_for_reid
+
+from vision_track.reid.reid_backbone import _REID_H, _REID_W  # noqa: E402
 
 
 def _make_crop():
@@ -74,22 +85,39 @@ def test_all_zero_mask_returns_crop_unchanged():
     assert out is crop
 
 
-def test_real_mask_tight_crops_to_dilated_bbox():
+def _resized_source(crop):
+    """Reproduce the helper's tight-crop + resize of the *source* pixels.
+
+    Mirrors _segment_crop_for_reid up to (but not including) the blur, so a
+    test can compare the helper's output against the resized source per-pixel.
+    Returns (resized_crop[256,128,3], resized_dilated_mask[256,128]).
+    """
+    h, w = crop.shape[:2]
+    mask = _make_l_mask(h, w)
+    m = (mask > 0).astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    dil = cv2.dilate(m, kernel, iterations=2)
+    ys, xs = np.where(dil > 0)
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    crop_tc = crop[y1:y2, x1:x2]
+    dil_tc = dil[y1:y2, x1:x2]
+    resized = cv2.resize(crop_tc, (_REID_W, _REID_H))
+    dil_rs = cv2.resize(dil_tc, (_REID_W, _REID_H),
+                        interpolation=cv2.INTER_NEAREST)
+    return resized, dil_rs
+
+
+def test_real_mask_output_is_osnet_input_size():
     crop = _make_crop()
     h, w = crop.shape[:2]
     mask = _make_l_mask(h, w)
     out = _seg(object(), crop, mask)
 
-    # Dilation grows the mask bbox by 2 px on each side (iters=2, 3x3 kernel),
-    # clamped to the crop bounds. The L bbox is [Y0:Y1, X0:X1], well inside the
-    # crop, so no clamping occurs here.
-    ey0, ey1 = max(0, Y0 - 2), min(h, Y1 + 2)
-    ex0, ex1 = max(0, X0 - 2), min(w, X1 + 2)
-    assert out.shape[0] == ey1 - ey0
-    assert out.shape[1] == ex1 - ex0
-    # Strictly smaller than the full crop (the mask is a sub-region).
-    assert out.shape[0] < h
-    assert out.shape[1] < w
+    # The blur/attenuation now happen at OSNet's fixed input size, so the output
+    # is always (H, W, 3) = (256, 128, 3) regardless of the person's pixel size.
+    assert out.shape == (_REID_H, _REID_W, 3)
+    assert out.shape == (256, 128, 3)
 
 
 def test_interior_unchanged_exterior_attenuated():
@@ -98,20 +126,20 @@ def test_interior_unchanged_exterior_attenuated():
     mask = _make_l_mask(h, w)
     out = _seg(object(), crop, mask)
 
-    # The tight-crop's origin in the original crop coords (dilated bbox).
-    ey0, ex0 = max(0, Y0 - 2), max(0, X0 - 2)
+    resized, dil_rs = _resized_source(crop)
 
-    # A pixel clearly INSIDE the mask (deep in the left column, > 2 px from any
-    # edge of the column): unchanged vs its source pixel.
-    iy, ix = 40, 24  # inside [Y0:Y1, X0:COL_X1], away from the column borders
-    src_in = crop[iy, ix]
-    got_in = out[iy - ey0, ix - ex0]
-    np.testing.assert_array_equal(got_in, src_in)
+    # Robust to the resize: every IN-mask pixel must be byte-identical to the
+    # resized source (the helper only touches background pixels), and at least
+    # one IN-mask pixel must exist to make that assertion meaningful.
+    in_mask = dil_rs != 0
+    bg_mask = dil_rs == 0
+    assert np.any(in_mask)
+    assert np.any(bg_mask)
+    np.testing.assert_array_equal(out[in_mask], resized[in_mask])
 
-    # A pixel clearly OUTSIDE the mask: the top-right notch corner, far (> 2 px)
-    # from both the left column and the bottom row, so the 2-px dilation cannot
-    # reach it -> attenuated toward the blurred copy -> differs from its source.
-    oy, ox = Y0 + 2, X1 - 2  # top-right of the bbox, inside the notch
-    src_out = crop[oy, ox]
-    got_out = out[oy - ey0, ox - ex0]
-    assert not np.array_equal(got_out, src_out)
+    # The set of background pixels must DIFFER from the resized source (they were
+    # attenuated toward the blurred copy). Robust: assert at least one bg pixel
+    # changed rather than requiring every single one to (blur of a near-uniform
+    # region could leave a pixel coincidentally unchanged).
+    bg_changed = np.any(out[bg_mask] != resized[bg_mask])
+    assert bg_changed

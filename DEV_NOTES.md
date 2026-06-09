@@ -16,6 +16,62 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-09 — host-RAM leak ROOT CAUSE FOUND + FIXED: 14 GB-per-write uint8-mask blend in vision_logging
+
+Follow-up to the entry below (which had flagged "confirm with a memory logger
+whether a single fresh bench still climbs"). I ran it. **It climbed: one fresh
+tracker, no orphans, went RSS 2.4 GB → ~28 GB in ~4 min** (live `/tmp/mem_watch.log`),
+usedMem 30/31 GB, GPU flat — so there WAS a fast host-RAM leak, and the
+orphan-guard (`7891661`) + per-id-dict bound (`cf20b21`) were necessary but
+SECONDARY. This is the primary cause of the ssh-drops and the Orbbec depthengine
+SIGSEGV.
+
+**Root cause (tracemalloc-proven), fixed in `1fa01241`:**
+`vision_util/vision_logging.py` `VisionLogger.write()` blended the seg-mask
+overlay with `overlay[mask]`, but `mask` is a **uint8 0/1** array (from
+`core/result_parser.py:98` `(mask>0.5).astype(uint8)`), NOT boolean. So
+`overlay[mask]` is **integer fancy-indexing along axis 0** → shape `(H,W,W,3)` →
+a **~14 GB float32 transient per masked log write** at 720p (vs ~5.5 MB for a
+correct boolean mask), and it also corrupted the overlay (rewrote rows 0/1). It
+runs off-loop on a single-worker `ThreadPoolExecutor` with an **unbounded queue**,
+so each lost/reclaim transition queued ~14 GB writes that took ~14 s each and
+backed up — the RSS ratchet + oscillation. A swallowing `try/except` hid it.
+
+Decisive evidence (instrumented repro, isolated ROS_DOMAIN_ID=44, person in view):
+- tracemalloc top grower = `vision_logging.py:243` at **26.4 GiB** (next line 20 MiB).
+- `MALLOC_ARENA_MAX=2` + trim → **no effect** (rules out glibc fragmentation).
+- `vision_logging_enabled:=false` (telemetry still ON) → **leak gone, flat 2.37 GB**.
+
+**Attribution:** pre-existing — the bad blend landed in commit `d11f80c9`
+(2026-04-23); the uint8 mask in `39ae85b0` (2025-12-01). NOT introduced by this
+session's tracker work, but the 2026-06-09 reseed/look-alike changes increased
+lost↔reclaim churn → fired the buggy write far more often → surfaced it hard now.
+
+**Fix (`1fa01241`, central, spec✅ + quality-APPROVED):** a shared
+`_apply_mask_overlay(overlay, mask, color, alpha)` helper coerces the mask to
+boolean (`m = mask if dtype==bool else np.asarray(mask)!=0`) + shape-guards
+before indexing; the orange blend is bit-identical for alpha=0.5. Because
+`VisionLogger.write` is the shared sink, this protects EVERY mask-logging node
+(person_track, yolo_seg, generalist, waving, object_match, placing_location).
+The other `mask_overlay[mask]` site (`object_seg_yolo.py:1162`) already coerces
+to bool, so no leak there. 6 TDD tests (fail on old code, pass after); tkbuild
+`vision_util` clean.
+
+**Optional defense-in-depth (not done, low value now):** bound the off-loop log
+writer queue (`person_track_node.py` `ThreadPoolExecutor(max_workers=1)` is
+unbounded). With 5.5 MB transients a backed-up queue is harmless, so the boolean
+coercion alone resolves it; the queue bound would only guard a future slow-disk
+scenario.
+
+**Test-debt (minor, follow-up):** `test_no_fancy_index_explosion_on_full_size_mask`
+in `test_mask_overlay.py` doesn't actually pin the explosion (the explosion is a
+transient alloc, not a persistent shape change; it passes on the old code too) —
+the regression IS covered by the other 5 tests; rename/strengthen when convenient.
+
+**Recommended validation:** re-run a 2-3 min bench WITH a person and
+`vision_logging_enabled` ON (default) and confirm tracker RSS now stays flat
+(~2.4 GB) instead of climbing.
+
 ## 2026-06-09 — Orbbec camera SIGSEGV + ssh-disconnect: one root cause (memory/swap exhaustion)
 
 Operator report: Orbbec `camera_container` dies with `exit code 11` (SIGSEGV)

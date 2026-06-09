@@ -62,6 +62,19 @@ def update_tracker(tracker, frame: np.ndarray, target_id: Optional[int] = None) 
     tracker._t_yolo_ms = (time.perf_counter() - _t_yolo) * 1000.0
     tracker.last_results = results or []
 
+    # Bound the per-track-id state dicts (candidate_consistency,
+    # relative_positions) by lazily evicting ids no longer visible. ByteTrack ids
+    # grow monotonically for the process lifetime, so without this the dicts leak
+    # one entry per id forever. Current ids are never evicted, so scoring is
+    # unchanged for normal scenes (see YOLOTracker._prune_track_state).
+    prune = getattr(tracker, "_prune_track_state", None)
+    if prune is not None:
+        current_ids = {
+            r.track_id for r in tracker.last_results
+            if r.class_id == 0 and r.track_id >= 0
+        }
+        prune(current_ids)
+
     if results:
         update_scene_motion(tracker, results, frame)
         _log_detections(tracker, results)

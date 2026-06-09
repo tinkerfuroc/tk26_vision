@@ -46,6 +46,15 @@ class YOLOTracker:
         target_track_id: ID of the object being tracked
     """
     
+    # Upper bound on per-track-id state dicts (candidate_consistency,
+    # relative_positions). ByteTrack ids grow monotonically for the life of the
+    # process, so these dicts would otherwise accumulate one entry per id
+    # forever. _prune_track_state lazily evicts GONE ids once a dict exceeds this
+    # cap; current ids are never evicted, so scenes with <= this many distinct
+    # ids behave identically to before. Generous on purpose — real scenes have
+    # far fewer simultaneous people; this only triggers on long-run id buildup.
+    MAX_TRACK_STATE_IDS = 256
+
     # Default YOLO model for segmentation
     DEFAULT_MODEL = "yolo11s-seg.pt"
     
@@ -854,8 +863,34 @@ class YOLOTracker:
         # Convert variance to score (lower variance = higher score)
         # variance of 0.01 = score ~0.9, variance of 0.04 = score ~0.6
         score = max(0.0, 1.0 - variance / self.CONSISTENCY_THRESHOLD)
-        
+
         return score
+
+    def _prune_track_state(self, current_ids) -> None:
+        """Bound the per-track-id state dicts by evicting gone ids.
+
+        ByteTrack assigns a fresh, monotonically increasing id every time a
+        person enters/leaves, so ``candidate_consistency`` and
+        ``relative_positions`` would otherwise grow one entry per id for the life
+        of the process — a slow host-RAM leak over long runs.
+
+        This eviction is lazy and behavior-preserving:
+
+        - It only acts on a dict once it exceeds ``MAX_TRACK_STATE_IDS``, so any
+          scene with <= cap distinct ids is left EXACTLY as before (no eviction).
+        - It only removes ids NOT in ``current_ids`` (i.e. people no longer
+          visible this frame), so a currently-relevant id — even one flickering
+          through occlusion — is never dropped, and scoring for visible ids is
+          unchanged.
+
+        Args:
+            current_ids: the set of person track_ids visible THIS frame.
+        """
+        current = set(current_ids)
+        for state in (self.candidate_consistency, self.relative_positions):
+            if len(state) > self.MAX_TRACK_STATE_IDS:
+                for track_id in [k for k in state if k not in current]:
+                    del state[track_id]
 
     def _periodic_reid_validation(
         self,

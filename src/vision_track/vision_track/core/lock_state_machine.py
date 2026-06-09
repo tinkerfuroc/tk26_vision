@@ -31,21 +31,32 @@ class LockStateMachine:
         distinct_margin: float = 0.10,
         commit_frames: int = 12,
         max_recovery_frames: int = 45,
+        provisional_commit_window: int = 18,
     ) -> None:
         """Store policy thresholds; call start() before stepping."""
         self.high_bar = high_bar
         self.distinct_margin = distinct_margin
         self.commit_frames = commit_frames
         self.max_recovery_frames = max_recovery_frames
+        # Phase 3 / Option A: N-of-M commit window. The provisional commits once
+        # commit_frames (N) clear-bar coast frames occur within the last
+        # provisional_commit_window (M) frames, tolerating dips instead of the old
+        # strict-consecutive accumulation. N consecutive still commits (superset).
+        self.provisional_commit_window = provisional_commit_window
         self._committed_id: Optional[int] = None
         self._state = "lost"
+        # Sliding window of the last M coast frames' clear-bar verdicts (bools).
+        # _provisional_streak is kept as a back-compat mirror (= current run of
+        # trailing hits); the WINDOW is the commit authority.
         self._provisional_streak = 0
+        self._provisional_window: list = []
 
     def start(self, committed_id: int) -> None:
         """Lock onto an initial committed id (called once on init/commit)."""
         self._committed_id = committed_id
         self._state = "tracking"
         self._provisional_streak = 0
+        self._provisional_window = []
 
     def start_probation(self, committed_id: int) -> None:
         """Re-arm onto a candidate id WITHOUT committing (probationary reseed).
@@ -57,6 +68,7 @@ class LockStateMachine:
         self._committed_id = committed_id
         self._state = "reidentifying"
         self._provisional_streak = 0
+        self._provisional_window = []
 
     def step(
         self,
@@ -85,6 +97,7 @@ class LockStateMachine:
         if present:
             self._state = "tracking"
             self._provisional_streak = 0
+            self._provisional_window = []
             return LockDecision(True, False, self._committed_id, "tracking")
 
         # Absent: coasting. Bound the coast first.
@@ -92,22 +105,37 @@ class LockStateMachine:
             self._committed_id = None
             self._state = "lost"
             self._provisional_streak = 0
+            self._provisional_window = []
             return LockDecision(False, True, None, "lost")
 
         self._state = "reidentifying"
 
         # Provisional FAST-publish gate: HIGH bar + distinctiveness + depth + single
-        # OR clearly-distinct multi. target_lost STAYS True (asymmetric).
+        # OR clearly-distinct multi. target_lost STAYS True (asymmetric). The
+        # per-frame bar is UNCHANGED — only the accumulation is windowed.
         clears_bar = sim_score >= self.high_bar and depth_consistent
         distinct_ok = num_candidates <= 1 or distinct_margin >= self.distinct_margin
-        if clears_bar and distinct_ok:
+        is_hit = clears_bar and distinct_ok
+
+        # Phase 3 / Option A: N-of-M window. Append this coast frame's hit verdict,
+        # trim to the last M frames, and commit when the window holds >= N hits.
+        # A non-hit frame KEEPS the window (does not zero it) so dips are tolerated;
+        # old hits expire only when they slide past M frames. N consecutive hits
+        # within an M-window still commit (a 12-of-12 in an 18-window has 12 hits),
+        # so the old strict-consecutive behaviour is a subset.
+        self._provisional_window.append(is_hit)
+        if len(self._provisional_window) > self.provisional_commit_window:
+            self._provisional_window = self._provisional_window[-self.provisional_commit_window:]
+
+        if is_hit:
             self._provisional_streak += 1
-            # SLOW commit: only after holding commit_frames do we drop target_lost.
-            if self._provisional_streak >= self.commit_frames:
+            if sum(self._provisional_window) >= self.commit_frames:
                 self._state = "tracking"
                 return LockDecision(True, False, self._committed_id, "tracking")
             return LockDecision(True, True, self._committed_id, "reidentifying")
 
-        # Did not clear the bar: coast silently, keep identity, stay lost.
+        # Did not clear the bar this frame: the dip does NOT zero the window
+        # (accumulated hits persist until they age out), but the consecutive-run
+        # mirror resets and we do not surface a provisional publish this frame.
         self._provisional_streak = 0
         return LockDecision(False, True, self._committed_id, "reidentifying")

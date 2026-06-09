@@ -88,7 +88,12 @@ def find_best_match_reid(
     if not _passes_distinctiveness(tracker, is_person, candidate_scores, best_match, best_features, best_similarity):
         return None
 
-    if not _single_candidate_guard(is_person, candidate_scores, best_similarity):
+    if not _single_candidate_guard(
+        is_person,
+        candidate_scores,
+        best_similarity,
+        getattr(tracker, "single_person_pursue_floor", 0.55),
+    ):
         return None
 
     if tracker.target_appearance.class_id == 0 and best_match.class_id != 0:
@@ -419,21 +424,35 @@ def _passes_distinctiveness(
     return True
 
 
-def _single_candidate_guard(is_person: bool, candidate_scores, best_similarity: float) -> bool:
-    """Handle single-person scenes with stricter threshold."""
+def _single_candidate_guard(
+    is_person: bool,
+    candidate_scores,
+    best_similarity: float,
+    pursue_floor: float = 0.55,
+) -> bool:
+    """Decide whether to PURSUE a lone-person candidate (Phase 3, Option B).
+
+    A lone person scoring below the old hard 0.72 wall used to be discarded here
+    before its good frames could accumulate. This now keeps the candidate in play
+    whenever its similarity clears the configurable PURSUE floor (default 0.55 =
+    reid_threshold). Pursuit is NOT a lock: the lone COMMIT bar (0.72) is enforced
+    downstream in tracking_pipeline._confirm_reid_candidate, so a lone candidate
+    that never clears 0.72 is surfaced as reidentifying (target_lost=True) but
+    never committed.
+    """
     if not (is_person and len(candidate_scores) == 1):
         return True
 
-    single_person_threshold = 0.72
-    if best_similarity < single_person_threshold:
+    if best_similarity < pursue_floor:
         logger.info(
-            f"ReID FAILED: only one person visible but similarity {best_similarity:.3f} < {single_person_threshold} "
-            "(requires high confidence when no comparison is possible)"
+            f"ReID FAILED: only one person visible and similarity {best_similarity:.3f} "
+            f"< pursue floor {pursue_floor} (below the floor — discarded)"
         )
         return False
 
     logger.info(
-        f"Single person mode: similarity {best_similarity:.3f} >= {single_person_threshold}, accepting"
+        f"Single person mode: similarity {best_similarity:.3f} >= pursue floor {pursue_floor}, "
+        "pursuing (commit bar enforced downstream)"
     )
     return True
 

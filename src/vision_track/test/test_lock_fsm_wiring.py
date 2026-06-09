@@ -182,17 +182,25 @@ class TestPartialConfirmDoesNotLeak:
             assert decision.publish is False
 
     def test_confirm_returns_non_none_partial_but_no_id_swap(self, monkeypatch):
-        """Sanity: at sim 0.6 the real _confirm_reid_candidate returns a non-None
-        PARTIAL each frame yet never swaps target_track_id in the window — so the
-        only thing that could have committed was the (now-fixed) early present-step.
+        """Sanity: at sim 0.6 the real _confirm_reid_candidate never swaps
+        target_track_id in the window.
+
+        Precision-leak fix: a LONE candidate at 0.60 (below the 0.72 commit bar)
+        must NEVER arm pending_reid_match. Arming is now gated on commit-bar hits
+        (sum(window)), not on the reid_threshold-counted reid_fit_streak. If
+        pending were armed here, Stage 1 (_confirm_pending_reid) would adopt and
+        lock the id by its ByteTrack id without re-checking the 0.72 bar — the
+        leak this fix closes. (The previous version of this test asserted the
+        opposite, encoding the leaky pre-fix behavior.)
         """
         tracker = _make_tracker()
         prev = tracker.target_track_id
-        # First frame seeds the pending match; subsequent frames accumulate.
         for _ in range(COMMIT_FRAMES + 5):
             _drive_frame(tracker, 0.60, monkeypatch)
         assert tracker.target_track_id == prev, "no id-swap expected in window"
-        assert tracker.pending_reid_match is not None, "partial-confirm pending set"
+        assert tracker.pending_reid_match is None, (
+            "lone sub-commit-bar candidate must NOT arm pending (precision invariant)"
+        )
 
 
 class TestHighBarStreakCommits:

@@ -16,6 +16,57 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-09 — Orbbec camera SIGSEGV + ssh-disconnect: one root cause (memory/swap exhaustion)
+
+Operator report: Orbbec `camera_container` dies with `exit code 11` (SIGSEGV)
+after recurring `Failed to TemperatureUpdate1: Resource busy!`; separately, "the
+tracker causes ssh to disconnect after a while." **Both are the same root
+cause: host memory exhaustion → swap-thrash.**
+
+Evidence (captured live on the host):
+- Swap **6.6 GiB/8 used**, 15-min **load average 63** (1-min 0.64 — it collapsed
+  once procs died). Classic thrash: when RAM fills, every process stalls on
+  swap IO, **sshd can't service the session → ssh times out/drops**, and native
+  worker threads get starved/fail.
+- The crash trace (`Log/camera_crash_stack_trace_2026_06_09_19_53_50.log`) faults
+  **inside `libdepthengine.so`** (Femto Bolt closed-source depth engine) called
+  from `libOrbbecSDK.so.2` — NO temperature/ROS-node frames. So it's the vendor
+  depth engine faulting under host starvation, not an Orbbec logic bug.
+- `TemperatureUpdate1: Resource busy` is a **red herring** — the diagnostic
+  updater's control-channel temperature poll colliding with streaming
+  (`ob_camera_node.cpp:2346 onTemperatureUpdate`); benign.
+
+Dominant contributor found: **orphaned `person_track_server` pileup.** Three
+were live (PID 96309/98259/99886, all `PPID=1`, on the `/replay/` perf-test
+topics), each squatting **~672 MiB GPU** — leftover from bench/perf-test runs
+whose launcher died ungracefully (children reparent to init and never exit).
+Operator confirmed only "tracker + camera bench" runs when ssh drops, so a
+single healthy tracker (~3-5 GB) reaching 37 GB means trackers accumulate across
+restarts. Manual cleanup run this session: SIGTERM'd the 3 orphans (GPU
+**2185→153 MiB**), cleared 16 stale FastDDS `/dev/shm` segments, swap recovered
+**6.6 GiB→<1 GiB**.
+
+Fixes (subagent-driven, Opus; two-stage reviewed):
+- **`7891661`** — idempotent `track_web_bench` startup. New `kill_stale` launch
+  arg (default on) SIGTERMs stale bench execs via narrow `lib/<pkg>/`-scoped
+  patterns BEFORE relaunch (nodes start after cleanup via `OnProcessExit`);
+  `scripts/kill_stale_bench.sh` mirrors it for manual use. SIGTERM not `-9`;
+  patterns scoped so editors/greps/the parent `ros2 launch` are never matched.
+  So a restart can never leave duplicates — kills the pileup at the source.
+- **`cf20b21`** — bound per-track-id state. `candidate_consistency` +
+  `relative_positions` kept one entry per ByteTrack id for the process lifetime
+  (ids grow forever) — a slow secondary leak. Lazily evict gone ids past
+  `MAX_TRACK_STATE_IDS` (256); current ids never evicted, scoring unchanged for
+  normal scenes. (Audit: `scene_center_history` already capped to 3;
+  `target_velocity_history` is dead/never-appended.)
+
+**Still to confirm (operator):** run a memory logger alongside ONE fresh bench
+(`while true; do date +%T; ps -eo rss,comm --sort=-rss|head -8; free -m|awk '/Mem|Swap/'; sleep 15; done | tee ~/mem_watch.log`).
+If a single tracker session's RSS still climbs steadily, there is a remaining
+fast per-frame leak the above two fixes won't catch (hunt it then); if it stays
+flat, the pileup+slow-dict fixes were the whole story. The depthengine SIGSEGV
+itself is a vendor crash — relieving host memory pressure is the mitigation.
+
 ## 2026-06-09 — tracker: yellow-box fix + reseed confirmation gate + look-alike pursuit
 
 Three operator-reported issues, each root-caused by a separate read-only

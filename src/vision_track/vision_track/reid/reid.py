@@ -204,6 +204,40 @@ class AppearanceExtractor:
             self.general_model = None
             self.use_general_cnn = False
     
+    def _segment_crop_for_reid(self, crop: np.ndarray,
+                               mask_crop: Optional[np.ndarray]) -> np.ndarray:
+        """Person-segment a crop for the deep OSNet embedding.
+
+        OSNet ingests 3-channel RGB (no alpha), so we feed it a
+        "transparent-background" person via: dilate the mask (keep the silhouette
+        and tolerate loose YOLO-seg edges) -> tight-crop to the mask bbox (evicts
+        a co-bbox bystander in the corner of a loose person box and re-centers the
+        person for the 128x256 resize) -> soft-attenuate out-of-mask pixels toward a
+        strongly-blurred copy (removes the bystander/background identity while
+        staying near OSNet's training distribution; not a hard black rectangle).
+
+        Applied identically on the single and batched deep paths (row-equivalence).
+        mask_crop None / empty / all-zero -> return crop unchanged.
+        """
+        if mask_crop is None or mask_crop.size == 0:
+            return crop
+        m = (mask_crop > 0).astype(np.uint8)
+        if int(m.sum()) == 0:
+            return crop
+        kernel = np.ones((3, 3), np.uint8)
+        dil = cv2.dilate(m, kernel, iterations=2)
+        ys, xs = np.where(dil > 0)
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        crop_tc = crop[y1:y2, x1:x2]
+        dil_tc = dil[y1:y2, x1:x2]
+        blurred = cv2.GaussianBlur(crop_tc, (0, 0), sigmaX=9)
+        out = crop_tc.copy()
+        bg = dil_tc == 0
+        if np.any(bg):
+            out[bg] = (0.15 * crop_tc[bg] + 0.85 * blurred[bg]).astype(crop_tc.dtype)
+        return out
+
     def extract_features(
         self,
         frame: np.ndarray,
@@ -250,7 +284,8 @@ class AppearanceExtractor:
         # Use specialized features for persons
         if class_id == self.PERSON_CLASS_ID:
             # Person ReID features
-            features['reid'] = self.person_reid.extract_features(crop)
+            features['reid'] = self.person_reid.extract_features(
+                self._segment_crop_for_reid(crop, mask_crop))
             
             # Body part color histograms
             features['body_color'] = self._extract_body_part_colors(crop, mask_crop)
@@ -312,8 +347,10 @@ class AppearanceExtractor:
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
                 if x2 > x1 and y2 > y1:
+                    raw = frame[y1:y2, x1:x2].copy()
+                    mci = masks[i][y1:y2, x1:x2] if masks[i] is not None else None
                     person_idx.append(i)
-                    person_crops.append(frame[y1:y2, x1:x2].copy())
+                    person_crops.append(self._segment_crop_for_reid(raw, mci))
 
         if person_crops:
             deep = self.person_reid.extract_features_batch(person_crops)  # [P, dim]

@@ -100,6 +100,16 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — person-segment the deep ReID crop. The deep OSNet embedding
+  was extracted from the raw bounding-box crop, so the gallery baked in
+  background and any bystander sharing the box — which both let the tracker lock
+  onto another person and depressed the same-person cosine when the scene
+  changed (forcing over-strict thresholds). The deep crop is now segmented:
+  dilate the YOLO-seg mask, tight-crop to it (evicts a co-bbox bystander +
+  re-centers the person for the 128×256 resize), and soft-blur the background
+  (OSNet takes RGB, so this is the equivalent of a transparent background).
+  Applied identically on the single + batched deep paths (row-equivalence
+  preserved); no thresholds changed.
 - **2026-06-09** — latch the help-hold so auto-reclaim isn't aborted
   mid-reappearance. Found while bag-testing the passive-reacquire fix: when the
   operator reappears, the pre-commit re-ID resets `frames_lost` to 0 on every

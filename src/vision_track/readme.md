@@ -100,6 +100,24 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — throttled the tracker's `vision_log` EVENT writes to real
+  acquire/lost transitions plus a ~5 s steady-state heartbeat, eliminating the
+  per-frame churn flood. Previously the lost↔reclaim artifacts were keyed on
+  `_was_lost`, which flips per-frame on `track_result` presence; in a churny
+  scene (rapid loss/reacquire, id churn) the "transition" writes re-fired over
+  and over, and there was **no** logging during steady tracking or steady lost.
+  Now `PersonTrackNode._vision_log_due(state, now)` gates emission: it fires on a
+  debounced state change (state changed **and** ≥ `vision_log_min_gap_s` since
+  the last write) or on the steady-state heartbeat (≥ `vision_log_interval_s`
+  since the last write), for both tracking and lost. New params
+  `vision_log_interval_s` (default `5.0`) and `vision_log_min_gap_s`
+  (default `1.0`); new states `self._vlog_last_state` / `self._vlog_last_time`.
+  Acquire emits `event=acquired` (first lock), `reclaimed` (lost→tracked), or
+  `tracking` (steady heartbeat); loss emits the `lost` + `lost_current` pair on a
+  real transition or a single `lost_heartbeat` artifact on the steady-lost
+  heartbeat. `_was_lost`/help-latch/point-EMA-reset logic is unchanged — only the
+  log-emission decision moved to the throttle; gallery thumbs out of scope.
+
 - **2026-06-09** — bounded the per-track-id state dicts to stop a slow host-RAM
   growth over long runs. `candidate_consistency` and `relative_positions` are
   keyed by ByteTrack track_id, which increases monotonically for the life of the

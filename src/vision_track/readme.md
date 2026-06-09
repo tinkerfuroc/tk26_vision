@@ -100,6 +100,18 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-10** — **tracker seg model upgraded to `yolo11m-seg` by default.**
+  Benchmark (`scripts/bench_yolo_seg.py`, imgsz 736 fp16, RTX 5070 Ti): `s`=4.0 ms
+  (250 fps), **`m`=5.5 ms (182 fps)**, `l`=7.0 ms (143 fps), `x`=9.5 ms (105 fps)
+  — all far under the 33 ms/frame 30 Hz budget *in plain PyTorch*, so the seg
+  model is nowhere near the bottleneck and a bigger model is fast enough **without
+  TensorRT** (TRT is now an optional top-end, not a requirement). `m`-seg gives
+  better and more-frequent masks, which directly feed the OSNet background
+  neutralization and the new mask-fill gallery gate. `model_path` default
+  `yolo11s-seg.pt` → `yolo11m-seg.pt` (node + `config/default.yaml`); override back
+  to `s` on weaker/offline GPUs (the m-seg weight must be cached for offline
+  arena), or point at a `.engine` for TRT (`scripts/export_yolo_trt.py`).
+
 - **2026-06-10** — **gallery admission gated on mask-fill, not bbox aspect
   ratio.** The operator stands throughout, so pose uprightness is guaranteed by
   behaviour, not box shape — but occlusion/clipping in a crowd makes a clean

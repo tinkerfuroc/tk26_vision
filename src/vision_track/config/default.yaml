@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # Model
-    model_path: 'yolo11s-seg.pt'
+    model_path: 'yolo11m-seg.pt'  # m-seg: better masks, 5.5ms @736 fp16 (~182fps); s-seg for weak/offline GPUs, or a .engine for TRT
     confidence_threshold: 0.5     # detection conf for non-tracking detect() calls / downstream gates
     yolo_track_conf: 0.15         # LOW conf into model.track so ByteTrack low-conf recovery runs
     enable_reid: true

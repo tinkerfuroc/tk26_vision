@@ -216,7 +216,12 @@ class PersonTrackNode(Node):
     def _declare_parameters(self):
         """Declare all ROS2 parameters."""
         # Prefer a stronger default model. If unavailable we will fall back at runtime.
-        self.declare_parameter('model_path', 'yolo11s-seg.pt')
+        # yolo11m-seg: better/more-frequent masks (helps ReID bg-neutralization +
+        # the mask-fill gallery gate) at 5.5 ms @ imgsz 736 fp16 on the RTX 5070 Ti
+        # (~182 fps, far under the 30 Hz budget — see scripts/bench_yolo_seg.py).
+        # Override to yolo11s-seg.pt on weaker GPUs / offline boxes without the
+        # m-seg weight cached, or to a .engine for a TensorRT top-end.
+        self.declare_parameter('model_path', 'yolo11m-seg.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         # LOW conf fed to model.track so ByteTrack's two-stage (high/low)
         # association recovery actually runs — kept separate from

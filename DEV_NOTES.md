@@ -16,6 +16,52 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-10 — passive recovery (wall-clock + post-NEEDS_HELP auto re-lock) + mask-fill gallery gate + m-seg default
+
+Four tracker changes from a systematic-debugging + subagent-driven session.
+Commits: `1817a48` (Issue 1), `0cfbb08` (Issue 3), `415f78c` (Issue 4),
+`69865be`/`a369802` (spec/plan). Spec/plan:
+`docs/superpowers/{specs,plans}/2026-06-09-passive-recovery-bg-parity-upright-gallery.md`.
+
+- **Issue 1 — passive recovery after NEEDS_HELP.** (a) While *latched* in
+  NEEDS_HELP with exactly one person visible, the lone re-ID commit bar relaxes
+  0.72 → `single_person_commit_bar_help` (0.62), needing 12 of the last 16 frames
+  (`needs_help_confirm_frames`/`needs_help_commit_window`) — auto re-lock without a
+  wave. Strict path byte-for-byte unchanged outside the gate; relaxed commit does
+  a real `target_track_id` swap so the latch clears. (b) **NEEDS_HELP escalation
+  is now WALL-CLOCK** (`active_help_after_sec`, default 5.0 s) instead of frame
+  count (was `active_help_after_frames=45`) — frame rate is unreliable under
+  tournament GPU contention. Anchored by `self._last_confirmed_time`, refreshed
+  only on a true re-lock (never a provisional coast) — abort-mid-reacquire
+  protection intact.
+- **Issue 2 — OSNet background parity: NO code change.** Investigated; the query
+  already uses the real seg mask at every call site (plumbing verified). The
+  first-draft ellipse pseudo-mask was reverted — fabricating a mask papers over a
+  non-problem; fewer maskless frames come from the bigger model (Issue 4).
+- **Issue 3 — gallery gate on mask-fill, not bbox aspect.** Admission now gates
+  on `gallery_min_mask_fill` (0.35 = mask_px/bbox_area) and relaxes the aspect
+  reject to `gallery_max_aspect_ratio` (2.0) — a square-but-clean upright operator
+  in a crowd is no longer starved from the gallery; merged/garbage boxes (low
+  fill) still rejected. Admission-only.
+- **Issue 4 — tracker seg model → `yolo11m-seg` default.** Benchmark
+  (`scripts/bench_yolo_seg.py`, imgsz 736 fp16, RTX 5070 Ti): s=4.0 / **m=5.5** /
+  l=7.0 / x=9.5 ms — all far under the 33 ms 30 Hz budget *in plain PyTorch*, so
+  TRT is optional, not required. m-seg = better/more-frequent masks feeding Issues
+  2 & 3. Verified it resolves to the cached weight at startup.
+
+Verification done here: full unit suite green (261 passed, 1 skipped; the 2
+package-wide `test_flake8`/`test_pep257` failures are pre-existing, from unrelated
+uncommitted WIP files); zero net-new flake8 on touched lines; `vision_track`
+builds; m-seg latency benchmarked; m-seg weight resolves.
+
+**Still needs operator-in-the-loop (T4):** (1) walk the operator out of frame >5 s
+then back in — confirm auto re-lock post-NEEDS_HELP without a wave, and that the
+web box turns green (not stuck yellow). (2) Crowd scene where the operator's bbox
+goes square-ish — confirm gallery keeps enriching (mask-fill gate). (3) Confirm
+m-seg sustains ~30 Hz end-to-end with the full ReID pipeline on live cameras (the
+raw model is 5.5 ms; the OSNet-per-candidate cost is the real budget). (4) Confirm
+the m-seg weight is cached on the actual arena robots (offline).
+
 ## 2026-06-09 — host-RAM leak ROOT CAUSE FOUND + FIXED: 14 GB-per-write uint8-mask blend in vision_logging
 
 Follow-up to the entry below (which had flagged "confirm with a memory logger

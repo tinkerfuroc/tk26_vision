@@ -659,7 +659,11 @@ class ReIDMatcher:
     MIN_BODY_COLOR_SIMILARITY = 0.40
     MIN_UPPER_SIMILARITY = 0.40
     MIN_LOWER_SIMILARITY = 0.40
-    
+
+    # gallery deep cosine clearly above bystander range (~0.47-0.57); a
+    # confident deep match bypasses the hard color vetoes
+    DEEP_CONFIDENT_BYPASS = 0.70
+
     # Legacy threshold for backward compatibility
     MIN_REID_SIMILARITY = 0.40  # Transformed similarity minimum
     
@@ -734,6 +738,7 @@ class ReIDMatcher:
         If features don't show this separation, they're not discriminative enough.
         """
         reid_sim_raw = None
+        deep_confident = False
         body_color_sim = None
         body_color_anchor_sim = None
         color_sim = None
@@ -757,6 +762,12 @@ class ReIDMatcher:
                     return 0.0
             else:
                 logger.debug("ReID deep term unavailable (no matching target feature)")
+
+        # A confident deep cosine bypasses the hard color vetoes below: a true
+        # match whose color drifted (lighting/pose) shouldn't be force-zeroed by
+        # a single low color histogram. Bystanders have low deep, so the veto
+        # still fires for them. Defined for all paths (defaults False above).
+        deep_confident = reid_sim_raw is not None and reid_sim_raw >= cls.DEEP_CONFIDENT_BYPASS
         
         # 2. Body part color similarity - use histogram intersection (stricter than Bhattacharyya)
         if 'body_color' in candidate_features:
@@ -770,9 +781,13 @@ class ReIDMatcher:
                     body_color_sim = max(body_color_sim, body_color_anchor_sim)
                 
                 # Hard rejection: if clothing colors are too different
-                if body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY:
+                if body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY and not deep_confident:
                     logger.info(f"Rejecting candidate: body color similarity {body_color_sim:.3f} < {cls.MIN_BODY_COLOR_SIMILARITY}")
                     return 0.0
+                elif body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY:
+                    logger.debug(
+                        f"color low (body={body_color_sim:.3f}) but deep "
+                        f"confident ({reid_sim_raw:.3f}) — not vetoing")
         
         # Upper/lower specific clothing color to combat outfit ambiguity
         if 'upper_color' in candidate_features:
@@ -783,9 +798,13 @@ class ReIDMatcher:
                 target_upper = target.upper_color_history[-1]
             if target_upper is not None:
                 upper_sim = cls._histogram_intersection(target_upper, candidate_features['upper_color'])
-                if upper_sim < cls.MIN_UPPER_SIMILARITY:
+                if upper_sim < cls.MIN_UPPER_SIMILARITY and not deep_confident:
                     logger.info(f"Rejecting candidate: upper color similarity {upper_sim:.3f} < {cls.MIN_UPPER_SIMILARITY}")
                     return 0.0
+                elif upper_sim < cls.MIN_UPPER_SIMILARITY:
+                    logger.debug(
+                        f"color low (upper={upper_sim:.3f}) but deep "
+                        f"confident ({reid_sim_raw:.3f}) — not vetoing")
         
         if 'lower_color' in candidate_features:
             target_lower = None
@@ -795,9 +814,13 @@ class ReIDMatcher:
                 target_lower = target.lower_color_history[-1]
             if target_lower is not None:
                 lower_sim = cls._histogram_intersection(target_lower, candidate_features['lower_color'])
-                if lower_sim < cls.MIN_LOWER_SIMILARITY:
+                if lower_sim < cls.MIN_LOWER_SIMILARITY and not deep_confident:
                     logger.info(f"Rejecting candidate: lower color similarity {lower_sim:.3f} < {cls.MIN_LOWER_SIMILARITY}")
                     return 0.0
+                elif lower_sim < cls.MIN_LOWER_SIMILARITY:
+                    logger.debug(
+                        f"color low (lower={lower_sim:.3f}) but deep "
+                        f"confident ({reid_sim_raw:.3f}) — not vetoing")
         
         # 3. General color histogram
         if 'color_hist' in candidate_features:

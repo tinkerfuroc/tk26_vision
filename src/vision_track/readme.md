@@ -100,6 +100,19 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — idempotent `track_web_bench` startup: `kill_stale` guard
+  (default `true`) SIGTERMs any stale `person_track_server`, `track_web`, and
+  `waving_person_server` instances via narrow `lib/<pkg>/`-scoped patterns before
+  the bench nodes start. Fixes orphan pileup across ungraceful bench restarts
+  (terminal closed / SIGKILL): each orphaned `person_track_server` squatted ~700
+  MiB GPU + growing host RAM until swap-thrash dropped ssh and SIGSEGV'd the
+  Orbbec depth engine. Patterns scoped to installed `lib/<pkg>/` exec paths so
+  editors, greps, and the parent `ros2 launch` process are never matched. SIGTERM
+  only (never -9), letting each node release cameras/GPU cleanly. Launch arg
+  `kill_stale:=false` disables the guard for CI/headless scenarios. Nodes start
+  only after the cleanup `ExecuteProcess` exits (`OnProcessExit`). Same three
+  patterns mirrored in `scripts/kill_stale_bench.sh` for manual cleanup.
+
 - **2026-06-09** — do not give up on look-alikes during **passive** reacquisition
   (operator returns without a wave), implemented as Option B (pursue floor) +
   Option A (N-of-M) **without lowering any commit bar** (Option D — relaxing the

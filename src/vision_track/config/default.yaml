@@ -16,6 +16,8 @@
     reid_gallery_size: 6              # K diverse views kept
     reid_gallery_novelty_max: 0.85    # admit a view only if < this cosine to existing
     reid_gallery_score_mode: 'max'    # 'max' | 'top2_mean' (precision fallback)
+    gallery_min_mask_fill: 0.35       # mask-fill gallery gate (mask_px/bbox_area, strict <=); configurable at launch — low fill = merged/occluded box, reject
+    gallery_max_aspect_ratio: 2.0     # relaxed w/h backstop for gallery admission; square-but-clean upright operator views now pass (was the old 0.9 reject)
 
     # Loss / recovery
     max_frames_lost: 600

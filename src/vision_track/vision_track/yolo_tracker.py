@@ -134,6 +134,10 @@ class YOLOTracker:
         self.reid_gallery_novelty_max = reid_gallery_novelty_max
         self.reid_gallery_score_mode = reid_gallery_score_mode
         self.keep_gallery_thumbs = keep_gallery_thumbs
+        # Issue 3: gallery-admission gate on mask-fill (not bbox aspect). The
+        # node overrides these from ROS params; these are the instance defaults.
+        self.gallery_min_mask_fill = 0.35
+        self.gallery_max_aspect_ratio = 2.0
         self.yolo_track_conf = yolo_track_conf
         self.state = TrackerState.UNINITIALIZED
         self.target_track_id: Optional[int] = None

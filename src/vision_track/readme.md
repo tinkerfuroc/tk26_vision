@@ -100,6 +100,27 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-10** — **passive recovery: post-NEEDS_HELP auto re-lock + wall-clock
+  escalation.** (1) While *latched* in NEEDS_HELP with exactly one person visible,
+  the lone re-ID commit bar relaxes from `single_person_commit_bar` (0.72) to
+  `single_person_commit_bar_help` (default **0.62**), requiring
+  `needs_help_confirm_frames` (**12**) confirm hits within the last
+  `needs_help_commit_window` (**16**) frames — so a returning operator
+  auto-re-locks without a wave. Outside that gate (multi-person, or before
+  escalation) behaviour is byte-for-byte unchanged (strict 0.72 lone /
+  `reid_threshold` multi); the N-of-M sustained gate is preserved and
+  strengthened. The relaxed commit produces a real `target_track_id` swap, so the
+  help-latch clears on the genuine re-lock. (2) **NEEDS_HELP escalation is now
+  wall-clock, not frame-count:** new param `active_help_after_sec` (default
+  **5.0 s**) replaces `active_help_after_frames` (was 45) — frame rate is
+  unreliable under tournament GPU contention, so a frame threshold gave an
+  unpredictable real-time window. `reacq_state(tracked, time_since_lost,
+  help_after_sec)` and `_is_awaiting_help` now key off seconds since the last
+  CONFIRMED lock, anchored by `self._last_confirmed_time` (refreshed only on a
+  true re-lock — never a provisional coast — preserving the abort-mid-reacquire
+  protection). The debug-state telemetry field `active_help_after_frames` →
+  `active_help_after_sec`.
+
 - **2026-06-09** — throttled the tracker's `vision_log` EVENT writes to real
   acquire/lost transitions plus a ~5 s steady-state heartbeat, eliminating the
   per-frame churn flood. Previously the lost↔reclaim artifacts were keyed on
@@ -199,8 +220,9 @@ ros2 run vision_track person_track_server --ros-args \
     the per-frame bar (`high_bar`, depth, distinctiveness) is unchanged.
   - **Untouched precision guards:** `high_bar=0.72`, deep-ratio `0.92`,
     distinctiveness `0.10/0.15`, `MIN_REID_SIMILARITY_RAW=0.40`, color vetoes, and
-    `DEEP_CONFIDENT_BYPASS` — all unchanged. `NEEDS_HELP` still fires at
-    `frames_lost >= active_help_after_frames`; the help-hold latch (`_help_latched`)
+    `DEEP_CONFIDENT_BYPASS` — all unchanged. `NEEDS_HELP` fires at
+    `time_since_lost >= active_help_after_sec` (wall-clock; see 2026-06-10);
+    the help-hold latch (`_help_latched`)
     still clears only on a true re-lock (pursuit frames are `target_lost=True`).
     Multi-person commit bar stays `reid_threshold` (N-of-M only adds dip-tolerant
     recall there, never lowers the bar). All four new knobs are ROS params on

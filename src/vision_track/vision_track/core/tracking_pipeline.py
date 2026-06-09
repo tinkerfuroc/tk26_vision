@@ -623,15 +623,28 @@ def _confirm_reid_candidate(
             match_similarity = 0.5
 
     post_shake_extra = 5 if (current_time - tracker.last_camera_motion_time) < 2.0 else 0
-    required_confirmation = tracker.reid_confirmation_frames + post_shake_extra
 
-    # Phase 3: lone-candidate commit bar held high; multi stays at reid_threshold.
-    commit_bar = (
-        getattr(tracker, "single_person_commit_bar", 0.72)
-        if num_candidates == 1 else tracker.reid_threshold
-    )
+    # Issue 1: precision-bounded escape hatch. ONLY while latched in NEEDS_HELP
+    # AND exactly one person is visible, relax the lone commit bar to
+    # single_person_commit_bar_help (0.62) and require needs_help_confirm_frames
+    # (N=12) confirm hits within the last needs_help_commit_window (M=16) frames,
+    # then commit (clearing the latch). OUTSIDE this gate the strict Phase-3
+    # bars are byte-for-byte unchanged. The relaxation NEVER fires when
+    # num_candidates > 1 or when in_needs_help is False.
+    in_help = bool(getattr(tracker, "in_needs_help", False)) and num_candidates == 1
+    if in_help:
+        commit_bar = getattr(tracker, "single_person_commit_bar_help", 0.62)
+        required_confirmation = int(getattr(tracker, "needs_help_confirm_frames", 12))
+        window_m = int(getattr(tracker, "needs_help_commit_window", 16))
+    else:
+        required_confirmation = tracker.reid_confirmation_frames + post_shake_extra
+        # Phase 3: lone-candidate commit bar held high; multi stays at reid_threshold.
+        commit_bar = (
+            getattr(tracker, "single_person_commit_bar", 0.72)
+            if num_candidates == 1 else tracker.reid_threshold
+        )
+        window_m = getattr(tracker, "provisional_commit_window", 18)
     is_hit = match_similarity >= commit_bar
-    window_m = getattr(tracker, "provisional_commit_window", 18)
 
     def _push_window(hit: bool) -> list:
         """Append a hit verdict for the current candidate, trim to the last M."""

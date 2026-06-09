@@ -1,18 +1,21 @@
-# Passive recovery (post-NEEDS_HELP) + OSNet background parity + mask-fill gallery gate — design
+# Passive recovery (post-NEEDS_HELP) + mask-fill gallery gate + larger seg model — design
 
-**Date:** 2026-06-09
+**Date:** 2026-06-09 (revised 2026-06-10)
 **Package:** `src/vision_track`
 **Branch:** `feat/track-web-idle-video`
-**Status:** approved (user, 2026-06-09 — numbers revised after first draft)
+**Status:** approved (user, 2026-06-09; revised 2026-06-10 — Issue 2 pseudo-mask dropped, passive window → 5 s)
 
-Four changes to `person_track_server`. The first three are root-caused tracker
-fixes; the fourth is the model-quality upgrade they all benefit from. They
-compose: background parity (#2) and a larger seg model (#4) raise the raw ReID
-operating point and produce better/more-frequent masks; the mask-fill gallery
+Changes to `person_track_server`. **Issue 1** extends the passive-recovery window
+to ~5 s and adds a precision-bounded auto-recovery escape hatch once latched in
+NEEDS_HELP. **Issue 2** (OSNet background parity) was investigated and resolved
+with NO code change — the query already uses the real seg mask. **Issue 3**
+gates gallery admission on mask-fill instead of bbox aspect ratio. **Issue 4** is
+the model-quality upgrade (larger YOLO-seg + TensorRT) that reduces maskless
+frames and lifts the raw ReID operating point Issue 1's bar depends on. They
+compose: a bigger model (#4) raises similarity and mask coverage; the mask-fill
 gate (#3) keeps the gallery clean without rejecting square-but-upright crowd
-views; the post-NEEDS_HELP relaxation (#1) is the gated escape hatch that catches
-a returning operator once #2/#4 have lifted their similarity above the relaxed
-bar.
+views; the post-NEEDS_HELP relaxation (#1) catches a returning operator once #4
+has lifted their similarity above the relaxed bar.
 
 ---
 
@@ -80,54 +83,70 @@ it can stay high and still recover:
 - `OTHER_PERSON_MAX_TARGET_SIM` (0.72) is unchanged (lone case doesn't run
   `register_other_persons` anyway).
 
+### Passive-recovery window — WALL-CLOCK, ~5 s (not frames)
+Escalation to NEEDS_HELP was frame-based (`reacq_state(...)` / `_is_awaiting_help`
+flip once `frames_lost >= active_help_after_frames`). **Operator constraint
+(2026-06-10): do not base need-help on frames — frame rate is unreliable during a
+tournament** (GPU contention, other nodes), so a frame count gives an
+unpredictable wall-clock window. Convert escalation to **wall-clock time**:
+
+- New param `active_help_after_sec` (default **5.0**); **remove**
+  `active_help_after_frames` (param, reads, telemetry, debug-state field).
+- `reacq_state(tracked, time_since_lost, help_after_sec)` — NEEDS_HELP once
+  `time_since_lost >= help_after_sec`, else PASSIVE (TRACKING while held). Pure,
+  time-based; `help_after_sec <= 0` escalates immediately when lost (disable
+  semantics preserved).
+- Time anchor: node tracks `self._last_confirmed_time` = wall-clock of the last
+  TRUE lock (`feedback.target_lost == False`), set at tracking start, reset per
+  goal, refreshed only on a confirmed lock (NOT on a provisional/pre-commit coast
+  — so a coast doesn't reset the clock). `time_since_lost = time.time() -
+  self._last_confirmed_time` feeds both the telemetry and the
+  `_is_awaiting_help` latch. This is robust to fps AND to the `frames_lost`-reset
+  problem the latch was created to paper over.
+- `_is_awaiting_help` latches at `time_since_lost >= active_help_after_sec`
+  (replacing the frame check); the `active_help_timeout_sec` post-escalation hold
+  bound is already time-based and unchanged. The latch still clears only on a true
+  re-lock, so the abort-mid-reacquire protection is intact.
+
+The latch (and thus Issue-1's relaxation) now engages at a *deterministic 5 s*
+regardless of fps: 5 s of strict passive recovery, then escalate + relax.
+
 ### New params (Issue 1)
 | Param | Default | Meaning |
 |---|---|---|
 | `single_person_commit_bar_help` | `0.62` | lone-candidate commit bar while latched in NEEDS_HELP |
 | `needs_help_confirm_frames` | `12` | confirm-hits required (N) to commit while latched in NEEDS_HELP |
 | `needs_help_commit_window` | `16` | N-of-M window length (M) for the help commit |
+| `active_help_after_sec` | `5.0` | wall-clock seconds lost before escalating to NEEDS_HELP (replaces `active_help_after_frames` — frame counts are unreliable when fps varies in a tournament) |
 
 ---
 
-## Issue 2 — OSNet query/gallery background parity (mask-None fallback)
+## Issue 2 — OSNet query/gallery background parity — RESOLVED, NO CODE CHANGE
 
-### Root cause
-The query and gallery deep pipelines are structurally identical (both call
-`reid/reid.py:_segment_crop_for_reid` with the detection mask, same
-resize/normalize/channel order) EXCEPT: `_segment_crop_for_reid` **early-returns
-the RAW, full-background crop when the mask is None / empty / all-zero**
-(`reid/reid.py`, the `if mask_crop is None or mask_crop.size == 0: return crop`
-guard plus the all-zero guard). The gallery is admitted only from quality-gated,
-mask-present frames (always background-neutralized); the query runs every frame,
-including hard ones (small / occluded / edge-clipped persons) where the seg mask
-is missing → a **background-laden query embedding** is cosine-compared against
-neutralized gallery views → background leaks into the deep cosine (intermittent,
-biased toward exactly the hard reacquisition frames). This also drags the deep
-cosine down ~0.10–0.15, feeding Issue 1's dead-band.
+### Decision (operator, 2026-06-09)
+**Rejected the pseudo-mask fallback.** "For the OSNet query you should have the
+seg mask — do not synthesize a pseudo mask." Verified the mask plumbing is
+correct and symmetric: `core/result_parser._extract_mask` populates
+`DetectionResult.mask`, and **every** OSNet query call site already passes the
+real `result.mask` to `extract_features` → `_segment_crop_for_reid` (init/present
+`tracking_pipeline.py:144`, reacq `:266`, verify `:319`, reid_match `:608`,
+periodic `:762`, register `:945`). There is no query-specific mask drop: the
+query uses the same real seg mask the gallery does whenever YOLO-seg emits one.
 
-### Fix — pseudo-mask fallback (Policy A)
-In `_segment_crop_for_reid`, when the mask is None/empty/all-zero, do NOT return
-the raw crop. Instead synthesize a **bbox-inscribed ellipse pseudo-mask** (an
-upright-person prior: ellipse centered in the crop, semi-axes ≈ the crop
-half-extents) and run the SAME pipeline (dilate → tight-crop → resize 128×256 →
-GaussianBlur → `0.15*fg + 0.85*blur` background attenuation). This keeps the
-OSNet input in the same neutralized-background distribution as the gallery even
-with no real mask. One edit point; both the gallery and query paths call this
-function, so parity is enforced everywhere (init, reseed, register, verify,
-periodic) with no other call-site change.
+The only asymmetry is inherent and acceptable: the gallery is *quality-gated*
+(rejects low-coverage frames), the query runs every frame. On the rare frame
+where YOLO-seg genuinely emits a box without a mask, `_segment_crop_for_reid`
+keeps its **existing** raw-crop behavior (unchanged). The right lever for fewer
+maskless frames is a better seg model (Issue 4), not a synthesized mask. Phase A
+was reverted; `reid/reid.py` is unchanged from `main`. No tests, no params.
 
-### Invariants / risks
-- Existing gallery views were built mask-present (neutralized) — a forward fix
-  does not invalidate them; no gallery clear needed.
-- Keep ALL neutralization at the 128×256 OSNet size (the perf-fix invariant —
-  never reintroduce a full-resolution blur). The pseudo-mask synth is
-  constant-time; per-candidate CPU budget unaffected.
-- The ellipse prior is coarser than a real seg mask: it removes corner/background
-  but cannot evict a co-bbox bystander the way a real tight-crop does. It is
-  strictly better than raw background for parity, not a substitute for a mask.
-- This is independent of the `mask_coverage` feature used by Issue 3 (that is
-  computed from the bbox mask in `extract_features`, not from
-  `_segment_crop_for_reid`); the pseudo-mask only affects the OSNet deep crop.
+### Superseded fix (NOT taken — kept for the record)
+The first draft synthesized a bbox-inscribed ellipse pseudo-mask in
+`_segment_crop_for_reid` when the mask was None/empty/all-zero, so a maskless
+query crop would still get the gallery's background neutralization. The operator
+rejected this: the OSNet query already has the real seg mask (plumbing verified
+above), so fabricating one papers over a non-problem and a coarse ellipse can't
+match a real tight-crop. Implementation reverted.
 
 ---
 
@@ -233,10 +252,9 @@ frames — raising the raw ReID operating point that Issue 1's 0.62 bar depends 
   `in_needs_help=False` it does NOT commit at 0.65 (stays strict 0.72); with
   `num_candidates>1` it does NOT use the relaxed path. Confirm the commit produces
   a `target_track_id` swap (latch-clearing path).
-- **Issue 2:** unit-test `_segment_crop_for_reid` with `mask=None` and an all-zero
-  mask: output is 128×256 (=(256,128,3)) and background-neutralized (NOT byte-equal
-  to a plain resize of the raw crop), with the center closer to the original than
-  the corners; a real nonzero mask is unchanged (still segments to the mask).
+- **Issue 2:** no test — no code change (pseudo-mask dropped; the real seg mask is
+  already used for the OSNet query). `reid/reid.py` stays at its `main` contract,
+  so its existing `test_deep_crop_segmentation.py` tests remain valid.
 - **Issue 3:** unit-test the admission gate via `crop_quality_ok` with the new
   thresholds: a square-but-clean box (w/h = 1.0, mask_coverage = 0.45) is ADMITTED
   with `gallery_max_aspect_ratio=2.0, gallery_min_mask_fill=0.35` (regression vs
@@ -251,13 +269,14 @@ frames — raising the raw ReID operating point that Issue 1's 0.62 bar depends 
 - `core/tracking_pipeline.py` — Issue 1 gated commit bar/count/window in
   `_confirm_reid_candidate`.
 - `person_track_node.py` — Issue 1 `tracker.in_needs_help = self._help_latched`
-  wiring + the new param declares/reads (Issues 1 & 3).
-- `reid/reid.py` — Issue 2 pseudo-mask fallback in `_segment_crop_for_reid`.
+  wiring + new param declares/reads (Issues 1 & 3) + `active_help_after_frames`
+  default 45→150 (Issue 1 passive window).
+- `reid/reid.py` — UNCHANGED (Issue 2 pseudo-mask reverted).
 - `reid/appearance_manager.py` — Issue 3 gate dict from tracker-configured
   thresholds.
 - `reid/quality.py` — Issue 3 (only if a default needs touching; signature already
   takes the thresholds as kwargs).
 - `yolo_tracker.py` — tracker defaults for the new attrs (Issues 1 & 3).
 - `scripts/export_yolo_trt.py` / launch docs — Issue 4 (operational).
-- `test/…` — new tests per issue.
+- `test/…` — new tests for Issues 1 & 3.
 - `readme.md` Changelog + `DEV_NOTES.md`.

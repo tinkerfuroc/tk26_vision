@@ -46,6 +46,29 @@ def test_single_waver_auto_reseeds():
     assert out["reseed"]["target_track_id"] == 7
 
 
+def test_single_waver_auto_reseed_inherits_gate_via_shared_service():
+    """Issue 2: the waving auto-reseed calls node.reseed (the same
+    ~/reseed_target service that hits _apply_reseed), so it inherits the reseed
+    confirmation gate by construction — no separate instant-lock path exists.
+
+    A 'success' from reseed_target now means 'accepted, confirming' (probation
+    armed), not 'locked' — the lock commits only after the per-frame appearance
+    confirmation (covered by test_reseed_probation)."""
+    resp = SimpleNamespace(status=0, waving_boxes=[_box(10, 20, 30, 40)],
+                           waving_persons=[])
+    seen = []
+    node = _node(resp, {"success": True, "target_track_id": 7, "message": "ok"},
+                 on_reseed=lambda box: seen.append(box))
+    out = wave(node)
+    # The single waver routed through the shared reseed service exactly once.
+    assert out["auto_reseeded"] is True
+    assert len(seen) == 1
+    # The box passed to reseed is the waver's box (x1,y1,x2,y2) — the same
+    # plumbing a manual dashboard click uses — so both triggers share
+    # _apply_reseed's probation gate.
+    assert seen[0] == [10, 20, 40, 60]
+
+
 def test_multiple_wavers_stay_manual():
     resp = SimpleNamespace(
         status=0, waving_boxes=[_box(10, 20, 30, 40), _box(80, 20, 30, 40)],

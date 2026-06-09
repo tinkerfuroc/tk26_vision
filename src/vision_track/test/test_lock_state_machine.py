@@ -119,3 +119,55 @@ class TestAsymmetricHysteresis:
                 committed_at = f
                 break
         assert committed_at == 12   # deterministic reacquire bound
+
+
+class TestStartProbation:
+    """Phase 2: probationary re-arm for the reseed confirmation gate."""
+
+    def test_enters_reidentifying_without_committing(self):
+        """start_probation arms a candidate id but does NOT jump to 'tracking'."""
+        sm = make_sm()
+        sm.start_probation(committed_id=7)
+        assert sm._state == "reidentifying"
+        assert sm._committed_id == 7
+        assert sm._provisional_streak == 0
+
+    def test_probation_alone_does_not_yield_target_lost_false(self):
+        """No step after start_probation → the machine has not committed a lock.
+
+        Unlike start() (which jumps to 'tracking', so a later present step
+        commits immediately), start_probation leaves the machine in a
+        non-committed state until the pipeline drives it to commit.
+        """
+        sm = make_sm()
+        sm.start_probation(committed_id=7)
+        # A coast (absent / sub-bar) frame must keep target_lost True.
+        d = sm.step(sim_score=0.0, present=False, frames_since_loss=1,
+                    num_candidates=1, distinct_margin=0.0, depth_consistent=True)
+        assert d.target_lost is True
+        assert d.state == "reidentifying"
+
+    def test_probation_lifts_machine_out_of_terminal_lost(self):
+        """start_probation re-arms a terminal-'lost' machine so it can step again."""
+        sm = make_sm()
+        assert sm._state == "lost"
+        sm.start_probation(committed_id=9)
+        # A present-by-id step now re-locks (a fresh 'lost' machine would not).
+        d = sm.step(sim_score=0.9, present=True, frames_since_loss=0,
+                    num_candidates=1, distinct_margin=0.0, depth_consistent=True)
+        assert d.target_lost is False
+        assert d.state == "tracking"
+        assert d.committed_id == 9
+
+    def test_present_step_after_probation_commits(self):
+        """A present-by-id step after probation yields tracking / target_lost False.
+
+        (The pipeline's commit drives start()+present; this asserts the FSM
+        contract the commit relies on.)"""
+        sm = make_sm()
+        sm.start_probation(committed_id=7)
+        d = sm.step(sim_score=0.9, present=True, frames_since_loss=0,
+                    num_candidates=1, distinct_margin=999.0, depth_consistent=True)
+        assert d.state == "tracking"
+        assert d.target_lost is False
+        assert d.committed_id == 7

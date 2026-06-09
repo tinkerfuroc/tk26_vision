@@ -10,20 +10,61 @@ from .quality import crop_quality_ok, DEFAULT_GATE
 logger = logging.getLogger(__name__)
 
 
-def _make_thumb(frame, bbox, max_h: int = 192):
-    """Clamped, aspect-preserving crop of ``bbox`` (same channel order as
-    ``frame`` — RGB in this pipeline) for gallery visualization; None when
-    the bbox is degenerate."""
+def _make_thumb(frame, bbox, mask=None, max_h: int = 192):
+    """Person-only, aspect-preserving gallery thumbnail with a transparent
+    background.
+
+    Returns a 4-channel **BGRA** array (alpha = mask) so the publisher can
+    ``cv2.imencode('.png', thumb)`` directly and the dashboard renders the
+    segmented person with everything else fully transparent. The RGB channels
+    are stored as **BGR** (PNG/imencode convention) — the publish path encodes
+    them with no colour conversion, and the on-disk vision_log writer uses
+    ``cv2.imwrite`` (also BGR), so both consumers stay consistent.
+
+    With a ``mask`` (full-frame, indexed like ``mask[y1:y2, x1:x2]``): tight-crop
+    to the mask's bbox within ``bbox`` (mirrors the deep-crop segmentation intent
+    — person-centered, bystander/background dropped), set the alpha channel to
+    255 where ``mask>0`` else 0, then resize preserving aspect (the whole
+    4-channel image is resized with INTER_NEAREST so the alpha edge stays crisp).
+
+    With ``mask is None``: returns an opaque BGRA thumb (alpha all 255) of the
+    clamped ``bbox`` crop, so behaviour degrades gracefully when no seg model is
+    present.
+
+    ``frame`` is RGB in this pipeline; the returned RGB channels are flipped to
+    BGR. Returns None when the bbox / mask region is degenerate.
+    """
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = (int(v) for v in bbox)
     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
     if x2 - x1 < 2 or y2 - y1 < 2:
         return None
     crop = frame[y1:y2, x1:x2]
-    if crop.shape[0] > max_h:
-        new_w = max(1, round(crop.shape[1] * max_h / crop.shape[0]))
-        crop = cv2.resize(crop, (new_w, max_h), interpolation=cv2.INTER_AREA)
-    return crop.copy()
+
+    alpha = None
+    if mask is not None:
+        mask_crop = mask[y1:y2, x1:x2]
+        if mask_crop.shape[:2] == crop.shape[:2] and mask_crop.size:
+            m = (mask_crop > 0)
+            if m.any():
+                ys, xs = np.where(m)
+                ty1, ty2 = int(ys.min()), int(ys.max()) + 1
+                tx1, tx2 = int(xs.min()), int(xs.max()) + 1
+                if ty2 - ty1 >= 2 and tx2 - tx1 >= 2:
+                    crop = crop[ty1:ty2, tx1:tx2]
+                    alpha = np.where(m[ty1:ty2, tx1:tx2], 255, 0).astype(np.uint8)
+
+    # RGB -> BGR so cv2.imencode('.png') / cv2.imwrite write the right colours.
+    bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+    if alpha is None:
+        alpha = np.full(bgr.shape[:2], 255, dtype=np.uint8)
+    bgra = np.dstack([bgr, alpha])
+
+    if bgra.shape[0] > max_h:
+        new_w = max(1, round(bgra.shape[1] * max_h / bgra.shape[0]))
+        # INTER_NEAREST on the 4-ch image keeps the alpha edge a hard cut.
+        bgra = cv2.resize(bgra, (new_w, max_h), interpolation=cv2.INTER_NEAREST)
+    return bgra.copy()
 
 
 def update_appearance(
@@ -100,7 +141,7 @@ def update_appearance(
 
     thumb = None
     if getattr(tracker, "keep_gallery_thumbs", False):
-        thumb = _make_thumb(frame, result.bbox)
+        thumb = _make_thumb(frame, result.bbox, result.mask)
     _update_feature_history(tracker, features, similarity, current_time, refresh_allowed, thumb)
     _update_color_histories(tracker, features, similarity, refresh_allowed)
     _update_motion(appearance=tracker.target_appearance, result=result, current_time=current_time)

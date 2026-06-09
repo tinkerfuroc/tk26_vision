@@ -7,21 +7,18 @@
 **Test:** `cd /home/tinker/tk25_ws/src/tk26_vision && source .venv-vision-main/bin/activate && python -m pytest src/vision_track/test/ -q`
 **Precision invariants:** no existing threshold changed except behind the new gated/param paths. The Issue-1 relaxation applies ONLY when `in_needs_help` (latched) AND `num_candidates==1`, at bar 0.62 over 12-of-16 frames. Background neutralization stays at 128×256 (perf invariant). The gallery gate is admission-only.
 
-Phases A and B touch DISJOINT files (A: `reid/reid.py`; B: `core/tracking_pipeline.py` + `person_track_node.py` + `yolo_tracker.py`) and may be implemented in parallel. Phase C touches `person_track_node.py` + `yolo_tracker.py` (params/defaults) so it runs AFTER Phase B. Phase D is operational (export + benchmark + docs) and runs last.
+Phase B (Issue 1) lands first; Phase C (Issue 3) follows it (both touch `person_track_node.py` + `yolo_tracker.py`); Phase D (Issue 4) is operational and runs last.
 
 ---
 
-## Phase A — Issue 2: pseudo-mask fallback in `_segment_crop_for_reid` (one commit)
+## Phase A — Issue 2: DROPPED (no code change)
 
-**Files:** `src/vision_track/vision_track/reid/reid.py` (`_segment_crop_for_reid`). Test: `src/vision_track/test/test_segment_crop_fallback.py` (new). Doc: `readme.md`.
-
-- [ ] **Step 1 — failing test.** `test_segment_crop_fallback.py`: `_segment_crop_for_reid` is pure numpy/cv2 — bind it onto a stub (do NOT construct `AppearanceExtractor`, which loads OSNet): e.g. `from vision_track.reid.reid import AppearanceExtractor` then call `AppearanceExtractor._segment_crop_for_reid(object.__new__(AppearanceExtractor), crop, mask)` OR extract the method's logic if `self` is unused (check — it appears to use no instance state). Construct a 200×100×3 uint8 crop with a distinct bright center and dark corners. Assert: (a) with `mask_crop=None` AND with an all-zero `mask`, the result is shape `(256,128,3)` and is NOT byte-equal to `cv2.resize(crop,(128,256))` (background was neutralized); (b) the center region (person prior) is closer to the resized original than the corner regions (corners blurred toward background); (c) with a real nonzero mask the output still segments to that mask (unchanged path — compare to current behavior). Apache header.
-- [ ] **Step 2 — run, verify FAIL** (current code returns the raw crop for mask-None/empty/all-zero).
-- [ ] **Step 3 — implement.** In `_segment_crop_for_reid`, replace the early-returns (`if mask_crop is None or mask_crop.size == 0: return crop` and the all-zero `m.sum()==0` guard) with: synthesize a **bbox-inscribed ellipse pseudo-mask** `uint8` array the size of `crop` — `m = np.zeros(crop.shape[:2], np.uint8); cv2.ellipse(m, center=(w//2,h//2), axes=(int(w*0.5), int(h*0.5)), angle=0, startAngle=0, endAngle=360, color=1, thickness=-1)` — then fall through to the SAME dilate→tight-crop→resize(128×256)→GaussianBlur→`0.15*fg+0.85*blur` path. Keep all work at the 128×256 size (no full-res blur). Guard `w>0 and h>0` (degenerate crop → still return a resize, never crash).
-- [ ] **Step 4 — run, verify PASS** + full suite (no regressions; no new flake8 in touched lines).
-- [ ] **Step 5 — README changelog** (same commit): mask-None/empty query crops are now background-neutralized via an ellipse pseudo-mask, so OSNet input has the same background processing as gallery views (background-independent matching).
-- [ ] **Step 6 — build + commit** explicit paths: `src/vision_track/vision_track/reid/reid.py` + `src/vision_track/test/test_segment_crop_fallback.py` + `src/vision_track/readme.md`.
-  `feat(vision_track): pseudo-mask fallback for maskless ReID crops (query/gallery bg parity)`
+Pseudo-mask fallback **reverted** per operator review (2026-06-10): the OSNet
+query already uses the real seg mask (plumbing verified — `result_parser`
+populates `DetectionResult.mask`; every query call site passes it). `reid/reid.py`
+is unchanged from `main`. No tests, no params, no commit. Fewer maskless frames
+come from the better seg model (Phase D), not a synthesized mask. See spec
+§"Issue 2 — RESOLVED, NO CODE CHANGE".
 
 ---
 
@@ -52,10 +49,11 @@ Phases A and B touch DISJOINT files (A: `reid/reid.py`; B: `core/tracking_pipeli
   ```
   (Replace the existing `required_confirmation`/`commit_bar`/`is_hit`/`window_m` assignments at ~626–634 with this block so `window_m` is set before `_push_window` closes over it. Keep the N-of-M window, the arming `sum(window) >= reid_preconfirm_frames`, and the commit `sum(window) >= required_confirmation` EXACTLY as Phase 3 — only the three locals change in the gate.) Everything downstream (commit → swap → caller's `committed_swap` → `fsm.start` present=True) is unchanged so the help-latch clears on the real re-lock.
 - [ ] **Step 4 — node wiring + params.** In `person_track_node.py`: `declare_parameter('single_person_commit_bar_help', 0.62)`, `declare_parameter('needs_help_confirm_frames', 12)`, `declare_parameter('needs_help_commit_window', 16)`; read them into `self.*` and set on `self.tracker` next to where `single_person_commit_bar` / `provisional_commit_window` are set (~447–448). Set `self.tracker.in_needs_help = self._help_latched` once per tracking iteration BEFORE the tracker's `update(...)` is called (the latched flag is stable so no oscillation). Add tracker defaults in `yolo_tracker.py` (`in_needs_help=False`, `single_person_commit_bar_help=0.62`, `needs_help_confirm_frames=12`, `needs_help_commit_window=16`).
+- [ ] **Step 4b — WALL-CLOCK passive-recovery window (~5 s, NOT frames).** Operator constraint: frame counts are unreliable in a tournament. Convert NEEDS_HELP escalation to wall-clock: (i) `core/reacq_state.py` → `reacq_state(tracked, time_since_lost, help_after_sec)` (NEEDS_HELP when `time_since_lost >= help_after_sec`; `<=0` immediate; update docstring); (ii) `person_track_node.py` — replace param `active_help_after_frames` with `active_help_after_sec` (default 5.0); add `self._last_confirmed_time` anchor (init at tracking start, reset per goal, refresh only on `feedback.target_lost == False`); pass `time_since_lost = time.time() - self._last_confirmed_time` to both `reacq_state` telemetry calls (~1254, ~1421) and to `_is_awaiting_help`; change `_is_awaiting_help` to latch at `time_since_lost >= active_help_after_sec` and disable at `active_help_after_sec <= 0` (keep the time-based `active_help_timeout_sec` bound; keep latch-clear-on-true-relock); update the warn log to seconds; (iii) `core/debug_state.py` — rename field `active_help_after_frames`→`active_help_after_sec` (float) and node call sites (~1529, ~1586); (iv) grep `track_web`/dashboard assets for `active_help_after_frames` and update any display to seconds. Update tests: `test/test_reacq_state.py`, `test/test_active_help_hold.py`, `test/test_debug_state.py`, `test/test_active_reid_interfaces.py` (any that reference the old name).
 - [ ] **Step 5 — run full suite green** (existing passive-reacq/lookalike/lock tests must stay green — the strict path is unchanged when `in_needs_help` is False).
-- [ ] **Step 6 — README changelog** (same commit): post-NEEDS_HELP passive recovery — while latched in NEEDS_HELP with exactly one person visible, the lone commit bar relaxes to `single_person_commit_bar_help` (0.62) over `needs_help_confirm_frames`/`needs_help_commit_window` (12-of-16) sustained hits, so a returning operator auto-re-locks without a wave; multi-person + in-window passive stay strict 0.72; N-of-M preserved and strengthened.
+- [ ] **Step 6 — README changelog** (same commit): (a) post-NEEDS_HELP passive recovery — while latched in NEEDS_HELP with exactly one person visible, the lone commit bar relaxes to `single_person_commit_bar_help` (0.62) over `needs_help_confirm_frames`/`needs_help_commit_window` (12-of-16) sustained hits, so a returning operator auto-re-locks without a wave; multi-person + in-window passive stay strict 0.72; N-of-M preserved and strengthened. (b) passive-recovery window extended to ~5 s (`active_help_after_frames` 45→150) before escalating to NEEDS_HELP.
 - [ ] **Step 7 — build + commit** explicit paths (`core/tracking_pipeline.py`, `person_track_node.py`, `yolo_tracker.py`, the test, `readme.md`).
-  `feat(vision_track): relax lone passive recovery (0.62, 12-of-16) while latched in NEEDS_HELP`
+  `feat(vision_track): relax lone passive recovery (0.62, 12-of-16) + extend passive window to 5s`
 
 ---
 

@@ -39,6 +39,17 @@ Two linked root causes (parallel investigation, bag-log corroborated):
   cosine bypasses the color veto; bystanders (deep ~0.47-0.57) still get vetoed.
   Raw-deep floor, distinctiveness margin, deep-ratio gate all unchanged.
 
+**Perf regression + fix (`95f8062`).** The deep-crop segmentation
+(`_segment_crop_for_reid`) initially ran `cv2.GaussianBlur(sigma=9)` on
+full-resolution crops ~2×/person/frame → tracking loop dropped to **13.2 Hz**
+(pipeline 56 ms), making the web feed laggy. Fixed by (1) doing the dilate/blur at
+the fixed OSNet input size (128×256, constant ~0.3 ms — the model resizes there
+anyway) and (2) `extract_features(compute_reid=False)` in the batch path to stop a
+redundant per-detection deep forward that was discarded. Pipeline **56 → 15 ms**;
+reacquisition + row-equivalence re-verified. Lesson: any per-detection CV op added
+to `extract_features`/`_batch` runs in the 30 Hz loop — keep it at OSNet input
+scale, and don't let the batch path re-run the per-detection deep pass.
+
 Plus operator request `d292471`: **transparent person-only crops** — gallery
 thumbnails are BGRA (mask alpha, tight-crop), published PNG to the dashboard and
 written to `vision_log` as transparent PNGs (gated by `gallery_keep_crops`).

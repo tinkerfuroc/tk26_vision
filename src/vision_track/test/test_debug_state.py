@@ -51,7 +51,7 @@ def _bare(**over):
 def _kw(**over):
     kw = dict(ts=123.0, target_lost=True, reacquisition_state=1,
               time_since_seen=0.8, awaiting_help=False,
-              active_help_after_frames=45, active_help_timeout_sec=20.0)
+              active_help_after_sec=5.0, active_help_timeout_sec=20.0)
     kw.update(over)
     return kw
 
@@ -62,6 +62,7 @@ def test_full_snapshot():
     assert d["fsm_state"] == "reidentifying"
     assert d["reacquisition_state"] == 1 and d["frames_lost"] == 12
     assert d["awaiting_help"] is False and d["active_help_timeout_sec"] == 20.0
+    assert d["active_help_after_sec"] == 5.0 and isinstance(d["active_help_after_sec"], float)
     assert d["target_track_id"] == 3 and d["original_track_id"] == 3
     # persons with a real track id only; scores joined on id; bbox may be None
     assert d["candidates"] == [

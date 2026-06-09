@@ -18,19 +18,20 @@ from vision_track.core.reacq_state import (
 
 
 def test_tracked_is_tracking():
-    assert reacq_state(tracked=True, frames_lost=0, help_after=45) == REACQ_TRACKING
-    assert reacq_state(tracked=True, frames_lost=999, help_after=45) == REACQ_TRACKING
+    assert reacq_state(tracked=True, time_since_lost=0.0, help_after_sec=5.0) == REACQ_TRACKING
+    assert reacq_state(tracked=True, time_since_lost=999.0, help_after_sec=5.0) == REACQ_TRACKING
 
 
 def test_lost_within_window_is_passive():
-    assert reacq_state(tracked=False, frames_lost=1, help_after=45) == REACQ_PASSIVE
-    assert reacq_state(tracked=False, frames_lost=44, help_after=45) == REACQ_PASSIVE
+    assert reacq_state(tracked=False, time_since_lost=0.1, help_after_sec=5.0) == REACQ_PASSIVE
+    assert reacq_state(tracked=False, time_since_lost=2.0, help_after_sec=5.0) == REACQ_PASSIVE
 
 
 def test_lost_past_window_needs_help():
-    assert reacq_state(tracked=False, frames_lost=45, help_after=45) == REACQ_NEEDS_HELP
-    assert reacq_state(tracked=False, frames_lost=200, help_after=45) == REACQ_NEEDS_HELP
+    assert reacq_state(tracked=False, time_since_lost=5.0, help_after_sec=5.0) == REACQ_NEEDS_HELP
+    assert reacq_state(
+        tracked=False, time_since_lost=200.0, help_after_sec=5.0) == REACQ_NEEDS_HELP
 
 
 def test_help_after_zero_escalates_immediately_when_lost():
-    assert reacq_state(tracked=False, frames_lost=0, help_after=0) == REACQ_NEEDS_HELP
+    assert reacq_state(tracked=False, time_since_lost=0.0, help_after_sec=0.0) == REACQ_NEEDS_HELP

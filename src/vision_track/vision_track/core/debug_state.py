@@ -29,7 +29,7 @@ def build_debug_state(
     reacquisition_state: int,
     time_since_seen: float,
     awaiting_help: bool,
-    active_help_after_frames: int,
+    active_help_after_sec: float,
     active_help_timeout_sec: float,
 ) -> Dict[str, Any]:
     """Snapshot tracker + node loss-state into a JSON-serializable dict."""
@@ -59,7 +59,7 @@ def build_debug_state(
         "frames_lost": int(getattr(tracker, "frames_lost", 0) or 0),
         "time_since_seen": float(time_since_seen),
         "awaiting_help": bool(awaiting_help),
-        "active_help_after_frames": int(active_help_after_frames),
+        "active_help_after_sec": float(active_help_after_sec),
         "active_help_timeout_sec": float(active_help_timeout_sec),
         "target_track_id": getattr(tracker, "target_track_id", None),
         "original_track_id": getattr(tracker, "original_track_id", None),

@@ -272,6 +272,17 @@ class YOLOTracker:
         self.single_person_commit_bar = 0.72
         self.provisional_commit_window = 18
         self.reid_confirm_window: list = []
+        # Issue 1: relaxed lone-candidate recovery while latched in NEEDS_HELP.
+        # in_needs_help mirrors the node's _help_latched (set per iteration before
+        # update). When True AND exactly one person is visible,
+        # _confirm_reid_candidate relaxes the lone commit bar to
+        # single_person_commit_bar_help (0.62) and requires needs_help_confirm_frames
+        # (N) confirm hits within the last needs_help_commit_window (M) frames.
+        # The node overrides the three knobs from ROS params.
+        self.in_needs_help = False
+        self.single_person_commit_bar_help = 0.62
+        self.needs_help_confirm_frames = 12
+        self.needs_help_commit_window = 16
         # Issue 2: reseed confirmation gate. After a reseed (manual or waving),
         # the seeded id must be present + ReID-confirmed for
         # reseed_confirmation_frames consecutive frames before the lock commits.

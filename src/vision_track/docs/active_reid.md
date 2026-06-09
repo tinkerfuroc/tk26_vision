@@ -34,15 +34,17 @@ three constants (defined in `action/TrackPerson.action`):
 |---|---|---|
 | `0` | `REACQ_TRACKING` | Target held this frame. Normal operation; no action. |
 | `1` | `REACQ_PASSIVE` | Target lost, but within the passive-recovery window. The tracker is still trying to re-lock on its own — **wait, do not call out yet.** |
-| `2` | `REACQ_NEEDS_HELP` | Lost for `>= active_help_after_frames` consecutive frames. Passive recovery has been given its budget and failed — escalation is now warranted. |
+| `2` | `REACQ_NEEDS_HELP` | Lost (since the last confirmed lock) for `>= active_help_after_sec` wall-clock seconds. Passive recovery has been given its budget and failed — escalation is now warranted. |
 
-The state is pure hysteresis over `(tracked?, consecutive frames lost)` —
-see `vision_track/core/reacq_state.py`. The tracker is the publish authority;
-`active_help_after_frames` (default **45**, `config/default.yaml`) is the
-**escalation debounce**: how many lost frames to spend on passive recovery before
-advertising `NEEDS_HELP`. It exists so the BT does not call out (and incur the
-penalty) on every momentary occlusion. Tune it up for a more patient robot, down
-for a more eager one.
+The state is pure hysteresis over `(tracked?, wall-clock seconds since the last
+confirmed lock)` — see `vision_track/core/reacq_state.py`. The tracker is the
+publish authority; `active_help_after_sec` (default **5.0**, `config/default.yaml`)
+is the **escalation debounce**: how many seconds to spend on passive recovery
+before advertising `NEEDS_HELP`. It is wall-clock, not frame-count, because
+tournament GPU contention makes the frame rate unreliable — a frame threshold
+would give an unpredictable real-time window. It exists so the BT does not call
+out (and incur the penalty) on every momentary occlusion. Tune it up for a more
+patient robot, down for a more eager one.
 
 `reacquisition_state` is published from both `_handle_tracked_frame`
 (→ `REACQ_TRACKING`) and `_handle_lost_frame` (→ `REACQ_PASSIVE` /
@@ -55,8 +57,8 @@ for a more eager one.
    `reacquisition_state` is `REACQ_TRACKING` (0) or `REACQ_PASSIVE` (1), do
    nothing — the tracker is coping.
 2. **Escalate on `NEEDS_HELP`.** When `reacquisition_state == REACQ_NEEDS_HELP`
-   (2), the target has been lost for `>= active_help_after_frames` (default 45)
-   frames. The BT decides escalation is worth the penalty (task-dependent),
+   (2), the target has been lost for `>= active_help_after_sec` (default 5.0)
+   wall-clock seconds. The BT decides escalation is worth the penalty (task-dependent),
    speaks a call-out ("please raise your hand / wait"), and accepts the RoboCup
    points penalty for the assist.
 3. **Find the raised hand.** The BT calls the waving detector
@@ -121,8 +123,8 @@ no re-seed, the action aborts (gives up) as before. Set
 `active_help_timeout_sec: 0.0` to disable the hold entirely (legacy fast-abort).
 
 > **Give-up timing changed for *all* `TrackPerson` callers, not just active-reID.**
-> Because `active_help_after_frames` (45) equals `max_recovery_frames` (45), the
-> hold engages on **every** hard loss. A caller that is *not* running an
+> Once the target has been lost for `active_help_after_sec` (default 5.0 s)
+> wall-clock seconds, the hold engages on **every** hard loss. A caller that is *not* running an
 > active-reID BT (the target genuinely left) now sees the action stay alive up to
 > `active_help_timeout_sec` (~20 s) before it aborts, versus ~1.5–3 s previously.
 > If a caller needs the old fast failure, lower `active_help_timeout_sec` or set

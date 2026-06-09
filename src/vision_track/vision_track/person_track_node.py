@@ -135,6 +135,13 @@ class PersonTrackNode(Node):
         # aborted mid-reappearance. Cleared on re-lock + cleanup. See
         # _is_awaiting_help.
         self._help_latched = False
+        # Wall-clock anchor for the NEEDS_HELP escalation: the time of the last
+        # CONFIRMED lock (target_lost False). The escalation clock is
+        # time.time()-_last_confirmed_time. Refreshed ONLY on a true re-lock —
+        # NOT on a provisional/coast frame — so it measures real time since the
+        # last confirmed sighting (frame rate is unreliable in a tournament).
+        # Set at tracking start and per goal; placeholder until then.
+        self._last_confirmed_time = 0.0
 
         # Phase 2: EMA smoother on the published 3D point; reset on loss so a
         # re-acquired target doesn't lerp from a stale point.
@@ -241,14 +248,28 @@ class PersonTrackNode(Node):
         self.declare_parameter('single_person_pursue_floor', 0.55)
         self.declare_parameter('single_person_commit_bar', 0.72)
         self.declare_parameter('provisional_commit_window', 18)
-        # Spec B: consecutive frames lost before the published reacquisition_state
+        # Issue 1: precision-bounded escape hatch out of a latched NEEDS_HELP. A
+        # lone returner scoring in the [0.55, 0.72) dead band is pursued every
+        # frame but never a strict hit → stuck in NEEDS_HELP forever. ONLY while
+        # latched in NEEDS_HELP AND exactly one person is visible, relax the lone
+        # commit bar to single_person_commit_bar_help (0.62) and require
+        # needs_help_confirm_frames (N) confirm hits within the last
+        # needs_help_commit_window (M) frames, then commit (clearing the latch).
+        # Outside that gate behavior is byte-for-byte unchanged.
+        self.declare_parameter('single_person_commit_bar_help', 0.62)
+        self.declare_parameter('needs_help_confirm_frames', 12)
+        self.declare_parameter('needs_help_commit_window', 16)
+        # Spec B: WALL-CLOCK seconds lost before the published reacquisition_state
         # escalates to NEEDS_HELP, so a BT can debounce active (call-out) re-ID.
-        self.declare_parameter('active_help_after_frames', 45)
+        # Wall-clock (not frame-count) because tournament GPU contention makes the
+        # frame rate unreliable — a frame threshold would give an unpredictable
+        # real-time escalation window. Measured from the last CONFIRMED lock.
+        self.declare_parameter('active_help_after_sec', 5.0)
         # While reacquisition_state==NEEDS_HELP, keep the tracker+gallery alive
         # (coast, no abort/reset) so the operator can wave and be reseeded.
         # <=0 (default) holds INDEFINITELY — only a successful reseed or a cancel
         # ends the hold; a positive value bounds it to that many seconds. Disable
-        # active help entirely with active_help_after_frames<=0 (legacy abort on
+        # active help entirely with active_help_after_sec<=0 (legacy abort on
         # hard-lost).
         self.declare_parameter('active_help_timeout_sec', 0.0)
         # Frame-starvation watchdog. The loop's only frame source is the
@@ -344,7 +365,14 @@ class PersonTrackNode(Node):
             self.get_parameter('single_person_commit_bar').value)
         self.provisional_commit_window = int(
             self.get_parameter('provisional_commit_window').value)
-        self.active_help_after_frames = int(self.get_parameter('active_help_after_frames').value)
+        # Issue 1: relaxed lone-candidate recovery while latched in NEEDS_HELP.
+        self.single_person_commit_bar_help = float(
+            self.get_parameter('single_person_commit_bar_help').value)
+        self.needs_help_confirm_frames = int(
+            self.get_parameter('needs_help_confirm_frames').value)
+        self.needs_help_commit_window = int(
+            self.get_parameter('needs_help_commit_window').value)
+        self.active_help_after_sec = float(self.get_parameter('active_help_after_sec').value)
         self.active_help_timeout_sec = float(self.get_parameter('active_help_timeout_sec').value)
         self.frame_stall_warn_sec = float(self.get_parameter('frame_stall_warn_sec').value)
         self.frame_stall_lost_sec = float(self.get_parameter('frame_stall_lost_sec').value)
@@ -446,6 +474,14 @@ class PersonTrackNode(Node):
                 self.tracker.single_person_pursue_floor = float(self.single_person_pursue_floor)
                 self.tracker.single_person_commit_bar = float(self.single_person_commit_bar)
                 self.tracker.provisional_commit_window = int(self.provisional_commit_window)
+                # Issue 1: relaxed lone-candidate recovery while latched in
+                # NEEDS_HELP. in_needs_help is set per tracking iteration (before
+                # tracker.update) from self._help_latched; these three knobs
+                # define the relaxed bar + N-of-M window used only then.
+                self.tracker.single_person_commit_bar_help = float(
+                    self.single_person_commit_bar_help)
+                self.tracker.needs_help_confirm_frames = int(self.needs_help_confirm_frames)
+                self.tracker.needs_help_commit_window = int(self.needs_help_commit_window)
                 self.tracker.lock_state_machine = LockStateMachine(
                     high_bar=self.tracker.provisional_high_bar,
                     distinct_margin=self.tracker.provisional_distinct_margin,
@@ -949,11 +985,20 @@ class PersonTrackNode(Node):
                         time.sleep(0.1)
                         continue
                     last_seen_time = time.time()
+                    # Tracking just started (init succeeded): anchor the
+                    # wall-clock escalation here. Refreshed only on a true
+                    # re-lock thereafter (never on a provisional coast).
+                    self._last_confirmed_time = time.time()
                 # Phase 2: median depth per visible person bbox (from the last
                 # frame's results against the current depth) so the pipeline's
                 # crosser gate can reject toward-camera candidates this frame.
                 if self.tracker.last_results and depth_msg is not None:
                     self._refresh_candidate_depths(depth_msg)
+                # Issue 1: expose the (stable) NEEDS_HELP latch to the tracker
+                # BEFORE update() so _confirm_reid_candidate can take the relaxed
+                # lone-candidate recovery path this frame. The latch is set/cleared
+                # in the lost/reclaim handlers, so it's well-defined here.
+                self.tracker.in_needs_help = bool(self._help_latched)
                 track_result = self.tracker.update(rgb_frame)
             t_track = time.perf_counter() - t_track0
 
@@ -1216,10 +1261,13 @@ class PersonTrackNode(Node):
         # track_result is not None but feedback.target_lost is True, so a hardcoded
         # REACQ_TRACKING would contradict target_lost. Report PASSIVE/NEEDS_HELP
         # honestly in that window and REACQ_TRACKING only when fully held.
+        # NOTE: this call is BEFORE the re-lock anchor refresh below — on a held
+        # frame tracked=True forces TRACKING regardless of the clock; on a
+        # provisional coast tracked=False and the elapsed time is correct.
         feedback.reacquisition_state = reacq_state(
             tracked=not feedback.target_lost,
-            frames_lost=int(getattr(self.tracker, 'frames_lost', 0)),
-            help_after=self.active_help_after_frames)
+            time_since_lost=time.time() - self._last_confirmed_time,
+            help_after_sec=self.active_help_after_sec)
         goal_handle.publish_feedback(feedback)
 
         # Cache the latest good frame for the lost-transition dump, and emit
@@ -1262,6 +1310,11 @@ class PersonTrackNode(Node):
         # _is_awaiting_help.
         if not feedback.target_lost:
             self._help_latched = False
+            # True re-lock: refresh the wall-clock escalation anchor. This is the
+            # ONLY refresh site (never a provisional/coast frame, where
+            # target_lost is still True) — that is what keeps the escalation clock
+            # measuring real time since the last CONFIRMED lock.
+            self._last_confirmed_time = time.time()
 
     def _vision_log_due(self, state: str, now: float) -> bool:
         """True if a vision-log write should fire for `state` ('tracked'/'lost') now.
@@ -1289,29 +1342,30 @@ class PersonTrackNode(Node):
             self.get_logger().warn(f'vision-log submit failed: {exc}',
                                    throttle_duration_sec=5.0)
 
-    def _is_awaiting_help(self, frames_lost, time_since_seen):
+    def _is_awaiting_help(self, time_since_lost, time_since_seen):
         """True while coasting (holding) for re-ID recovery — auto-reclaim or wave.
 
-        Escalates after ``active_help_after_frames`` consecutive lost frames and
-        then LATCHES (``_help_latched``). The latch is essential: when the
-        operator reappears, the passive re-ID path resets ``frames_lost`` to 0 on
-        every pre-commit confirmation frame (see _confirm_reid_candidate) — well
-        before the ~12-frame re-lock commits. Without the latch that reset would
-        drop ``frames_lost`` below the escalation threshold, flip this predicate
-        False, and let the hard-lost abort fire mid-reappearance — killing the
-        goal before the auto-reclaim can complete. The latch clears only on a
-        successful re-lock (_handle_tracked_frame) or goal cleanup, so each
-        loss→reclaim cycle gets a fresh hold.
+        Escalates after ``active_help_after_sec`` WALL-CLOCK seconds lost
+        (measured from the last CONFIRMED lock) and then LATCHES
+        (``_help_latched``). The latch is essential: when the operator reappears,
+        the passive re-ID path resets ``frames_lost`` to 0 on every pre-commit
+        confirmation frame (see _confirm_reid_candidate) — and a provisional coast
+        does NOT refresh the confirmed-lock anchor, so the elapsed clock can read
+        low right after escalation. Without the latch a sub-threshold reading
+        would flip this predicate False and let the hard-lost abort fire
+        mid-reappearance — killing the goal before the auto-reclaim can complete.
+        The latch clears only on a successful re-lock (_handle_tracked_frame) or
+        goal cleanup, so each loss→reclaim cycle gets a fresh hold.
 
         Once latched, holds INDEFINITELY when ``active_help_timeout_sec <= 0``
         (default — only a reseed, re-lock, or cancel ends it), or up to that many
         seconds measured from the last CONFIRMED sighting (a pre-commit match does
-        not refresh ``time_since_seen``). ``active_help_after_frames <= 0``
-        disables active help (legacy abort on hard-lost).
+        not refresh ``time_since_seen``). ``active_help_after_sec <= 0`` disables
+        active help (legacy abort on hard-lost).
         """
-        if self.active_help_after_frames <= 0:
+        if self.active_help_after_sec <= 0:
             return False
-        if frames_lost >= self.active_help_after_frames:
+        if time_since_lost >= self.active_help_after_sec:
             self._help_latched = True
         if not getattr(self, '_help_latched', False):
             return False
@@ -1385,8 +1439,9 @@ class PersonTrackNode(Node):
                 feedback.rgb_img = rgb_msg
 
         feedback.reacquisition_state = reacq_state(
-            tracked=False, frames_lost=int(getattr(self.tracker, 'frames_lost', 0)),
-            help_after=self.active_help_after_frames)
+            tracked=False,
+            time_since_lost=time.time() - self._last_confirmed_time,
+            help_after_sec=self.active_help_after_sec)
         goal_handle.publish_feedback(feedback)
 
         # Republish a lost-sentinel so /target_points consumers see the loss
@@ -1406,13 +1461,13 @@ class PersonTrackNode(Node):
         # ~/reseed_target and re-lock the self-identified operator preserving
         # identity. Bounded by active_help_timeout_sec; lost_timeout stays the
         # absolute ceiling. Set active_help_timeout_sec<=0 to disable (legacy abort).
-        frames_lost = int(getattr(self.tracker, 'frames_lost', 0))
-        if self._is_awaiting_help(frames_lost, time_since_seen):
+        time_since_lost = time.time() - self._last_confirmed_time
+        if self._is_awaiting_help(time_since_lost, time_since_seen):
             if not self._active_help_logged:
                 bound = ('indefinitely' if self.active_help_timeout_sec <= 0.0
                          else f'up to {self.active_help_timeout_sec:.0f}s')
                 self.get_logger().warn(
-                    f'Target lost {frames_lost}f; awaiting active re-ID help '
+                    f'Target lost {time_since_lost:.1f}s; awaiting active re-ID help '
                     f'(holding {bound} for ~/reseed_target — wave to resume)')
                 self._active_help_logged = True
             return False
@@ -1494,7 +1549,7 @@ class PersonTrackNode(Node):
                 target_lost=True,
                 reacquisition_state=1,  # REACQ_PASSIVE: searching, not locked
                 time_since_seen=0.0, awaiting_help=False,
-                active_help_after_frames=self.active_help_after_frames,
+                active_help_after_sec=self.active_help_after_sec,
                 active_help_timeout_sec=self.active_help_timeout_sec)
             state["fsm_state"] = phase
             state["candidates"] = []      # may be stale from a previous goal;
@@ -1543,15 +1598,15 @@ class PersonTrackNode(Node):
         try:
             if self.debug_state_enabled:
                 tss = time.time() - last_seen_time
-                frames_lost = int(getattr(self.tracker, 'frames_lost', 0))
+                time_since_lost = time.time() - self._last_confirmed_time
                 awaiting = (bool(feedback.target_lost)
-                            and self._is_awaiting_help(frames_lost, tss))
+                            and self._is_awaiting_help(time_since_lost, tss))
                 state = build_debug_state(
                     self.tracker, ts=time.time(),
                     target_lost=bool(feedback.target_lost),
                     reacquisition_state=int(feedback.reacquisition_state),
                     time_since_seen=tss, awaiting_help=awaiting,
-                    active_help_after_frames=self.active_help_after_frames,
+                    active_help_after_sec=self.active_help_after_sec,
                     active_help_timeout_sec=self.active_help_timeout_sec)
                 self.debug_state_pub.publish(String(data=json.dumps(state)))
                 if self.gallery_keep_crops:
@@ -1635,6 +1690,9 @@ class PersonTrackNode(Node):
         self._was_lost = False
         self._active_help_logged = False
         self._help_latched = False
+        # Re-anchor the escalation clock per goal (runs on goal completion, so
+        # the next goal begins with a fresh anchor); tracking start overwrites it.
+        self._last_confirmed_time = time.time()
         self._point_ema.reset()
 
         if self.target_point_pub is not None:

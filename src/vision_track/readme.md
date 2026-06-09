@@ -100,6 +100,14 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — deep-gate the hard color veto (ReID was too strict). The
+  body/upper/lower color-histogram floors (0.40) used to `return 0.0` outright,
+  force-zeroing even a 0.9 deep match the instant a color score dipped — the top
+  cause of a correct (yellow) target never re-locking (going green) under
+  lighting/pose change. The color veto now bypasses when the deep cosine is
+  confident (`DEEP_CONFIDENT_BYPASS = 0.70`, well above the bystander deep band
+  ~0.47–0.57). Bystanders still have low deep, so the veto still rejects them;
+  the raw-deep floor, distinctiveness margin, and deep-ratio gates are unchanged.
 - **2026-06-09** — person-segment the deep ReID crop. The deep OSNet embedding
   was extracted from the raw bounding-box crop, so the gallery baked in
   background and any bystander sharing the box — which both let the tracker lock

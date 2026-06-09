@@ -100,6 +100,17 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — fix stuck-yellow bounding box after ReID reacquire. After any
+  reacquisition the live ByteTrack id (`target_track_id`) diverges from the frozen
+  `original_track_id` stored in `target_result.track_id`. The old color decision
+  compared `track_id == target_result.track_id`, so the matched detection failed the
+  green test and fell through to yellow. The fix: refactor the per-box color decision
+  into `_target_box_color_kind()` which gates on the LIVE id (`target_track_id`) AND
+  the FSM state (`last_lock_decision.state == 'tracking'`). A fully-locked target is
+  now drawn GREEN regardless of id-space divergence; yellow is reserved for the
+  reidentifying coast; blue for unrelated detections. Visualization only — no
+  behavior/threshold/feedback changes.
+
 - **2026-06-09** — fix the laggy web feed introduced by the deep-crop
   segmentation. `_segment_crop_for_reid` ran `cv2.GaussianBlur` on full-resolution
   crops ~2× per person per frame, dropping the tracking loop (and thus the

@@ -62,6 +62,32 @@ from vision_track.core.reacq_state import reacq_state
 from vision_track.core.debug_state import build_debug_state
 
 
+def _target_box_color_kind(track_id, target_result, target_track_id, decision):
+    """Return the color kind for one detection box in the debug overlay.
+
+    Uses the LIVE ByteTrack id (target_track_id) and the FSM state so the
+    decision stays correct after a ReID reacquire, when target_result.track_id
+    (frozen original_track_id) may differ from the live id.
+
+    Returns:
+        'target'      — green, fully locked (live id match + FSM 'tracking')
+        'yolo_target' — yellow, live id matches but not fully committed
+        'other'       — blue, unrelated detection
+    """
+    fsm_tracking = (getattr(decision, 'state', None) == 'tracking')
+    is_target = (
+        target_result is not None
+        and target_track_id is not None
+        and track_id == target_track_id
+        and fsm_tracking
+    )
+    if is_target:
+        return 'target'
+    if track_id == target_track_id:
+        return 'yolo_target'
+    return 'other'
+
+
 class PersonTrackNode(Node):
     """
     ROS2 Action Server node for person tracking using YOLO.
@@ -654,56 +680,57 @@ class PersonTrackNode(Node):
         return point
 
     def _draw_debug_info(
-        self, 
-        rgb_img: np.ndarray, 
+        self,
+        rgb_img: np.ndarray,
         all_results: list,
         target_result: 'TrackingResult',
         target_track_id: int
     ) -> np.ndarray:
         """
         Draw debug visualization on the RGB image.
-        
+
         Args:
             rgb_img: BGR image to draw on
             all_results: All tracking results from YOLO
             target_result: The target tracking result (or None)
             target_track_id: The current target YOLO track ID
-            
+
         Returns:
             Annotated BGR image
         """
         debug_img = rgb_img.copy()
-        
+        decision = getattr(self.tracker, 'last_lock_decision', None)
+
         # Draw all detected persons
         for result in all_results:
             if result.class_id != 0:  # Skip non-person
                 continue
-                
+
             x1, y1, x2, y2 = result.bbox
             track_id = result.track_id
-            
-            # Determine color based on whether this is the target
-            is_target = (target_result is not None and track_id == target_result.track_id)
-            is_yolo_target = (track_id == target_track_id)
-            
-            if is_target:
-                color = (0, 255, 0)  # Green for tracked target
+
+            # Determine color using live id + FSM state (fixes stuck-yellow after reacquire)
+            color_kind = _target_box_color_kind(
+                track_id, target_result, target_track_id, decision)
+
+            if color_kind == 'target':
+                color = (0, 255, 0)    # Green for locked target
                 thickness = 3
-            elif is_yolo_target:
-                color = (0, 255, 255)  # Yellow for YOLO target ID (but not matched)
+            elif color_kind == 'yolo_target':
+                color = (0, 255, 255)  # Yellow for YOLO id match, not fully committed
                 thickness = 2
             else:
-                color = (255, 0, 0)  # Blue for other detections
+                color = (255, 0, 0)    # Blue for other detections
                 thickness = 1
-            
+
             # Draw bounding box
             cv2.rectangle(debug_img, (x1, y1), (x2, y2), color, thickness)
-            
+
             # Draw track ID label
             label = f"ID:{track_id}"
-            if is_target:
+            if color_kind == 'target':
                 label += " (TARGET)"
-            elif is_yolo_target:
+            elif color_kind == 'yolo_target':
                 label += " (YOLO_TARGET)"
             
             # Add confidence

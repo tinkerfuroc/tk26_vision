@@ -100,6 +100,23 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — bounded the per-track-id state dicts to stop a slow host-RAM
+  growth over long runs. `candidate_consistency` and `relative_positions` are
+  keyed by ByteTrack track_id, which increases monotonically for the life of the
+  process (a fresh id every time someone enters/leaves), so both dicts grew one
+  entry per id forever — a slow leak feeding the long-run swap-thrash (the
+  secondary cause behind the ssh-drop + Orbbec depth-engine SIGSEGV; the
+  dominant orphan-process pileup was fixed separately). New
+  `YOLOTracker._prune_track_state(current_ids)`, called once per frame from
+  `core/tracking_pipeline.py update_tracker`, lazily evicts gone ids past
+  `MAX_TRACK_STATE_IDS` (256): it only acts once a dict exceeds the cap and only
+  removes ids NOT visible this frame, so a currently-relevant id (even one
+  flickering through occlusion) is never dropped and scenes with ≤ cap distinct
+  ids behave **identically** to before — no scoring threshold or window changed.
+  `scene_center_history` was already bounded (capped to 3 in `update_scene_motion`)
+  and `target_velocity_history` is declared/cleared but never appended (dead
+  state, always empty), so both were left untouched.
+
 - **2026-06-09** — idempotent `track_web_bench` startup: `kill_stale` guard
   (default `true`) SIGTERMs any stale `person_track_server`, `track_web`, and
   `waving_person_server` instances via narrow `lib/<pkg>/`-scoped patterns before

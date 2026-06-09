@@ -16,6 +16,81 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-09 — tracker: yellow-box fix + reseed confirmation gate + look-alike pursuit
+
+Three operator-reported issues, each root-caused by a separate read-only
+investigation and implemented subagent-driven (Opus implementer + spec-review +
+quality-review per phase; controller drove git/build/review). Spec + plan:
+`docs/superpowers/specs/2026-06-09-tracker-viz-reseed-gate-lookalike-recovery.md`
+(and the sibling `plans/` file). Phases each landed as one commit.
+
+- **`f571b95` Issue 1 — yellow box during TRACKING (viz only).** `_draw_debug_info`
+  greened on `target_result.track_id`, which `_with_original_id` rewrites to the
+  FROZEN `original_track_id`, while the per-box ids are LIVE ByteTrack ids — they
+  diverge after any reacquire, so the locked target stuck YELLOW. Fix: green ⇔
+  live `target_track_id` match AND `last_lock_decision.state=='tracking'`; yellow ⇔
+  same id but not committed. No behavior/threshold change.
+- **`f375997` Issue 2 — gate reseed (manual click + waving auto-reseed).** Both
+  triggers share `~/reseed_target`→`_apply_reseed`, which instant-locked on a
+  single IoU frame (no appearance check). Now reseed SEEDS a probation
+  (`start_probation` enters the FSM `reidentifying`, not `tracking`); the seeded
+  id must be present AND ReID-confirmed (`sim≥reid_threshold`) for
+  `reseed_confirmation_frames` (default **5**) consecutive frames before the lock
+  commits. During probation `target_lost=True` (YELLOW via Issue 1); a miss
+  resets, an absent id abandons. Help-latch preserved (probation is target_lost).
+- **`4a99c8f` Issue 3 — don't give up on look-alikes in passive reacq.** The lone
+  returner (ReID ~0.55–0.71) was discarded every frame at the single-candidate
+  0.72 wall and the commit streak reset on any dip. Now: a lone candidate in
+  `[single_person_pursue_floor 0.55, 0.72)` is PURSUED (reidentifying) instead of
+  dropped, and commit uses **N-of-M** (12 hits within `provisional_commit_window`
+  18) so dips don't wipe accumulated evidence — in both the pipeline
+  `_confirm_reid_candidate` and the FSM provisional streak. **Precision invariant
+  held:** the lone COMMIT bar stays 0.72 via `single_person_commit_bar`; pursuit
+  never reports "found", so a lone <0.72 candidate is pursued but never committed.
+  Option D (relaxing the color veto / `DEEP_CONFIDENT_BYPASS`) was **dropped** per
+  operator — `reid/reid.py` is untouched.
+
+**Precision leak caught in spec-review and fixed (in the same Phase-3 commit).**
+The new pursue floor first let `_confirm_reid_candidate` ARM `pending_reid_match`
+at `reid_threshold`; once armed, **Stage 1** (`track_by_id`→`_confirm_pending_reid`)
+adopted the id and committed at ~0.50 — silently locking a lone <0.72 candidate.
+Fix: arm only on commit-bar hits (`sum(window) >= reid_preconfirm_frames`), so a
+lone sub-0.72 candidate never arms → Stage 1 never adopts it. A full-`update_tracker`
+loop test (`test_full_loop_lone_below_bar_never_arms_or_locks`) now pins this — it
+FAILED before the fix, PASSES after. A unit test that had encoded the leaky
+behavior was inverted (with a rationale comment).
+
+New ROS params on `person_track_server`: `reseed_confirmation_frames=5`,
+`single_person_pursue_floor=0.55`, `single_person_commit_bar=0.72`,
+`provisional_commit_window=18`. No existing threshold changed (`high_bar=0.72`,
+`reid_threshold=0.55`, deep-ratio 0.92, margins 0.10/0.15,
+`MIN_REID_SIMILARITY_RAW=0.40`, `DEEP_CONFIDENT_BYPASS=0.70` all intact).
+
+Verification: full unit suite **239 passed, 1 skipped** (the 2 reds are the
+pre-existing repo-wide `test_flake8`/`test_pep257` baseline — zero new lint on
+touched lines); `tkbuild tk26_vision --packages-select vision_track` clean. A
+final whole-implementation review confirmed READY-TO-MERGE with no integration
+regressions and the precision invariant holding on every path.
+
+**Minor follow-ups (non-blocking, flagged in quality review):**
+1. `reid_fit_streak` in `_confirm_reid_candidate` is now vestigial (commit
+   authority is `sum(window)`) — kept only for candidate-id-change detection; its
+   comment should be relabeled or the field removed.
+2. `consecutive_reid_frames` carries two meanings — Stage-2 mirror of
+   `sum(window)` vs Stage-1 strict present-frame count. Mutually-exclusive paths,
+   so safe, but a future-edit seam worth a one-line warm-start note.
+3. `window[-M:]` is a no-op at `provisional_commit_window=0` (unbounded growth);
+   unreachable with the default 18, but a `max(1, M)` clamp would harden it.
+
+**Pending operator-in-the-loop checks (t4_hardware `person_phase*`):**
+- Issue 1: a real reclaim flips YELLOW→GREEN at the moment of true lock (no stuck
+  yellow; no false green during probation/pursuit).
+- Issue 2: a wave/click reclaim now takes ~5 confirmed frames to lock (and
+  rejects a click that lands on a bystander).
+- Issue 3: a lone operator returning under lighting/pose change re-locks without a
+  wave (the look-alike is pursued then committed once it clears 0.72), and no
+  bystander look-alike ever commits.
+
 ## 2026-06-09 — ReID precision: deep-feature segmentation + deep-gated color veto + transparent crops
 
 Operator report: ReID too strict (the dashboard's YELLOW "YOLO_TARGET" box is

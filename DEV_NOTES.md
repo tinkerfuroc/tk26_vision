@@ -16,6 +16,44 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-09 — ReID precision: deep-feature segmentation + deep-gated color veto + transparent crops
+
+Operator report: ReID too strict (the dashboard's YELLOW "YOLO_TARGET" box is
+often the correct person but never goes GREEN), and the gallery can lock onto a
+bystander sharing the box. Spec:
+`src/vision_track/docs/specs/2026-06-09-reid-segmentation-and-deep-gated-veto.md`.
+Built subagent-driven (implementer + adversarial review per task; controller did
+git/build).
+
+Two linked root causes (parallel investigation, bag-log corroborated):
+- **Deep OSNet embedding from the RAW bbox crop** (`reid/reid.py:253` single +
+  the batch forward) → gallery baked in background + co-bbox bystander → locks
+  onto others AND drops same-person cosine when the scene changes (forcing the
+  strict bars to over-reject). Fix `b17b8db`: `_segment_crop_for_reid` —
+  dilate mask → tight-crop → soft-blur background, applied identically on single
+  + batch (row-equivalence). OSNet takes RGB so this is the deep-feature
+  equivalent of a transparent background. No thresholds changed.
+- **Hard color veto** (`reid.py` body/upper/lower `< 0.40 → return 0.0`)
+  force-zeroed a strong deep match on color drift — the top cause of "yellow
+  never green". Fix `cbe7a4e`: `DEEP_CONFIDENT_BYPASS = 0.70` — a confident deep
+  cosine bypasses the color veto; bystanders (deep ~0.47-0.57) still get vetoed.
+  Raw-deep floor, distinctiveness margin, deep-ratio gate all unchanged.
+
+Plus operator request `d292471`: **transparent person-only crops** — gallery
+thumbnails are BGRA (mask alpha, tight-crop), published PNG to the dashboard and
+written to `vision_log` as transparent PNGs (gated by `gallery_keep_crops`).
+
+Verification: full suite **202 passed / 1 skip** (flake8 baseline 532, no new
+lint); each precision change adversarially reviewed (incl. a mutation test for the
+veto gate, row-equivalence for the segmentation). Bag `--loop` smoke on the
+canonical `/install`: no tracebacks, deep-gate active, **4 reclaims, 0 aborts**
+(matches the pre-change baseline — no reacquisition regression). **Operator check
+on-robot:** the yellow-correct case should now go green (re-lock) under
+lighting/pose change, and the tracker should not lock onto a bystander sharing the
+box. NOTE: restart any running bench to load the new ReID code.
+
+---
+
 ## 2026-06-09 — help-hold latch saga + verified multi-reclaim on the bag
 
 Code review of the two prior fixes (passive-reacquire + reseed) came back APPROVE

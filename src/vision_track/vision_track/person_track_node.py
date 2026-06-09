@@ -1467,8 +1467,10 @@ class PersonTrackNode(Node):
             enc = None
             if t is not None:
                 try:
-                    ok, buf = cv2.imencode('.jpg', cv2.cvtColor(t, cv2.COLOR_RGB2BGR),
-                                           [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    # Thumbs are BGRA (alpha = person mask); PNG preserves the
+                    # transparent background, JPEG would discard it. No colour
+                    # conversion: _make_thumb already stores BGR(A).
+                    ok, buf = cv2.imencode('.png', t)
                     if ok:
                         enc = base64.b64encode(buf).decode('ascii')
                 except Exception:
@@ -1476,7 +1478,36 @@ class PersonTrackNode(Node):
             encoded.append(enc)
         self.debug_gallery_pub.publish(String(data=json.dumps(
             {'version': version, 'thumbs': encoded})))
+        self._write_gallery_thumbs_to_log(version, thumbs)
         self._last_gallery_version = version
+
+    def _write_gallery_thumbs_to_log(self, version: int, thumbs: list):
+        """Best-effort: persist each transparent BGRA gallery thumb as a PNG in
+        the active vision_log run dir (Change 3b).
+
+        Only runs when vision logging is enabled. Gated by ``version`` via the
+        caller (``_maybe_publish_gallery`` returns early when the version is
+        unchanged), so this writes once per gallery change — no per-frame spam.
+        Wrapped so a logging failure never propagates into the tracking loop.
+        """
+        logger = getattr(self, '_vision_logger', None)
+        if logger is None or not getattr(logger, 'enabled', False):
+            return
+        try:
+            run_dir = logger._ensure_run_dir()
+        except Exception as exc:  # noqa: BLE001 — never break tracking on logging
+            self.get_logger().warn(f'vision_logging: gallery run_dir failed: {exc}')
+            return
+        for i, t in enumerate(thumbs):
+            if t is None:
+                continue
+            try:
+                path = os.path.join(run_dir, f'gallery_view_{version}_{i}.png')
+                cv2.imwrite(path, t)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f'vision_logging: gallery thumb {i} write failed: {exc}'
+                )
 
     def _cleanup_tracking(self):
         """Clean up tracking state."""

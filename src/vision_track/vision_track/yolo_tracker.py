@@ -105,9 +105,10 @@ class YOLOTracker:
             reid_gallery_novelty_max: admit a view only if its cosine to existing
                 views is below this threshold
             reid_gallery_score_mode: gallery scoring mode ('max' | 'top2_mean')
-            keep_gallery_thumbs: stash an RGB view crop alongside each admitted
-                gallery feature for the track_web dashboard (off by default;
-                pure visualization, never feeds scoring)
+            keep_gallery_thumbs: stash a person-segmented BGRA view crop (mask
+                alpha, transparent background) alongside each admitted gallery
+                feature for the track_web dashboard (off by default; pure
+                visualization, never feeds scoring)
             yolo_track_conf: LOW detection conf fed to model.track so ByteTrack's
                 two-stage (high/low) association recovery actually runs — kept
                 separate from confidence_threshold, which still gates detect()

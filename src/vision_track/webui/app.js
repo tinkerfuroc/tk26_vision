@@ -56,7 +56,7 @@ function renderGallery(g) {
   g.thumbs.forEach((b64, i) => {
     if (!b64) return;
     const img = document.createElement("img");
-    img.src = "data:image/jpeg;base64," + b64;
+    img.src = "data:image/png;base64," + b64;
     if (i === 0) img.classList.add("anchor");
     img.title = i === 0 ? "anchor view" : `view ${i}`;
     div.appendChild(img);

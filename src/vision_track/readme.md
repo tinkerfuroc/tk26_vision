@@ -100,6 +100,14 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — transparent (person-only) gallery crops. Gallery view
+  thumbnails are now built as BGRA with the seg mask as alpha and tight-cropped
+  to the person (transparent background), published as PNG to the dashboard
+  (was opaque JPEG) and written to the `vision_log` run dir as transparent PNGs
+  when crops + logging are enabled. Reinforces the deep-crop segmentation: the
+  operator sees exactly the person the gallery stores, with no bystander/
+  background. Visualization/telemetry only (gated by `gallery_keep_crops`,
+  default off); does not feed scoring.
 - **2026-06-09** — deep-gate the hard color veto (ReID was too strict). The
   body/upper/lower color-histogram floors (0.40) used to `return 0.0` outright,
   force-zeroing even a 0.9 deep match the instant a color score dipped — the top

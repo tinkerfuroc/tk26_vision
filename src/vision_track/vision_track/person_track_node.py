@@ -121,6 +121,12 @@ class PersonTrackNode(Node):
         # freeze doesn't spam the log / feedback at loop rate.
         self._last_stall_tick = 0.0
         self._was_lost = False
+        # Vision-log EVENT throttle (separate from _was_lost, which still drives
+        # latch/ema/help). Tracks the last STATE we wrote an artifact for and
+        # when, so writes fire only on a debounced acquire/lost transition or a
+        # steady-state heartbeat — never per-frame on churny tracked<->lost flips.
+        self._vlog_last_state = None  # 'tracked' | 'lost' | None
+        self._vlog_last_time = 0.0
         # Active re-ID hold: throttle the "awaiting help" log to once per lost
         # episode (reset on re-track and on cleanup).
         self._active_help_logged = False
@@ -307,6 +313,12 @@ class PersonTrackNode(Node):
         # transitions — no per-frame artifacts during steady-state tracking.
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
+        # Vision-log EVENT write throttle. The steady-state heartbeat period
+        # (writes one artifact every interval while tracking OR while lost) and
+        # the churn debounce (minimum gap between writes, so a rapid
+        # tracked<->lost flip-flop can't flood the log).
+        self.declare_parameter('vision_log_interval_s', 5.0)
+        self.declare_parameter('vision_log_min_gap_s', 1.0)
 
         # Perf/quality instrumentation (default-off; zero overhead in production).
         self.declare_parameter('perf_logging_enabled', False)
@@ -365,6 +377,8 @@ class PersonTrackNode(Node):
 
         self.vision_logging_enabled = self.get_parameter('vision_logging_enabled').value
         self.vision_log_folder = self.get_parameter('vision_log_folder').value
+        self._vlog_interval_s = float(self.get_parameter('vision_log_interval_s').value)
+        self._vlog_min_gap_s = float(self.get_parameter('vision_log_min_gap_s').value)
 
         self.perf_logging_enabled = self.get_parameter('perf_logging_enabled').value
         
@@ -1222,13 +1236,18 @@ class PersonTrackNode(Node):
             ] if position is not None else None,
             'track_id': int(track_result.track_id),
         }
-        if self._was_lost and self._vision_logger.enabled:
+        now = time.time()
+        if self._vision_logger.enabled and self._vision_log_due('tracked', now):
+            event = ('reclaimed' if self._vlog_last_state == 'lost'
+                     else 'acquired' if self._vlog_last_state is None
+                     else 'tracking')
             self._log_async(
                 rgb_img, [self._last_tracked_detection],
                 request_ctx={'target_frame': params.get('target_frame')},
                 branch='person_track',
-                extras={'event': 'reclaimed'},
+                extras={'event': event},
             )
+            self._mark_vision_logged('tracked', now)
         self._was_lost = False
         # Re-tracking ends the lost episode: re-arm the active-help log throttle
         # so the next loss logs the hold entry again.
@@ -1243,6 +1262,23 @@ class PersonTrackNode(Node):
         # _is_awaiting_help.
         if not feedback.target_lost:
             self._help_latched = False
+
+    def _vision_log_due(self, state: str, now: float) -> bool:
+        """True if a vision-log write should fire for `state` ('tracked'/'lost') now.
+
+        Fires on a debounced state transition (changed AND >= min_gap since last
+        write) or on the steady-state heartbeat (>= interval since last write).
+        """
+        changed = state != self._vlog_last_state
+        gap = now - self._vlog_last_time
+        if changed and gap >= self._vlog_min_gap_s:
+            return True
+        return gap >= self._vlog_interval_s
+
+    def _mark_vision_logged(self, state, now):
+        """Record the state + time of the most recent vision-log write."""
+        self._vlog_last_state = state
+        self._vlog_last_time = now
 
     def _log_async(self, *args, **kwargs):
         """Submit a vision-log write to the off-loop writer (never blocks the
@@ -1298,20 +1334,31 @@ class PersonTrackNode(Node):
         # First tick after a TRACKING → LOST transition: dump the last-good
         # frame and the current (failed) frame. Subsequent lost ticks don't
         # log, so a long occlusion produces exactly two artifacts.
-        if (not self._was_lost) and self._vision_logger.enabled:
-            if self._last_tracked_rgb is not None and self._last_tracked_detection is not None:
+        now = time.time()
+        if self._vision_logger.enabled and self._vision_log_due('lost', now):
+            if self._vlog_last_state != 'lost':  # real transition into lost
+                if self._last_tracked_rgb is not None and self._last_tracked_detection is not None:
+                    self._log_async(
+                        self._last_tracked_rgb, [self._last_tracked_detection],
+                        request_ctx={'target_frame': params.get('target_frame')},
+                        branch='person_track',
+                        extras={'event': 'lost', 'time_since_seen_s': float(time_since_seen)},
+                    )
                 self._log_async(
-                    self._last_tracked_rgb, [self._last_tracked_detection],
+                    rgb_img, None,
                     request_ctx={'target_frame': params.get('target_frame')},
                     branch='person_track',
-                    extras={'event': 'lost', 'time_since_seen_s': float(time_since_seen)},
+                    extras={'event': 'lost_current', 'time_since_seen_s': float(time_since_seen)},
                 )
-            self._log_async(
-                rgb_img, None,
-                request_ctx={'target_frame': params.get('target_frame')},
-                branch='person_track',
-                extras={'event': 'lost_current', 'time_since_seen_s': float(time_since_seen)},
-            )
+            else:  # steady-lost heartbeat — one current-frame artifact
+                self._log_async(
+                    rgb_img, None,
+                    request_ctx={'target_frame': params.get('target_frame')},
+                    branch='person_track',
+                    extras={'event': 'lost_heartbeat',
+                            'time_since_seen_s': float(time_since_seen)},
+                )
+            self._mark_vision_logged('lost', now)
         # Phase 2: reset the point smoother on the TRACKING → LOST transition so a
         # re-acquired target doesn't lerp from a stale pre-loss point.
         if not self._was_lost:

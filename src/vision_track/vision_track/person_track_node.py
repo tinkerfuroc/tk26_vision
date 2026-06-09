@@ -216,6 +216,12 @@ class PersonTrackNode(Node):
         # Phase 2: bound recovery so the tracker eventually declares hard-lost.
         # Replaces the effectively-infinite allow_indefinite_recovery coast.
         self.declare_parameter('max_recovery_frames', 45)
+        # Issue 2: reseed confirmation gate. After a reseed (manual dashboard
+        # click OR waving auto-reseed — same ~/reseed_target service path), the
+        # IoU-selected id must be present + ReID-confirmed for this many
+        # consecutive frames before the lock commits (target_lost flips False).
+        # Adds an appearance check on top of the geometric reseed selection.
+        self.declare_parameter('reseed_confirmation_frames', 5)
         # Spec B: consecutive frames lost before the published reacquisition_state
         # escalates to NEEDS_HELP, so a BT can debounce active (call-out) re-ID.
         self.declare_parameter('active_help_after_frames', 45)
@@ -304,6 +310,8 @@ class PersonTrackNode(Node):
         self.inference_size = self.get_parameter('inference_size').value
         self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
         self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
+        self.reseed_confirmation_frames = int(
+            self.get_parameter('reseed_confirmation_frames').value)
         self.active_help_after_frames = int(self.get_parameter('active_help_after_frames').value)
         self.active_help_timeout_sec = float(self.get_parameter('active_help_timeout_sec').value)
         self.frame_stall_warn_sec = float(self.get_parameter('frame_stall_warn_sec').value)
@@ -392,6 +400,9 @@ class PersonTrackNode(Node):
                 self.tracker.frame_rate = float(self.tracking_rate)
                 from vision_track.core.lock_state_machine import LockStateMachine
                 self.tracker.max_recovery_frames = int(self.max_recovery_frames)
+                # Issue 2: reseed probation length (frames the seeded id must be
+                # present + ReID-confirmed before the reseed lock commits).
+                self.tracker.reseed_confirmation_frames = int(self.reseed_confirmation_frames)
                 self.tracker.provisional_high_bar = float(self.provisional_high_bar)
                 self.tracker.provisional_distinct_margin = float(self.provisional_distinct_margin)
                 self.tracker.lock_state_machine = LockStateMachine(

@@ -8,7 +8,7 @@ import numpy as np
 from ..reid.appearance_manager import update_appearance
 from ..reid.reid import ReIDMatcher
 from ..reid.reid_search import find_best_match_reid
-from .tracking_types import TargetAppearance, TrackerState, TrackingResult
+from .tracking_types import LockDecision, TargetAppearance, TrackerState, TrackingResult
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,19 @@ def update_tracker(tracker, frame: np.ndarray, target_id: Optional[int] = None) 
         _log_detections(tracker, results)
 
     _t_pipe = time.perf_counter()
+
+    # Issue 2: reseed confirmation gate. While a reseed probation is active, the
+    # seeded id must clear an appearance check for N consecutive frames before
+    # the lock commits. This MUST run before track_by_id — otherwise track_by_id
+    # would instant-lock the seeded id by its ByteTrack id, defeating the gate.
+    if getattr(tracker, "reseed_probation_id", None) is not None:
+        handled, out = _step_reseed_probation(tracker, frame, results)
+        if handled:
+            tracker._t_pipeline_ms = (time.perf_counter() - _t_pipe) * 1000.0
+            return out
+        # not handled => probation abandoned (seeded id absent): fall through to
+        # normal recovery this frame.
+
     match = track_by_id(tracker, frame, results)
     if match is not None:
         tracker._t_pipeline_ms = (time.perf_counter() - _t_pipe) * 1000.0
@@ -75,6 +88,81 @@ def update_tracker(tracker, frame: np.ndarray, target_id: Optional[int] = None) 
     out = reidentify_target(tracker, frame, results)
     tracker._t_pipeline_ms = (time.perf_counter() - _t_pipe) * 1000.0
     return out
+
+
+def _step_reseed_probation(
+    tracker, frame: np.ndarray, results: List[TrackingResult]
+) -> Tuple[bool, Optional[TrackingResult]]:
+    """One frame of the reseed confirmation gate (Issue 2).
+
+    Returns (handled, out):
+      - handled=True  => this frame was fully owned by probation; `out` is the
+        committed result (commit frame) or None (still confirming / count reset).
+        The node defers to last_lock_decision (last_frame_recovery=True).
+      - handled=False => probation was abandoned (seeded id absent this frame);
+        the caller falls through to the normal recovery path. Probation state is
+        cleared so it does not re-trigger next frame.
+
+    Selection of the seeded detection is by ByteTrack id (the reseed already
+    chose it geometrically). The gate ADDS an appearance confirmation: the
+    seeded id must score sim >= reid_threshold for reseed_confirmation_frames
+    consecutive present frames before committing the lock (target_lost False).
+    A present-but-unconfirmed frame resets the count; an absent frame abandons.
+    """
+    # The probation path is the publish/target_lost authority this frame; the
+    # node must defer to last_lock_decision rather than re-step present=True.
+    tracker.last_frame_recovery = True
+    fsm = getattr(tracker, "lock_state_machine", None)
+    seeded_id = tracker.reseed_probation_id
+
+    present = next(
+        (r for r in results
+         if r.track_id == seeded_id and r.class_id == 0), None)
+
+    if present is None:
+        # Seeded id absent: abandon probation, fall back to normal recovery.
+        tracker.reseed_probation_id = None
+        tracker.reseed_probation_count = 0
+        return False, None
+
+    # Compute ReID similarity the same way _confirm_reid_candidate does.
+    sim = 0.0
+    if getattr(tracker, "appearance_extractor", None) is not None:
+        features = _get_or_extract_features(
+            tracker, frame, present.track_id, present.bbox, present.mask, present.class_id)
+        if features:
+            sim = ReIDMatcher.compute_similarity(
+                tracker.target_appearance, features, present.bbox, time.time(), is_person=True)
+
+    if sim >= tracker.reid_threshold:
+        tracker.reseed_probation_count += 1
+        tracker.frames_lost = 0
+        if tracker.reseed_probation_count >= tracker.reseed_confirmation_frames:
+            # COMMIT: the seeded id confirmed for the full window.
+            tracker.state = TrackerState.TRACKING
+            tracker.reseed_probation_id = None
+            tracker.reseed_probation_count = 0
+            if fsm is not None and tracker.original_track_id is not None:
+                num_persons = len(
+                    [r for r in results if r.class_id == 0 and r.track_id >= 0])
+                fsm.start(tracker.original_track_id)
+                tracker.last_lock_decision = fsm.step(
+                    sim_score=float(sim), present=True, frames_since_loss=0,
+                    num_candidates=num_persons, distinct_margin=float("inf"),
+                    depth_consistent=True,
+                )
+            return True, tracker._with_original_id(present)
+        # Still confirming: not committed, target_lost stays True (YELLOW).
+        tracker.last_lock_decision = LockDecision(
+            False, True, tracker.original_track_id, "reidentifying")
+        return True, None
+
+    # Present but unconfirmed (sim < reid_threshold): reset the streak.
+    tracker.reseed_probation_count = 0
+    tracker.frames_lost += 1
+    tracker.last_lock_decision = LockDecision(
+        False, True, tracker.original_track_id, "reidentifying")
+    return True, None
 
 
 def _switch_target(tracker, target_id: Optional[int]) -> None:

@@ -47,6 +47,17 @@ class LockStateMachine:
         self._state = "tracking"
         self._provisional_streak = 0
 
+    def start_probation(self, committed_id: int) -> None:
+        """Re-arm onto a candidate id WITHOUT committing (probationary reseed).
+
+        Unlike start() (jumps to 'tracking'), this enters 'reidentifying' so the
+        node does not report a lock until the reseed probation confirms; it also
+        lifts the machine out of terminal 'lost' so it can be stepped again.
+        """
+        self._committed_id = committed_id
+        self._state = "reidentifying"
+        self._provisional_streak = 0
+
     def step(
         self,
         sim_score: float,

@@ -247,6 +247,15 @@ class YOLOTracker:
         self.pending_reid_match: Optional[Tuple[int, float]] = None
         self.reid_fit_streak = 0
         self.reid_fit_id: Optional[int] = None
+        # Issue 2: reseed confirmation gate. After a reseed (manual or waving),
+        # the seeded id must be present + ReID-confirmed for
+        # reseed_confirmation_frames consecutive frames before the lock commits.
+        # While probation is active (reseed_probation_id is not None) the
+        # per-frame probation step in tracking_pipeline owns target_lost. The
+        # node param overrides reseed_confirmation_frames.
+        self.reseed_probation_id: Optional[int] = None
+        self.reseed_probation_count = 0
+        self.reseed_confirmation_frames = 5
         # Phase 2: asymmetric-hysteresis recovery policy params (defaults;
         # the node overrides from ROS params). Pure FSM lives in core/.
         self.max_recovery_frames = 45
@@ -553,13 +562,18 @@ class YOLOTracker:
         return False
 
     def _apply_reseed(self, selected_result, fresh_reid_feature) -> int:
-        """Re-lock onto an externally-confirmed detection, preserving identity.
+        """Accept an externally-confirmed detection and enter reseed probation.
 
         Unlike initialize_tracking (which resets appearance), this keeps the
         multi-view gallery + person registry (same operator, self-identified),
-        appends the fresh confirmed view, re-locks the ids, clears the lost
-        counter, and re-arms the lock FSM. Returns the locked track id, or -1
-        if selected_result is None.
+        appends the fresh confirmed view, and re-locks the ids — but it does NOT
+        instant-lock. Issue 2: a single IoU-selected frame has no appearance
+        check, so the reseed now starts a short *probation* instead of jumping
+        to TRACKING. The seeded id must be present + ReID-confirmed for
+        reseed_confirmation_frames consecutive frames (per-frame gate in
+        tracking_pipeline._step_reseed_probation) before the lock commits and
+        target_lost flips False. Returns the seeded track id (meaning "accepted,
+        confirming", not "locked"), or -1 if selected_result is None.
         """
         if selected_result is None:
             return -1
@@ -568,15 +582,22 @@ class YOLOTracker:
         self.target_class_id = selected_result.class_id
         self.target_class_name = selected_result.class_name
         self.frames_lost = 0
-        self.state = TrackerState.TRACKING
+        # Issue 2: enter probation (REIDENTIFYING), NOT an instant TRACKING lock.
+        self.state = TrackerState.REIDENTIFYING
         # Re-lock onto a confirmed view: clear stale occlusion bookkeeping so a
         # mid-occlusion reseed doesn't carry a pre-occlusion appearance snapshot.
         self.is_occluded = False
         self.pre_occlusion_appearance = None
         if self.target_appearance is not None and fresh_reid_feature is not None:
             self.target_appearance.gallery.maybe_add(fresh_reid_feature)
+        # Arm the reseed probation: confirm over N frames before committing.
+        self.reseed_probation_id = self.target_track_id
+        self.reseed_probation_count = 0
+        # Re-arm the FSM probationally (reidentifying, NOT tracking) so the node
+        # does not report a lock until the probation confirms; this also lifts
+        # the FSM out of a terminal 'lost' so it can be stepped again.
         if self.lock_state_machine is not None and self.original_track_id is not None:
-            self.lock_state_machine.start(self.original_track_id)
+            self.lock_state_machine.start_probation(self.original_track_id)
         return self.target_track_id
 
     def reseed_target(self, frame, bbox, target_class: str = "person") -> int:
@@ -1034,6 +1055,9 @@ class YOLOTracker:
         self.pending_reid_match = None
         self.reid_fit_streak = 0
         self.reid_fit_id = None
+        # Issue 2: clear any in-flight reseed probation.
+        self.reseed_probation_id = None
+        self.reseed_probation_count = 0
         # dead: original_track_id already None here (cleared above), so this
         # start() never fires on reset(). The FSM is (re)started on the next
         # initialize_tracking() commit instead; kept for symmetry/intent.

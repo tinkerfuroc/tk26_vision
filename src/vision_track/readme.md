@@ -100,6 +100,31 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — gate the reseed re-lock behind a short ReID confirmation
+  (manual dashboard click AND waving auto-reseed — both share the
+  `~/reseed_target` service). Previously `_apply_reseed` matched the requested
+  bbox by IoU only and immediately set `state=TRACKING` + `lock_state_machine.start()`,
+  so a reseed re-locked on a single geometric frame with no appearance check — a
+  box overlapping a bystander, or a slightly-off click, could lock the wrong
+  person. Now a reseed enters a **probation** (new param
+  `reseed_confirmation_frames`, default **5**): `_apply_reseed` still re-locks the
+  ids and appends the fresh crop to the gallery, but sets `state=REIDENTIFYING`
+  and re-arms the FSM via the new `LockStateMachine.start_probation()` (enters
+  `reidentifying`, not `tracking`; also lifts a terminal `lost`). A per-frame gate
+  (`tracking_pipeline._step_reseed_probation`, run BEFORE `track_by_id` so
+  ByteTrack can't instant-lock the seeded id) requires the seeded id to be
+  **present** (matched by ByteTrack) AND **ReID-confirmed** (`sim >= reid_threshold`,
+  scored against the gallery that now includes the fresh crop) for 5 **consecutive**
+  frames before committing the lock (`target_lost` flips False → GREEN). A
+  present-but-unconfirmed frame **resets** the streak; an **absent** seeded-id
+  frame **abandons** probation (falls back to normal recovery). Selection stays
+  geometric (IoU); the gate only **adds** an appearance confirmation — strictly
+  stricter than before, no threshold lowered. During probation the tracker reports
+  `target_lost=True` (YELLOW via the prior viz fix), so the help-hold latch
+  (`_help_latched`, clears only on a true re-lock) correctly persists until a real
+  commit. The reseed service still returns the seeded tid — it now means
+  "accepted, confirming", not "locked".
+
 - **2026-06-09** — fix stuck-yellow bounding box after ReID reacquire. After any
   reacquisition the live ByteTrack id (`target_track_id`) diverges from the frozen
   `original_track_id` stored in `target_result.track_id`. The old color decision

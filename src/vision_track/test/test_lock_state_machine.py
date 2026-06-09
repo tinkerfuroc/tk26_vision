@@ -171,3 +171,123 @@ class TestStartProbation:
         assert d.state == "tracking"
         assert d.target_lost is False
         assert d.committed_id == 7
+
+
+class TestNofMProvisionalStreak:
+    """Phase 3 / Option A: windowed (N-of-M) provisional commit in the FSM.
+
+    Replaces strict-consecutive accumulation: commit when commit_frames (N)
+    clear-bar coast frames occur within the last provisional_commit_window (M)
+    frames. N consecutive still commits (superset of the old behaviour); a single
+    dip no longer zeroes the accumulated count.
+    """
+
+    def _coast(self, sm, sim, f):
+        return sm.step(sim_score=sim, present=False, frames_since_loss=f,
+                       num_candidates=1, distinct_margin=999.0, depth_consistent=True)
+
+    def test_12_of_18_commits(self):
+        """12 clear-bar hits within an 18-frame window → commit, despite 6 dips."""
+        sm = make_sm(high_bar=0.72, commit_frames=12, provisional_commit_window=18)
+        sm.start(committed_id=5)
+        # Pattern: 2 hits, 1 dip, repeated → over 18 frames yields 12 hits, 6 dips.
+        pattern = ([0.80, 0.80, 0.60] * 6)  # 18 frames, 12 hits
+        committed_at = None
+        for i, sim in enumerate(pattern, start=1):
+            d = self._coast(sm, sim, i)
+            if d.target_lost is False:
+                committed_at = i
+                break
+        assert committed_at is not None
+        assert committed_at <= 18
+        assert d.state == "tracking"
+
+    def test_11_hits_in_18_never_commits(self):
+        """Only 11 clear-bar hits within the window → no commit."""
+        sm = make_sm(high_bar=0.72, commit_frames=12, provisional_commit_window=18)
+        sm.start(committed_id=5)
+        # 11 hits + 7 dips = 18 frames, never 12 within any 18-window.
+        sims = [0.80] * 11 + [0.60] * 7
+        last = None
+        for i, sim in enumerate(sims, start=1):
+            last = self._coast(sm, sim, i)
+        assert last.target_lost is True
+        assert last.state == "reidentifying"
+
+    def test_single_dip_does_not_zero_count(self):
+        """11 hits, then a dip, then the 12th hit (all within 18) still commits.
+
+        Strict-consecutive would have zeroed at the dip and required 12 fresh
+        consecutive hits; the window keeps the 11 alive so the 12th commits.
+        """
+        sm = make_sm(high_bar=0.72, commit_frames=12, provisional_commit_window=18)
+        sm.start(committed_id=5)
+        # 11 hits (frames 1-11).
+        for i in range(1, 12):
+            d = self._coast(sm, 0.80, i)
+            assert d.target_lost is True
+        # A dip at frame 12 — must NOT zero the accumulated 11.
+        d = self._coast(sm, 0.60, 12)
+        assert d.target_lost is True
+        # The 12th hit at frame 13 (window now holds 11 old hits + this = 12).
+        d = self._coast(sm, 0.80, 13)
+        assert d.target_lost is False
+        assert d.state == "tracking"
+
+    def test_12_consecutive_still_commits(self):
+        """Regression: 12 unbroken hits commits at exactly frame 12."""
+        sm = make_sm(high_bar=0.72, commit_frames=12, provisional_commit_window=18)
+        sm.start(committed_id=5)
+        committed_at = None
+        for i in range(1, 30):
+            d = self._coast(sm, 0.80, i)
+            if d.target_lost is False:
+                committed_at = i
+                break
+        assert committed_at == 12
+        assert d.state == "tracking"
+
+    def test_5_frame_spike_then_gone_never_commits(self):
+        """A 5-frame >=0.72 spike then sub-bar coast never reaches 12 in any window."""
+        sm = make_sm(high_bar=0.72, commit_frames=12, provisional_commit_window=18)
+        sm.start(committed_id=5)
+        sims = [0.80] * 5 + [0.50] * 40  # spike then gone
+        committed = False
+        for i, sim in enumerate(sims, start=1):
+            d = self._coast(sm, sim, i)
+            if d.target_lost is False:
+                committed = True
+                break
+        assert committed is False
+
+    def test_window_slides_old_hits_expire(self):
+        """Hits older than M frames drop out of the window (no infinite memory).
+
+        9 hits, then a long sub-bar coast that slides them all out, then 11 fresh
+        hits: total >12 hits historically but never 12 within any single M-window.
+        """
+        sm = make_sm(high_bar=0.72, commit_frames=12, provisional_commit_window=18)
+        sm.start(committed_id=5)
+        f = 0
+        for _ in range(9):       # 9 hits
+            f += 1
+            self._coast(sm, 0.80, f)
+        for _ in range(18):      # 18 dips slide the 9 hits fully out of the window
+            f += 1
+            self._coast(sm, 0.50, f)
+        last = None
+        for _ in range(11):      # 11 fresh hits — under 12, must not commit
+            f += 1
+            last = self._coast(sm, 0.80, f)
+        assert last.target_lost is True
+
+    def test_start_resets_window(self):
+        """start() clears the windowed accumulator (no carry-over across re-arm)."""
+        sm = make_sm(high_bar=0.72, commit_frames=12, provisional_commit_window=18)
+        sm.start(committed_id=5)
+        for i in range(1, 12):   # 11 hits
+            self._coast(sm, 0.80, i)
+        sm.start(committed_id=5)  # re-arm: window must reset
+        # One fresh hit must NOT commit (would if the 11 carried over).
+        d = self._coast(sm, 0.80, 1)
+        assert d.target_lost is True

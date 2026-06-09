@@ -247,6 +247,22 @@ class YOLOTracker:
         self.pending_reid_match: Optional[Tuple[int, float]] = None
         self.reid_fit_streak = 0
         self.reid_fit_id: Optional[int] = None
+        # Phase 3 (Issue 3): pursue look-alikes during passive reacquisition
+        # without lowering any commit bar.
+        #  - single_person_pursue_floor: lone-candidate similarity floor to PURSUE
+        #    (keep in play) in reid_search._single_candidate_guard. Below it the
+        #    candidate is discarded. Default = reid_threshold (0.55).
+        #  - single_person_commit_bar: lone-candidate similarity bar to COMMIT a
+        #    re-lock (held HIGH; the old hard-coded _single_candidate_guard 0.72).
+        #    A lone frame is a confirm hit only at sim >= this bar.
+        #  - provisional_commit_window: N-of-M window (M). _confirm_reid_candidate
+        #    commits once reid_confirmation_frames (N) confirm hits occur within
+        #    the last M frames; reid_confirm_window holds the per-frame verdicts.
+        # The node overrides all three from ROS params.
+        self.single_person_pursue_floor = 0.55
+        self.single_person_commit_bar = 0.72
+        self.provisional_commit_window = 18
+        self.reid_confirm_window: list = []
         # Issue 2: reseed confirmation gate. After a reseed (manual or waving),
         # the seeded id must be present + ReID-confirmed for
         # reseed_confirmation_frames consecutive frames before the lock commits.
@@ -484,7 +500,8 @@ class YOLOTracker:
         self.last_reid_switch_time = 0.0
         self.consecutive_reid_frames = 0
         self.pending_reid_match = None
-        
+        self.reid_confirm_window = []  # Phase 3: clear N-of-M commit window
+
         # Perform initial detection/tracking
         results = self.track(frame, persist=True)
         
@@ -1055,6 +1072,7 @@ class YOLOTracker:
         self.pending_reid_match = None
         self.reid_fit_streak = 0
         self.reid_fit_id = None
+        self.reid_confirm_window = []  # Phase 3: clear N-of-M commit window
         # Issue 2: clear any in-flight reseed probation.
         self.reseed_probation_id = None
         self.reseed_probation_count = 0

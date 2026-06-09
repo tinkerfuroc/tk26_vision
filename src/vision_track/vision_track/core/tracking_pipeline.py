@@ -337,6 +337,7 @@ def _verify_person_candidate(
     if not keep_current and better_match is not None:
         tracker.pending_reid_match = (better_match.track_id, current_time)
         tracker.consecutive_reid_frames = 1
+        tracker.reid_confirm_window = []  # Phase 3: new candidate => fresh window
         return None
 
     if _confirm_pending_reid(tracker, result):
@@ -346,6 +347,7 @@ def _verify_person_candidate(
     tracker.frames_lost = 0
     tracker.pending_reid_match = None
     tracker.consecutive_reid_frames = 0
+    tracker.reid_confirm_window = []  # Phase 3: clear Stage-2 N-of-M window
 
     if not tracker.fast_tracking_mode and tracker.frame_count > 30:
         tracker.fast_tracking_mode = True
@@ -382,6 +384,7 @@ def _confirm_pending_reid(tracker, result: TrackingResult) -> bool:
         tracker.target_track_id = result.track_id
         tracker.pending_reid_match = None
         tracker.consecutive_reid_frames = 0
+        tracker.reid_confirm_window = []  # Phase 3: clear Stage-2 N-of-M window
         tracker.person_registry.clear()
         if tracker.original_track_id is not None:
             tracker.person_registry.register_person(tracker.original_track_id, tracker.target_appearance)
@@ -402,6 +405,7 @@ def _finalize_track_match(
     tracker.frames_lost = 0
     tracker.pending_reid_match = None
     tracker.consecutive_reid_frames = 0
+    tracker.reid_confirm_window = []  # Phase 3: clear Stage-2 N-of-M window
 
     tracker.target_class_id = result.class_id
     tracker.target_class_name = result.class_name
@@ -473,6 +477,7 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
         tracker.frames_lost += 1
         tracker.reid_fit_streak = 0
         tracker.reid_fit_id = None
+        tracker.reid_confirm_window = []  # Phase 3: no candidate => drop window
         if tracker.fast_tracking_mode:
             tracker.fast_tracking_mode = False
         if tracker.frames_lost > 3:
@@ -489,16 +494,21 @@ def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult])
         _step_coast()
         return None
 
+    # Phase 3: num_candidates selects the commit bar inside _confirm_reid_candidate
+    # (lone => single_person_commit_bar 0.72; multi => reid_threshold), so it MUST
+    # be computed before the call and passed in. Reused for the FSM step below.
+    num_cands = len([r for r in results if r.class_id == 0 and r.track_id >= 0])
+
     # _confirm_reid_candidate is the SOLE writer of target_track_id (the id-swap
     # at its ~:397). It also returns non-None on PARTIAL confirms (pending /
     # sim>=reid_threshold pre-commit), so a non-None return does NOT imply a
     # commit. The committed-vs-provisional signal is target_track_id changing
     # across the call: only the real id-swap mutates it. Capture before/after.
     prev_target_id = tracker.target_track_id
-    confirmed = _confirm_reid_candidate(tracker, frame, match_result, best_similarity)
+    confirmed = _confirm_reid_candidate(
+        tracker, frame, match_result, best_similarity, num_candidates=num_cands)
     committed_swap = confirmed is not None and tracker.target_track_id != prev_target_id
 
-    num_cands = len([r for r in results if r.class_id == 0 and r.track_id >= 0])
     margin = float(getattr(tracker, "last_reid_margin", 0.0) or 0.0)
 
     # Phase 2: real depth-consistency for the chosen recovery candidate (replaces
@@ -564,7 +574,19 @@ def _confirm_reid_candidate(
     frame: np.ndarray,
     reid_match: TrackingResult,
     best_similarity: float,
+    num_candidates: int = 1,
 ) -> Optional[TrackingResult]:
+    """Accumulate per-frame confirmation toward a passive re-ID id-swap (Phase 3).
+
+    THE PRECISION INVARIANT: the lone-candidate COMMIT bar is held high
+    (single_person_commit_bar, default 0.72) even though the PURSUE floor was
+    lowered. A frame is a CONFIRM HIT only when match_similarity >= commit_bar,
+    where commit_bar = single_person_commit_bar when num_candidates == 1 else
+    reid_threshold. The commit uses an N-of-M window over reid_confirm_window
+    (commit when sum(window) >= N within the last M frames), so dips are tolerated
+    but a lone candidate that never clears 0.72 is pursued (returned as
+    provisional) and NEVER committed.
+    """
     current_time = time.time()
     new_yolo_id = reid_match.track_id
     match_similarity = best_similarity
@@ -590,44 +612,95 @@ def _confirm_reid_candidate(
     post_shake_extra = 5 if (current_time - tracker.last_camera_motion_time) < 2.0 else 0
     required_confirmation = tracker.reid_confirmation_frames + post_shake_extra
 
-    if tracker.pending_reid_match is not None and tracker.pending_reid_match[0] == new_yolo_id:
-        if match_similarity >= tracker.reid_threshold:
-            tracker.consecutive_reid_frames += 1
-            tracker.state = TrackerState.REIDENTIFYING
-            tracker.frames_lost = 0
-            if tracker.consecutive_reid_frames >= required_confirmation:
-                if (current_time - tracker.last_reid_switch_time) >= tracker.reid_switch_cooldown:
-                    old_yolo_id = tracker.target_track_id
-                    tracker.target_track_id = new_yolo_id
-                    tracker.state = TrackerState.TRACKING
-                    tracker.frames_lost = 0
-                    tracker.last_reid_switch_time = current_time
-                    tracker.pending_reid_match = None
-                    tracker.consecutive_reid_frames = 0
-                    tracker.reid_fit_streak = 0
-                    tracker.reid_fit_id = None
-                    tracker.person_registry.clear()
-                    if tracker.original_track_id is not None:
-                        tracker.person_registry.register_person(tracker.original_track_id, tracker.target_appearance)
-                    logger.info(f"Confirmed ReID: YOLO ID {old_yolo_id} -> {tracker.target_track_id}")
-                    return tracker._with_original_id(reid_match)
-        return tracker._with_original_id(reid_match)
+    # Phase 3: lone-candidate commit bar held high; multi stays at reid_threshold.
+    commit_bar = (
+        getattr(tracker, "single_person_commit_bar", 0.72)
+        if num_candidates == 1 else tracker.reid_threshold
+    )
+    is_hit = match_similarity >= commit_bar
+    window_m = getattr(tracker, "provisional_commit_window", 18)
+
+    def _push_window(hit: bool) -> list:
+        """Append a hit verdict for the current candidate, trim to the last M."""
+        window = getattr(tracker, "reid_confirm_window", None) or []
+        window.append(bool(hit))
+        if len(window) > window_m:
+            window = window[-window_m:]
+        tracker.reid_confirm_window = window
+        # Back-compat mirror: number of hits currently in the window.
+        tracker.consecutive_reid_frames = sum(window)
+        return window
+
+    is_pending = (
+        tracker.pending_reid_match is not None
+        and tracker.pending_reid_match[0] == new_yolo_id
+    )
 
     if match_similarity >= tracker.reid_threshold:
+        # Same candidate? Accumulate the N-of-M window from the FIRST ramp frame so
+        # the preconfirm ramp does not silently burn early hits. A new candidate id
+        # resets the streak + window.
         if tracker.reid_fit_id == new_yolo_id:
             tracker.reid_fit_streak += 1
         else:
             tracker.reid_fit_id = new_yolo_id
             tracker.reid_fit_streak = 1
-        if tracker.reid_fit_streak >= tracker.reid_preconfirm_frames:
-            tracker.pending_reid_match = (new_yolo_id, current_time)
-            tracker.consecutive_reid_frames = 1
-        tracker.frames_lost = 0
+            tracker.reid_confirm_window = []
+
+        window = _push_window(is_hit)
         tracker.state = TrackerState.REIDENTIFYING
+
+        # frames_lost resets only on a genuine confirm hit (>= commit_bar); a
+        # pursued-but-not-hit frame leaves it growing so NEEDS_HELP can escalate.
+        if is_hit:
+            tracker.frames_lost = 0
+        else:
+            tracker.frames_lost += 1
+
+        # Pre-confirm ramp: ARM candidacy only once the candidate has cleared the
+        # COMMIT bar (>= commit_bar) for reid_preconfirm_frames frames within the
+        # current window — count via sum(window), NOT reid_fit_streak (which is
+        # counted at reid_threshold). This is the PRECISION INVARIANT at the arming
+        # gate: a LONE sub-0.72 candidate never accumulates commit-bar hits, so it
+        # never arms pending_reid_match. That matters because once armed, Stage 1
+        # (track_by_id -> _confirm_pending_reid) would adopt and lock the pending
+        # id by its ByteTrack id WITHOUT re-checking the commit bar; gating arming
+        # here is what keeps the lone commit bar held high across BOTH commit paths
+        # (Stage 1 and the Stage 2 N-of-M below). For the MULTI case
+        # commit_bar == reid_threshold, so is_hit is true on every >= reid_threshold
+        # frame and arming is unchanged (windowed at the same bar). Arming only
+        # opens commit eligibility; it does not itself commit.
+        if not is_pending and sum(window) >= tracker.reid_preconfirm_frames:
+            tracker.pending_reid_match = (new_yolo_id, current_time)
+            is_pending = True
+
+        # N-of-M commit: once armed, commit when the window holds N confirm hits
+        # (>= commit_bar) within the last M frames. A non-hit frame keeps the
+        # pending alive (the window persists; dips do not zero it).
+        if is_pending and is_hit and sum(window) >= required_confirmation:
+            if (current_time - tracker.last_reid_switch_time) >= tracker.reid_switch_cooldown:
+                old_yolo_id = tracker.target_track_id
+                tracker.target_track_id = new_yolo_id
+                tracker.state = TrackerState.TRACKING
+                tracker.frames_lost = 0
+                tracker.last_reid_switch_time = current_time
+                tracker.pending_reid_match = None
+                tracker.consecutive_reid_frames = 0
+                tracker.reid_confirm_window = []
+                tracker.reid_fit_streak = 0
+                tracker.reid_fit_id = None
+                tracker.person_registry.clear()
+                if tracker.original_track_id is not None:
+                    tracker.person_registry.register_person(tracker.original_track_id, tracker.target_appearance)
+                logger.info(f"Confirmed ReID: YOLO ID {old_yolo_id} -> {tracker.target_track_id}")
+                return tracker._with_original_id(reid_match)
+
         return tracker._with_original_id(reid_match)
 
+    # Below the pursue floor for this candidate: drop the ramp + window.
     tracker.reid_fit_streak = 0
     tracker.reid_fit_id = None
+    tracker.reid_confirm_window = []
     return None
 
 
@@ -734,6 +807,7 @@ def update_scene_motion(tracker, results: List[TrackingResult], frame: Optional[
         if was_stable and tracker.pending_reid_match is not None:
             tracker.pending_reid_match = None
             tracker.consecutive_reid_frames = 0
+            tracker.reid_confirm_window = []  # Phase 3: camera shake => drop window
     elif tracker.camera_motion_detected:
         if current_time - tracker.last_camera_motion_time > tracker.CAMERA_MOTION_COOLDOWN:
             tracker.camera_motion_detected = False

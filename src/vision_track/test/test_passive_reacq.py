@@ -57,7 +57,7 @@ def test_committed_swap_relocks_fsm_from_lost(monkeypatch):
 
     monkeypatch.setattr(TP, "find_best_match_reid", lambda tr, fr, res: (match, 0.9))
 
-    def fake_confirm(tracker, frame, match, sim):
+    def fake_confirm(tracker, frame, match, sim, num_candidates=1):
         # Simulate the real id-swap commit: target_track_id mutates.
         tracker.target_track_id = 7
         return match

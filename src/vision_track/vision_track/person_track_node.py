@@ -222,6 +222,19 @@ class PersonTrackNode(Node):
         # consecutive frames before the lock commits (target_lost flips False).
         # Adds an appearance check on top of the geometric reseed selection.
         self.declare_parameter('reseed_confirmation_frames', 5)
+        # Issue 3 (Phase 3): pursue look-alikes during passive reacquisition
+        # WITHOUT lowering any commit bar.
+        #  - single_person_pursue_floor: lone-candidate similarity floor to PURSUE
+        #    (keep in play) rather than discard; default reid_threshold (0.55).
+        #  - single_person_commit_bar: lone-candidate similarity bar to COMMIT a
+        #    re-lock; held HIGH (0.72) so a lone look-alike that never clears it is
+        #    pursued (YELLOW) but never locked.
+        #  - provisional_commit_window: N-of-M window M; commit needs
+        #    reid_confirmation_frames (N) confirm hits within the last M frames, so
+        #    dips are tolerated without the strict-consecutive reset.
+        self.declare_parameter('single_person_pursue_floor', 0.55)
+        self.declare_parameter('single_person_commit_bar', 0.72)
+        self.declare_parameter('provisional_commit_window', 18)
         # Spec B: consecutive frames lost before the published reacquisition_state
         # escalates to NEEDS_HELP, so a BT can debounce active (call-out) re-ID.
         self.declare_parameter('active_help_after_frames', 45)
@@ -312,6 +325,13 @@ class PersonTrackNode(Node):
         self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
         self.reseed_confirmation_frames = int(
             self.get_parameter('reseed_confirmation_frames').value)
+        # Issue 3 (Phase 3): look-alike pursuit knobs.
+        self.single_person_pursue_floor = float(
+            self.get_parameter('single_person_pursue_floor').value)
+        self.single_person_commit_bar = float(
+            self.get_parameter('single_person_commit_bar').value)
+        self.provisional_commit_window = int(
+            self.get_parameter('provisional_commit_window').value)
         self.active_help_after_frames = int(self.get_parameter('active_help_after_frames').value)
         self.active_help_timeout_sec = float(self.get_parameter('active_help_timeout_sec').value)
         self.frame_stall_warn_sec = float(self.get_parameter('frame_stall_warn_sec').value)
@@ -405,11 +425,19 @@ class PersonTrackNode(Node):
                 self.tracker.reseed_confirmation_frames = int(self.reseed_confirmation_frames)
                 self.tracker.provisional_high_bar = float(self.provisional_high_bar)
                 self.tracker.provisional_distinct_margin = float(self.provisional_distinct_margin)
+                # Issue 3 (Phase 3): look-alike pursuit floor + held-high commit
+                # bar + N-of-M window. Set on the tracker AND threaded into the FSM
+                # (M) so both the pipeline's _confirm_reid_candidate window and the
+                # FSM provisional streak use the same dip-tolerant window.
+                self.tracker.single_person_pursue_floor = float(self.single_person_pursue_floor)
+                self.tracker.single_person_commit_bar = float(self.single_person_commit_bar)
+                self.tracker.provisional_commit_window = int(self.provisional_commit_window)
                 self.tracker.lock_state_machine = LockStateMachine(
                     high_bar=self.tracker.provisional_high_bar,
                     distinct_margin=self.tracker.provisional_distinct_margin,
                     commit_frames=self.tracker.reid_confirmation_frames,
                     max_recovery_frames=self.tracker.max_recovery_frames,
+                    provisional_commit_window=self.tracker.provisional_commit_window,
                 )
                 # Phase 2: crosser-rejection gate threshold (m). The tracker
                 # reads operator_last_depth_m + candidate_depths_m (both plumbed

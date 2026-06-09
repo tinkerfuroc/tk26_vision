@@ -100,6 +100,64 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-09** — do not give up on look-alikes during **passive** reacquisition
+  (operator returns without a wave), implemented as Option B (pursue floor) +
+  Option A (N-of-M) **without lowering any commit bar** (Option D — relaxing the
+  color veto — was dropped; `reid/reid.py` and `DEEP_CONFIDENT_BYPASS` are
+  untouched). A lone returner scoring ReID ~0.55-0.71 with occasional dips used
+  to be dropped: the lone candidate hit the hard `0.72` `_single_candidate_guard`
+  wall (so `find_best_match_reid` returned `None` every sub-0.72 frame) and any
+  dip wiped the strict-consecutive confirmation streak, so 12 unbroken ≥0.72
+  frames were effectively unreachable for a real returner.
+  - **Pursue floor** (`reid_search._single_candidate_guard`, new param
+    `single_person_pursue_floor`, default **0.55** = `reid_threshold`): a lone
+    person whose similarity is in `[pursue_floor, 0.72)` is now KEPT IN PLAY
+    (pursued, surfaced as `reidentifying` / `target_lost=True` → YELLOW) instead
+    of discarded. Below the floor it is still discarded. Pursuit is **not** a
+    lock.
+  - **Commit bar held high** (`tracking_pipeline._confirm_reid_candidate`, new
+    param `single_person_commit_bar`, default **0.72**): a frame counts as a
+    *confirm hit* only when `match_similarity >= commit_bar`, where
+    `commit_bar = single_person_commit_bar` when there is one candidate else
+    `reid_threshold`. `num_candidates` is now computed in `reidentify_target`
+    BEFORE the confirm call and passed in. **THE PRECISION INVARIANT:** lowering
+    the lone *pursue* floor did NOT lower the lone *commit* bar — a lone candidate
+    that never clears 0.72 is pursued but **never** committed (no wrong-person
+    lock). `frames_lost` resets only on a confirm hit, so a pursued-but-not-hit
+    lone frame leaves it growing and `NEEDS_HELP` still escalates (operator can
+    wave). **Both commit paths respect the held-high lone bar:** the pre-confirm
+    ramp ARMS `pending_reid_match` only after `reid_preconfirm_frames`
+    **commit-bar hits** (`sum(reid_confirm_window)`), not after
+    `reid_preconfirm_frames` `reid_threshold`-counted `reid_fit_streak` frames. A
+    lone sub-0.72 candidate therefore never arms, so neither the Stage 2 N-of-M
+    commit (`_confirm_reid_candidate`) NOR the Stage 1 by-id adoption
+    (`track_by_id` → `_confirm_pending_reid`, which would otherwise lock the
+    pending id by its ByteTrack id without re-checking the bar) can ever lock it.
+    (Closes a precision leak found in Phase-3 spec-review: the original arming on
+    `reid_fit_streak` let a lone 0.60 candidate arm pending and be locked via
+    Stage 1, bypassing the 0.72 bar.) For the multi-candidate case
+    `commit_bar == reid_threshold`, so arming is unchanged.
+  - **N-of-M confirmation** (new param `provisional_commit_window`, default
+    **18** = M; reuses `reid_confirmation_frames` = **12** = N): the strict-
+    consecutive `consecutive_reid_frames` commit is replaced by a sliding window
+    (`reid_confirm_window`) — commit when there are **≥ N confirm hits within the
+    last M frames**. A non-hit frame (sim in `[pursue_floor, commit_bar)`) KEEPS
+    the pending alive (does not zero the window), so dips are tolerated; the good
+    ≥0.72 frames accumulate across dips and eventually reach the commit (→ GREEN).
+    N consecutive hits still commit (a 12-of-12 within an 18-window), so the old
+    behaviour is a strict subset and existing consecutive-confirmation tests stay
+    green. The same windowed counter replaces the FSM's strict `_provisional_streak`
+    reset in `LockStateMachine.step()` (new `provisional_commit_window` ctor arg);
+    the per-frame bar (`high_bar`, depth, distinctiveness) is unchanged.
+  - **Untouched precision guards:** `high_bar=0.72`, deep-ratio `0.92`,
+    distinctiveness `0.10/0.15`, `MIN_REID_SIMILARITY_RAW=0.40`, color vetoes, and
+    `DEEP_CONFIDENT_BYPASS` — all unchanged. `NEEDS_HELP` still fires at
+    `frames_lost >= active_help_after_frames`; the help-hold latch (`_help_latched`)
+    still clears only on a true re-lock (pursuit frames are `target_lost=True`).
+    Multi-person commit bar stays `reid_threshold` (N-of-M only adds dip-tolerant
+    recall there, never lowers the bar). All four new knobs are ROS params on
+    `person_track_server` with tracker defaults so unit tests work without the node.
+
 - **2026-06-09** — gate the reseed re-lock behind a short ReID confirmation
   (manual dashboard click AND waving auto-reseed — both share the
   `~/reseed_target` service). Previously `_apply_reseed` matched the requested

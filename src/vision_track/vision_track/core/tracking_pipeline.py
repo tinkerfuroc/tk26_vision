@@ -665,8 +665,28 @@ def _confirm_reid_candidate(
     if match_similarity >= tracker.reid_threshold:
         # Same candidate? Accumulate the N-of-M window from the FIRST ramp frame so
         # the preconfirm ramp does not silently burn early hits. A new candidate id
-        # resets the streak + window.
+        # normally resets the streak + window.
+        #
+        # ROOT-CAUSE FIX (NEEDS_HELP passive re-acquisition): during a real
+        # loss+reappearance ByteTrack re-emits the returning operator under a
+        # CHURNING track_id (a fresh id most/every frame). Keyed on the raw id,
+        # the window was wiped on every frame, so sum(window) never reached the
+        # preconfirm (3) or commit (12) count even with the operator standing in
+        # clear view at high similarity — passive re-lock was impossible. While
+        # in_help (latched NEEDS_HELP AND exactly one person visible) the lone
+        # candidate IS the same person regardless of its churning id, so DO NOT
+        # reset the window on an id change — only retarget the id so the eventual
+        # commit (and arming) uses the live id. PRECISION is preserved: the gate
+        # is still num_candidates == 1 + the relaxed-but-nonzero help bar
+        # (is_hit = match_similarity >= commit_bar is unchanged), so a different
+        # person scoring below the help bar still accumulates no hits. Outside
+        # in_help the strict id-keyed reset is byte-for-byte unchanged.
         if tracker.reid_fit_id == new_yolo_id:
+            tracker.reid_fit_streak += 1
+        elif in_help:
+            # Same lone person under a new ByteTrack id: keep the accumulated
+            # window, just retarget the id so commit/arming use the live id.
+            tracker.reid_fit_id = new_yolo_id
             tracker.reid_fit_streak += 1
         else:
             tracker.reid_fit_id = new_yolo_id

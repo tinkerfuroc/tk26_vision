@@ -114,11 +114,24 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
     def record_stop():
         return bridge.record_stop()
 
+    @app.post("/api/proc/{name}/start")
+    def proc_start(name: str):
+        return bridge.proc_start(name)
+
+    @app.post("/api/proc/{name}/stop")
+    def proc_stop(name: str):
+        return bridge.proc_stop(name)
+
+    @app.get("/api/proc/status")
+    def proc_status():
+        return bridge.proc_status()
+
     @app.websocket("/ws/state")
     async def ws_state(ws: WebSocket):
         await ws.accept()
         last_state_seq = -1
         last_gallery_version = -1
+        last_proc = None
         try:
             while True:
                 seq, state = bridge.latest_state()
@@ -129,6 +142,13 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
                     if gal is not None and gal.get("version", -1) != last_gallery_version:
                         last_gallery_version = gal["version"]
                         await ws.send_text(json.dumps({"type": "gallery", "data": gal}))
+                # Push the bringup-process map whenever it changes (and on the
+                # first iteration, since last_proc starts as a sentinel None that
+                # never equals a real status dict).
+                proc = bridge.proc_status()
+                if proc != last_proc:
+                    last_proc = proc
+                    await ws.send_text(json.dumps({"type": "proc", "data": proc}))
                 await asyncio.sleep(_STATE_POLL_S)
         except WebSocketDisconnect:
             return

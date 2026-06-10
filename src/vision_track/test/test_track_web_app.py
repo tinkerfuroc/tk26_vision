@@ -63,6 +63,25 @@ class FakeBridge:
         self.calls.append("record_stop")
         return {"ok": True, "message": "saved /tmp/bag", "path": "/tmp/bag"}
 
+    # -- bringup process control (mirrors ProcessManager semantics) ----------
+    def proc_start(self, name):
+        self.calls.append(("proc_start", name))
+        if name not in ("audio", "dummy_nav", "bt"):
+            return {"name": name, "error": f"unknown process '{name}'"}
+        return {"name": name, "running": True, "pid": 1234, "returncode": None}
+
+    def proc_stop(self, name):
+        self.calls.append(("proc_stop", name))
+        if name not in ("audio", "dummy_nav", "bt"):
+            return {"name": name, "error": f"unknown process '{name}'"}
+        return {"name": name, "running": False, "pid": None, "returncode": 0}
+
+    def proc_status(self):
+        self.calls.append("proc_status")
+        return {n: {"name": n, "running": False, "pid": None,
+                    "returncode": None}
+                for n in ("audio", "dummy_nav", "bt")}
+
 
 def _client():
     b = FakeBridge()
@@ -160,6 +179,36 @@ def test_mjpeg_stream_ends_on_client_disconnect():
         return [chunk async for chunk in resp.body_iterator]
 
     assert asyncio.run(_consume()) == []   # generator exits without yielding
+
+
+def test_proc_start_stop_known():
+    b, c = _client()
+    r = c.post("/api/proc/audio/start")
+    assert r.status_code == 200
+    assert r.json() == {"name": "audio", "running": True, "pid": 1234,
+                        "returncode": None}
+    r = c.post("/api/proc/audio/stop")
+    assert r.status_code == 200
+    assert r.json()["running"] is False
+    assert b.calls[-2:] == [("proc_start", "audio"), ("proc_stop", "audio")]
+
+
+def test_proc_status_map():
+    b, c = _client()
+    r = c.get("/api/proc/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"audio", "dummy_nav", "bt"}
+    assert body["dummy_nav"] == {"name": "dummy_nav", "running": False,
+                                 "pid": None, "returncode": None}
+
+
+def test_proc_start_unknown_is_error_dict_not_500():
+    b, c = _client()
+    r = c.post("/api/proc/bogus/start")
+    assert r.status_code == 200
+    assert "error" in r.json()
+    assert r.json()["name"] == "bogus"
 
 
 def test_webui_served_from_dir(tmp_path):

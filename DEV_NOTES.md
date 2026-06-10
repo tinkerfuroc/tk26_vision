@@ -16,6 +16,42 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-10 — track_web bringup control (launch BT + audio + dummy nav from the webui)
+
+The `track_web` dashboard can now start/stop the follow-person demo components on
+demand, plus a `track_web_control.launch.py` brings up the tracker + upgraded
+webui. Built via subagent-driven-development (4 tasks). Commits `84e79d7`
+(ProcessManager), `09d0909` (endpoints+bridge), `928dae5` (Bringup panel),
+`47f6e26` (control launch), `1b10d3c` (spec/plan).
+
+- **ProcessManager** (`vision_track/process_manager.py`): fixed-allowlist
+  supervisor (audio → `ros2 launch audio_pakage audio.launch.py`, dummy_nav →
+  `ros2 run behavior_tree dummy-nav`, bt → `ros2 run behavior_tree
+  follow-person`). API takes a *name*, never a command. Children spawn in their
+  own process group, killed group-wide SIGTERM→SIGKILL; start idempotent; status
+  reaps+caches returncode; `shutdown_all()` on dashboard exit; thread-safe.
+- **Endpoints + bridge**: `POST /api/proc/{name}/start|stop`, `GET
+  /api/proc/status`; `/ws/state` pushes `{"type":"proc"}` on change; `TrackWebNode`
+  owns the manager and calls `shutdown_all()` in `main()`'s `finally`.
+- **Bringup panel** (webui): per-component start/stop toggles + status dots;
+  manual goal-Start disabled while `bt` runs (the BT owns the `/track_person`
+  goal).
+- **`track_web_control.launch.py`**: cleanup + `person_track_server` (debug_* ON,
+  `launch_tracker` toggle) + `track_web`; args launch_tracker/with_waving/
+  kill_stale/bind/port/perf_logging.
+
+Verified here: `tkbuild tk26_vision --packages-select vision_track` clean; 18 unit
+tests pass (process_manager 6 + track_web_app 12); `--show-args` lists all 6 args;
+launch + upgraded webui install to `share/`.
+
+**Operator (T4) checks before relying on it:** (1) build `behavior_tree` +
+`audio_pakage` into `tk25_ws/install` via `tkbuild tk25_decision` +
+`tkbuild tk_24_audio` so the Bringup spawns resolve; (2) click each toggle →
+component starts, dot turns green, stop kills it; (3) start `bt` → manual Start
+disables + the follow demo runs (announcements via the `announce` TTS service,
+`/follow_target` logged by dummy_nav); (4) close the dashboard → all spawned
+children die (no orphans).
+
 ## 2026-06-10 — PERSON TRACKING FINALIZED
 
 `vision_track/person_track_server` is finalized for the arena (unit suite green,

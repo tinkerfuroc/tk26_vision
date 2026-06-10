@@ -87,3 +87,37 @@ def test_no_scores_yields_nulls():
     d = build_debug_state(_bare(last_debug_scores={}), **_kw())
     assert d["candidates"][0]["score"] is None
     assert d["best_sim"] is None and d["second_sim"] is None
+
+
+def _init_payload(tracker, *, search_started_ts):
+    """Reconstruct the exact 'initializing' phase payload that
+    PersonTrackNode._publish_phase_debug_state emits (build_debug_state + the
+    node's phase overrides). Mirrors the node so the contract is unit-tested
+    without ROS."""
+    state = build_debug_state(tracker, **_kw())
+    state["fsm_state"] = "initializing"
+    state["candidates"] = []
+    state["best_sim"] = None
+    state["second_sim"] = None
+    state["search_started_ts"] = search_started_ts
+    return state
+
+
+def test_initializing_payload_carries_search_started_ts():
+    # Even with stale candidates/scores on the tracker, the init phase payload
+    # must show empty candidates, null sims, and a wall-clock search anchor so
+    # the dashboard renders an alive "Searching…" timer instead of dead "—"s.
+    d = _init_payload(_bare(), search_started_ts=123.5)
+    assert d["fsm_state"] == "initializing"
+    assert d["candidates"] == []
+    assert d["best_sim"] is None and d["second_sim"] is None
+    assert d["search_started_ts"] == 123.5
+    json.dumps(d)   # still JSON-serializable
+
+
+def test_idle_payload_has_no_search_timer():
+    # Between goals (idle) there is no search anchor — None so the webui doesn't
+    # surface a stale elapsed timer.
+    d = _init_payload(_bare(), search_started_ts=None)
+    d["fsm_state"] = "idle"
+    assert d["search_started_ts"] is None

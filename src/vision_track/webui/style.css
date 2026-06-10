@@ -63,6 +63,14 @@ main { display:flex; gap:12px; padding:12px; align-items:flex-start; }
 .reacq.tracking { background:var(--green); color:#04110a; }
 .reacq.passive  { background:var(--amber); color:#1a1200; }
 .reacq.needs-help { background:var(--red); color:#fff; }
+/* Init-phase liveness: shown only while fsm_state === 'initializing'. */
+.searching { display:flex; align-items:center; justify-content:center; gap:8px;
+             margin-bottom:10px; padding:8px; border-radius:6px;
+             border:1px solid var(--line); color:var(--blue); font-weight:600; }
+.searching .spinner { width:13px; height:13px; border-radius:50%;
+                      border:2px solid var(--line); border-top-color:var(--blue);
+                      animation:spin .8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
 #state-table { width:100%; font-size:13px; border-collapse:collapse; }
 #state-table td { padding:3px 4px; border-bottom:1px solid var(--line); }
 #state-table td:first-child { color:var(--dim); }

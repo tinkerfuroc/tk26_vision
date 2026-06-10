@@ -123,6 +123,23 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-10** — **track_web: state panel + gallery now update at goal start
+  (no more ~10 s freeze).** The video stream came up immediately but the state
+  panel and gallery sat frozen until the first lock, because (1) `~/debug_gallery`
+  was only ever published from the post-lock tracking branch, (2) the init
+  `'initializing'` `~/debug_state` payload carried no fields the dashboard
+  renders (so it looked dead), and (3) a post-goal-accept warmup window
+  (idle-timer already off, CUDA warmup holding `lock_tracker`) published nothing.
+  Fixes, all additive to the search phase: emit an empty `{"version":0,
+  "thumbs":[]}` "searching" gallery once per goal; publish the `'initializing'`
+  state (+ searching gallery) up front *before* the warmup block to close the
+  blackout; add a `search_started_ts` anchor to the init payload and render an
+  animated "Searching for target… Ns" banner (1 Hz elapsed timer) in the webui
+  while `fsm_state === 'initializing'`. Post-lock tracking/gallery behaviour is
+  unchanged. Verified: `debug_gallery` (v0) and `debug_state` (`initializing`,
+  carrying `search_started_ts`) both arrive ~300 ms after goal-accept, before any
+  lock.
+
 - **2026-06-10** — **`~/reacq_state` UInt8 heartbeat for the navigation follow
   executive.** Added a permanently-on 10 Hz `std_msgs/UInt8` topic
   (`/person_track_node/reacq_state`) mirroring the `TrackPerson` feedback

@@ -100,6 +100,23 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-10** — **fix: NEEDS_HELP passive re-acquisition near-impossible
+  despite a clear, near-identical operator.** Root cause: the N-of-M re-ID
+  confirm window (`reid_confirm_window`) was keyed on the raw ByteTrack
+  `track_id` and **wiped on every id change** — but during a real loss +
+  reappearance ByteTrack re-emits the returning operator under a *churning*
+  `track_id` (a fresh id most/every frame), so `sum(window)` never reached the
+  arm (3) or commit (12) count even at high similarity → the swap never
+  committed. Fix (in `_confirm_reid_candidate`): while `in_help` (latched
+  NEEDS_HELP **AND** exactly one person visible) an id change KEEPS the
+  accumulated window and only retargets the id, so the lone returning operator
+  re-locks regardless of id churn. Precision preserved — the `is_hit` bar
+  (`>= single_person_commit_bar_help` 0.62) and the `num_candidates == 1` gate
+  are unchanged (a different person below the bar still accumulates nothing), and
+  OUTSIDE `in_help` the strict id-keyed window reset is byte-for-byte unchanged.
+  Surfaced by an integration repro (stable id re-locks; same-similarity churning
+  id did not, until fixed).
+
 - **2026-06-10** — **fix: premature `/track_person` abort after loss
   (regression from the wall-clock escalation).** Moving the help-latch to 5 s
   wall-clock decoupled it from the lock-FSM recovery cap (`max_recovery_frames`,

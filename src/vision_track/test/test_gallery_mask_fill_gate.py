@@ -11,19 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Issue 3: gate ReID gallery admission on MASK-FILL, not bbox aspect ratio.
+"""Issue 3: gate ReID gallery admission on BOTH bbox w/h ratio AND mask-fill.
 
-The operator stands throughout, so only clean, well-segmented operator views
-should enrich the gallery. The OLD admission gate rejected on aspect ratio
-(w/h <= 0.9), which wrongly drops a genuinely-upright operator whose bbox is
-square-ish from occlusion / box-clipping (w/h ~= 1.0). The robust signal is
-mask-fill = mask_pixels / bbox_area (the ``mask_coverage`` feature): a clean
-view fills its box even when square (admit); a merged/garbage/occlusion-
-inflated box has the operator mask as a thin slice (low fill -> reject).
+The operator stands throughout, so only clean, UPRIGHT, well-segmented operator
+views should enrich the gallery. Admission requires BOTH:
+  - bbox width/height <= ``gallery_max_aspect_ratio`` (default 0.5) — upright
+    (taller-than-wide) only; a square/wide box is rejected.
+  - mask-fill (mask_pixels / bbox_area, the ``mask_coverage`` feature) >
+    ``gallery_min_mask_fill`` (default 0.35) — a merged/garbage/occlusion-
+    inflated box has the operator mask as a thin slice and is rejected.
 
-These tests pin (1) the NEW gate defaults via direct ``crop_quality_ok``
-calls and (2) that ``update_appearance`` wires the per-call gate from tracker
-attrs (mask-fill 0.35, relaxed aspect 2.0) rather than ``DEFAULT_GATE``.
+``crop_quality_ok`` ANDs every check (False if any fails), so the two gates
+compose automatically. These tests pin (1) the combined behaviour via direct
+``crop_quality_ok`` calls and (2) that ``update_appearance`` wires the per-call
+gate from the tracker attrs rather than the shared ``DEFAULT_GATE``.
 """
 import time
 from types import SimpleNamespace
@@ -34,61 +35,81 @@ import pytest
 import vision_track.reid.appearance_manager as AM
 from vision_track.reid.quality import crop_quality_ok
 
-# The NEW gate the implementation must apply (mask-fill 0.35, relaxed aspect).
+# The NEW gate the implementation must apply: upright w/h <= 0.5 AND fill > 0.35.
 NEW_GATE = dict(
     min_crop_h=80,
     min_blur_var=50.0,
     min_mask_coverage=0.35,
-    max_aspect_ratio=2.0,
+    max_aspect_ratio=0.5,
 )
 
+UPRIGHT = 0.4   # w/h of a clean standing person (admit)
+SQUARE = 1.0    # w/h of an occlusion/clipping-collapsed box (reject on aspect)
 
-def test_square_but_clean_admits():
-    """REGRESSION GUARD: a square (w/h=1.0) but well-segmented crop now passes.
 
-    Under the OLD ``max_aspect_ratio=0.9`` this was rejected — exactly the
-    occluded-but-upright operator view the gallery needs most.
-    """
+def test_upright_clean_admits():
+    """Both gates satisfied: tall box + good fill -> admit."""
     assert crop_quality_ok(
-        crop_h=200, crop_w=200, mask_coverage=0.45, blur_var=100,
-        aspect_ratio=1.0, **NEW_GATE,
+        crop_h=300, crop_w=120, mask_coverage=0.45, blur_var=100,
+        aspect_ratio=UPRIGHT, **NEW_GATE,
     ) is True
 
 
-def test_low_fill_rejected():
-    """Thin operator slice in an inflated box -> low fill -> reject."""
+def test_square_rejected_by_aspect():
+    """A square (w/h=1.0) box is now REJECTED even with good fill (operator is
+    upright; a square box is occluded/merged/non-standing)."""
     assert crop_quality_ok(
-        crop_h=200, crop_w=200, mask_coverage=0.20, blur_var=100,
-        aspect_ratio=1.0, **NEW_GATE,
+        crop_h=200, crop_w=200, mask_coverage=0.45, blur_var=100,
+        aspect_ratio=SQUARE, **NEW_GATE,
     ) is False
 
 
-def test_none_coverage_admits():
-    """No seg mask this frame -> not rejected on fill."""
+def test_upright_but_low_fill_rejected():
+    """Tall box but a thin operator slice -> low fill -> reject (mask-fill gate)."""
+    assert crop_quality_ok(
+        crop_h=300, crop_w=120, mask_coverage=0.20, blur_var=100,
+        aspect_ratio=UPRIGHT, **NEW_GATE,
+    ) is False
+
+
+def test_none_coverage_upright_admits():
+    """No seg mask this frame -> not rejected on fill, but still must be upright."""
+    assert crop_quality_ok(
+        crop_h=300, crop_w=120, mask_coverage=None, blur_var=100,
+        aspect_ratio=UPRIGHT, **NEW_GATE,
+    ) is True
+
+
+def test_none_coverage_square_rejected():
+    """No mask doesn't bypass the aspect gate: a square maskless box still rejects."""
     assert crop_quality_ok(
         crop_h=200, crop_w=200, mask_coverage=None, blur_var=100,
-        aspect_ratio=1.0, **NEW_GATE,
+        aspect_ratio=SQUARE, **NEW_GATE,
+    ) is False
+
+
+def test_aspect_boundary_is_strict():
+    """Aspect gate is ``>`` reject: exactly 0.5 admits, 0.51 rejects."""
+    assert crop_quality_ok(
+        crop_h=300, crop_w=150, mask_coverage=0.45, blur_var=100,
+        aspect_ratio=0.5, **NEW_GATE,
     ) is True
+    assert crop_quality_ok(
+        crop_h=300, crop_w=153, mask_coverage=0.45, blur_var=100,
+        aspect_ratio=0.51, **NEW_GATE,
+    ) is False
 
 
 def test_mask_fill_boundary_is_strict():
-    """Gate is strict ``<=``: exactly 0.35 rejects, 0.36 admits."""
+    """Mask-fill gate is strict ``<=``: exactly 0.35 rejects, 0.36 admits (upright)."""
     assert crop_quality_ok(
-        crop_h=200, crop_w=200, mask_coverage=0.35, blur_var=100,
-        aspect_ratio=1.0, **NEW_GATE,
+        crop_h=300, crop_w=120, mask_coverage=0.35, blur_var=100,
+        aspect_ratio=UPRIGHT, **NEW_GATE,
     ) is False
     assert crop_quality_ok(
-        crop_h=200, crop_w=200, mask_coverage=0.36, blur_var=100,
-        aspect_ratio=1.0, **NEW_GATE,
+        crop_h=300, crop_w=120, mask_coverage=0.36, blur_var=100,
+        aspect_ratio=UPRIGHT, **NEW_GATE,
     ) is True
-
-
-def test_very_wide_degenerate_still_rejected():
-    """The relaxed aspect backstop (2.0) still catches a 2.5 wide box."""
-    assert crop_quality_ok(
-        crop_h=200, crop_w=500, mask_coverage=0.45, blur_var=100,
-        aspect_ratio=2.5, **NEW_GATE,
-    ) is False
 
 
 def _make_capture_tracker():
@@ -114,13 +135,13 @@ def _make_capture_tracker():
         keep_gallery_thumbs=False,
         feature_refresh_interval=1.5,
         gallery_min_mask_fill=0.35,
-        gallery_max_aspect_ratio=2.0,
+        gallery_max_aspect_ratio=0.5,
     )
 
 
 def test_update_appearance_wires_gate_from_tracker(monkeypatch):
     """update_appearance must call crop_quality_ok with the tracker's mask-fill
-    + relaxed-aspect gate, NOT the shared DEFAULT_GATE (0.4 / 0.9).
+    + aspect gate, NOT the shared DEFAULT_GATE (0.4 / 0.9).
     """
     captured = {}
 
@@ -139,7 +160,7 @@ def test_update_appearance_wires_gate_from_tracker(monkeypatch):
     AM.update_appearance(tracker, frame, result, similarity=0.5)
 
     assert captured["min_mask_coverage"] == 0.35
-    assert captured["max_aspect_ratio"] == 2.0
+    assert captured["max_aspect_ratio"] == 0.5
     # The untouched keys still fall back to DEFAULT_GATE.
     assert captured["min_crop_h"] == 80
     assert captured["min_blur_var"] == 50.0

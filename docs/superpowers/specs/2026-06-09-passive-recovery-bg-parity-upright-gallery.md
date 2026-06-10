@@ -1,4 +1,4 @@
-# Passive recovery (post-NEEDS_HELP) + mask-fill gallery gate + larger seg model — design
+# Passive recovery (post-NEEDS_HELP) + upright+mask-fill gallery gate + larger seg model — design
 
 **Date:** 2026-06-09 (revised 2026-06-10)
 **Package:** `src/vision_track`
@@ -9,13 +9,13 @@ Changes to `person_track_server`. **Issue 1** extends the passive-recovery windo
 to ~5 s and adds a precision-bounded auto-recovery escape hatch once latched in
 NEEDS_HELP. **Issue 2** (OSNet background parity) was investigated and resolved
 with NO code change — the query already uses the real seg mask. **Issue 3**
-gates gallery admission on mask-fill instead of bbox aspect ratio. **Issue 4** is
-the model-quality upgrade (larger YOLO-seg + TensorRT) that reduces maskless
-frames and lifts the raw ReID operating point Issue 1's bar depends on. They
-compose: a bigger model (#4) raises similarity and mask coverage; the mask-fill
-gate (#3) keeps the gallery clean without rejecting square-but-upright crowd
-views; the post-NEEDS_HELP relaxation (#1) catches a returning operator once #4
-has lifted their similarity above the relaxed bar.
+gates gallery admission on BOTH bbox w/h ratio (upright) AND mask-fill (clean).
+**Issue 4** is the model-quality upgrade (larger YOLO-seg + TensorRT) that reduces
+maskless frames and lifts the raw ReID operating point Issue 1's bar depends on.
+They compose: a bigger model (#4) raises similarity and mask coverage; the
+upright+mask-fill gate (#3) keeps the gallery to clean standing operator views;
+the post-NEEDS_HELP relaxation (#1) catches a returning operator once #4 has
+lifted their similarity above the relaxed bar.
 
 ---
 
@@ -150,56 +150,50 @@ match a real tight-crop. Implementation reverted.
 
 ---
 
-## Issue 3 — mask-fill gallery admission gate (not bbox aspect ratio)
+## Issue 3 — gallery admission gate on BOTH bbox w/h ratio AND mask-fill
 
-### Root cause / rationale
-The operator stands throughout, so we want only clean, well-segmented operator
-views in the ReID gallery. The **existing** gate (`reid/quality.py:crop_quality_ok`,
-fed by `reid/appearance_manager.py:update_appearance` via `DEFAULT_GATE`) already
-rejects on `min_mask_coverage` (0.4) AND `max_aspect_ratio` (w/h ≤ 0.9). The
-**aspect-ratio gate is wrong for crowds**: occlusion / box-clipping makes a
-genuinely upright operator's bbox square-ish (w/h ≈ 1.0 > 0.9) → such clean views
-are *rejected*, starving the gallery exactly when reacquisition is hardest. Pose
-uprightness is guaranteed by operator behaviour, not by bbox shape, so it should
-not be inferred from bbox shape.
-
-The robust signal is **how much of the bbox the mask fills**
-(`mask_coverage = mask_pixels / bbox_area`, already computed as `area_ratio` in
-`extract_features`): a merged/garbage/occlusion-inflated box has the operator's
-mask as a thin slice (low fill → reject); a clean view — including a
-square-but-clean crowd view — fills its box well (admit).
+### Rationale (operator decision, revised 2026-06-10)
+The operator is **always standing**, so only clean, UPRIGHT, well-segmented
+operator views should enrich the ReID gallery. The first draft (mask-fill only,
+aspect relaxed to 2.0) was reconsidered: the operator opted to **keep an upright
+bbox w/h gate AND the mask-fill gate** — admit a view only when BOTH hold. The
+existing gate (`reid/quality.py:crop_quality_ok`, fed by
+`reid/appearance_manager.py:update_appearance`) already checks both
+`min_mask_coverage` and `max_aspect_ratio` and ANDs all checks, so this is a
+threshold + wiring change, not new gate logic.
 
 ### Fix
-- **Parameterize the mask-fill floor:** new launch param `gallery_min_mask_fill`
-  (default **0.35**, configurable at launch). It overrides `min_mask_coverage` in
-  the gate. (0.35 is slightly below the old 0.4 — a clean upright silhouette fills
-  ~0.35–0.55 of its tight bbox, so 0.35 keeps margin while still rejecting
-  merged/garbage boxes whose target mask is a thin slice.)
-- **Neutralize the aspect-ratio rejection:** make `max_aspect_ratio` a launch
-  param `gallery_max_aspect_ratio` with a **permissive default (2.0)** so
-  square-but-upright crowd boxes are admitted. Truly degenerate wide boxes
-  (merged neighbours) are still caught by the mask-fill floor (a wide merged box
-  has low target-mask coverage), so mask-fill subsumes the old aspect rejection.
-- Wire both into the gate dict built in `update_appearance` (read from tracker
-  attrs, falling back to `DEFAULT_GATE` for the untouched `min_crop_h` /
-  `min_blur_var`). `crop_quality_ok` already accepts these as kwargs — no change
-  to its signature. `min_mask_coverage` is still skipped when `mask_coverage` is
-  None (no mask that frame), so a maskless frame is never rejected on fill alone.
+- **Aspect (uprightness) gate:** launch param `gallery_max_aspect_ratio`
+  (default **0.5**). `crop_quality_ok` rejects when `aspect_ratio` (= w/h) `>`
+  this. An upright standing operator is taller-than-wide (w/h ~0.4), so 0.5
+  admits clearly-upright boxes and rejects square/wide (occluded/merged/
+  non-standing) ones. Adjustable at launch.
+- **Mask-fill gate:** launch param `gallery_min_mask_fill` (default **0.35** =
+  mask_pixels/bbox_area). `crop_quality_ok` rejects when `mask_coverage <=` this.
+  A merged/garbage/occlusion-inflated box has the operator mask as a thin slice
+  (low fill → reject). `mask_coverage` is `None` when no seg mask is present that
+  frame → not rejected on fill, but still subject to the aspect gate.
+- Both are wired into the per-call gate dict in `update_appearance` (read from
+  tracker attrs, falling back to `DEFAULT_GATE` for `min_crop_h` / `min_blur_var`).
+  `crop_quality_ok` ANDs all checks, so admission requires upright AND clean.
 
 ### New params (Issue 3)
 | Param | Default | Meaning |
 |---|---|---|
-| `gallery_min_mask_fill` | `0.35` | min mask_pixels/bbox_area to admit a view into the ReID gallery (clean-detection gate; configurable at launch) |
-| `gallery_max_aspect_ratio` | `2.0` | max bbox w/h to admit (permissive — degenerate-box backstop; mask-fill is the primary signal) |
+| `gallery_max_aspect_ratio` | `0.5` | max bbox w/h to admit (upright gate — operator is taller-than-wide; reject square/wide); adjustable at launch |
+| `gallery_min_mask_fill` | `0.35` | min mask_pixels/bbox_area to admit (clean-detection gate, strict `<=`); adjustable at launch |
 
 ### Invariants / risks
 - Admission-only gate — never affects the query/matching path or the live lock.
   A rejected frame still refreshes motion/last-seen (existing behaviour kept).
+- Both gates AND'd: a view must be upright (w/h ≤ 0.5) AND clean (fill > 0.35).
+  Trade-off the operator accepted: a genuinely-upright operator whose bbox is
+  clipped square in a dense crowd will be skipped for gallery enrichment that
+  frame (tracking continues via ByteTrack regardless; the gallery just waits for a
+  cleaner upright view). Loosen `gallery_max_aspect_ratio` at launch if a venue
+  proves too crowded.
 - `mask_coverage` is `None` when no mask is available → not rejected on fill that
-  frame (unchanged). The gate only enriches the gallery; tracking continues via
-  ByteTrack regardless.
-- Loosening the aspect gate cannot admit garbage: the mask-fill floor (now the
-  controlling signal) rejects the wide/merged boxes the aspect gate used to.
+  frame, but the aspect gate still applies.
 
 ---
 
@@ -256,11 +250,14 @@ frames — raising the raw ReID operating point that Issue 1's 0.62 bar depends 
   already used for the OSNet query). `reid/reid.py` stays at its `main` contract,
   so its existing `test_deep_crop_segmentation.py` tests remain valid.
 - **Issue 3:** unit-test the admission gate via `crop_quality_ok` with the new
-  thresholds: a square-but-clean box (w/h = 1.0, mask_coverage = 0.45) is ADMITTED
-  with `gallery_max_aspect_ratio=2.0, gallery_min_mask_fill=0.35` (regression vs
-  the old 0.9 aspect reject); a low-fill box (mask_coverage = 0.20) is REJECTED; a
-  None mask_coverage is not rejected on fill; the boundary mask_coverage == 0.35
-  is rejected (gate is strict `<=`), 0.36 admitted.
+  thresholds (`gallery_max_aspect_ratio=0.5, gallery_min_mask_fill=0.35`): an
+  upright clean box (w/h = 0.4, mask_coverage = 0.45) ADMITTED; a square box
+  (w/h = 1.0) REJECTED even with good fill (aspect gate); an upright low-fill box
+  (mask_coverage = 0.20) REJECTED (mask-fill gate); a None-coverage upright box
+  ADMITTED but a None-coverage square box REJECTED (aspect still applies); aspect
+  boundary w/h == 0.5 admits / 0.51 rejects (gate is `>`); mask boundary
+  mask_coverage == 0.35 rejects / 0.36 admits (gate is `<=`); plus an
+  `update_appearance` wiring test that both tracker attrs reach `crop_quality_ok`.
 - **Issue 4:** no unit test (operational); manual latency benchmark recorded in
   DEV_NOTES.
 - Full suite green; no NEW flake8 in touched lines (pre-existing baseline only).

@@ -112,20 +112,21 @@ ros2 run vision_track person_track_server --ros-args \
   to `s` on weaker/offline GPUs (the m-seg weight must be cached for offline
   arena), or point at a `.engine` for TRT (`scripts/export_yolo_trt.py`).
 
-- **2026-06-10** — **gallery admission gated on mask-fill, not bbox aspect
-  ratio.** The operator stands throughout, so pose uprightness is guaranteed by
-  behaviour, not box shape — but occlusion/clipping in a crowd makes a clean
-  upright operator's bbox square-ish (w/h ≈ 1.0), which the old `max_aspect_ratio`
-  0.9 reject wrongly dropped, starving the gallery when reacquisition is hardest.
-  Now admission gates on **mask-fill** (`gallery_min_mask_fill`, default **0.35** =
-  mask_px/bbox_area, strict `<=`) — a merged/garbage/occlusion-inflated box has
-  the operator mask as a thin slice (low fill → reject); a clean view, even
-  square, fills its box (admit). The aspect reject is relaxed to a
-  wide-degenerate backstop (`gallery_max_aspect_ratio`, default **2.0**). Both are
-  per-call overrides of the shared `crop_quality_ok` gate (assembled in
-  `update_appearance` from tracker attrs; `DEFAULT_GATE` unchanged) and
-  configurable at launch. Admission-only — never affects the query/match path or
-  the live lock; a rejected frame still refreshes motion/last-seen.
+- **2026-06-10** — **gallery admission gated on BOTH bbox w/h ratio AND
+  mask-fill (upright + clean).** The operator is always standing, so only
+  upright, well-segmented views should enrich the gallery. Admission now requires
+  BOTH: bbox width/height `<= gallery_max_aspect_ratio` (default **0.5** — upright
+  is taller-than-wide ~0.4; a square/wide box rejects) AND mask-fill
+  `> gallery_min_mask_fill` (default **0.35** = mask_px/bbox_area, strict `<=` —
+  a merged/garbage/occlusion-inflated box has the operator mask as a thin slice →
+  reject). `crop_quality_ok` ANDs the checks (reject if either fails); a
+  None-coverage frame isn't rejected on fill but still must pass the aspect gate.
+  Both are per-call overrides of the shared gate (assembled in `update_appearance`
+  from tracker attrs; `DEFAULT_GATE` unchanged) and adjustable at launch.
+  Admission-only — never affects the query/match path or the live lock; a rejected
+  frame still refreshes motion/last-seen. (Supersedes the first-draft mask-fill-
+  only / relaxed-aspect-2.0 approach — operator opted to keep the upright w/h gate
+  too.)
 
 - **2026-06-10** — **passive recovery: post-NEEDS_HELP auto re-lock + wall-clock
   escalation.** (1) While *latched* in NEEDS_HELP with exactly one person visible,

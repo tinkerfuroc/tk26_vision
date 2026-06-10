@@ -325,15 +325,16 @@ class PersonTrackNode(Node):
         self.declare_parameter('reid_gallery_novelty_max', 0.85)
         self.declare_parameter('reid_gallery_score_mode', 'max')
         # Issue 3: gate gallery admission on MASK-FILL (mask_pixels / bbox_area),
-        # not bbox aspect ratio. A clean upright operator view fills its box even
-        # when occlusion/clipping makes the bbox square-ish; a merged/garbage box
-        # has the operator mask as a thin slice (low fill -> reject).
+        # on BOTH bbox w/h ratio AND mask-fill. The operator is always standing,
+        # so admit only UPRIGHT, well-segmented views; crop_quality_ok ANDs the
+        # checks (reject if either fails).
+        #  - gallery_max_aspect_ratio: max bbox width/height to admit (default
+        #    0.5 — upright is taller-than-wide ~0.4; a square/wide box rejects).
         #  - gallery_min_mask_fill: min mask-fill to admit (strict <=); None
-        #    coverage (no seg mask that frame) is never rejected on fill.
-        #  - gallery_max_aspect_ratio: relaxed w/h backstop catching only very
-        #    wide degenerate boxes (square-but-clean now passes).
+        #    coverage (no seg mask that frame) is not rejected on fill, but still
+        #    must pass the aspect gate.
         self.declare_parameter('gallery_min_mask_fill', 0.35)
-        self.declare_parameter('gallery_max_aspect_ratio', 2.0)
+        self.declare_parameter('gallery_max_aspect_ratio', 0.5)
 
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')

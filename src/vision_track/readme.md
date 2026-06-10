@@ -100,6 +100,27 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-10** — **`track_web_control.launch.py`: follow-demo control surface
+  (tracker + upgraded dashboard).** A focused one-command bringup of the person
+  tracker (with the three `debug_*` telemetry flags forced ON, like the bench) +
+  the upgraded `track_web` dashboard. The dashboard's new **Bringup panel** has
+  per-component start/stop toggles for the follow demo's supporting stack —
+  **audio** (`ros2 launch audio_pakage audio.launch.py`), **dummy_nav**
+  (`ros2 run behavior_tree dummy-nav`), and the **follow-person BT**
+  (`ros2 run behavior_tree follow-person`) — spawned on demand at runtime by a
+  fixed-allowlist `ProcessManager` (NOT part of this launch). While the BT runs,
+  the dashboard's manual goal-Start is disabled (the BT owns the
+  `/track_person` goal). Args: `launch_tracker` (default `true`; set `false` to
+  point the dashboard at an already-running tracker — the dashboard always
+  starts), `with_waving` (default `false`, the 👋 button backend), `kill_stale`
+  (default `true`, SIGTERMs stale tracker/dashboard `lib/<pkg>/` execs first),
+  `bind` (`0.0.0.0`), `port` (`8766`), `perf_logging` (`false`).
+  **Prerequisite:** build `behavior_tree` + `audio_pakage` into
+  `tk25_ws/install` via `tkbuild tk25_decision` + `tkbuild tk_24_audio` so the
+  Bringup-panel spawns resolve. Run:
+  `ros2 launch vision_track track_web_control.launch.py` (cameras started first
+  per `src/tk26_vision/CAMERA_BRINGUP.md`).
+
 - **2026-06-10** — **fix: NEEDS_HELP passive re-acquisition near-impossible
   despite a clear, near-identical operator.** Root cause: the N-of-M re-ID
   confirm window (`reid_confirm_window`) was keyed on the raw ByteTrack

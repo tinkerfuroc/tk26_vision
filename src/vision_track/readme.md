@@ -100,6 +100,19 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-10** — **fix: premature `/track_person` abort after loss
+  (regression from the wall-clock escalation).** Moving the help-latch to 5 s
+  wall-clock decoupled it from the lock-FSM recovery cap (`max_recovery_frames`,
+  ~1.5 s @ 30 fps), which still set `hard_lost` and fired the abort branch in the
+  `[~1.5 s, 5 s]` window — so the goal aborted (`'hard-lost (recovery cap)'`)
+  before reaching the NEEDS_HELP hold. (Pre-change the frame-based latch coincided
+  with the recovery cap and always shadowed it.) Fix: the abort decision is now a
+  pure `lost_should_abort(...)` helper — the FSM recovery cap aborts ONLY when
+  active help is DISABLED (`active_help_after_sec <= 0`); with active help enabled
+  the goal coasts through the passive-recovery window into the indefinite
+  NEEDS_HELP hold. The `lost_timeout` absolute ceiling and the legacy
+  (help-disabled) abort are unchanged. `_handle_frame_stall` inherits the fix.
+
 - **2026-06-10** — **tracker seg model upgraded to `yolo11m-seg` by default.**
   Benchmark (`scripts/bench_yolo_seg.py`, imgsz 736 fp16, RTX 5070 Ti): `s`=4.0 ms
   (250 fps), **`m`=5.5 ms (182 fps)**, `l`=7.0 ms (143 fps), `x`=9.5 ms (105 fps)

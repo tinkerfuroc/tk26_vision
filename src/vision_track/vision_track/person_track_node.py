@@ -88,6 +88,37 @@ def _target_box_color_kind(track_id, target_result, target_track_id, decision):
     return 'other'
 
 
+def lost_should_abort(*, hard_lost, awaiting_help, time_since_seen,
+                      lost_timeout, active_help_enabled):
+    """True iff the lost goal should abort this frame.
+
+    Pure decision split out of ``_handle_lost_frame`` so the abort policy is
+    unit-testable (see test_needs_help_no_premature_abort.py).
+
+    Policy:
+    - ``time_since_seen > lost_timeout`` is the ABSOLUTE ceiling — always abort,
+      regardless of any active-help state.
+    - While the active-help hold is engaged (``awaiting_help``) the goal coasts:
+      never abort (the caller's _is_awaiting_help early-return normally handles
+      this, but it's folded in here too so the helper is correct standalone).
+    - The FSM recovery-cap (``hard_lost``) aborts ONLY when active help is
+      DISABLED (legacy ``active_help_after_sec <= 0``). With active help ENABLED
+      the recovery-cap must NOT abort — the goal coasts through the passive-
+      recovery window into the indefinite NEEDS_HELP hold (the pre-wall-clock
+      frame-coupled behavior). REGRESSION FIX (commit 1817a48 decoupled the FSM
+      recovery cap, ~1.5 s @ 30 fps, from the now-wall-clock 5 s escalation,
+      opening a [recovery-cap, active_help_after_sec] window where hard_lost
+      fired before the help-latch could shadow it).
+    """
+    if time_since_seen > lost_timeout:
+        return True
+    if awaiting_help:
+        return False
+    if hard_lost and not active_help_enabled:
+        return True
+    return False
+
+
 class PersonTrackNode(Node):
     """
     ROS2 Action Server node for person tracking using YOLO.
@@ -1495,8 +1526,20 @@ class PersonTrackNode(Node):
                     f'(holding {bound} for ~/reseed_target — wave to resume)')
                 self._active_help_logged = True
             return False
-        if hard_lost or time_since_seen > self.lost_timeout:
-            reason = 'hard-lost (recovery cap)' if hard_lost else f'lost for {time_since_seen:.1f}s'
+        # The _is_awaiting_help early-return above already held the goal when the
+        # active-help hold is engaged, so pass awaiting_help=False here. With
+        # active help ENABLED the FSM recovery-cap (hard_lost) must NOT abort —
+        # the goal coasts through the passive-recovery window into the indefinite
+        # NEEDS_HELP hold (matching the pre-1817a48 frame-coupled behavior, where
+        # the latch always shadowed hard_lost). hard_lost aborts ONLY in the
+        # legacy active-help-disabled mode; lost_timeout stays the absolute ceiling.
+        if lost_should_abort(
+                hard_lost=hard_lost, awaiting_help=False,
+                time_since_seen=time_since_seen, lost_timeout=self.lost_timeout,
+                active_help_enabled=self.active_help_after_sec > 0):
+            over_ceiling = time_since_seen > self.lost_timeout
+            reason = (f'lost for {time_since_seen:.1f}s' if over_ceiling
+                      else 'hard-lost (recovery cap)')
             self.get_logger().warn(f'Target {reason}, aborting')
             goal_handle.abort()
             result.status = 1

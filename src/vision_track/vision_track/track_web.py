@@ -34,6 +34,7 @@ from std_msgs.msg import String
 from tinker_vision_msgs_26.action import TrackPerson
 from tinker_vision_msgs_26.srv import DetectWaving, ReseedTarget
 
+from vision_track.process_manager import ProcessManager
 from vision_track.track_web_app import create_app
 
 _STALE_S = 1.0
@@ -90,6 +91,9 @@ class TrackWebNode(Node):
         self._goal_handle = None    # our bench goal (None = not held by us)
         self._rec_proc = None       # `ros2 bag record` subprocess (None = idle)
         self._rec_path = None       # output dir of the active/last recording
+        # Fixed-allowlist supervisor for the bringup demo components
+        # (audio / dummy_nav / bt). Children die in main()'s teardown.
+        self.proc_manager = ProcessManager()
 
         cb = ReentrantCallbackGroup()
         self.create_subscription(
@@ -316,6 +320,16 @@ class TrackWebNode(Node):
         self.get_logger().info(f"rosbag recording stopped -> {path}")
         return {"ok": True, "message": f"saved {path}", "path": path or ""}
 
+    # ---- bringup process control (delegates to ProcessManager, never raises) -
+    def proc_start(self, name):
+        return self.proc_manager.start(name)
+
+    def proc_stop(self, name):
+        return self.proc_manager.stop(name)
+
+    def proc_status(self):
+        return self.proc_manager.status_all()
+
 
 def main():
     # Mirror calib_web: avoid the SHM-discovery stall on a live robot.
@@ -350,6 +364,7 @@ def main():
     finally:
         server.should_exit = True
         node.record_stop()  # finalize any in-progress bag before teardown
+        node.proc_manager.shutdown_all()  # kill spawned children with the dashboard
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

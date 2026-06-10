@@ -38,11 +38,14 @@ Commits: `1817a48` (Issue 1), `0cfbb08` (Issue 3), `415f78c` (Issue 4),
   already uses the real seg mask at every call site (plumbing verified). The
   first-draft ellipse pseudo-mask was reverted — fabricating a mask papers over a
   non-problem; fewer maskless frames come from the bigger model (Issue 4).
-- **Issue 3 — gallery gate on mask-fill, not bbox aspect.** Admission now gates
-  on `gallery_min_mask_fill` (0.35 = mask_px/bbox_area) and relaxes the aspect
-  reject to `gallery_max_aspect_ratio` (2.0) — a square-but-clean upright operator
-  in a crowd is no longer starved from the gallery; merged/garbage boxes (low
-  fill) still rejected. Admission-only.
+- **Issue 3 — gallery gate on BOTH bbox w/h ratio AND mask-fill** (revised
+  2026-06-10). Admission requires upright AND clean: `gallery_max_aspect_ratio`
+  (default 0.5 — operator is taller-than-wide ~0.4; square/wide rejected) AND
+  `gallery_min_mask_fill` (default 0.35 = mask_px/bbox_area; merged/low-fill
+  rejected). `crop_quality_ok` ANDs both; both adjustable at launch. Admission-
+  only. (First draft was mask-fill-only with aspect relaxed to 2.0; operator opted
+  to keep the upright w/h gate too — trade-off: a clipped-square upright operator
+  in a dense crowd waits for a cleaner view before enriching the gallery.)
 - **Issue 4 — tracker seg model → `yolo11m-seg` default.** Benchmark
   (`scripts/bench_yolo_seg.py`, imgsz 736 fp16, RTX 5070 Ti): s=4.0 / **m=5.5** /
   l=7.0 / x=9.5 ms — all far under the 33 ms 30 Hz budget *in plain PyTorch*, so
@@ -56,8 +59,10 @@ builds; m-seg latency benchmarked; m-seg weight resolves.
 
 **Still needs operator-in-the-loop (T4):** (1) walk the operator out of frame >5 s
 then back in — confirm auto re-lock post-NEEDS_HELP without a wave, and that the
-web box turns green (not stuck yellow). (2) Crowd scene where the operator's bbox
-goes square-ish — confirm gallery keeps enriching (mask-fill gate). (3) Confirm
+web box turns green (not stuck yellow). (2) Confirm the
+gallery enriches from upright operator views and does NOT admit square/wide or
+low-fill boxes; in a dense crowd watch for gallery starvation (clipped-square
+operator) — loosen `gallery_max_aspect_ratio` at launch if needed. (3) Confirm
 m-seg sustains ~30 Hz end-to-end with the full ReID pipeline on live cameras (the
 raw model is 5.5 ms; the OSNet-per-candidate cost is the real budget). (4) Confirm
 the m-seg weight is cached on the actual arena robots (offline).

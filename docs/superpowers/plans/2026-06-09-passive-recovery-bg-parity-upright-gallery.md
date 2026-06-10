@@ -57,9 +57,11 @@ come from the better seg model (Phase D), not a synthesized mask. See spec
 
 ---
 
-## Phase C — Issue 3: mask-fill gallery admission gate (one commit; AFTER Phase B)
+## Phase C — Issue 3: upright + mask-fill gallery admission gate (one commit; AFTER Phase B)
 
-**Files:** `reid/appearance_manager.py` (gate dict from tracker attrs), `person_track_node.py` (params), `yolo_tracker.py` (defaults). Test: `test/test_gallery_mask_fill_gate.py` (new). Doc: `readme.md`. (`reid/quality.py` needs NO change — `crop_quality_ok` already takes `min_mask_coverage`/`max_aspect_ratio` as kwargs.)
+> **REVISED 2026-06-10 (final, shipped):** gate on **BOTH** `gallery_max_aspect_ratio` (default **0.5** — upright w/h) AND `gallery_min_mask_fill` (default **0.35**). `crop_quality_ok` ANDs both, so the wiring is identical to the steps below — only the `gallery_max_aspect_ratio` default is **0.5, not 2.0**, and a square box is REJECTED (not admitted). The test asserts the upright-clean/square-rejected/low-fill/boundary cases at 0.5. The steps below (written for the first-draft mask-fill-only/relaxed-2.0 approach) are kept for history; the shipped values are 0.5 + 0.35.
+
+**Files:** `reid/appearance_manager.py` (gate dict from tracker attrs), `person_track_node.py` (params), `yolo_tracker.py` (defaults), `config/default.yaml`. Test: `test/test_gallery_mask_fill_gate.py` (new). Doc: `readme.md`. (`reid/quality.py` needs NO change — `crop_quality_ok` already takes `min_mask_coverage`/`max_aspect_ratio` as kwargs and ANDs them.)
 
 - [ ] **Step 1 — failing test.** `test_gallery_mask_fill_gate.py`: import `crop_quality_ok` from `vision_track.reid.quality`. With `min_crop_h=80, min_blur_var=50.0` fixed and `min_mask_coverage=0.35, max_aspect_ratio=2.0` (the new defaults):
   - square-but-clean: `crop_h=200, crop_w=200, mask_coverage=0.45, blur_var=100, aspect_ratio=1.0` → True (REGRESSION GUARD: under the old `max_aspect_ratio=0.9` this was False).

@@ -16,6 +16,35 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-10 — PERSON TRACKING FINALIZED
+
+`vision_track/person_track_server` is finalized for the arena (unit suite green,
+builds, pushed to `dev`). The complete 2026-06-10 changeset (see the detailed
+entry below + the `readme.md` Changelog):
+
+- **Passive recovery after NEEDS_HELP** — wall-clock 5 s escalation
+  (`active_help_after_sec`, not frame count) + relaxed lone auto re-lock (0.62,
+  12-of-16) gated on latched NEEDS_HELP + single visible person (`1817a48`).
+- **Premature-abort regression fixed** — the FSM recovery-cap no longer aborts the
+  goal while active help is enabled; the goal coasts to the NEEDS_HELP hold
+  (`ebcdb5a`).
+- **Re-acquisition id-churn fix** — the N-of-M confirm window survives ByteTrack
+  `track_id` churn during a loss+reappearance while latched in NEEDS_HELP, so a
+  lone returning operator re-locks (`d195c4e`).
+- **Gallery admission gate** — upright (bbox w/h ≤ 0.5) AND clean
+  (mask-fill > 0.35), both launch-adjustable (`dceeca4`).
+- **Seg model** — default `yolo11m-seg` (5.5 ms @736 fp16; benchmark
+  `scripts/bench_yolo_seg.py`); TRT optional (`bfa68c2`).
+
+**Still requires operator-in-the-loop (T4) sign-off** before competition (these
+are validated by unit/integration tests with monkeypatched similarity, not yet on
+a live robot): (1) >5 s out-and-back auto re-lock without a wave + web box turns
+green; (2) re-lock fires within ~12-16 frames despite real id churn (check `reid
+candidates` logs); (3) m-seg sustains ~30 Hz end-to-end with full ReID; (4) m-seg
+weight cached on the arena robots (offline); (5) optional: if real recovery
+similarity sits below 0.62 in sparse-gallery scenes, relax `gallery_max_aspect_ratio`
+0.5→~0.7 (recall tuning, not a fix).
+
 ## 2026-06-10 — passive recovery (wall-clock + post-NEEDS_HELP auto re-lock) + mask-fill gallery gate + m-seg default
 
 Four tracker changes from a systematic-debugging + subagent-driven session.

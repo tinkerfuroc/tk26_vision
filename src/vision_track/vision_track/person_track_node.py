@@ -31,7 +31,7 @@ import os
 # ROS2 messages
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped, Point
-from std_msgs.msg import Header, String
+from std_msgs.msg import Header, String, UInt8
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_point
 
@@ -60,6 +60,14 @@ from vision_track.core.depth_roi import roi_window
 from vision_track.core.frame_diag import compute_frame_diag
 from vision_track.core.reacq_state import reacq_state
 from vision_track.core.debug_state import build_debug_state
+
+
+# Sentinel for the ~/reacq_state heartbeat when no TrackPerson goal is active.
+# It extends the reacq_state enum (0 TRACKING / 1 PASSIVE / 2 NEEDS_HELP) with a
+# value the live enum never takes, so a navigation-side consumer can tell
+# "tracker idle / shut down" apart from a real "wait, don't abort" period. 255 =
+# UInt8 max, an unambiguous out-of-band byte.
+REACQ_INACTIVE = 255
 
 
 def _target_box_color_kind(track_id, target_result, target_track_id, decision):
@@ -201,6 +209,18 @@ class PersonTrackNode(Node):
         self.debug_gallery_pub = self.create_publisher(String, '~/debug_gallery', gallery_qos)
         self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 1)
         self._last_gallery_version = -1
+
+        # ~/reacq_state heartbeat: a permanently-on low-rate UInt8 mirror of the
+        # TrackPerson feedback reacquisition enum (0 TRACKING / 1 PASSIVE /
+        # 2 NEEDS_HELP), publishing REACQ_INACTIVE (255) whenever no goal is
+        # active. Plain std_msgs/UInt8 so the navigation follow executive can
+        # consume it without depending on tinker_vision_msgs_26. Unlike the
+        # debug_* publishers this is unconditional (no param gate) — the
+        # consumer needs a continuous liveness signal to tell a "wait, don't
+        # abort" period (PASSIVE/NEEDS_HELP) from tracker shutdown (INACTIVE).
+        self.reacq_state_pub = self.create_publisher(UInt8, '~/reacq_state', 10)
+        self._last_reacq_state = REACQ_INACTIVE
+        self.create_timer(0.1, self._publish_reacq_state)
 
         # Idle telemetry: between goals the tracking loop isn't running, so a
         # light timer keeps the dashboard alive (camera preview + 'idle' state)
@@ -1323,6 +1343,9 @@ class PersonTrackNode(Node):
             tracked=not feedback.target_lost,
             time_since_lost=time.time() - self._last_confirmed_time,
             help_after_sec=self.active_help_after_sec)
+        # Mirror into the ~/reacq_state heartbeat so the nav consumer tracks the
+        # same enum the action feedback carries.
+        self._last_reacq_state = feedback.reacquisition_state
         goal_handle.publish_feedback(feedback)
 
         # Cache the latest good frame for the lost-transition dump, and emit
@@ -1497,6 +1520,9 @@ class PersonTrackNode(Node):
             tracked=False,
             time_since_lost=time.time() - self._last_confirmed_time,
             help_after_sec=self.active_help_after_sec)
+        # Mirror into the ~/reacq_state heartbeat so the nav consumer tracks the
+        # same enum the action feedback carries.
+        self._last_reacq_state = feedback.reacquisition_state
         goal_handle.publish_feedback(feedback)
 
         # Republish a lost-sentinel so /target_points consumers see the loss
@@ -1599,6 +1625,18 @@ class PersonTrackNode(Node):
                 last_seen_time, self._last_tracked_rgb, self._last_tracked_msg,
                 feedback, goal_handle, params, result)
         return False
+
+    def _publish_reacq_state(self):
+        """10 Hz heartbeat mirroring the last published reacquisition state.
+
+        Emits ``_last_reacq_state`` — set at each feedback publish to the live
+        TrackPerson enum, and reset to REACQ_INACTIVE (255) on goal teardown —
+        as a plain UInt8 so a navigation consumer always sees a current liveness
+        byte without subscribing to the action feedback. Permanently on.
+        """
+        msg = UInt8()
+        msg.data = int(self._last_reacq_state)
+        self.reacq_state_pub.publish(msg)
 
     def _publish_phase_debug_state(self, phase: str):
         """Out-of-tracking telemetry tick: 'initializing' during goal init,
@@ -1757,6 +1795,10 @@ class PersonTrackNode(Node):
         self._was_lost = False
         self._active_help_logged = False
         self._help_latched = False
+        # Goal over (success/abort/cancel/exception — this runs in the execute
+        # callback's finally): the ~/reacq_state heartbeat reverts to INACTIVE so
+        # the nav consumer sees "no goal" rather than a stale last-frame enum.
+        self._last_reacq_state = REACQ_INACTIVE
         # Re-anchor the escalation clock per goal (runs on goal completion, so
         # the next goal begins with a fresh anchor); tracking start overwrites it.
         self._last_confirmed_time = time.time()

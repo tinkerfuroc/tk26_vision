@@ -27,6 +27,13 @@
     </div>
   </section>
   <aside id="rail">
+    <div class="panel" id="bringup">
+      <h2>Bringup</h2>
+      <div class="proc-row"><span class="proc-dot" id="dot-audio"></span><span class="proc-name">Audio</span><button class="proc-btn" id="proc-audio" data-proc="audio">Start</button></div>
+      <div class="proc-row"><span class="proc-dot" id="dot-dummy_nav"></span><span class="proc-name">Dummy Nav</span><button class="proc-btn" id="proc-dummy_nav" data-proc="dummy_nav">Start</button></div>
+      <div class="proc-row"><span class="proc-dot" id="dot-bt"></span><span class="proc-name">Follow BT</span><button class="proc-btn" id="proc-bt" data-proc="bt">Start</button></div>
+      <p id="bringup-hint" class="hint hidden">Follow BT owns the tracking goal — manual Start disabled.</p>
+    </div>
     <div class="panel">
       <div id="reacq-badge" class="reacq">—</div>
       <table id="state-table">

@@ -9,6 +9,7 @@ let lastStateAt = 0;
 let waveBoxes = [];
 let lastMode = "—";   // bench | observer | idle (from the /api/status poll)
 let recording = false;  // rosbag record state (from the /api/status poll)
+let procState = {};     // {audio,dummy_nav,bt: <proc status>} (ws "proc" + /api/proc/status)
 
 function log(msg) {
   const li = document.createElement("li");
@@ -63,6 +64,23 @@ function renderGallery(g) {
   });
 }
 
+const PROC_NAMES = ["audio", "dummy_nav", "bt"];
+
+function renderProc(map) {
+  procState = map || {};
+  PROC_NAMES.forEach((name) => {
+    const p = procState[name] || {};
+    $("dot-" + name).className = "proc-dot " +
+      (p.running ? "on" : (p.returncode != null && p.returncode !== 0 ? "err" : "off"));
+    $("proc-" + name).textContent = p.running ? "Stop" : "Start";
+  });
+  // Manual-goal guard: Follow BT owns the tracking goal, so disable the manual
+  // Start button (and surface the hint) whenever the BT process is running.
+  const btRun = !!(procState.bt && procState.bt.running);
+  $("btn-start").disabled = btRun;
+  $("bringup-hint").classList.toggle("hidden", !btRun);
+}
+
 function connectWS() {
   const ws = new WebSocket(`ws://${location.host}/ws/state`);
   ws.onopen = () => { $("conn").textContent = "live"; $("conn").className = "badge on"; };
@@ -70,6 +88,7 @@ function connectWS() {
     const msg = JSON.parse(ev.data);
     if (msg.type === "state") renderState(msg.data);
     if (msg.type === "gallery") renderGallery(msg.data);
+    if (msg.type === "proc") renderProc(msg.data);
   };
   ws.onclose = () => {
     $("conn").textContent = "reconnecting…";
@@ -174,6 +193,16 @@ $("btn-record").onclick = async () => {
   log(`record ${recording ? "stop" : "start"} → ${r.message || (r.ok ? "ok" : "failed")}`);
 };
 
+/* Per-component bringup toggles. The next "proc" ws push refreshes dot/label. */
+PROC_NAMES.forEach((name) => {
+  $("proc-" + name).onclick = async () => {
+    const running = !!(procState[name] && procState[name].running);
+    const action = running ? "stop" : "start";
+    const r = await post(`/api/proc/${name}/${action}`);
+    log(`${name} ${action} → ${r.error || (r.running ? "running pid " + r.pid : "stopped")}`);
+  };
+});
+
 /* Stale banner + observer/bench mode chip + record state. */
 setInterval(async () => {
   $("stale-banner").classList.toggle("hidden", Date.now() - lastStateAt < 1000);
@@ -190,6 +219,9 @@ setInterval(async () => {
       rb.classList.toggle("rec-on", recording);
     }
   } catch (e) { /* status poll is best-effort */ }
+  // Seed/refresh the Bringup panel even before the first ws "proc" push;
+  // self-healing if a push is ever missed.
+  try { renderProc(await (await fetch("/api/proc/status")).json()); } catch (e) { /* best-effort */ }
 }, 1000);
 
 window.addEventListener("resize", renderWaveBoxes);

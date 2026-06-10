@@ -29,6 +29,17 @@ main { display:flex; gap:12px; padding:12px; align-items:flex-start; }
 .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
          padding:12px; }
 .panel h2 { font-size:13px; color:var(--dim); margin-bottom:8px; }
+.proc-row { display:flex; align-items:center; gap:8px; padding:4px 0; }
+.proc-name { flex:1; }
+.proc-dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+            flex:0 0 auto; background:var(--dim); }
+.proc-dot.off { background:var(--dim); }
+.proc-dot.on  { background:var(--green); }
+.proc-dot.err { background:var(--red); }
+.proc-btn { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+            border-radius:6px; padding:4px 12px; cursor:pointer; }
+.proc-btn:hover { border-color:var(--blue); }
+.hint { font-size:12px; color:var(--dim); margin-top:8px; }
 .reacq { text-align:center; font-weight:700; padding:10px; border-radius:6px;
          margin-bottom:10px; background:var(--line); }
 .reacq.tracking { background:var(--green); color:#04110a; }

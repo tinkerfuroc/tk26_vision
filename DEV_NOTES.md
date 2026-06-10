@@ -16,6 +16,71 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-10 — follow-demo debugging round (reacquire, announce, stop-all, dashboard lag, launch crash)
+
+Operator ran the full Follow Demo (`track_web_control.launch.py` + the webui
+Bringup card starting audio/dummy_nav/bt) and reported four problems. All
+root-caused systematically; the BT-side fixes live in `tk25_decision`, the
+tracker/webui fix here. **Hardware-free reproduction** was achieved for every
+one (throwaway `/track_person` servers + a mock `/announce`), so the diagnoses
+are evidence-backed, not guesses.
+
+- **Reacquire failed after loss when BT-driven (worked standalone).** Root cause:
+  the follow tree sent `TrackPerson.Goal.target_frame="map"` while the webui
+  sends `""`. A non-empty frame makes the tracker do a **blocking TF lookup
+  (~0.2 s) every tracked frame**; the demo has no `map` frame (dummy_nav is a
+  stub, no nav stack), so the loop collapsed ~30 Hz → ~5 Hz and ReID
+  reacquisition starved. Fixed in `tk25_decision` (`8c9b154`): default
+  `target_frame=""`. Confirmed 30 Hz restored on the robot.
+
+- **No voice announcement.** NOT a software bug. Proved end-to-end that the live
+  `follow-person` BT relays NEEDS_HELP → calls the real `/announce` → audible
+  prompt (operator heard it; `status=0`). The demo silence was a **speaker
+  power/battery issue** (hit 3× live during diagnosis). `/announce` is
+  `tinker_audio_msgs/srv/TextToSpeech`, advertised by the always-on audio
+  launch; the BT's announce client type matches. No code change.
+
+- **"Stop All" left the TrackPerson goal running.** Root cause: ProcessManager
+  stops the BT with **SIGTERM**, which Python kills on without raising, so
+  `run_tree`'s graceful-shutdown `finally` (the only thing that cancels the goal)
+  never ran — and even when it did, `tree.shutdown()` destroyed the node before
+  the async `cancel_goal_async()` flushed. Fixed in `tk25_decision` (`a0604c9`):
+  SIGTERM→KeyboardInterrupt handler + an explicit cancel-and-flush spin before
+  node destruction. Verified: `killpg(SIGTERM)` now produces a server-side
+  cancellation; pre-fix it did not.
+
+- **Dashboard state panel + gallery froze ~10 s after goal start (video was
+  immediate).** Tracker-side. Three gaps in the search phase: `~/debug_gallery`
+  only published post-lock; the init `'initializing'` `~/debug_state` payload
+  carried no rendered fields (looked dead); and a post-goal-accept warmup
+  blackout (idle timer off, CUDA warmup holding `lock_tracker`) published
+  nothing. Fixed here (`298786d`, subagent-driven): emit an empty `{"version":0,
+  "thumbs":[]}` "searching" gallery once per goal; publish `'initializing'`
+  state up front *before* the warmup; add `search_started_ts` to the init
+  payload and render an animated "Searching for target… Ns" banner in the webui.
+  Verified (camera-less, private ns): `debug_gallery` (v0) + `debug_state`
+  (`initializing`, with `search_started_ts`) both arrive ~300 ms after
+  goal-accept, before any lock. 17 focused tests pass + 2 new contract tests.
+
+- **Launch crash: `PackageNotFoundError: No package metadata was found for
+  vision-track`.** Build-hygiene, not code. `vision_track`'s install had a stale
+  `--symlink-install` **egg-link** (pointing at `build/vision_track`) instead of
+  a real `*-py3.10.egg-info`; the setuptools console scripts use
+  `importlib.metadata`, which **cannot read egg-links**, so every vision_track
+  node died at import. Caused by mixing `scripts/build.sh` (`--symlink-install`)
+  with `tkbuild` (regular install) across incremental builds. Fixed with a clean
+  rebuild: `rm -rf build/vision_track install/vision_track && tkbuild tk26_vision
+  --packages-select vision_track` → real egg-info restored; `track_web` +
+  `person_track_server` start clean. Prefer `tkbuild` over `build.sh` for
+  tk26_vision to avoid recreating the egg-link.
+
+**Still needs operator-in-the-loop:** with powered speakers, run the full demo
+and confirm (a) reacquire after a real loss, (b) the spoken PASSIVE/NEEDS_HELP
+prompts, (c) "Stop All" stops the tracker, (d) the dashboard shows
+"Searching… Ns" + "0 views" within ~1 s of goal start (no 10 s freeze).
+
+---
+
 ## 2026-06-10 — track_web bringup control (launch BT + audio + dummy nav from the webui)
 
 The `track_web` dashboard can now start/stop the follow-person demo components on

@@ -33,7 +33,14 @@ Commits: `1817a48` (Issue 1), `0cfbb08` (Issue 3), `415f78c` (Issue 4),
   count (was `active_help_after_frames=45`) — frame rate is unreliable under
   tournament GPU contention. Anchored by `self._last_confirmed_time`, refreshed
   only on a true re-lock (never a provisional coast) — abort-mid-reacquire
-  protection intact.
+  protection intact. **Regression follow-up (same day):** moving the latch to 5 s
+  decoupled it from the lock-FSM recovery cap (`max_recovery_frames` ~1.5 s),
+  which still fired `hard_lost` → the goal aborted in the `[~1.5 s, 5 s]` window
+  before reaching the hold. Fixed with a pure `lost_should_abort(...)` helper: the
+  recovery-cap abort now applies ONLY when active help is disabled
+  (`active_help_after_sec <= 0`); with help enabled the goal coasts to the hold
+  (`lost_timeout` ceiling preserved). Regression test
+  `test_needs_help_no_premature_abort.py`.
 - **Issue 2 — OSNet background parity: NO code change.** Investigated; the query
   already uses the real seg mask at every call site (plumbing verified). The
   first-draft ellipse pseudo-mask was reverted — fabricating a mask papers over a

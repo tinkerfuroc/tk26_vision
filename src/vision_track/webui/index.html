@@ -28,11 +28,30 @@
   </section>
   <aside id="rail">
     <div class="panel" id="bringup">
-      <h2>Bringup</h2>
-      <div class="proc-row"><span class="proc-dot" id="dot-audio"></span><span class="proc-name">Audio</span><button class="proc-btn" id="proc-audio" data-proc="audio">Start</button></div>
-      <div class="proc-row"><span class="proc-dot" id="dot-dummy_nav"></span><span class="proc-name">Dummy Nav</span><button class="proc-btn" id="proc-dummy_nav" data-proc="dummy_nav">Start</button></div>
-      <div class="proc-row"><span class="proc-dot" id="dot-bt"></span><span class="proc-name">Follow BT</span><button class="proc-btn" id="proc-bt" data-proc="bt">Start</button></div>
-      <p id="bringup-hint" class="hint hidden">Follow BT owns the tracking goal — manual Start disabled.</p>
+      <h2>Follow Demo</h2>
+      <div class="demo-master">
+        <button id="demo-start" class="demo-btn primary">▶ Start Demo</button>
+        <button id="demo-stop" class="demo-btn">■ Stop All</button>
+      </div>
+      <div class="proc-row" data-proc="audio">
+        <span class="proc-num">1</span>
+        <span class="proc-name">Audio</span>
+        <span class="proc-pill off" id="pill-audio">stopped</span>
+        <button class="proc-btn" id="proc-audio">Start</button>
+      </div>
+      <div class="proc-row" data-proc="dummy_nav">
+        <span class="proc-num">2</span>
+        <span class="proc-name">Dummy Nav</span>
+        <span class="proc-pill off" id="pill-dummy_nav">stopped</span>
+        <button class="proc-btn" id="proc-dummy_nav">Start</button>
+      </div>
+      <div class="proc-row" data-proc="bt">
+        <span class="proc-num">3</span>
+        <span class="proc-name">Follow BT</span>
+        <span class="proc-pill off" id="pill-bt">stopped</span>
+        <button class="proc-btn" id="proc-bt">Start</button>
+      </div>
+      <p id="bringup-hint" class="hint hidden">ⓘ Follow BT owns the tracking goal — manual Start disabled while it runs.</p>
     </div>
     <div class="panel">
       <div id="reacq-badge" class="reacq">—</div>

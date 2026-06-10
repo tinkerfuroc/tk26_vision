@@ -15,6 +15,29 @@ long enough, `TrackPerson` feedback escalates `reacquisition_state` to
 tracker on the waving box (`ReseedTarget` at `~/reseed_target`, gallery-preserving).
 See [`docs/active_reid.md`](docs/active_reid.md) for the full consumer contract.
 
+### `~/reacq_state` heartbeat (navigation follow executive)
+
+A permanently-on, low-rate **`std_msgs/UInt8`** topic — `~/reacq_state`
+(`/person_track_node/reacq_state`) published at **10 Hz** — that mirrors the
+`TrackPerson` feedback reacquisition enum as a plain byte so the navigation
+follow executive can consume it **without depending on `tinker_vision_msgs_26`**:
+
+| Value | Meaning |
+|---|---|
+| `0` | `TRACKING` — target held this frame |
+| `1` | `PASSIVE` — lost, within the passive-recovery window |
+| `2` | `NEEDS_HELP` — lost past `help_after_sec`, awaiting active re-ID |
+| `255` | `INACTIVE` — **no `TrackPerson` goal active** (idle / between goals / tracker shut down) |
+
+It carries the last value pushed to the action feedback (updated at each feedback
+publish) and reverts to `255` (`INACTIVE`) on goal teardown — success, abort,
+cancel, or exception. **Consumer guidance:** treat `1`/`2` as a "wait, don't
+abort" hold (the tracker is actively trying to recover the operator) and `255` as
+"no follow target — tracker is not driving" (distinct from a real loss). Unlike
+the `debug_*` telemetry below, this publisher has **no param gate** — it is always
+on, since the consumer needs a continuous liveness signal. It is purely advisory
+and reflects the tracker's published state; it changes no tracking logic.
+
 ## track_web dashboard
 
 A browser-based **live tracking dashboard + active-reID test bench** for
@@ -99,6 +122,17 @@ ros2 run vision_track person_track_server --ros-args \
 | `waving_service` | `detect_waving_persons` | DetectWaving service the 👋 button calls |
 
 ## Changelog
+
+- **2026-06-10** — **`~/reacq_state` UInt8 heartbeat for the navigation follow
+  executive.** Added a permanently-on 10 Hz `std_msgs/UInt8` topic
+  (`/person_track_node/reacq_state`) mirroring the `TrackPerson` feedback
+  reacquisition enum (`0` TRACKING / `1` PASSIVE / `2` NEEDS_HELP), reporting
+  `255` INACTIVE whenever no goal is active (idle / teardown). Lets the nav-side
+  follow executive distinguish a "wait, don't abort" PASSIVE/NEEDS_HELP hold from
+  tracker shutdown **without depending on `tinker_vision_msgs_26`**. Additive
+  only — mirrors the value at the two feedback-publish sites and reverts to
+  INACTIVE in `_cleanup_tracking`; no tracking logic changed. (P2 of the
+  person-following navigation plan.)
 
 - **2026-06-10** — **`track_web_control.launch.py`: follow-demo control surface
   (tracker + upgraded dashboard).** A focused one-command bringup of the person

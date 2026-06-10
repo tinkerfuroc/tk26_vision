@@ -209,6 +209,15 @@ class PersonTrackNode(Node):
         self.debug_gallery_pub = self.create_publisher(String, '~/debug_gallery', gallery_qos)
         self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 1)
         self._last_gallery_version = -1
+        # One-shot guard so the init-phase "searching" gallery (empty, v0) is
+        # published exactly once per goal — without it the gallery panel either
+        # shows a stale gallery from a previous goal or nothing until first lock.
+        # Reset per goal in _run_tracking_loop so a later goal re-emits it.
+        self._searching_gallery_published = False
+        # Wall-clock anchor (time.time()) for the init "searching" elapsed timer;
+        # set at goal/init start, None between goals. None ⇒ the webui animates
+        # rather than counting.
+        self._search_started_ts = None
 
         # ~/reacq_state heartbeat: a permanently-on low-rate UInt8 mirror of the
         # TrackPerson feedback reacquisition enum (0 TRACKING / 1 PASSIVE /
@@ -997,6 +1006,22 @@ class PersonTrackNode(Node):
         last_frame_time = time.time()
         initialized = False
 
+        # Per-goal init/search liveness anchors (Fix A/B/C): re-arm the one-shot
+        # "searching" gallery, anchor the elapsed-search timer to goal start.
+        self._search_started_ts = init_start_time
+        self._searching_gallery_published = False
+
+        # Close the warmup blackout: goal-accept stops the idle telemetry timer
+        # (tracking_active=True), and the CUDA warmup below holds lock_tracker for
+        # a short window before the first loop iteration — so without this the
+        # dashboard sees neither 'idle' nor 'initializing' state and shows the
+        # NO-DATA stale banner. Publish the 'initializing' phase (and the empty
+        # "searching" gallery) ONCE up front so the panels reflect goal-accept
+        # within ~1 s. _publish_phase_debug_state reads only getattr-guarded
+        # snapshot fields, so it's safe to call without holding lock_tracker.
+        self._publish_phase_debug_state('initializing')
+        self._publish_searching_gallery()
+
         # Warm CUDA on THIS executor thread before the lock loop. The __init__
         # warmup ran on the main thread; the first cuDNN call on an action-worker
         # thread pays a ~0.5s one-time init that would otherwise land on the first
@@ -1056,6 +1081,11 @@ class PersonTrackNode(Node):
                         # ("NO DATA") shows for the whole init search right
                         # after the operator presses Start.
                         self._publish_phase_debug_state('initializing')
+                        # One-shot empty "searching" gallery (no-op after the
+                        # pre-warmup emit) so the gallery panel shows "0 views"
+                        # during the whole search even if a subscriber connects
+                        # only after the up-front publish.
+                        self._publish_searching_gallery()
                         self._publish_raw_debug_image(rgb_img)
                         time.sleep(0.1)
                         continue
@@ -1660,6 +1690,12 @@ class PersonTrackNode(Node):
             state["candidates"] = []      # may be stale from a previous goal;
             state["best_sim"] = None      # no live click targets outside the
             state["second_sim"] = None    # tracking loop
+            # Init search liveness: a wall-clock anchor so the dashboard can show
+            # an elapsed "Searching for target…" timer instead of a dead row of
+            # "—". Set once at goal/init start (see _run_tracking_loop); cleared
+            # to None between goals so the 'idle' phase doesn't show a timer.
+            state["search_started_ts"] = (
+                self._search_started_ts if phase == 'initializing' else None)
             self.debug_state_pub.publish(String(data=json.dumps(state)))
         except Exception as exc:
             self.get_logger().warn(f'{phase} debug state failed: {exc}',
@@ -1724,6 +1760,28 @@ class PersonTrackNode(Node):
                     self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8'))
         except Exception as exc:  # telemetry must never kill tracking
             self.get_logger().warn(f'debug output failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _publish_searching_gallery(self):
+        """Emit an empty (v0) gallery ONCE at init so the dashboard panel shows
+        "0 views" immediately instead of a stale gallery or nothing until lock.
+
+        One-shot per goal via ``_searching_gallery_published`` (reset at the top
+        of ``_run_tracking_loop``). Gated the same way as the live gallery
+        (``gallery_keep_crops``); must never raise into the loop.
+        """
+        if self._searching_gallery_published or not self.gallery_keep_crops:
+            return
+        self._searching_gallery_published = True
+        try:
+            self.debug_gallery_pub.publish(String(data=json.dumps(
+                {'version': 0, 'thumbs': []})))
+            # Keep _last_gallery_version coherent so the first real lock (which
+            # bumps the gallery version off 0) still publishes via
+            # _maybe_publish_gallery.
+            self._last_gallery_version = 0
+        except Exception as exc:
+            self.get_logger().warn(f'searching gallery failed: {exc}',
                                    throttle_duration_sec=5.0)
 
     def _maybe_publish_gallery(self, version: int):
@@ -1799,6 +1857,9 @@ class PersonTrackNode(Node):
         # callback's finally): the ~/reacq_state heartbeat reverts to INACTIVE so
         # the nav consumer sees "no goal" rather than a stale last-frame enum.
         self._last_reacq_state = REACQ_INACTIVE
+        # Drop the init-search liveness anchor so the 'idle' phase between goals
+        # doesn't surface a stale "searching" elapsed timer in the dashboard.
+        self._search_started_ts = None
         # Re-anchor the escalation clock per goal (runs on goal completion, so
         # the next goal begins with a fresh anchor); tracking start overwrites it.
         self._last_confirmed_time = time.time()

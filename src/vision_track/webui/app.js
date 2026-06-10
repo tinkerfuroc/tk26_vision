@@ -6,6 +6,8 @@ const REACQ = {0: ["TRACKING", "tracking"], 1: ["PASSIVE", "passive"],
 const $ = (id) => document.getElementById(id);
 let lastState = null;
 let lastStateAt = 0;
+let searching = false;      // fsm_state === 'initializing' (init/search phase)
+let searchStartedTs = null; // node wall-clock (s) anchor for the elapsed timer
 let waveBoxes = [];
 let lastMode = "—";   // bench | observer | idle (from the /api/status poll)
 let recording = false;  // rosbag record state (from the /api/status poll)
@@ -31,6 +33,16 @@ function renderState(s) {
     badge.textContent = label;
     badge.className = "reacq " + cls;
   }
+  // Init liveness: during the (≈10 s, pre-lock) search the FSM is
+  // 'initializing' and every state field is "—", which is indistinguishable
+  // from a dead dashboard. Show an animated "Searching for target…" banner
+  // with an elapsed-seconds timer (anchored to the node's search_started_ts;
+  // animates without a count if the ts is absent). renderSearching() also runs
+  // on a 1 Hz interval so the timer advances between ws pushes.
+  searching = s.fsm_state === "initializing";
+  searchStartedTs = (searching && s.search_started_ts != null)
+    ? s.search_started_ts : null;
+  renderSearching();
   $("fsm").textContent = s.fsm_state ?? "—";
   $("lost").textContent = s.target_lost;
   $("ids").textContent = `${s.target_track_id ?? "—"} (orig ${s.original_track_id ?? "—"})`;
@@ -49,6 +61,26 @@ function renderState(s) {
       log(`reacq → ${(REACQ[s.reacquisition_state] || ["?"])[0]}`);
   }
 }
+
+/* Init "Searching for target…" banner. Driven by renderState (on/off + ts)
+   and a 1 Hz tick (timer advance). search_started_ts is the node's wall-clock,
+   so the elapsed value is robust to client/server clock skew only at the few-
+   hundred-ms level — fine for a coarse seconds counter; if it ever reads
+   negative we clamp to 0. Absent ts ⇒ spinner only, no count. */
+function renderSearching() {
+  const box = $("searching");
+  if (!box) return;
+  box.classList.toggle("hidden", !searching);
+  if (!searching) return;
+  const txt = $("searching-text");
+  if (searchStartedTs != null) {
+    const elapsed = Math.max(0, Date.now() / 1000 - searchStartedTs);
+    txt.textContent = `Searching for target… ${elapsed.toFixed(0)}s`;
+  } else {
+    txt.textContent = "Searching for target…";
+  }
+}
+setInterval(renderSearching, 1000);
 
 function renderGallery(g) {
   $("gal-meta").textContent = `v${g.version} · ${g.thumbs.length} views`;

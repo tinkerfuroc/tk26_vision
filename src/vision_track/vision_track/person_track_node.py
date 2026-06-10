@@ -228,6 +228,11 @@ class PersonTrackNode(Node):
         # consumer needs a continuous liveness signal to tell a "wait, don't
         # abort" period (PASSIVE/NEEDS_HELP) from tracker shutdown (INACTIVE).
         self.reacq_state_pub = self.create_publisher(UInt8, '~/reacq_state', 10)
+        # Lock-free on purpose: single plain-int attribute, written from the
+        # action thread and read from the timer thread under
+        # MultiThreadedExecutor. Atomic under the GIL (single-bytecode
+        # load/store, no read-modify-write, no multi-field invariant), so a
+        # lock would add nothing.
         self._last_reacq_state = REACQ_INACTIVE
         self.create_timer(0.1, self._publish_reacq_state)
 

@@ -91,3 +91,31 @@ def test_shutdown_all_stops_running(mgr):
     mgr.start("sleeper")
     mgr.shutdown_all()
     assert mgr.status("sleeper")["running"] is False
+
+
+def test_start_group_starts_all_members_in_order():
+    reg = {"a": ["sleep", "5"], "b": ["sleep", "5"], "c": ["sleep", "5"]}
+    groups = {"g": ["a", "b", "c"]}
+    pm = ProcessManager(registry=reg, groups=groups, stagger_sec=0.0)
+    res = pm.start_group("g")
+    try:
+        assert [r["name"] for r in res] == ["a", "b", "c"]
+        assert all(r["running"] for r in res)
+    finally:
+        pm.shutdown_all()
+
+
+def test_start_group_unknown_is_error_not_raise():
+    pm = ProcessManager(registry={}, groups={}, stagger_sec=0.0)
+    res = pm.start_group("nope")
+    assert isinstance(res, dict) and "error" in res
+
+
+def test_stop_group_stops_reverse_order():
+    reg = {"a": ["sleep", "5"], "b": ["sleep", "5"]}
+    groups = {"g": ["a", "b"]}
+    pm = ProcessManager(registry=reg, groups=groups, stagger_sec=0.0)
+    pm.start_group("g")
+    res = pm.stop_group("g")
+    assert [r["name"] for r in res] == ["b", "a"]
+    assert all(not r["running"] for r in res)

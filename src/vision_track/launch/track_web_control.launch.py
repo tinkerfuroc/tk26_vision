@@ -8,15 +8,15 @@ control surface":
     ros2 launch vision_track track_web_control.launch.py launch_tracker:=false
     ros2 launch vision_track track_web_control.launch.py port:=9000 with_waving:=true
 
-The upgraded dashboard carries a new **Bringup panel** with per-component
-start/stop toggles for the follow demo's supporting stack — audio
-(``ros2 launch audio_pakage audio.launch.py``), dummy_nav
-(``ros2 run behavior_tree dummy-nav``), and the follow-person behaviour tree
-(``ros2 run behavior_tree follow-person``). Those are spawned on demand AT
-RUNTIME by the dashboard's fixed-allowlist ProcessManager — they are
-deliberately NOT part of this launch. For those spawns to resolve, build
-``behavior_tree`` + ``audio_pakage`` into ``tk25_ws/install`` first via
-``tkbuild tk25_decision`` + ``tkbuild tk_24_audio``.
+The upgraded dashboard carries a **Bringup panel** with a follow-mode selector
+(vision+audio | with navigation) + Start/Stop. "vision+audio" spawns
+audio + ``follow-person --no-nav`` (tracking + voice, no base motion);
+"with navigation" spawns audio + ``following follow_server`` + ``follow-person``
+and drives the base — Nav2 must ALREADY be running (this launch does not start
+it). A live Follow-state panel reads ``/follow_server/status``. Components are
+spawned on demand AT RUNTIME by the dashboard's fixed-allowlist ProcessManager
+(see process_manager.py REGISTRY/GROUPS); for the spawns to resolve, build
+``behavior_tree`` + ``following`` + ``audio_pakage`` into the overlay first.
 
 Cameras are deliberately NOT included — start them first per
 src/tk26_vision/CAMERA_BRINGUP.md (the vendored launches alone drop to ~3 Hz).

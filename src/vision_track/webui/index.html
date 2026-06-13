@@ -27,31 +27,15 @@
     </div>
   </section>
   <aside id="rail">
-    <div class="panel" id="bringup">
-      <h2>Follow Demo</h2>
-      <div class="demo-master">
-        <button id="demo-start" class="demo-btn primary">▶ Start Demo</button>
-        <button id="demo-stop" class="demo-btn">■ Stop All</button>
+    <div class="panel" id="follow-card">
+      <h2>Follow demo</h2>
+      <label><input type="radio" name="follow-mode" value="follow_vision" checked> vision + audio</label>
+      <label><input type="radio" name="follow-mode" value="follow_nav"> with navigation</label>
+      <div class="row">
+        <button id="follow-start">▶ Start follow</button>
+        <button id="follow-stop">■ Stop follow</button>
       </div>
-      <div class="proc-row" data-proc="audio">
-        <span class="proc-num">1</span>
-        <span class="proc-name">Audio</span>
-        <span class="proc-pill off" id="pill-audio">stopped</span>
-        <button class="proc-btn" id="proc-audio">Start</button>
-      </div>
-      <div class="proc-row" data-proc="dummy_nav">
-        <span class="proc-num">2</span>
-        <span class="proc-name">Dummy Nav</span>
-        <span class="proc-pill off" id="pill-dummy_nav">stopped</span>
-        <button class="proc-btn" id="proc-dummy_nav">Start</button>
-      </div>
-      <div class="proc-row" data-proc="bt">
-        <span class="proc-num">3</span>
-        <span class="proc-name">Follow BT</span>
-        <span class="proc-pill off" id="pill-bt">stopped</span>
-        <button class="proc-btn" id="proc-bt">Start</button>
-      </div>
-      <p id="bringup-hint" class="hint hidden">ⓘ Follow BT owns the tracking goal — manual Start disabled while it runs.</p>
+      <div id="follow-state" class="follow-state">Follow state: —</div>
     </div>
     <div class="panel">
       <div id="reacq-badge" class="reacq">—</div>

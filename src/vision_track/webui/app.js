@@ -11,7 +11,6 @@ let searchStartedTs = null; // node wall-clock (s) anchor for the elapsed timer
 let waveBoxes = [];
 let lastMode = "—";   // bench | observer | idle (from the /api/status poll)
 let recording = false;  // rosbag record state (from the /api/status poll)
-let procState = {};     // {audio,dummy_nav,bt: <proc status>} (ws "proc" + /api/proc/status)
 
 function log(msg) {
   const li = document.createElement("li");
@@ -96,32 +95,39 @@ function renderGallery(g) {
   });
 }
 
-const PROC_NAMES = ["audio", "dummy_nav", "bt"];
+/* Follow-mode bringup: one radio selects the group (follow_vision = vision+audio
+   tracking with no base motion, follow_nav = audio + follow_server + nav BT),
+   and a single Start/Stop pair posts that group to the ProcessManager. */
+function selectedFollowMode() {
+  const r = document.querySelector('input[name="follow-mode"]:checked');
+  return r ? r.value : 'follow_vision';
+}
 
-function renderProc(map) {
-  procState = map || {};
-  PROC_NAMES.forEach((name) => {
-    const p = procState[name] || {};
-    const exited = p.returncode != null && p.returncode !== 0;
-    const pill = $("pill-" + name);
-    pill.textContent = p.running ? "RUNNING" : (exited ? "exited" : "stopped");
-    pill.className = "proc-pill " + (p.running ? "on" : (exited ? "err" : "off"));
-    pill.title = exited ? `exited (code ${p.returncode})` : "";
-    const btn = $("proc-" + name);
-    btn.textContent = p.running ? "Stop" : "Start";
-    btn.classList.toggle("on", !!p.running);
+function setFollowControlsRunning(running) {
+  document.querySelectorAll('input[name="follow-mode"]').forEach((el) => {
+    el.disabled = running;
   });
-  // Master buttons: Start Demo only when something is stoppable-to-start,
-  // Stop All only when something runs — purely cosmetic affordance.
-  const anyRun = PROC_NAMES.some((n) => procState[n] && procState[n].running);
-  const allRun = PROC_NAMES.every((n) => procState[n] && procState[n].running);
-  $("demo-start").disabled = allRun;
-  $("demo-stop").disabled = !anyRun;
-  // Manual-goal guard: Follow BT owns the tracking goal, so disable the manual
-  // Start button (and surface the hint) whenever the BT process is running.
-  const btRun = !!(procState.bt && procState.bt.running);
-  $("btn-start").disabled = btRun;
-  $("bringup-hint").classList.toggle("hidden", !btRun);
+  $("follow-start").disabled = running;
+  $("follow-stop").disabled = !running;
+}
+
+/* follow_server FollowState enum mirrored from the JSON status topic. */
+const FOLLOW_STATES = {0: 'IDLE', 1: 'TRACKING', 2: 'PURSUIT_LAST_SEEN',
+                       3: 'APPROACHING_FINAL', 4: 'SUCCEEDED', 5: 'FAILED'};
+
+function renderFollow(f) {
+  const el = $("follow-state");
+  if (!el) return;
+  // Stale (no /follow_server/status in ~2 s, e.g. vision-only mode or Nav2
+  // down) or an empty payload -> the panel reads "—".
+  if (!f || f.stale || f.state === undefined) {
+    el.textContent = 'Follow state: —';
+    return;
+  }
+  const name = FOLLOW_STATES[f.state] ?? `state ${f.state}`;
+  const d = (f.distance_to_person >= 0)
+    ? `, ${f.distance_to_person.toFixed(2)} m` : '';
+  el.textContent = `Follow state: ${name}${d}${f.goal_held ? ' (HOLDING)' : ''}`;
 }
 
 function connectWS() {
@@ -131,7 +137,7 @@ function connectWS() {
     const msg = JSON.parse(ev.data);
     if (msg.type === "state") renderState(msg.data);
     if (msg.type === "gallery") renderGallery(msg.data);
-    if (msg.type === "proc") renderProc(msg.data);
+    if (msg.type === "follow") renderFollow(msg.data);
   };
   ws.onclose = () => {
     $("conn").textContent = "reconnecting…";
@@ -236,34 +242,21 @@ $("btn-record").onclick = async () => {
   log(`record ${recording ? "stop" : "start"} → ${r.message || (r.ok ? "ok" : "failed")}`);
 };
 
-/* Bringup helpers. The next "proc" ws push refreshes pills/labels. */
-async function procDo(name, action) {
-  const r = await post(`/api/proc/${name}/${action}`);
-  log(`${name} ${action} → ${r.error || (r.running ? "running pid " + r.pid : "stopped")}`);
-  return r;
-}
-
-/* Per-component toggles. */
-PROC_NAMES.forEach((name) => {
-  $("proc-" + name).onclick = () =>
-    procDo(name, procState[name] && procState[name].running ? "stop" : "start");
+/* Follow Start/Stop: each posts the selected group to the fixed-allowlist
+   ProcessManager (audio + BT for vision+audio, +follow_server for with-nav).
+   The follow-state panel then updates off the ws "follow" push. */
+$("follow-start").addEventListener("click", async () => {
+  const mode = selectedFollowMode();
+  setFollowControlsRunning(true);
+  const r = await post(`/api/proc/group/${mode}/start`, undefined);
+  log(`follow start (${mode}) → ${r.error || "started"}`);
 });
-
-/* Master: Start Demo brings the stack up in order (audio → dummy_nav → bt);
-   the BT retries the service/action, so a brief lead for the others is enough. */
-$("demo-start").onclick = async () => {
-  log("Start Demo → audio, dummy_nav, bt");
-  for (const name of PROC_NAMES) {
-    if (!(procState[name] && procState[name].running)) await procDo(name, "start");
-  }
-};
-$("demo-stop").onclick = async () => {
-  log("Stop All");
-  // Stop in reverse so the BT releases the goal before its deps go.
-  for (const name of [...PROC_NAMES].reverse()) {
-    if (procState[name] && procState[name].running) await procDo(name, "stop");
-  }
-};
+$("follow-stop").addEventListener("click", async () => {
+  const mode = selectedFollowMode();
+  const r = await post(`/api/proc/group/${mode}/stop`, undefined);
+  log(`follow stop (${mode}) → ${r.error || "stopped"}`);
+  setFollowControlsRunning(false);
+});
 
 /* Stale banner + observer/bench mode chip + record state. */
 setInterval(async () => {
@@ -281,9 +274,6 @@ setInterval(async () => {
       rb.classList.toggle("rec-on", recording);
     }
   } catch (e) { /* status poll is best-effort */ }
-  // Seed/refresh the Bringup panel even before the first ws "proc" push;
-  // self-healing if a push is ever missed.
-  try { renderProc(await (await fetch("/api/proc/status")).json()); } catch (e) { /* best-effort */ }
 }, 1000);
 
 window.addEventListener("resize", renderWaveBoxes);

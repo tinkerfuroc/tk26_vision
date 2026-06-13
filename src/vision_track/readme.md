@@ -123,6 +123,8 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- sim_track_server: topic->action adapter mirroring /target_points + reacq_state into /track_person, the sim stand-in for person_track_server (F4 BT-in-the-loop).
+
 - **2026-06-13** — track_web: follow-mode selector (vision+audio | with-nav) +
   Start/Stop + live Follow-state panel; dropped dead dummy_nav; allowlist now
   audio/follow_server/bt_vision/bt_nav.

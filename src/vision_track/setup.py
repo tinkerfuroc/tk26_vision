@@ -30,6 +30,7 @@ setup(
             'person_track_server = vision_track.person_track_node:main',
             'person_track_test_client = vision_track.person_track_test_client:main',
             'track_web = vision_track.track_web:main',
+            'sim_track_server = vision_track.sim_track_server:main',
         ],
     },
 )

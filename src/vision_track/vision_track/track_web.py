@@ -95,6 +95,11 @@ class TrackWebNode(Node):
         # (audio / dummy_nav / bt). Children die in main()'s teardown.
         self.proc_manager = ProcessManager()
 
+        # Latest follow-server status (parsed /follow_server/status JSON) so the
+        # dashboard can render live follow state; staleness is derived per-read.
+        self._follow_status = None
+        self._follow_status_t = 0.0
+
         cb = ReentrantCallbackGroup()
         self.create_subscription(
             String, f"/{tracker}/debug_state", self._on_state, 10,
@@ -106,6 +111,9 @@ class TrackWebNode(Node):
             callback_group=cb)
         self.create_subscription(
             Image, f"/{tracker}/debug_image", self._on_image, 1,
+            callback_group=cb)
+        self.create_subscription(
+            String, "/follow_server/status", self._on_follow_status, 10,
             callback_group=cb)
 
         self._action = ActionClient(self, TrackPerson, "track_person",
@@ -329,6 +337,30 @@ class TrackWebNode(Node):
 
     def proc_status(self):
         return self.proc_manager.status_all()
+
+    def proc_group_start(self, group):
+        return self.proc_manager.start_group(group)
+
+    def proc_group_stop(self, group):
+        return self.proc_manager.stop_group(group)
+
+    # ---- live follow-server status (subscriber callback + reader) -----------
+    def _on_follow_status(self, msg):
+        try:
+            parsed = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        with self._lock:
+            self._follow_status = parsed
+            self._follow_status_t = time.time()
+
+    def follow_status(self):
+        with self._lock:
+            data = dict(self._follow_status) if self._follow_status else {}
+            age = (time.time() - self._follow_status_t
+                   if self._follow_status else 1e9)
+        data["stale"] = age > 2.0   # no fresh status in 2 s -> panel shows "—"
+        return data
 
 
 def main():

@@ -114,6 +114,21 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
     def record_stop():
         return bridge.record_stop()
 
+    # Group routes are declared BEFORE the single-name routes: FastAPI matches
+    # in declaration order, so the literal "group" segment in /api/proc/group/...
+    # would otherwise be captured by the {name} param of /api/proc/{name}/...
+    @app.post("/api/proc/group/{group}/start")
+    def proc_group_start(group: str):
+        return bridge.proc_group_start(group)
+
+    @app.post("/api/proc/group/{group}/stop")
+    def proc_group_stop(group: str):
+        return bridge.proc_group_stop(group)
+
+    @app.get("/api/follow/status")
+    def follow_status():
+        return bridge.follow_status()
+
     @app.post("/api/proc/{name}/start")
     def proc_start(name: str):
         return bridge.proc_start(name)
@@ -132,6 +147,7 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
         last_state_seq = -1
         last_gallery_version = -1
         last_proc = None
+        last_follow = None
         try:
             while True:
                 seq, state = bridge.latest_state()
@@ -149,6 +165,13 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
                 if proc != last_proc:
                     last_proc = proc
                     await ws.send_text(json.dumps({"type": "proc", "data": proc}))
+                # Push live follow state alongside proc so the panel updates as
+                # /follow_server/status arrives. Guarded for older bridges/fakes.
+                follow = (bridge.follow_status()
+                          if hasattr(bridge, "follow_status") else {})
+                if follow != last_follow:
+                    last_follow = follow
+                    await ws.send_text(json.dumps({"type": "follow", "data": follow}))
                 await asyncio.sleep(_STATE_POLL_S)
         except WebSocketDisconnect:
             return

@@ -15,8 +15,9 @@
 """Fixed-allowlist subprocess supervisor for the track_web dashboard.
 
 The track_web webui starts/stops the follow-person demo components (audio,
-dummy nav, behavior tree) on demand. This module is the standalone, ROS-free,
-unit-testable supervisor that does the spawning.
+follow_server, and the follow-person BT — vision-only or with-nav) on demand.
+This module is the standalone, ROS-free, unit-testable supervisor that does the
+spawning.
 
 SECURITY: the public API takes a *name* validated against a fixed module-level
 REGISTRY, never a command. The browser can therefore only ever launch one of a
@@ -43,24 +44,41 @@ import time
 # Fixed allowlist. Keys are the only values the API will accept; the argv lists
 # are never built from caller input.
 REGISTRY = {
-    "audio":     ["ros2", "launch", "audio_pakage", "audio.launch.py"],
-    "dummy_nav": ["ros2", "run", "behavior_tree", "dummy-nav"],
-    "bt":        ["ros2", "run", "behavior_tree", "follow-person"],
+    "audio":         ["ros2", "launch", "audio_pakage", "audio.launch.py"],
+    "follow_server": ["ros2", "run", "following", "follow_server",
+                      "--ros-args", "-p", "working_frame:=map"],
+    "bt_vision":     ["ros2", "run", "behavior_tree", "follow-person", "--no-nav"],
+    "bt_nav":        ["ros2", "run", "behavior_tree", "follow-person"],
+}
+
+# Fixed group allowlist for the two follow demo modes. Members are REGISTRY keys
+# started in listed order (audio + TTS up, then follow_server, then the BT).
+GROUPS = {
+    "follow_vision": ["audio", "bt_vision"],
+    "follow_nav":    ["audio", "follow_server", "bt_nav"],
 }
 
 
 class ProcessManager:
     """Supervise a fixed set of named subprocesses (start/stop/status)."""
 
-    def __init__(self, registry=REGISTRY):
+    def __init__(self, registry=REGISTRY, groups=GROUPS, stagger_sec=1.5):
         """Store the allowlist and init per-name process / returncode caches.
 
         Args:
             registry: mapping of name -> argv list. Defaults to the module
                 REGISTRY. A copy is stored so later edits to the passed dict
                 don't mutate this manager's allowlist.
+            groups: mapping of group name -> list of REGISTRY keys started as a
+                unit. Defaults to the module GROUPS. A copy is stored so later
+                edits to the passed dict don't mutate this manager's groups.
+            stagger_sec: seconds to sleep BETWEEN successive members when
+                starting a group, so a downstream node has a moment to come up
+                before the next one launches. Defaults to 1.5.
         """
         self._registry = dict(registry)
+        self._groups = dict(groups)
+        self._stagger_s = float(stagger_sec)
         self._procs: dict[str, subprocess.Popen] = {}
         self._last_rc: dict[str, int | None] = {}
         self._lock = threading.Lock()
@@ -147,6 +165,32 @@ class ProcessManager:
                     self._last_rc[name] = proc.poll()
                 except Exception:
                     pass
+
+    # -- group API ---------------------------------------------------------
+
+    def start_group(self, group) -> list | dict:
+        """Start every member of ``group`` in listed order, staggered.
+
+        Returns the list of per-member status dicts, or an error dict for an
+        unknown group. Never raises. Each member goes through ``start`` (its own
+        lock acquisition), so the stagger sleep happens BETWEEN members, outside
+        the lock — the dashboard stays responsive.
+        """
+        if group not in self._groups:
+            return {"group": group, "error": f"unknown group '{group}'"}
+        out = []
+        members = self._groups[group]
+        for i, name in enumerate(members):
+            out.append(self.start(name))
+            if self._stagger_s and i < len(members) - 1:
+                time.sleep(self._stagger_s)
+        return out
+
+    def stop_group(self, group) -> list | dict:
+        """Stop every member of ``group`` in REVERSE order. Never raises."""
+        if group not in self._groups:
+            return {"group": group, "error": f"unknown group '{group}'"}
+        return [self.stop(name) for name in reversed(self._groups[group])]
 
     # -- internals (all called with self._lock held) -----------------------
 

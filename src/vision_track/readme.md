@@ -123,6 +123,10 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-13** — track_web: follow-mode selector (vision+audio | with-nav) +
+  Start/Stop + live Follow-state panel; dropped dead dummy_nav; allowlist now
+  audio/follow_server/bt_vision/bt_nav.
+
 - **2026-06-10** — **track_web: state panel + gallery now update at goal start
   (no more ~10 s freeze).** The video stream came up immediately but the state
   panel and gallery sat frozen until the first lock, because (1) `~/debug_gallery`

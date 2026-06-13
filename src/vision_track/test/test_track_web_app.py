@@ -82,6 +82,19 @@ class FakeBridge:
                     "returncode": None}
                 for n in ("audio", "dummy_nav", "bt")}
 
+    def proc_group_start(self, group):
+        self.calls.append(("proc_group_start", group))
+        return [{"name": "audio", "running": True}]
+
+    def proc_group_stop(self, group):
+        self.calls.append(("proc_group_stop", group))
+        return [{"name": "audio", "running": False}]
+
+    def follow_status(self):
+        self.calls.append("follow_status")
+        return {"state": 1, "distance_to_person": 1.2, "reacq_state": 0,
+                "breadcrumbs_pending": 0, "goal_held": False, "stale": False}
+
 
 def _client():
     b = FakeBridge()
@@ -209,6 +222,24 @@ def test_proc_start_unknown_is_error_dict_not_500():
     assert r.status_code == 200
     assert "error" in r.json()
     assert r.json()["name"] == "bogus"
+
+
+def test_proc_group_start_stop():
+    b, c = _client()
+    r = c.post("/api/proc/group/follow_nav/start")
+    assert r.status_code == 200
+    r = c.post("/api/proc/group/follow_nav/stop")
+    assert r.status_code == 200
+    assert b.calls[-2:] == [("proc_group_start", "follow_nav"),
+                            ("proc_group_stop", "follow_nav")]
+
+
+def test_follow_status_endpoint():
+    b, c = _client()
+    r = c.get("/api/follow/status")
+    assert r.status_code == 200
+    assert r.json()["state"] == 1
+    assert "follow_status" in b.calls
 
 
 def test_webui_served_from_dir(tmp_path):

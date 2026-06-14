@@ -92,7 +92,8 @@ class TrackWebNode(Node):
         self._rec_proc = None       # `ros2 bag record` subprocess (None = idle)
         self._rec_path = None       # output dir of the active/last recording
         # Fixed-allowlist supervisor for the bringup demo components
-        # (audio / dummy_nav / bt). Children die in main()'s teardown.
+        # (audio / follow_server / follow-person BT). Children die in main()'s
+        # teardown. (dummy_nav was dropped in the 2026-06-13 follow integration.)
         self.proc_manager = ProcessManager()
 
         # Latest follow-server status (parsed /follow_server/status JSON) so the

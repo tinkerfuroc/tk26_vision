@@ -123,6 +123,16 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-14** — track_web: static assets (`/`, `/app.js`, `/style.css`) now
+  send `Cache-Control: no-cache` so the browser revalidates against the server's
+  Last-Modified on every load. Without any cache directive a browser could keep a
+  stale bundle across a rebuild/relaunch indefinitely — the cause of "I relaunched
+  and the UI still shows the old thing" (e.g. the `dummy_nav` control, dropped in
+  the 2026-06-13 integration, lingering in a cached pre-integration `app.js`).
+  Clear an already-cached tab once with a hard refresh (Ctrl+Shift+R). Also
+  removed a stale `dummy_nav` comment in `track_web.py`. Test:
+  `test/test_track_web_app.py::test_webui_static_assets_are_no_cache`.
+
 - sim_track_server: topic->action adapter mirroring /target_points + reacq_state into /track_person, the sim stand-in for person_track_server (F4 BT-in-the-loop).
 
 - **2026-06-13** — track_web: follow-mode selector (vision+audio | with-nav) +

@@ -69,18 +69,30 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
     if webui_dir is not None and Path(webui_dir).exists():
         webui = Path(webui_dir)
 
+        # The dashboard bundle is served at fixed URLs (/, /app.js, /style.css)
+        # with no version hash, so without a cache directive a browser may keep a
+        # stale bundle across a rebuild/redeploy indefinitely — the classic "I
+        # relaunched and the UI still shows the old thing" trap (e.g. a dropped
+        # `dummy_nav` control lingering after the follow-pipeline integration).
+        # `no-cache` lets the browser cache but FORCES revalidation against the
+        # server's Last-Modified each load, so a rebuilt asset is always picked up.
+        _NO_CACHE = {"Cache-Control": "no-cache"}
+
         @app.get("/")
         def index():
-            return FileResponse(webui / "index.html", media_type="text/html")
+            return FileResponse(webui / "index.html", media_type="text/html",
+                                headers=_NO_CACHE)
 
         @app.get("/style.css")
         def style():
-            return FileResponse(webui / "style.css", media_type="text/css")
+            return FileResponse(webui / "style.css", media_type="text/css",
+                                headers=_NO_CACHE)
 
         @app.get("/app.js")
         def appjs():
             return FileResponse(webui / "app.js",
-                                media_type="application/javascript")
+                                media_type="application/javascript",
+                                headers=_NO_CACHE)
     else:
         @app.get("/")
         def index_missing():

@@ -20,7 +20,9 @@ from rclpy.duration import Duration
 
 import numpy as np
 import cv2
+import math
 import threading
+from threading import Lock
 import time
 import json
 import base64
@@ -41,6 +43,9 @@ from tinker_vision_msgs_26.action import TrackPerson
 # Service definition (active re-ID / re-seed)
 from tinker_vision_msgs_26.srv import ReseedTarget
 
+# Pan-tilt head-follow messages (optional, default-off feature)
+from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
+
 # Message filters for synchronization
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
@@ -60,6 +65,7 @@ from vision_track.core.depth_roi import roi_window
 from vision_track.core.frame_diag import compute_frame_diag
 from vision_track.core.reacq_state import reacq_state
 from vision_track.core.debug_state import build_debug_state
+from vision_track.core.pan_follow import PanFollower
 
 
 # Sentinel for the ~/reacq_state heartbeat when no TrackPerson goal is active.
@@ -235,6 +241,45 @@ class PersonTrackNode(Node):
         # lock would add nothing.
         self._last_reacq_state = REACQ_INACTIVE
         self.create_timer(0.1, self._publish_reacq_state)
+
+        # --- Pan-tilt head follow (optional; gated by enable_pan_tilt_follow) ---
+        # These attributes are set UNCONDITIONALLY so the tracking loop + tick never
+        # AttributeError when the feature is disabled. Only the PanFollower, the
+        # pub/sub, and the enabled-log live inside the if-guard, so a disabled tracker
+        # creates no servo traffic and is byte-for-byte unchanged.
+        self.enable_pan_tilt_follow = bool(
+            self.get_parameter('enable_pan_tilt_follow').value)
+        self._current_pan_rad = None
+        self._pan_state_lock = Lock()
+        self._pan_tilt_initialized = False
+        self._last_target_u = None
+        self._pan_follower = None
+        self._pan_cmd_pub = None
+        self._fixed_tilt_rad = math.radians(
+            float(self.get_parameter('fixed_tilt_deg').value))
+        self._pan_cmd_speed = int(self.get_parameter('pan_command_speed_raw').value)
+        self._pan_cmd_accel = int(self.get_parameter('pan_command_accel_raw').value)
+        if self.enable_pan_tilt_follow:
+            self._pan_follower = PanFollower(
+                pan_sign=float(self.get_parameter('pan_sign').value),
+                deadband_rad=math.radians(
+                    float(self.get_parameter('pan_deadband_deg').value)),
+                min_change_rad=math.radians(
+                    float(self.get_parameter('pan_min_command_change_deg').value)),
+                min_interval_s=float(
+                    self.get_parameter('pan_min_command_interval_sec').value),
+                ema_alpha=float(self.get_parameter('pan_ema_alpha').value),
+                pan_min_rad=math.radians(float(self.get_parameter('pan_min_deg').value)),
+                pan_max_rad=math.radians(float(self.get_parameter('pan_max_deg').value)),
+            )
+            cmd_topic = self.get_parameter('pan_tilt_command_topic').value
+            state_topic = self.get_parameter('pan_tilt_state_topic').value
+            self._pan_cmd_pub = self.create_publisher(PanTiltCommand, cmd_topic, 1)
+            self.create_subscription(
+                PanTiltState, state_topic, self._pan_state_cb, 10)
+            self.get_logger().info(
+                f'Pan-tilt follow ENABLED: cmd={cmd_topic} state={state_topic} '
+                f'tilt={float(self.get_parameter("fixed_tilt_deg").value)} deg')
 
         # Idle telemetry: between goals the tracking loop isn't running, so a
         # light timer keeps the dashboard alive (camera preview + 'idle' state)
@@ -424,6 +469,27 @@ class PersonTrackNode(Node):
 
         # Perf/quality instrumentation (default-off; zero overhead in production).
         self.declare_parameter('perf_logging_enabled', False)
+
+        # --- Pan-tilt head follow (default OFF; needs pan_tilt controller running) ---
+        # When enabled the tracker keeps the locked person horizontally centered by
+        # commanding the head pan servo in ABSOLUTE mode (tilt held at fixed_tilt_deg).
+        # Runs in this ~30 Hz loop, NOT the BT (which ticks too slowly to center a head).
+        self.declare_parameter('enable_pan_tilt_follow', False)
+        self.declare_parameter('pan_tilt_command_topic', '/pan_tilt_controller/cmd')
+        self.declare_parameter('pan_tilt_state_topic', '/pan_tilt_controller/state')
+        self.declare_parameter('fixed_tilt_deg', 40.0)
+        # pan_sign: +1 derived from follow_head (world_pan = cur_pan + atan2(x_cam,z_cam),
+        # +x=right, URDF pan axis "0 0 -1" => positive pan turns right toward a right-side
+        # person). Param only so a different mount can flip it.
+        self.declare_parameter('pan_sign', 1.0)
+        self.declare_parameter('pan_deadband_deg', 3.0)
+        self.declare_parameter('pan_min_command_change_deg', 1.0)
+        self.declare_parameter('pan_min_command_interval_sec', 0.15)
+        self.declare_parameter('pan_ema_alpha', 0.5)
+        self.declare_parameter('pan_min_deg', -90.0)
+        self.declare_parameter('pan_max_deg', 90.0)
+        self.declare_parameter('pan_command_speed_raw', 0)   # 0 -> controller default
+        self.declare_parameter('pan_command_accel_raw', 0)
 
         self.get_logger().info('Parameters declared')
 
@@ -1123,6 +1189,9 @@ class PersonTrackNode(Node):
                 # lone-candidate recovery path this frame. The latch is set/cleared
                 # in the lost/reclaim handlers, so it's well-defined here.
                 self.tracker.in_needs_help = bool(self._help_latched)
+                # Reset the pan-follow bbox each iteration so a lost frame leaves it
+                # None (HOLD/RECENTER); _handle_tracked_frame repopulates it on a lock.
+                self._last_target_u = None
                 track_result = self.tracker.update(rgb_frame)
             t_track = time.perf_counter() - t_track0
 
@@ -1136,6 +1205,9 @@ class PersonTrackNode(Node):
                 if self._handle_lost_frame(last_seen_time, rgb_img, rgb_msg, feedback, goal_handle, params, result):
                     return result
             self._publish_debug_outputs(rgb_img, track_result, feedback, last_seen_time)
+            # Pan-tilt head follow (no-op unless enable_pan_tilt_follow). Reads the
+            # bbox center-x set above (CENTER) / NEEDS_HELP (RECENTER) / else HOLD.
+            self._pan_follow_tick()
             t_post = time.perf_counter() - t_post0
 
             if self.perf_logging_enabled:
@@ -1264,6 +1336,11 @@ class PersonTrackNode(Node):
         goal_handle,
         params,
     ):
+        # Pan-tilt head follow: record the bbox center-x (u) so _pan_follow_tick can
+        # CENTER the head on the locked person this iteration (bbox is x1,y1,x2,y2).
+        if track_result.bbox is not None:
+            self._last_target_u = 0.5 * (float(track_result.bbox[0]) + float(track_result.bbox[2]))
+
         try:
             points, valid_mask = self._depth_image_to_points(depth_msg, intrinsic, bbox=track_result.bbox)
         except Exception as e:
@@ -1859,6 +1936,51 @@ class PersonTrackNode(Node):
                     f'vision_logging: gallery thumb {i} write failed: {exc}'
                 )
 
+    def _pan_state_cb(self, msg: PanTiltState):
+        with self._pan_state_lock:
+            self._current_pan_rad = float(msg.pan_rad)
+
+    def _publish_pan_tilt(self, pan_rad: float):
+        cmd = PanTiltCommand()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.mode = PanTiltCommand.ABSOLUTE          # ABSOLUTE only — no accumulation
+        cmd.pan_rad = float(pan_rad)
+        cmd.tilt_rad = float(self._fixed_tilt_rad)  # tilt held at fixed_tilt_deg
+        cmd.speed_raw = int(self._pan_cmd_speed)
+        cmd.accel_raw = int(self._pan_cmd_accel)
+        self._pan_cmd_pub.publish(cmd)
+
+    def _pan_follow_tick(self):
+        """Center the head on the tracked person; called once per loop iteration."""
+        if not self.enable_pan_tilt_follow or self._pan_cmd_pub is None:
+            return
+        with self._pan_state_lock:
+            current_pan = self._current_pan_rad
+        if current_pan is None:
+            # No PanTiltState yet -> can't do ABSOLUTE centering; wait (state_publisher
+            # publishes continuously once the controller is up).
+            self.get_logger().warn('pan-tilt follow: awaiting PanTiltState',
+                                   throttle_duration_sec=5.0)
+            return
+        now = time.monotonic()
+        # One-time: pitch the head to the fixed tilt (and hold current pan) so the
+        # head reaches 40 deg even before the first centering command.
+        if not self._pan_tilt_initialized:
+            self._publish_pan_tilt(current_pan)
+            self._pan_tilt_initialized = True
+            return
+        target = None
+        if self._last_target_u is not None and self.camera_intrinsic is not None:
+            fx = float(self.camera_intrinsic.k[0])
+            cx = float(self.camera_intrinsic.k[2])
+            target = self._pan_follower.center(
+                self._last_target_u, cx, fx, current_pan, now)   # CENTER
+        elif int(self._last_reacq_state) == 2:                   # REACQ_NEEDS_HELP
+            target = self._pan_follower.recenter(current_pan, now)  # RECENTER -> 0
+        # else: HOLD (normal lost / passive) -> no command.
+        if target is not None:
+            self._publish_pan_tilt(target)
+
     def _cleanup_tracking(self):
         """Clean up tracking state."""
         with self.lock_lifecycle:
@@ -1876,6 +1998,11 @@ class PersonTrackNode(Node):
         # callback's finally): the ~/reacq_state heartbeat reverts to INACTIVE so
         # the nav consumer sees "no goal" rather than a stale last-frame enum.
         self._last_reacq_state = REACQ_INACTIVE
+        # Drop pan-follow EMA/throttle + re-arm the one-time tilt init so the next
+        # goal re-pitches the head and doesn't carry stale centering state.
+        if self._pan_follower is not None:
+            self._pan_follower.reset()
+        self._pan_tilt_initialized = False
         # Drop the init-search liveness anchor so the 'idle' phase between goals
         # doesn't surface a stale "searching" elapsed timer in the dashboard.
         self._search_started_ts = None

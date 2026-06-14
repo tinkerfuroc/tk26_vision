@@ -179,6 +179,40 @@ def _drive(monkeypatch, tracker, sim_sequence, track_ids):
     return committed
 
 
+def _drive_multi(monkeypatch, tracker, sim_sequence, track_ids, distractor_id):
+    """Like _drive but with a SECOND person in frame each tick (num_candidates==2).
+
+    find_best_match still returns the operator (track_ids[i]) at the scripted sim;
+    the static distractor only makes the scene multi-candidate, exercising the
+    clearly-distinct relaxation gate. register_other_persons is stubbed out (it is
+    irrelevant to the gate and needs tracker attrs the stub does not carry).
+    """
+    box = {"i": 0}
+
+    def fake_find(tr, fr, res):
+        return (_match(track_ids[box["i"]]), sim_sequence[box["i"]])
+
+    def fake_sim(appearance, features, bbox, t, is_person=True, use_gallery=False):
+        return sim_sequence[box["i"]]
+
+    monkeypatch.setattr(TP, "find_best_match_reid", fake_find)
+    monkeypatch.setattr(TP, "register_other_persons", lambda *a, **k: None)
+    monkeypatch.setattr(ReIDMatcher, "compute_similarity", staticmethod(fake_sim))
+
+    committed = False
+    for i in range(len(sim_sequence)):
+        box["i"] = i
+        tracker.frame_count += 1
+        tracker.last_frame_recovery = False
+        prev = tracker.target_track_id
+        results = [_match(track_ids[i]), _match(distractor_id)]
+        TP.reidentify_target(tracker, frame=None, results=results)
+        if tracker.target_track_id != prev:
+            committed = True
+            break
+    return committed
+
+
 def test_reacq_stable_id_relocks(monkeypatch):
     """CONTROL: lone returner with a STABLE id at 0.65 (>=0.62 help bar) re-locks
     within the N-of-M window while latched in NEEDS_HELP."""
@@ -287,6 +321,43 @@ def test_reacq_cap_still_applies_when_active_help_disabled(monkeypatch):
     assert not committed, (
         "legacy (active-help-disabled) path must still cap re-ID at "
         "max_frames_lost")
+    assert tracker.target_track_id == 3
+
+
+def test_reacq_multi_candidate_clearly_distinct_relocks(monkeypatch):
+    """LIVE REPRODUCTION (2026-06-14): a bystander makes the scene multi-candidate,
+    but the operator is re-identified at a steady 0.71 and is CLEARLY the best
+    (margin 0.16 >= REID_MARGIN). The relaxed NEEDS_HELP re-lock must engage even
+    though num_candidates > 1 (operator id churns, as on a real loss+reappearance),
+    so the operator re-locks. Before the fix the num==1 gate forced the strict path,
+    which hard-resets the window on every id change -> never commits (operator
+    recognized at 0.71 every frame yet status stays red)."""
+    tracker = make_tracker(in_needs_help=True)
+    tracker.last_reid_margin = 0.16            # operator clearly the best
+    n = 40
+    sims = [0.71] * n
+    ids = [400 + i for i in range(n)]          # churning operator id
+    committed = _drive_multi(monkeypatch, tracker, sims, ids, distractor_id=557)
+    assert committed, (
+        "clearly-distinct operator failed to re-lock in a multi-candidate scene")
+    assert tracker.target_track_id != 3
+    assert tracker.last_lock_decision.target_lost is False
+
+
+def test_reacq_multi_candidate_ambiguous_stays_strict(monkeypatch):
+    """PRECISION GUARD: with NO clear margin (best ~= second), the relaxation must
+    NOT engage on a multi-candidate scene -- a churning-id operator then takes the
+    strict path (window reset on id change) and does NOT commit, exactly as before.
+    Proves the relaxation is gated on the distinctiveness margin, not opened up for
+    every multi-candidate scene."""
+    tracker = make_tracker(in_needs_help=True)
+    tracker.last_reid_margin = 0.05            # NOT clearly distinct
+    n = 40
+    sims = [0.71] * n
+    ids = [400 + i for i in range(n)]
+    committed = _drive_multi(monkeypatch, tracker, sims, ids, distractor_id=557)
+    assert not committed, (
+        "ambiguous multi-candidate wrongly used the relaxed churn-surviving path")
     assert tracker.target_track_id == 3
 
 

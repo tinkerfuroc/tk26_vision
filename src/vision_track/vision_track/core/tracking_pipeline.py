@@ -637,14 +637,26 @@ def _confirm_reid_candidate(
 
     post_shake_extra = 5 if (current_time - tracker.last_camera_motion_time) < 2.0 else 0
 
-    # Issue 1: precision-bounded escape hatch. ONLY while latched in NEEDS_HELP
-    # AND exactly one person is visible, relax the lone commit bar to
-    # single_person_commit_bar_help (0.62) and require needs_help_confirm_frames
-    # (N=12) confirm hits within the last needs_help_commit_window (M=16) frames,
-    # then commit (clearing the latch). OUTSIDE this gate the strict Phase-3
-    # bars are byte-for-byte unchanged. The relaxation NEVER fires when
-    # num_candidates > 1 or when in_needs_help is False.
-    in_help = bool(getattr(tracker, "in_needs_help", False)) and num_candidates == 1
+    # Issue 1: precision-bounded escape hatch while latched in NEEDS_HELP. Relax the
+    # commit to single_person_commit_bar_help (0.62), needs_help_confirm_frames
+    # (N=12) of needs_help_commit_window (M=16), and (crucially) DROP the
+    # camera-motion post_shake inflation + the id-churn window reset, then commit.
+    #
+    # Engage it when the operator is the LONE candidate OR the CLEARLY-DISTINCT best
+    # (best-vs-second margin >= REID_MARGIN). Live-robot evidence (2026-06-14): a
+    # returning operator re-identified at a steady 0.71 (distinctly best, margin
+    # ~0.16) never re-locked because a borderline bystander made it multi-candidate,
+    # which forced the strict path — there, camera motion from the operator walking
+    # up inflated the confirm window (post_shake +5 => 17 of 18) and intermittent
+    # match drops kept resetting it. Requiring num==1 was over-strict: a clear
+    # distinctiveness margin already establishes the confidence the num==1 gate was
+    # standing in for, so the relaxation stays precision-safe (a candidate that is
+    # NOT clearly distinct still takes the strict path). OUTSIDE this gate the
+    # strict Phase-3 bars are byte-for-byte unchanged.
+    reid_margin = float(getattr(tracker, "last_reid_margin", 0.0) or 0.0)
+    clearly_distinct = reid_margin >= ReIDMatcher.REID_MARGIN
+    in_help = bool(getattr(tracker, "in_needs_help", False)) and (
+        num_candidates == 1 or clearly_distinct)
     if in_help:
         commit_bar = getattr(tracker, "single_person_commit_bar_help", 0.62)
         required_confirmation = int(getattr(tracker, "needs_help_confirm_frames", 12))

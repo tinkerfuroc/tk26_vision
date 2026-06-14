@@ -123,6 +123,22 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-14** — **NEEDS_HELP re-lock now engages the relaxed path for the
+  CLEARLY-DISTINCT best candidate, not only when the operator is alone.** Live
+  evidence: a returning operator was re-identified at a steady **0.71** (distinctly
+  best, margin ~0.16) every frame yet **never re-locked** (status stuck red) —
+  because a borderline bystander made the scene multi-candidate, which forced the
+  strict path. There, camera motion from the operator walking up inflated the
+  confirm window (`post_shake_extra` +5 ⇒ 17 of 18) and intermittent
+  distinctiveness drops kept resetting it. Requiring `num_candidates == 1` was
+  over-strict: a clear best-vs-second margin (`>= REID_MARGIN` 0.15) already
+  supplies the confidence the num==1 gate stood in for, so the relaxed commit
+  (0.62 bar, 12-of-16, no camera-motion penalty, churn-surviving window) is
+  precision-safe — a candidate that is NOT clearly distinct still takes the strict
+  path. Fixes "the tracker won't pick the operator up even standing right in
+  front." Tests: `test_needs_help_reacq_integration.py::test_reacq_multi_candidate_clearly_distinct_relocks`
+  (+ `…_ambiguous_stays_strict` precision guard).
+
 - **2026-06-14** — `reacq_debug_logging` param (default OFF): while the operator is
   lost/recovering, logs a ~3 Hz `[reacq-diag]` line through the ROS console with the
   best ReID candidate similarity, per-candidate scores, `persons` count,

@@ -61,7 +61,7 @@
     # --- Pan-tilt head follow (default OFF; needs pan_tilt controller running) ---
     # Keeps the locked person horizontally centered via the head pan servo (ABSOLUTE
     # mode, tilt held at fixed_tilt_deg). Runs in the ~30 Hz tracking loop.
-    enable_pan_tilt_follow: false
+    enable_pan_tilt_follow: true
     pan_tilt_command_topic: /pan_tilt_controller/cmd
     pan_tilt_state_topic: /pan_tilt_controller/state
     fixed_tilt_deg: 40.0

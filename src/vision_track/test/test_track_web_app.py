@@ -250,3 +250,18 @@ def test_webui_served_from_dir(tmp_path):
     c = TestClient(create_app(b, webui_dir=tmp_path))
     assert c.get("/").status_code == 200
     assert "javascript" in c.get("/app.js").headers["content-type"]
+
+
+def test_webui_static_assets_are_no_cache(tmp_path):
+    # The bundle is served at fixed URLs with no version hash; without a cache
+    # directive a browser keeps a stale bundle across a rebuild (the dropped
+    # dummy_nav control lingering after the follow integration). Every static
+    # route must send Cache-Control: no-cache so the browser revalidates.
+    (tmp_path / "index.html").write_text("<html>ok</html>")
+    (tmp_path / "style.css").write_text("body{}")
+    (tmp_path / "app.js").write_text("'use strict';")
+    c = TestClient(create_app(FakeBridge(), webui_dir=tmp_path))
+    for route in ("/", "/style.css", "/app.js"):
+        r = c.get(route)
+        assert r.status_code == 200
+        assert r.headers.get("cache-control") == "no-cache", route

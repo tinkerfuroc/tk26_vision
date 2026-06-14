@@ -510,9 +510,13 @@ class PersonTrackNode(Node):
         try:
             model_file = resolve_weights(self.model_path)
             # Allow loss duration to be governed by time, not fixed frames.
-            # Use whichever is larger: explicit max_frames_lost or rate * lost_timeout.
-            # Bounded by max_recovery_frames; max_frames_lost remains the
-            # ByteTrack buffer ceiling. The lock FSM owns hard-lost timing.
+            # Coast/ByteTrack frame ceiling: the larger of the configured
+            # max_frames_lost and the FSM's max_recovery_frames. NOTE: this bounds
+            # the LEGACY (active-help-disabled) re-ID coast ONLY — while active
+            # help is enabled (active_help_after_sec > 0) passive re-ID runs
+            # indefinitely (the timer only escalates the advisory NEEDS_HELP
+            # state; see reidentify_target's active_help_enabled gate). The lock
+            # FSM owns hard-lost timing.
             max_frames_allowed = max(int(self.max_frames_lost), int(self.max_recovery_frames))
             
             if self.reid_mode == 'native':
@@ -567,6 +571,12 @@ class PersonTrackNode(Node):
                     self.single_person_commit_bar_help)
                 self.tracker.needs_help_confirm_frames = int(self.needs_help_confirm_frames)
                 self.tracker.needs_help_commit_window = int(self.needs_help_commit_window)
+                # Passive re-ID liveness. When active help is enabled the
+                # NEEDS_HELP hold is the recovery regime, so re-ID must run
+                # indefinitely (never dead-end on frames_lost > max_frames_lost);
+                # the active-help timer only escalates the advisory state. Disabled
+                # (active_help_after_sec <= 0) restores the legacy frame-capped coast.
+                self.tracker.active_help_enabled = bool(self.active_help_after_sec > 0)
                 self.tracker.lock_state_machine = LockStateMachine(
                     high_bar=self.tracker.provisional_high_bar,
                     distinct_margin=self.tracker.provisional_distinct_margin,
@@ -586,8 +596,12 @@ class PersonTrackNode(Node):
             
             self.get_logger().info(
                 f"Max frames lost set to {self.tracker.max_frames_lost} "
-                f"(tracking_rate={self.tracking_rate} Hz, lost_timeout={self.lost_timeout}s, "
-                f"param_max_frames_lost={self.max_frames_lost})"
+                f"(param_max_frames_lost={self.max_frames_lost}, "
+                f"max_recovery_frames={self.max_recovery_frames}). "
+                f"active_help_enabled={self.tracker.active_help_enabled} "
+                f"(active_help_after_sec={self.active_help_after_sec}s) — when "
+                f"enabled, passive re-ID runs indefinitely (the cap bounds only "
+                f"the legacy active-help-disabled coast)."
             )
             
         except Exception as e:

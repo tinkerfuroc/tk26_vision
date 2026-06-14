@@ -70,7 +70,9 @@ class _NullCache:
 
 
 def make_tracker(in_needs_help=True, commit_bar_help=0.62,
-                 confirm_frames=12, window=16, preconfirm=3):
+                 confirm_frames=12, window=16, preconfirm=3,
+                 active_help_enabled=True, max_frames_lost=10_000,
+                 frames_lost=0):
     """Stub tracker exposing every attribute the recovery path touches.
 
     A real LockStateMachine is wired in (started + then driven to terminal
@@ -90,8 +92,12 @@ def make_tracker(in_needs_help=True, commit_bar_help=0.62,
     )
     tracker = SimpleNamespace(
         enable_reid=True,
-        frames_lost=0,
-        max_frames_lost=10_000,
+        frames_lost=frames_lost,
+        max_frames_lost=max_frames_lost,
+        # The active-help timer only escalates the advisory NEEDS_HELP state; with
+        # active help enabled, passive re-ID runs indefinitely (never capped by
+        # max_frames_lost). False restores the legacy hard-lost re-ID cap.
+        active_help_enabled=active_help_enabled,
         state=None,
         frame_count=0,
         target_track_id=3,
@@ -244,6 +250,43 @@ def test_churning_id_not_in_help_still_resets(monkeypatch):
     ids = [8 + i for i in range(n)]
     committed = _drive(monkeypatch, tracker, sims, ids)
     assert not committed, "strict (non-help) path wrongly accumulated across id churn"
+    assert tracker.target_track_id == 3
+
+
+def test_reacq_after_frames_lost_exceeds_cap_indefinite_hold(monkeypatch):
+    """ROOT CAUSE (indefinite NEEDS_HELP hold vs the ~20s re-ID frame cap): the
+    operator was gone long enough that frames_lost passed max_frames_lost (600 @
+    30fps ~= 20s), then walks back into clear view at high sim. Passive re-ID must
+    STILL re-lock — the active-help timer only escalates the advisory NEEDS_HELP
+    state, it must not bound re-ID.
+
+    Before the fix, reidentify_target short-circuits on
+    ``frames_lost > max_frames_lost`` every frame (and bumps frames_lost further),
+    so find_best_match_reid / _confirm_reid_candidate never run and the
+    fully-visible operator is never re-acquired — tracking effectively stops.
+    """
+    tracker = make_tracker(in_needs_help=True, active_help_enabled=True,
+                           max_frames_lost=600, frames_lost=700)
+    committed = _drive(monkeypatch, tracker, [0.65] * 16, [7] * 16)
+    assert committed, (
+        "re-ID dead-ended after frames_lost passed the cap during the indefinite "
+        "NEEDS_HELP hold — the operator stood in clear view and never re-locked")
+    assert tracker.target_track_id == 7
+    assert tracker.last_lock_decision.target_lost is False
+
+
+def test_reacq_cap_still_applies_when_active_help_disabled(monkeypatch):
+    """PRECISION/LEGACY INVARIANT: with active help DISABLED (legacy abort mode),
+    the ``frames_lost > max_frames_lost`` cap still dead-ends re-ID — the
+    indefinite behavior is gated strictly on active_help_enabled, not made
+    unconditional. (A stable-id 0.9 candidate would otherwise commit on the strict
+    path; the cap is what refuses it here.)"""
+    tracker = make_tracker(in_needs_help=False, active_help_enabled=False,
+                           max_frames_lost=600, frames_lost=700)
+    committed = _drive(monkeypatch, tracker, [0.9] * 16, [7] * 16)
+    assert not committed, (
+        "legacy (active-help-disabled) path must still cap re-ID at "
+        "max_frames_lost")
     assert tracker.target_track_id == 3
 
 

@@ -450,7 +450,20 @@ def _log_stage1_failure(tracker, results: List[TrackingResult]) -> None:
 
 def reidentify_target(tracker, frame: np.ndarray, results: List[TrackingResult]) -> Optional[TrackingResult]:
     """Stage 2: appearance-based re-identification."""
-    if not tracker.enable_reid or tracker.frames_lost > tracker.max_frames_lost:
+    # The frames_lost > max_frames_lost cap dead-ends re-ID after ~20 s @ 30 fps
+    # (max_frames_lost=600). That CONTRADICTS the indefinite NEEDS_HELP hold
+    # (active_help_timeout_sec=0): the active-help timer only escalates the
+    # advisory NEEDS_HELP state so the robot can request help — it must NOT bound
+    # passive re-ID. Once the cap was crossed, this returned None every frame and
+    # bumped frames_lost further (it never falls back under the cap), so a
+    # returning operator standing in clear view was never re-acquired — the follow
+    # sat alive but frozen. While active help is enabled, keep re-ID alive
+    # indefinitely; frames_lost still drives the spatial-gate relaxation and is
+    # reset to 0 on the first confirm hit. The cap only dead-ends in the legacy
+    # active-help-disabled mode (which aborts earlier via the FSM hard-lost path).
+    help_active = bool(getattr(tracker, "active_help_enabled", False))
+    capped = tracker.frames_lost > tracker.max_frames_lost and not help_active
+    if not tracker.enable_reid or capped:
         tracker.frames_lost += 1
         if tracker.frames_lost > tracker.max_frames_lost:
             tracker.state = TrackerState.LOST

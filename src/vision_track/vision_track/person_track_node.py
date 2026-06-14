@@ -1978,9 +1978,13 @@ class PersonTrackNode(Node):
             cx = float(self.camera_intrinsic.k[2])
             target = self._pan_follower.center(
                 self._last_target_u, cx, fx, current_pan, now)   # CENTER
-        elif int(self._last_reacq_state) == 2:                   # REACQ_NEEDS_HELP
-            target = self._pan_follower.recenter(current_pan, now)  # RECENTER -> 0
-        # else: HOLD (normal lost / passive) -> no command.
+        # No bbox -> HOLD: issue no command, so the servo keeps pointing where the
+        # person was last seen. This applies during BOTH the PASSIVE coast AND the
+        # NEEDS_HELP hold: do NOT recenter the head during NEEDS_HELP — turning the
+        # camera away from the operator's last direction is exactly what made
+        # re-acquisition fail (they walk back into where they left, but the head
+        # had swung to face forward, so they were never re-detected). Holding keeps
+        # the camera on that direction so they re-enter the view and re-lock.
         if target is not None:
             self._publish_pan_tilt(target)
 

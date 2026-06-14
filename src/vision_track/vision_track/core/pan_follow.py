@@ -9,9 +9,12 @@ every command, error never accumulates (the explicit reason ABSOLUTE is used
 instead of RELATIVE). Tilt is held fixed by the caller; this class owns pan only.
 
 Modes:
-  - center(...)   CENTER:   a bbox is visible -> pan toward atan2(u - cx, fx).
-  - recenter(...) RECENTER: NEEDS_HELP, no bbox -> pan back to 0 (forward pose).
-  (HOLD = the caller simply does not call either -> no command.)
+  - center(...)  CENTER: a bbox is visible -> pan toward atan2(u - cx, fx).
+  - HOLD: no bbox -> the caller does not call center(), so no command issues and
+    the servo keeps pointing where the person was last seen. This holds through
+    BOTH the PASSIVE coast and the NEEDS_HELP hold: the head must NOT swing away
+    during NEEDS_HELP, because keeping it on the operator's last direction is what
+    lets the tracker re-detect them when they walk back into that view.
 
 Every command passes a common gate: EMA-smooth the target, clamp to limits, then
 suppress it if (a) the servo already points within deadband_rad of it, (b) it is
@@ -60,10 +63,6 @@ class PanFollower:
         theta = math.atan2(float(u) - float(cx), float(fx))
         raw_target = float(current_pan) + self.pan_sign * theta
         return self._gate(raw_target, current_pan, now)
-
-    def recenter(self, current_pan, now) -> Optional[float]:
-        """RECENTER: pan back to 0 (NEEDS_HELP forward search pose)."""
-        return self._gate(0.0, current_pan, now)
 
     def _clamp(self, p: float) -> float:
         return max(self.pan_min_rad, min(self.pan_max_rad, p))

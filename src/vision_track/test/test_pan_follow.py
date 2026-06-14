@@ -50,10 +50,11 @@ def test_center_clamps_to_limits():
     assert out == pytest.approx(math.radians(30.0), abs=1e-6)
 
 
-def test_recenter_targets_zero_for_needs_help():
-    foll = _f(deadband_rad=math.radians(1.0))
-    out = foll.recenter(current_pan=math.radians(40.0), now=1.0)
-    assert out == pytest.approx(0.0, abs=1e-6)
+def test_no_recenter_method_holds_during_needs_help():
+    # The head must HOLD (not recenter) on any loss, including NEEDS_HELP — so the
+    # camera keeps pointing where the operator was last seen and can re-detect them.
+    # The caller simply stops calling center(); there is no recenter path.
+    assert not hasattr(PanFollower, "recenter")
 
 
 def test_min_interval_throttles_commands():

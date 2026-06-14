@@ -123,12 +123,22 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-14** — head pan-tilt now **HOLDS its last direction on any loss,
+  including NEEDS_HELP** (removed the recenter-to-0 behavior + `PanFollower.recenter`).
+  Recentering during NEEDS_HELP swung the camera to face forward, away from the
+  operator's last bearing — so when the operator walked back to where they
+  vanished they were outside the FOV and the tracker never re-detected them,
+  making re-acquisition near-impossible. Holding keeps the camera on that bearing,
+  so the operator re-enters the view and the passive re-ID re-locks. (Reverses the
+  earlier "RECENTER to 0 in NEEDS_HELP" choice in the same-day entry below.)
+
 - **2026-06-14** — tracker now drives the head pan-tilt to keep the locked person
   centered (`enable_pan_tilt_follow`, **default ON**). Runs in the ~30 Hz tracking
   loop (the BT ticks too slowly for head centering): per locked frame it pans in
   ABSOLUTE mode toward `current_pan + sign*atan2(u-cx, fx)` from the live
-  `/pan_tilt_controller/state`, tilt held at `fixed_tilt_deg` (40°). HOLD on
-  normal loss, RECENTER to 0 in NEEDS_HELP. Bring up the servo via
+  `/pan_tilt_controller/state`, tilt held at `fixed_tilt_deg` (40°). HOLD on loss
+  (PASSIVE and NEEDS_HELP alike — keeps the camera on the operator's last bearing).
+  Bring up the servo via
   `ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
   launch_robot_state_publisher:=false` (the `follow_bringup` launch does this for
   you with `pan_tilt:=true`, now the default on the real robot). Default ON is

@@ -402,6 +402,12 @@ class PersonTrackNode(Node):
         self.declare_parameter('debug_state_enabled', False)
         self.declare_parameter('gallery_keep_crops', False)
         self.declare_parameter('debug_image_enabled', False)
+        # Reacquisition diagnostic (default OFF): while lost/recovering, log ~3 Hz the
+        # best ReID candidate similarity vs the pursue floor / help commit bar + the
+        # N-of-M window, so an operator can see on the live robot WHY a returning
+        # person does or doesn't re-lock (confirms whether the appearance bar is the
+        # wall). Routed through the ROS logger so it shows on the console.
+        self.declare_parameter('reacq_debug_logging', False)
         self.declare_parameter('provisional_high_bar', 0.72)
         self.declare_parameter('provisional_distinct_margin', 0.10)
         # Phase 2: reject candidates whose median depth jumps this much (m)
@@ -529,6 +535,8 @@ class PersonTrackNode(Node):
         self.debug_state_enabled = bool(self.get_parameter('debug_state_enabled').value)
         self.gallery_keep_crops = bool(self.get_parameter('gallery_keep_crops').value)
         self.debug_image_enabled = bool(self.get_parameter('debug_image_enabled').value)
+        self.reacq_debug_logging = bool(self.get_parameter('reacq_debug_logging').value)
+        self._reacq_diag_last = 0.0
         self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
         self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
         self.crosser_depth_jump_m = self.get_parameter('crosser_depth_jump_m').value
@@ -1209,8 +1217,13 @@ class PersonTrackNode(Node):
                     return result
             self._publish_debug_outputs(rgb_img, track_result, feedback, last_seen_time)
             # Pan-tilt head follow (no-op unless enable_pan_tilt_follow). Reads the
-            # bbox center-x set above (CENTER) / NEEDS_HELP (RECENTER) / else HOLD.
+            # bbox center-x set above (CENTER); no bbox -> HOLD (incl. NEEDS_HELP).
             self._pan_follow_tick()
+            # Reacquisition diagnostic (no-op unless reacq_debug_logging). Logs why a
+            # returning person does/doesn't re-lock while lost/recovering.
+            if self.reacq_debug_logging and (
+                    track_result is None or int(self._last_reacq_state) != 0):
+                self._log_reacq_diag(track_result)
             t_post = time.perf_counter() - t_post0
 
             if self.perf_logging_enabled:
@@ -1938,6 +1951,38 @@ class PersonTrackNode(Node):
                 self.get_logger().warn(
                     f'vision_logging: gallery thumb {i} write failed: {exc}'
                 )
+
+    def _log_reacq_diag(self, track_result):
+        """Throttled (~3 Hz) NEEDS_HELP reacquisition diagnostic.
+
+        Surfaces, while the operator is lost/recovering, the best ReID candidate
+        similarity vs the pursue floor / help commit bar and the N-of-M confirm
+        window — so an operator can read on the live console WHY a returning person
+        does or doesn't re-lock. A person standing in clear view with
+        ``best_sim`` below ``pursue_floor`` (0.55) confirms the appearance bar is
+        the wall; ``persons=0`` while they're plainly visible would instead point at
+        detection. Gated by ``reacq_debug_logging`` (default off) — no normal-run cost.
+        """
+        now = time.time()
+        if (now - self._reacq_diag_last) < 0.3:
+            return
+        self._reacq_diag_last = now
+        tk = self.tracker
+        scores = getattr(tk, 'last_debug_scores', {}) or {}
+        best = max(scores.values()) if scores else 0.0
+        persons = len([r for r in (tk.last_results or [])
+                       if r.class_id == 0 and r.track_id >= 0])
+        needs_help = bool(getattr(tk, 'in_needs_help', False))
+        in_help = needs_help and persons == 1
+        win = getattr(tk, 'reid_confirm_window', []) or []
+        scores_str = ', '.join(f'{int(k)}:{float(v):.2f}' for k, v in scores.items())
+        self.get_logger().warn(
+            f"[reacq-diag] reacq_state={int(self._last_reacq_state)} "
+            f"needs_help={needs_help} in_help={in_help} persons={persons} "
+            f"frames_lost={getattr(tk, 'frames_lost', -1)} best_sim={best:.3f} "
+            f"scores={{{scores_str}}} pursue_floor={self.single_person_pursue_floor:.2f} "
+            f"help_commit_bar={self.single_person_commit_bar_help:.2f} "
+            f"window={sum(win)}/{len(win)} locked={track_result is not None}")
 
     def _pan_state_cb(self, msg: PanTiltState):
         with self._pan_state_lock:

@@ -123,6 +123,15 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-14** — `reacq_debug_logging` param (default OFF): while the operator is
+  lost/recovering, logs a ~3 Hz `[reacq-diag]` line through the ROS console with the
+  best ReID candidate similarity, per-candidate scores, `persons` count,
+  `frames_lost`, the N-of-M confirm `window`, and the `pursue_floor` (0.55) /
+  `help_commit_bar` (0.62). Lets an operator see on the live robot WHY a returning
+  person does/doesn't re-lock — `best_sim` below the floor while they stand in clear
+  view confirms the appearance bar is the wall (vs `persons=0` = a detection gap).
+  Enable with `-p reacq_debug_logging:=true`.
+
 - **2026-06-14** — head pan-tilt now **HOLDS its last direction on any loss,
   including NEEDS_HELP** (removed the recenter-to-0 behavior + `PanFollower.recenter`).
   Recentering during NEEDS_HELP swung the camera to face forward, away from the

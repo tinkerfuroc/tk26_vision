@@ -123,6 +123,23 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-14** — **fix: passive re-ID now runs indefinitely under the NEEDS_HELP
+  hold (operator could not be re-acquired after ~20 s lost).** The hold is
+  indefinite (`active_help_timeout_sec=0`), but `reidentify_target` dead-ended once
+  `frames_lost > max_frames_lost` (600 ≈ 20 s @ 30 fps): past the cap it returned
+  None every frame and kept incrementing `frames_lost`, so `find_best_match_reid` /
+  `_confirm_reid_candidate` never ran again — a fully-visible returning operator was
+  never re-locked, and with wave→reseed not wired into the follow tree the follow
+  sat alive but frozen. The active-help timer only escalates the *advisory*
+  NEEDS_HELP state (so the robot can request help); it must not bound re-ID. Now
+  the node sets `tracker.active_help_enabled = (active_help_after_sec > 0)` and
+  `reidentify_target` keeps re-ID alive indefinitely while it is enabled; the cap
+  bounds only the legacy active-help-disabled coast. No ReID/lock threshold
+  changed. Fixed a stale "rate * lost_timeout" comment + init log that misdescribed
+  the cap. Tests:
+  `test/test_needs_help_reacq_integration.py::test_reacq_after_frames_lost_exceeds_cap_indefinite_hold`
+  (+ `…_cap_still_applies_when_active_help_disabled` legacy guard).
+
 - **2026-06-14** — track_web: static assets (`/`, `/app.js`, `/style.css`) now
   send `Cache-Control: no-cache` so the browser revalidates against the server's
   Last-Modified on every load. Without any cache directive a browser could keep a

@@ -123,6 +123,13 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-14** — pan-tilt person-follow core (`core/pan_follow.py`): pure
+  horizontal pan-to-center control law — ABSOLUTE target `current_pan +
+  sign*atan2(u-cx, fx)` (recomputed from live state + live pixel error, so error
+  never accumulates), with error-vs-state deadband, anti-chatter min-change, min
+  command interval, EMA + clamp. CENTER/RECENTER(NEEDS_HELP)/HOLD modes. Wired
+  into the tracker in a follow-up commit. Tests: `test/test_pan_follow.py` (9).
+
 - **2026-06-14** — **fix: passive re-ID now runs indefinitely under the NEEDS_HELP
   hold (operator could not be re-acquired after ~20 s lost).** The hold is
   indefinite (`active_help_timeout_sec=0`), but `reidentify_target` dead-ended once

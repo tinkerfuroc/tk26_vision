@@ -470,11 +470,14 @@ class PersonTrackNode(Node):
         # Perf/quality instrumentation (default-off; zero overhead in production).
         self.declare_parameter('perf_logging_enabled', False)
 
-        # --- Pan-tilt head follow (default OFF; needs pan_tilt controller running) ---
+        # --- Pan-tilt head follow (default ON; needs the pan_tilt controller up) ---
         # When enabled the tracker keeps the locked person horizontally centered by
         # commanding the head pan servo in ABSOLUTE mode (tilt held at fixed_tilt_deg).
         # Runs in this ~30 Hz loop, NOT the BT (which ticks too slowly to center a head).
-        self.declare_parameter('enable_pan_tilt_follow', False)
+        # Default ON: when no /pan_tilt_controller/state arrives it just warns
+        # (throttled) and issues no commands, so a setup without the servo is benign.
+        # Set False to disable entirely (e.g. when another node owns the head).
+        self.declare_parameter('enable_pan_tilt_follow', True)
         self.declare_parameter('pan_tilt_command_topic', '/pan_tilt_controller/cmd')
         self.declare_parameter('pan_tilt_state_topic', '/pan_tilt_controller/state')
         self.declare_parameter('fixed_tilt_deg', 40.0)

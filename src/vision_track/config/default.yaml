@@ -34,6 +34,7 @@
     debug_state_enabled: false       # ~/debug_state JSON per frame
     gallery_keep_crops: false        # retain + publish gallery view thumbnails (~/debug_gallery)
     debug_image_enabled: false       # ~/debug_image annotated frames (only drawn when subscribed)
+    reacq_debug_logging: false       # ~3 Hz reacq similarity-vs-bar diagnostic while lost (console)
     provisional_high_bar: 0.72       # single-candidate fast-publish floor (reid_search.py)
     provisional_distinct_margin: 0.10  # min best-vs-second margin to publish in a crowd
     crosser_depth_jump_m: 0.6        # reject candidates this much nearer than the operator

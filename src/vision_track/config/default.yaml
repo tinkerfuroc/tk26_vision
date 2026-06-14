@@ -57,3 +57,20 @@
     vision_logging_enabled: true
     vision_log_folder: 'vision_log'
     perf_logging_enabled: false       # introduced in Phase 0
+
+    # --- Pan-tilt head follow (default OFF; needs pan_tilt controller running) ---
+    # Keeps the locked person horizontally centered via the head pan servo (ABSOLUTE
+    # mode, tilt held at fixed_tilt_deg). Runs in the ~30 Hz tracking loop.
+    enable_pan_tilt_follow: false
+    pan_tilt_command_topic: /pan_tilt_controller/cmd
+    pan_tilt_state_topic: /pan_tilt_controller/state
+    fixed_tilt_deg: 40.0
+    pan_sign: 1.0                      # flip to -1.0 if the head turns away from the person
+    pan_deadband_deg: 3.0
+    pan_min_command_change_deg: 1.0
+    pan_min_command_interval_sec: 0.15
+    pan_ema_alpha: 0.5
+    pan_min_deg: -90.0
+    pan_max_deg: 90.0
+    pan_command_speed_raw: 0          # 0 -> controller default
+    pan_command_accel_raw: 0

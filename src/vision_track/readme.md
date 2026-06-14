@@ -123,6 +123,16 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-14** — tracker now drives the head pan-tilt to keep the locked person
+  centered (`enable_pan_tilt_follow`, default OFF). Runs in the ~30 Hz tracking
+  loop (the BT ticks too slowly for head centering): per locked frame it pans in
+  ABSOLUTE mode toward `current_pan + sign*atan2(u-cx, fx)` from the live
+  `/pan_tilt_controller/state`, tilt held at `fixed_tilt_deg` (40°). HOLD on
+  normal loss, RECENTER to 0 in NEEDS_HELP. Bring up the servo via
+  `ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
+  launch_robot_state_publisher:=false` and `-p enable_pan_tilt_follow:=true`.
+  Hardware: flip `pan_sign` if the head turns away instead of toward the person.
+
 - **2026-06-14** — pan-tilt person-follow core (`core/pan_follow.py`): pure
   horizontal pan-to-center control law — ABSOLUTE target `current_pan +
   sign*atan2(u-cx, fx)` (recomputed from live state + live pixel error, so error

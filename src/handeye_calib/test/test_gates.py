@@ -35,3 +35,20 @@ def test_quality_ok_reasons():
     assert not ok and "corners" in reason
     ok, reason = gates.quality_ok(n_corners=16, reproj_px=3.0, area_frac=0.2)
     assert not ok and "reproj" in reason
+
+
+def test_quality_ok_board_too_small():
+    ok, reason = gates.quality_ok(n_corners=16, reproj_px=0.8, area_frac=0.01)
+    assert not ok and "board too small" in reason
+
+
+def test_stability_tracker_rejects_slow_drift():
+    # Safety-critical: each frame is within tol of its neighbor, but the window
+    # spans > tol end-to-end. The all-vs-most-recent comparison must reject this
+    # (a naive neighbor-vs-neighbor check would wrongly accept it).
+    trk = gates.StabilityTracker(window=3, rot_tol_deg=0.1, trans_tol_m=0.0003)
+    out = False
+    for k in range(3):
+        T = tf.T_from_Rt(np.eye(3), [0, 0, 0.5 + 0.0002 * k])  # 0.2 mm/frame
+        out = trk.update(T)
+    assert out is False  # oldest vs newest = 0.4 mm > 0.3 mm tol

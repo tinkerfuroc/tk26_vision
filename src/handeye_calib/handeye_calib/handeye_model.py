@@ -21,7 +21,7 @@ def board_corners(squares_x=5, squares_y=5, square_len=0.04):
 
 def project_corners(board_pts, T_cam_board, K, dist=None):
     """Project board points (N,3, board frame) into pixels via T_cam_board and K."""
-    board_pts = np.asarray(board_pts, float).reshape(-1, 3)
+    board_pts = np.ascontiguousarray(board_pts, dtype=float).reshape(-1, 3)
     rvec, _ = cv2.Rodrigues(np.asarray(T_cam_board)[:3, :3])
     tvec = np.asarray(T_cam_board)[:3, 3]
     if dist is None:

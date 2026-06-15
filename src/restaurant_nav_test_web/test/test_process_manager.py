@@ -37,3 +37,46 @@ def test_group_starts_all_members():
     pm.shutdown_all()
     time.sleep(0.1)
     assert pm.status("a")["running"] is False
+
+
+import os
+import tempfile
+
+from restaurant_nav_test_web.process_manager import load_registry
+
+
+def test_unknown_group_rejected():
+    pm = _pm()
+    assert pm.start_group("nope").get("error")
+    assert pm.stop_group("nope").get("error")
+
+
+def test_stop_of_never_started_is_safe():
+    pm = _pm()
+    out = pm.stop("a")  # never started
+    assert out["running"] is False  # no raise
+
+
+def test_load_registry_rejects_malformed_entry():
+    import pytest
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("registry:\n  bad: just_a_string\n")
+        path = f.name
+    try:
+        with pytest.raises(ValueError):
+            load_registry(path)
+    finally:
+        os.unlink(path)
+
+
+def test_load_registry_parses_lists():
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("stagger_sec: 2.0\nregistry:\n  a: [sleep, '5']\ngroups:\n  g: [a]\n")
+        path = f.name
+    try:
+        reg, groups, stagger = load_registry(path)
+        assert reg == {"a": ["sleep", "5"]}
+        assert groups == {"g": ["a"]}
+        assert stagger == 2.0
+    finally:
+        os.unlink(path)

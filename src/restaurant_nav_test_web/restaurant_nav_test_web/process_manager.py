@@ -53,12 +53,27 @@ GROUPS: dict = {}
 
 def load_registry(path):
     """Load {registry, groups, stagger_sec} from processes.yaml -> (registry,
-    groups, stagger_sec)."""
+    groups, stagger_sec). Validates that each registry/group value is a list of
+    strings so a malformed config fails loudly instead of producing a corrupt
+    per-character argv."""
     with open(path, "r") as f:
         doc = yaml.safe_load(f) or {}
-    registry = {str(k): list(v) for k, v in (doc.get("registry") or {}).items()}
-    groups = {str(k): list(v) for k, v in (doc.get("groups") or {}).items()}
-    stagger = float(doc.get("stagger_sec", 1.5))
+    registry = {}
+    for k, v in (doc.get("registry") or {}).items():
+        if not isinstance(v, list) or not v or not all(isinstance(a, str) for a in v):
+            raise ValueError(
+                f"processes.yaml: registry entry '{k}' must be a non-empty list of strings")
+        registry[str(k)] = list(v)
+    groups = {}
+    for k, v in (doc.get("groups") or {}).items():
+        if not isinstance(v, list) or not all(isinstance(a, str) for a in v):
+            raise ValueError(
+                f"processes.yaml: group '{k}' must be a list of strings")
+        groups[str(k)] = list(v)
+    try:
+        stagger = float(doc.get("stagger_sec", 1.5))
+    except (TypeError, ValueError):
+        raise ValueError("processes.yaml: stagger_sec must be a number")
     return registry, groups, stagger
 
 

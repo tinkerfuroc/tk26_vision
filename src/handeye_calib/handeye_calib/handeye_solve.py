@@ -72,3 +72,59 @@ def bundle_adjust(samples, K, dist, board_pts, X0, Tbb0):
     info = {"final_reproj_px": _reproj_rms(X, Tbb, samples, K, dist, board_pts),
             "success": bool(sol.success), "cost": float(sol.cost)}
     return X, Tbb, info
+
+
+@dataclass
+class SolveResult:
+    X: np.ndarray
+    Tbb: np.ndarray
+    train_metrics: dict
+    heldout_metrics: dict
+    status: str
+    per_method: list
+
+
+# pan-tilt parity thresholds
+_PASS = {"trans_rmse_m": 0.003, "rot_rmse_rad": 0.00873, "reproj_px": 1.5}
+_WARN = {"trans_rmse_m": 0.006, "rot_rmse_rad": 0.01745, "reproj_px": 3.0}
+
+
+def split_train_test(samples, heldout_frac, rng_seed=0):
+    rng = np.random.default_rng(rng_seed)
+    idx = np.arange(len(samples))
+    rng.shuffle(idx)
+    n_te = max(1, int(round(len(samples) * heldout_frac)))
+    te = sorted(idx[:n_te].tolist())
+    tr = sorted(idx[n_te:].tolist())
+    return [samples[i] for i in tr], [samples[i] for i in te]
+
+
+def evaluate(X, Tbb, samples, K, dist, board_pts):
+    trans_e, rot_e = [], []
+    for s in samples:
+        T_pred = tf.invert(s.T_base_eef @ X) @ Tbb     # predicted board-in-cam
+        T_obs = s.T_cam_board                           # observed (PnP)
+        trans_e.append(np.linalg.norm(T_pred[:3, 3] - T_obs[:3, 3]))
+        rot_e.append(np.radians(tf.rotation_angle_deg(T_pred[:3, :3], T_obs[:3, :3])))
+    return {"trans_rmse_m": float(np.sqrt(np.mean(np.square(trans_e)))),
+            "rot_rmse_rad": float(np.sqrt(np.mean(np.square(rot_e)))),
+            "reproj_px": _reproj_rms(X, Tbb, samples, K, dist, board_pts)}
+
+
+def gate(metrics):
+    def ok(th):
+        return all(metrics[k] <= th[k] for k in th)
+    if ok(_PASS):
+        return "PASS"
+    if ok(_WARN):
+        return "WARN"
+    return "FAIL"
+
+
+def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0):
+    train, test = split_train_test(samples, heldout_frac, rng_seed)
+    X0, Tbb0, per_method = seed_handeye(train, K, dist, board_pts)
+    X, Tbb, _ = bundle_adjust(train, K, dist, board_pts, X0, Tbb0)
+    train_m = evaluate(X, Tbb, train, K, dist, board_pts)
+    held_m = evaluate(X, Tbb, test, K, dist, board_pts)
+    return SolveResult(X, Tbb, train_m, held_m, gate(held_m), per_method)

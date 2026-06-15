@@ -27,6 +27,18 @@ import math
 from typing import Optional
 
 
+def pan_follow_suppressed(enable_follow: bool, has_publisher: bool,
+                          help_latched: bool) -> bool:
+    """True when the tracker must NOT issue a pan command this tick.
+
+    Suppress when pan-follow is disabled, when there is no command publisher, or
+    when NEEDS_HELP is latched — in NEEDS_HELP the behavior tree owns the head
+    (the two-pass recovery scan), so the tracker holds off until re-lock clears
+    the latch and hands head control back.
+    """
+    return (not enable_follow) or (not has_publisher) or bool(help_latched)
+
+
 class PanFollower:
     def __init__(
         self,

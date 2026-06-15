@@ -65,7 +65,7 @@ from vision_track.core.depth_roi import roi_window
 from vision_track.core.frame_diag import compute_frame_diag
 from vision_track.core.reacq_state import reacq_state
 from vision_track.core.debug_state import build_debug_state
-from vision_track.core.pan_follow import PanFollower
+from vision_track.core.pan_follow import PanFollower, pan_follow_suppressed
 
 
 # Sentinel for the ~/reacq_state heartbeat when no TrackPerson goal is active.
@@ -2000,7 +2000,9 @@ class PersonTrackNode(Node):
 
     def _pan_follow_tick(self):
         """Center the head on the tracked person; called once per loop iteration."""
-        if not self.enable_pan_tilt_follow or self._pan_cmd_pub is None:
+        if pan_follow_suppressed(self.enable_pan_tilt_follow,
+                                 self._pan_cmd_pub is not None,
+                                 getattr(self, '_help_latched', False)):
             return
         with self._pan_state_lock:
             current_pan = self._current_pan_rad

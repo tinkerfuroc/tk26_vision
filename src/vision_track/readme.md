@@ -123,6 +123,13 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-15 — Pan-follow suppressed during NEEDS_HELP.** `_pan_follow_tick`
+  now holds off issuing any pan command while `_help_latched` (NEEDS_HELP), via
+  the new pure `pan_follow_suppressed(enable, has_pub, help_latched)` predicate.
+  This hands head control to the behavior tree's two-pass recovery scan during
+  NEEDS_HELP (clean mutual exclusion keyed on the help latch; the tracker
+  resumes centering the instant a re-lock clears the latch). Pairs with
+  tk25_decision `BtNode_RecoveryScan`.
 - **2026-06-14** — **NEEDS_HELP re-lock now engages the relaxed path for the
   CLEARLY-DISTINCT best candidate, not only when the operator is alone.** Live
   evidence: a returning operator was re-identified at a steady **0.71** (distinctly

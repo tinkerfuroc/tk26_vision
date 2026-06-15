@@ -33,8 +33,12 @@ def invert(T):
 
 
 def se3_average(Ts):
-    """Chordal SE(3) mean: quaternion mean of rotations + arithmetic mean of translations."""
+    """Approximate SE(3) mean: normalized quaternion average of rotations + arithmetic
+    mean of translations. Valid for small angular scatter (the hand-eye repeat-sample
+    case); not a true Fréchet mean for wide angular spreads."""
     Ts = [np.asarray(T) for T in Ts]
+    if not Ts:
+        raise ValueError("se3_average requires at least one transform")
     quats = R.from_matrix([T[:3, :3] for T in Ts]).as_quat()
     # sign-align quaternions to the first to avoid cancellation
     ref = quats[0]

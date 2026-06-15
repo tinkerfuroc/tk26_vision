@@ -50,7 +50,8 @@ class RestaurantNavTestWebNode(Node):
         self.bind_port = int(self.get_parameter("port").value)
         ws = str(self.get_parameter("workspace_root").value)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # reentrant: snapshot/latest_state call
+        # _distance_to_target()/_readiness() which re-acquire the same lock.
         self._state = None
         self._state_seq = 0
         self._state_ts = 0.0

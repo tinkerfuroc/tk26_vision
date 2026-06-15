@@ -34,6 +34,7 @@ DEFAULT_PACKAGES=(
     kimi_api
     vision_track
     tk_vision_specialized
+    restaurant_nav_test_web
 )
 if [ -n "${PACKAGES:-}" ]; then
     # shellcheck disable=SC2206

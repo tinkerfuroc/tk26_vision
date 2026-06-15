@@ -15,7 +15,7 @@ setup(
     maintainer='tinker',
     maintainer_email='cindy.w0135@gmail.com',
     description='Eye-in-hand calibration for the wrist-mounted RealSense on the xArm.',
-    license='MIT',
+    license='Apache-2.0',
     entry_points={
         'console_scripts': [
             'handeye_synthetic_check = handeye_calib.synthetic:main',

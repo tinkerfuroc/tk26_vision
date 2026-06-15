@@ -49,3 +49,26 @@ def seed_handeye(samples, K, dist, board_pts):
         raise RuntimeError("all calibrateHandEye methods failed")
     best = min(per_method, key=lambda m: m["reproj_px"])
     return best["X"], best["Tbb"], per_method
+
+
+def _residuals(params, samples, K, dist, board_pts):
+    X = tf.T_from_vec(params[:6])
+    Tbb = tf.T_from_vec(params[6:])
+    res = []
+    for s in samples:
+        T_cam_board = tf.invert(s.T_base_eef @ X) @ Tbb
+        pred = hm.project_corners(board_pts[s.corner_idx], T_cam_board, K, dist)
+        res.append((pred - s.obs_px).ravel())
+    return np.concatenate(res)
+
+
+def bundle_adjust(samples, K, dist, board_pts, X0, Tbb0):
+    """Jointly refine X (T_eef_cam) and Tbb (T_base_board) minimizing corner reprojection."""
+    p0 = np.concatenate([tf.vec_from_T(X0), tf.vec_from_T(Tbb0)])
+    sol = least_squares(_residuals, p0, loss="soft_l1", method="trf",
+                        args=(samples, K, dist, board_pts))
+    X = tf.T_from_vec(sol.x[:6])
+    Tbb = tf.T_from_vec(sol.x[6:])
+    info = {"final_reproj_px": _reproj_rms(X, Tbb, samples, K, dist, board_pts),
+            "success": bool(sol.success), "cost": float(sol.cost)}
+    return X, Tbb, info

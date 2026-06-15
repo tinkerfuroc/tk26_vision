@@ -49,8 +49,9 @@ def main():
     from cv_bridge import CvBridge
     from sensor_msgs.msg import Image, CameraInfo
     from tinker_arm_msgs.action import JointMove
-    from pan_tilt.calibration import aruco_detect
-    from handeye_calib import transforms as tf
+    # The hardware capture loop additionally imports pan_tilt.calibration.aruco_detect
+    # (ChArUco detection/consensus) and handeye_calib.transforms (FK math) where used,
+    # when the _on_image/run loop below is fleshed out on hardware.
 
     class HandeyeCollect(Node):
         def __init__(self):

@@ -123,6 +123,11 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-15 — Pan-follow tilt 40° → 37°.** `fixed_tilt_deg` default lowered to
+  37° (code default + `config/default.yaml`) to match the behavior tree's recovery
+  head-scan tilt (`BtNode_RecoveryScan.tilt_deg=37`), so the head holds one
+  consistent tilt across normal follow and NEEDS_HELP recovery (no tilt jump on
+  the pan-ownership handoff).
 - **2026-06-15 — Pan-follow suppressed during NEEDS_HELP.** `_pan_follow_tick`
   now holds off issuing any pan command while `_help_latched` (NEEDS_HELP), via
   the new pure `pan_follow_suppressed(enable, has_pub, help_latched)` predicate.
@@ -168,7 +173,7 @@ ros2 run vision_track person_track_server --ros-args \
   centered (`enable_pan_tilt_follow`, **default ON**). Runs in the ~30 Hz tracking
   loop (the BT ticks too slowly for head centering): per locked frame it pans in
   ABSOLUTE mode toward `current_pan + sign*atan2(u-cx, fx)` from the live
-  `/pan_tilt_controller/state`, tilt held at `fixed_tilt_deg` (40°). HOLD on loss
+  `/pan_tilt_controller/state`, tilt held at `fixed_tilt_deg` (37°). HOLD on loss
   (PASSIVE and NEEDS_HELP alike — keeps the camera on the operator's last bearing).
   Bring up the servo via
   `ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0

@@ -486,7 +486,7 @@ class PersonTrackNode(Node):
         self.declare_parameter('enable_pan_tilt_follow', True)
         self.declare_parameter('pan_tilt_command_topic', '/pan_tilt_controller/cmd')
         self.declare_parameter('pan_tilt_state_topic', '/pan_tilt_controller/state')
-        self.declare_parameter('fixed_tilt_deg', 40.0)
+        self.declare_parameter('fixed_tilt_deg', 37.0)
         # pan_sign: +1 derived from follow_head (world_pan = cur_pan + atan2(x_cam,z_cam),
         # +x=right, URDF pan axis "0 0 -1" => positive pan turns right toward a right-side
         # person). Param only so a different mount can flip it.

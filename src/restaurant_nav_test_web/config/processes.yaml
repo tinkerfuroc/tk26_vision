@@ -1,0 +1,64 @@
+# Allowlist: the dashboard can ONLY spawn these named commands. argv lists are
+# never built from request input. <WS> -> workspace root, substituted at load.
+stagger_sec: 2.0
+registry:
+  camera_femto:
+    - ros2
+    - launch
+    - orbbec_camera
+    - femto_bolt.launch.py
+    - depth_registration:=true
+    - enable_ir:=false
+    - enable_frame_sync:=false
+  camera_realsense:
+    - ros2
+    - launch
+    - realsense2_camera
+    - rs_launch.py
+    - camera_name:=xarm_camera
+    - align_depth.enable:=true
+    - config_file:=<WS>/src/tk26_vision/config/realsense_qos.yaml
+  pan_tilt:
+    - ros2
+    - launch
+    - pan_tilt
+    - pan_tilt.launch.py
+    - device:=/dev/ttyUSB0
+  waving:
+    - ros2
+    - launch
+    - tk_vision_specialized
+    - detect_waving.launch.py
+  nav_driver:
+    - ros2
+    - launch
+    - navigation_bringup
+    - driver.launch.py
+  nav2:
+    - ros2
+    - launch
+    - navigation_bringup
+    - bringup_launch.py
+    - slam:=false
+    - map:=<WS>/src/tk26_navigation/src/navigation_bringup/maps/xlab_2d_0430.map.yaml
+    - use_sim_time:=false
+    - autostart:=true
+  approach:
+    - ros2
+    - launch
+    - approach_planner
+    - approach_planner.launch.py
+    - use_sim_time:=false
+  test_bt:
+    - ros2
+    - run
+    - behavior_tree
+    - restaurant-nav-test
+groups:
+  prereqs:
+    - camera_femto
+    - pan_tilt
+    - waving
+    - nav_driver
+    - nav2
+    - approach

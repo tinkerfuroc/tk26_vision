@@ -1,6 +1,7 @@
 import math
 import pytest
 from vision_track.core.pan_follow import PanFollower
+from vision_track.core.pan_follow import pan_follow_suppressed
 
 
 def _f(**kw):
@@ -82,3 +83,14 @@ def test_reset_clears_throttle_and_ema():
     foll.reset()
     # After reset the interval clock no longer blocks the next command.
     assert foll.center(u=1000.0, cx=320.0, fx=600.0, current_pan=0.0, now=1.5) is not None
+
+
+def test_pan_follow_suppressed_during_needs_help():
+    # Tracker must NOT command pan while NEEDS_HELP is latched — the behavior
+    # tree owns the head (two-pass recovery scan) until re-lock clears the latch.
+    assert pan_follow_suppressed(True, True, help_latched=True) is True
+    # Normal tracking: pan-follow runs.
+    assert pan_follow_suppressed(True, True, help_latched=False) is False
+    # Existing enable gates still suppress.
+    assert pan_follow_suppressed(False, True, help_latched=False) is True
+    assert pan_follow_suppressed(True, False, help_latched=False) is True

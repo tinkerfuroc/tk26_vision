@@ -12,7 +12,9 @@
     <span id="conn-indicator" class="conn-indicator">WS: connecting…</span>
   </header>
   <main>
-    <!-- Live frame panel: floats top-left, controls wrap around it. -->
+    <!-- Live frame panel: sticky-pinned on the left as the user scrolls the
+         controls column on the right. Layout is `main { display: flex }` so
+         the camera stays in view across long capture-tab scrolls. -->
     <div class="cam-panel" id="cam-panel">
       <img id="cam-img" class="cam-img" alt="">
       <div class="cam-resize" id="cam-resize" title="drag to resize"></div>
@@ -24,6 +26,10 @@
       <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/camera/xarm_camera/color/image_raw</span></div>
     </div>
 
+    <!-- Controls column: tabs + all panels. Becomes the right-hand flex item;
+         the cam-panel above is the left-hand item, kept sticky so it doesn't
+         scroll out of view during long capture-tab workflows. -->
+    <div class="controls-col">
     <nav class="side-tabs">
       <button class="side-tab active" data-tab="info">Info</button>
       <button class="side-tab" data-tab="capture">Capture</button>
@@ -261,6 +267,7 @@
         </div>
       </div>
     </section>
+    </div><!-- /.controls-col -->
   </main>
   <script src="/static/app.js"></script>
 </body>

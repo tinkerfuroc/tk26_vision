@@ -246,26 +246,10 @@ def _make_node_class():
             jm = self.node._jm
             if not jm.wait_for_server(timeout_sec=0.5):
                 return {"ok": False, "reason": "arm action server unavailable"}
-            # SafetyEnvelope pre-check on current EE pose (best-effort,
-            # mirrors do_move; skipped silently when no TF / no envelope).
-            if self.node._safety is not None:
-                try:
-                    tfm = self.node.tf_buffer.lookup_transform(
-                        self.node._base_frame, self.node._eef_frame,
-                        self.node._rclpy_time())
-                    T = ws.tf_to_matrix(
-                        [tfm.transform.translation.x,
-                         tfm.transform.translation.y,
-                         tfm.transform.translation.z],
-                        [tfm.transform.rotation.x,
-                         tfm.transform.rotation.y,
-                         tfm.transform.rotation.z,
-                         tfm.transform.rotation.w])
-                    reason = self.node._safety.validate(T)
-                    if reason is not None:
-                        return {"ok": False, "reason": f"safety: {reason}"}
-                except Exception:
-                    pass
+            # SafetyEnvelope pre-check REMOVED 2026-06-20 at operator request
+            # (see do_move docstring). The arm driver / MoveIt's collision
+            # checker remains the real safety boundary; safety_preview still
+            # publishes informational verdict to state.safety_preview.
             goal = JointMove.Goal()
             j = [float(x) for x in joints]
             goal.joint0, goal.joint1, goal.joint2, goal.joint3 = j[0], j[1], j[2], j[3]
@@ -943,25 +927,15 @@ def _make_node_class():
             if not isinstance(joints, (list, tuple)) or len(joints) != 7:
                 return {"ok": False, "reason": "expected 7 joint values"}
 
-            # SafetyEnvelope.validate() gates a 4x4 base->eef POSE, not joints.
-            # We can't FK joints here, so validate the *current* EE pose from TF
-            # as a sanity guard; "no TF / no envelope" => skip validation (the
-            # collision-checking arm server is the real safety boundary).
-            if self._safety is not None:
-                try:
-                    tfm = self.tf_buffer.lookup_transform(
-                        self._base_frame, self._eef_frame, self._rclpy_time())
-                    T = ws.tf_to_matrix(
-                        [tfm.transform.translation.x, tfm.transform.translation.y,
-                         tfm.transform.translation.z],
-                        [tfm.transform.rotation.x, tfm.transform.rotation.y,
-                         tfm.transform.rotation.z, tfm.transform.rotation.w])
-                    reason = self._safety.validate(T)
-                    if reason is not None:
-                        return {"ok": False, "reason": f"safety: {reason}"}
-                except Exception:
-                    # No TF available (no robot in this env) — skip the pose gate.
-                    pass
+            # SafetyEnvelope pre-check REMOVED 2026-06-20 at operator request —
+            # the calibration workflow needs poses that the envelope's
+            # mast-cylinder / z-floor heuristics flag as violations (looking
+            # down at a board near the base, EE behind the mast for diversity,
+            # etc.). The arm driver / MoveIt's collision checker remains the
+            # real safety boundary. `safety_preview` still publishes the
+            # informational verdict to state.safety_preview so the operator
+            # can glance at the verdict in the left-dock — it just no longer
+            # blocks. To re-enable the block, restore the validate() branch.
 
             if not self._jm.wait_for_server(timeout_sec=0.5):
                 return {"ok": False, "reason": "arm action server unavailable"}

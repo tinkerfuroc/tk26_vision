@@ -36,7 +36,11 @@ foundation_stereo:
     output_frame_id: ""
     stream_publish_vis: false
     stream_max_fps: 15.0
-    extrinsics_warmup_timeout_sec: 5.0
+    # Now that the cold TRT warmup runs off the synchronous init path
+    # (background daemon thread + model-ready gate), the executor is live
+    # immediately and the latched extrinsics/color_info arrive within ms,
+    # so this gate passes far inside its window. Kept at 15 s as margin.
+    extrinsics_warmup_timeout_sec: 15.0
     stream_measure_forward_ms: false
     # 'reliable' (default) = drop-in for realsense aligned_depth_to_color,
     # visible in default-QoS RViz; 'best_effort' = lower-overhead sensor stream.

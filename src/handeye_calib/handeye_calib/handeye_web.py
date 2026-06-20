@@ -753,16 +753,36 @@ def _make_node_class():
                     return None
                 return self._thumbs.get(idx)
 
-        def do_solve(self):
+        def do_solve(self, method: str = "auto"):
+            """Run the hand-eye solve with optional method picker.
+
+            ``method`` is one of ``"auto"`` (default — sweep all five OpenCV
+            methods and pick the lowest reproj RMS) or one of the canonical
+            method names: ``TSAI`` / ``PARK`` / ``HORAUD`` / ``ANDREFF`` /
+            ``DANIILIDIS``. Unknown values fall back to ``auto`` (the brief's
+            preferred-over-error stance, mirroring the rest of this node's
+            degrade-rather-than-422 philosophy). On success returns
+            ``{"ok": True, **solve_payload_v2(...)}``; on degraded paths returns
+            ``{"ok": False, "reason": ...}``.
+            """
             with self.lock:
                 samples, K, D = list(self.session.samples), self._K, self._D
             if len(samples) < 6:
                 return {"ok": False, "reason": f"need >=6 samples, have {len(samples)}"}
             if K is None:
                 return {"ok": False, "reason": "no camera intrinsics"}
-            res = hs.solve(samples, K, D, self._board_pts)
+            method_str = str(method or "auto").strip()
+            if method_str.lower() == "auto":
+                methods_subset = None
+            elif method_str in hs._METHODS:
+                methods_subset = {method_str: hs._METHODS[method_str]}
+            else:
+                # Unknown method: degrade to auto rather than 422; same
+                # philosophy as do_capture's "no detection" fallthrough.
+                methods_subset = None
+            res = hs.solve(samples, K, D, self._board_pts, methods=methods_subset)
             self.last_solve = res
-            return {"ok": True, **ws.solve_payload(res)}
+            return {"ok": True, **ws.solve_payload_v2(res, samples, K, D, self._board_pts)}
 
         def do_promote(self):
             import os
@@ -892,8 +912,15 @@ def make_app(node):
         return JSONResponse(node.do_delete_sample(idx))
 
     @app.post("/api/solve")
-    def solve():
-        return JSONResponse(node.do_solve())
+    async def solve(request: Request):
+        # T5: accept an optional ``{method: "auto"|"TSAI"|"PARK"|"HORAUD"|
+        # "ANDREFF"|"DANIILIDIS"}`` body and forward to ``do_solve``. Missing
+        # or empty body falls back to ``method="auto"``.
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        return JSONResponse(node.do_solve(method=(body or {}).get("method", "auto")))
 
     @app.post("/api/promote")
     def promote():

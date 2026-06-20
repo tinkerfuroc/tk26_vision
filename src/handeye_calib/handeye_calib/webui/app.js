@@ -602,3 +602,318 @@ function render() {
   // T4: Capture-tab stability badge + gallery + diversity meter.
   renderCaptureTab(state);
 }
+
+// ---- T5: Solve tab — method picker, comparison table, canvases -----------
+// One Solve button drives POST /api/solve {method: ...}. The server returns
+// solve_payload_v2 (mm/deg/px pre-rendered) on success or {ok:false,reason}
+// on a degraded path (no samples / no intrinsics / etc). All three canvases
+// are vanilla canvas2d — no chart library, no SVG. The brief is literal:
+// histogram = simple bar chart, scatter = dots at (i, v[i]), coverage =
+// project T_cam_board * [0,0,0] to image with K.
+const SOLVE_BTN = $("#solve-btn");
+const SOLVE_METHOD = $("#solve-method");
+const SOLVE_STATUS = "solve-status";
+const SOLVE_VERDICT = $("#solve-verdict");
+const METHOD_TABLE = $("#method-table");
+let lastSolve = null;  // last successful solve payload — drives the coverage canvas + re-renders
+
+// Canvas helpers --------------------------------------------------------------
+function _getCtx(canvasId) {
+  const c = typeof canvasId === "string" ? document.getElementById(canvasId) : canvasId;
+  if (!c || !c.getContext) return null;
+  return c.getContext("2d");
+}
+
+function drawHistogram(canvasId, values, opts = {}) {
+  // Simple bar chart with N bins (default 20). Values < 0 are clamped to 0.
+  const ctx = _getCtx(canvasId);
+  if (!ctx) return;
+  const c = ctx.canvas;
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.strokeStyle = "#2c3140";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, c.width - 1, c.height - 1);
+  if (!Array.isArray(values) || values.length === 0) {
+    ctx.fillStyle = "#8a93a6";
+    ctx.font = "11px JetBrains Mono, monospace";
+    ctx.fillText("no data", 8, 16);
+    return;
+  }
+  const bins = Math.max(2, Math.min(60, opts.bins || 20));
+  const vmin = 0;
+  const vmax = Math.max(1e-6, ...values.map((v) => Math.max(0, Number(v) || 0)));
+  const counts = new Array(bins).fill(0);
+  for (const v of values) {
+    const x = Math.max(vmin, Math.min(vmax, Number(v) || 0));
+    let idx = Math.floor(((x - vmin) / (vmax - vmin)) * bins);
+    if (idx >= bins) idx = bins - 1;
+    counts[idx]++;
+  }
+  const cmax = Math.max(...counts) || 1;
+  const pad = 18;
+  const w = c.width - 2 * pad;
+  const h = c.height - 2 * pad;
+  const bw = w / bins;
+  ctx.fillStyle = "#4da3ff";
+  for (let i = 0; i < bins; i++) {
+    const bh = (counts[i] / cmax) * h;
+    ctx.fillRect(pad + i * bw + 0.5, pad + (h - bh), Math.max(1, bw - 1), bh);
+  }
+  ctx.fillStyle = "#8a93a6";
+  ctx.font = "10px JetBrains Mono, monospace";
+  ctx.fillText("0", pad, c.height - 4);
+  ctx.fillText(vmax.toFixed(2) + " px", c.width - pad - 40, c.height - 4);
+  ctx.fillText("N=" + values.length, pad, 12);
+}
+
+function drawScatter(canvasId, values, opts = {}) {
+  // Dots at (i, v[i]). x = sample index, y = residual px. Useful for spotting
+  // a single bad sample dominating the RMS.
+  const ctx = _getCtx(canvasId);
+  if (!ctx) return;
+  const c = ctx.canvas;
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.strokeStyle = "#2c3140";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, c.width - 1, c.height - 1);
+  if (!Array.isArray(values) || values.length === 0) {
+    ctx.fillStyle = "#8a93a6";
+    ctx.font = "11px JetBrains Mono, monospace";
+    ctx.fillText("no data", 8, 16);
+    return;
+  }
+  const n = values.length;
+  const vmax = Math.max(1e-6, ...values.map((v) => Math.max(0, Number(v) || 0)));
+  const pad = 18;
+  const w = c.width - 2 * pad;
+  const h = c.height - 2 * pad;
+  ctx.fillStyle = "#5fd37f";
+  for (let i = 0; i < n; i++) {
+    const x = pad + (n === 1 ? w / 2 : (i / (n - 1)) * w);
+    const v = Math.max(0, Number(values[i]) || 0);
+    const y = pad + (h - (v / vmax) * h);
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = "#8a93a6";
+  ctx.font = "10px JetBrains Mono, monospace";
+  ctx.fillText("0", pad, c.height - 4);
+  ctx.fillText("i=" + (n - 1), c.width - pad - 40, c.height - 4);
+  ctx.fillText("max=" + vmax.toFixed(2) + "px", pad, 12);
+}
+
+function _projectBoardCentroid(sample, K) {
+  // For each sample, project the board origin (T_cam_board * [0,0,0,1]) to
+  // pixel coordinates via the K-pinhole. Returns {x, y, z} where z is the
+  // depth in metres (used for warm-vs-cool colouring).
+  // sample is expected to expose `T_cam_board` as a 4x4 row-major list-of-
+  // lists; we tolerate flat 16-element arrays too. K is 3x3 (list-of-lists or
+  // flat 9-element). If anything is missing we return null and the caller
+  // skips the dot.
+  if (!sample || !K) return null;
+  const T = sample.T_cam_board || sample.t_cam_board;
+  if (!T) return null;
+  const fx = K[0] && K[0][0] !== undefined ? K[0][0] : (Array.isArray(K) ? K[0] : null);
+  const fy = K[1] && K[1][1] !== undefined ? K[1][1] : (Array.isArray(K) ? K[4] : null);
+  const cx = K[0] && K[0][2] !== undefined ? K[0][2] : (Array.isArray(K) ? K[2] : null);
+  const cy = K[1] && K[1][2] !== undefined ? K[1][2] : (Array.isArray(K) ? K[5] : null);
+  if ([fx, fy, cx, cy].some((v) => v === null || v === undefined)) return null;
+  // Board origin in camera frame == T_cam_board[:3, 3]
+  let tx, ty, tz;
+  if (Array.isArray(T[0])) {
+    tx = T[0][3]; ty = T[1][3]; tz = T[2][3];
+  } else {
+    tx = T[3]; ty = T[7]; tz = T[11];
+  }
+  if (!Number.isFinite(tz) || tz <= 0) return null;
+  return { x: fx * (tx / tz) + cx, y: fy * (ty / tz) + cy, z: tz };
+}
+
+function drawCoverage(canvasId, samples, K, opts = {}) {
+  // Plot the projected board centroid for each sample, colored by depth
+  // (warm = closer). Assumes a typical RealSense 640x480 image grid; if the
+  // K matrix's principal point implies a larger image, we expand the visible
+  // box to cover it.
+  const ctx = _getCtx(canvasId);
+  if (!ctx) return;
+  const c = ctx.canvas;
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.strokeStyle = "#2c3140";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, c.width - 1, c.height - 1);
+  if (!Array.isArray(samples) || samples.length === 0 || !K) {
+    ctx.fillStyle = "#8a93a6";
+    ctx.font = "11px JetBrains Mono, monospace";
+    ctx.fillText("no samples", 8, 16);
+    return;
+  }
+  // Heuristic image bounds from the K principal point.
+  let imgW = 640, imgH = 480;
+  try {
+    const cx = Array.isArray(K[0]) ? K[0][2] : K[2];
+    const cy = Array.isArray(K[1]) ? K[1][2] : K[5];
+    if (Number.isFinite(cx)) imgW = Math.max(imgW, Math.round(2 * cx));
+    if (Number.isFinite(cy)) imgH = Math.max(imgH, Math.round(2 * cy));
+  } catch (_) {}
+  const pad = 6;
+  const sx = (c.width - 2 * pad) / imgW;
+  const sy = (c.height - 2 * pad) / imgH;
+  const s = Math.min(sx, sy);
+  const offX = (c.width - imgW * s) / 2;
+  const offY = (c.height - imgH * s) / 2;
+  // Draw image-bound rectangle so the operator can see the camera frame.
+  ctx.strokeStyle = "#3a4255";
+  ctx.strokeRect(offX, offY, imgW * s, imgH * s);
+
+  const projected = samples.map((s_) => _projectBoardCentroid(s_, K)).filter(Boolean);
+  if (projected.length === 0) {
+    ctx.fillStyle = "#8a93a6";
+    ctx.font = "11px JetBrains Mono, monospace";
+    ctx.fillText("no projected centroids (missing T_cam_board?)", 8, 16);
+    return;
+  }
+  const zmin = Math.min(...projected.map((p) => p.z));
+  const zmax = Math.max(...projected.map((p) => p.z));
+  const zr = Math.max(1e-6, zmax - zmin);
+  ctx.font = "10px JetBrains Mono, monospace";
+  projected.forEach((p, i) => {
+    const t = (p.z - zmin) / zr;
+    // Warm (closer, t=0) -> orange/red; cool (farther, t=1) -> blue.
+    const r = Math.round(255 * (1 - t));
+    const g = Math.round(120 + 80 * (1 - t));
+    const b = Math.round(80 + 175 * t);
+    const px = offX + p.x * s;
+    const py = offY + p.y * s;
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.beginPath();
+    ctx.arc(px, py, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#e3e7ef";
+    ctx.fillText(String(i), px + 5, py - 5);
+  });
+  // Depth legend
+  ctx.fillStyle = "#8a93a6";
+  ctx.fillText(
+    `N=${projected.length}  z=[${zmin.toFixed(2)}, ${zmax.toFixed(2)}] m`,
+    8, c.height - 6);
+}
+
+function _setKv(rootSel, key, text) {
+  const cell = document.querySelector(`${rootSel} td[data-k="${key}"]`);
+  if (cell) cell.textContent = text;
+}
+
+function _renderVerdict(status) {
+  if (!SOLVE_VERDICT) return;
+  SOLVE_VERDICT.hidden = !status;
+  SOLVE_VERDICT.className = "gate-pill";
+  if (!status) return;
+  const cls = String(status).toLowerCase();
+  if (cls === "pass" || cls === "warn" || cls === "fail") {
+    SOLVE_VERDICT.classList.add(cls);
+  }
+  SOLVE_VERDICT.textContent = String(status);
+}
+
+function _renderMethodTable(rows) {
+  if (!METHOD_TABLE) return;
+  METHOD_TABLE.innerHTML = "";
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>method</th><th>reproj (px)</th></tr>";
+  METHOD_TABLE.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  if (!Array.isArray(rows) || rows.length === 0) {
+    const tr = document.createElement("tr");
+    tr.className = "empty";
+    tr.innerHTML = '<td colspan="2">(no methods reported)</td>';
+    tbody.appendChild(tr);
+  } else {
+    const bestPx = Math.min(...rows.map((r) => Number(r.reproj_px)));
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      const px = Number(r.reproj_px);
+      if (Number.isFinite(px) && Math.abs(px - bestPx) < 1e-9) tr.className = "best";
+      tr.innerHTML = `<td>${r.name}</td><td class="num">${Number.isFinite(px) ? px.toFixed(3) : "?"}</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+  METHOD_TABLE.appendChild(tbody);
+}
+
+function renderSolvePayload(p) {
+  lastSolve = p;
+  _renderVerdict(p.status);
+  _renderMethodTable(p.per_method_summary || []);
+  const tm = p.train_metrics_mm_deg || {};
+  const hm = p.heldout_metrics_mm_deg || {};
+  _setKv("#solve-metrics", "train_trans",
+    Number.isFinite(tm.trans_rmse_mm) ? tm.trans_rmse_mm.toFixed(3) + " mm" : "–");
+  _setKv("#solve-metrics", "train_rot",
+    Number.isFinite(tm.rot_rmse_deg) ? tm.rot_rmse_deg.toFixed(3) + " deg" : "–");
+  _setKv("#solve-metrics", "train_reproj",
+    Number.isFinite(tm.reproj_px) ? tm.reproj_px.toFixed(3) + " px" : "–");
+  _setKv("#solve-metrics", "held_trans",
+    Number.isFinite(hm.trans_rmse_mm) ? hm.trans_rmse_mm.toFixed(3) + " mm" : "–");
+  _setKv("#solve-metrics", "held_rot",
+    Number.isFinite(hm.rot_rmse_deg) ? hm.rot_rmse_deg.toFixed(3) + " deg" : "–");
+  _setKv("#solve-metrics", "held_reproj",
+    Number.isFinite(hm.reproj_px) ? hm.reproj_px.toFixed(3) + " px" : "–");
+  const xyz = p.X_xyz_mm || [];
+  const rpy = p.X_rpy_deg || [];
+  _setKv("#solve-X", "X_xyz_mm",
+    xyz.length === 3 ? `[${xyz.map((v) => Number(v).toFixed(3)).join(", ")}] mm` : "–");
+  _setKv("#solve-X", "X_rpy_deg",
+    rpy.length === 3 ? `[${rpy.map((v) => Number(v).toFixed(3)).join(", ")}] deg` : "–");
+
+  const resids = p.per_sample_reproj_px || [];
+  drawHistogram("resid-hist", resids, { bins: 20 });
+  drawScatter("resid-scatter", resids);
+  // Coverage uses sample metadata (T_cam_board + K) which T4 will publish via
+  // state.samples + state.K. Until then we fall back to whatever the latest
+  // state push exposes; an empty array just yields the "no samples" message.
+  const samples = (state && Array.isArray(state.samples)) ? state.samples : [];
+  const K = (state && state.K) || (state && state.intrinsics && state.intrinsics.K) || null;
+  drawCoverage("coverage", samples, K);
+}
+
+async function runSolve() {
+  if (!SOLVE_METHOD) return;
+  const method = SOLVE_METHOD.value || "auto";
+  setStatus(SOLVE_STATUS, "solving…", "warn");
+  if (SOLVE_BTN) SOLVE_BTN.disabled = true;
+  try {
+    const r = await fetch("/api/solve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method }),
+    });
+    const body = await r.json();
+    if (!r.ok || !body.ok) {
+      _renderVerdict(null);
+      setStatus(SOLVE_STATUS,
+        "FAIL: " + (body.reason || body.detail || ("HTTP " + r.status)),
+        "err");
+      return;
+    }
+    const verdict = body.status || "PASS";
+    const kind = verdict === "PASS" ? "ok" : (verdict === "WARN" ? "warn" : "err");
+    setStatus(SOLVE_STATUS, `solve ${verdict} (method=${method})`, kind);
+    renderSolvePayload(body);
+  } catch (e) {
+    _renderVerdict(null);
+    setStatus(SOLVE_STATUS, "ERROR: " + e, "err");
+  } finally {
+    if (SOLVE_BTN) SOLVE_BTN.disabled = false;
+  }
+}
+
+if (SOLVE_BTN) SOLVE_BTN.addEventListener("click", runSolve);
+
+// Expose the canvas helpers + solve handler on `window` so manual smoke tests
+// and the brief's "Produces" list both have an inspectable surface.
+window.drawHistogram = drawHistogram;
+window.drawScatter = drawScatter;
+window.drawCoverage = drawCoverage;
+window.runSolve = runSolve;
+window.renderSolvePayload = renderSolvePayload;

@@ -412,3 +412,56 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: var(--err);
   color: #fff;
 }
+
+/* ---- T5: Solve tab — method picker + comparison table + canvases --- *
+ * Same monospace / muted-label visual grammar as the rest of the dark   *
+ * surfaces. method-table mirrors pan_tilt's per-method residual table:  *
+ * left-aligned name column, right-aligned numeric column, the row with  *
+ * the best (lowest) reproj_px highlighted via .best. The canvas-row     *
+ * sits a histogram + scatter side-by-side; both are 360x140 vanilla     *
+ * canvas2d (no chart library). Coverage canvas is wider (600x400) to    *
+ * fit the projected board centroids comfortably.                       */
+.solve-panel { max-width: 720px; }
+.solve-panel h3 {
+  margin: 14px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.method-table {
+  width: 100%;
+  max-width: 360px;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
+.method-table th,
+.method-table td { padding: 3px 8px; }
+.method-table th {
+  text-align: left;
+  color: var(--fg-muted);
+  font-weight: normal;
+  border-bottom: 1px solid var(--border);
+}
+.method-table td.num { text-align: right; }
+.method-table tr.best td { color: var(--ok); font-weight: 600; }
+.method-table tr.empty td { color: var(--fg-muted); font-style: italic; }
+
+.canvas-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+}
+.canvas-row canvas,
+#coverage {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  display: block;
+  max-width: 100%;
+}

@@ -16,12 +16,26 @@ _METHODS = {
 }
 
 
-def _reproj_rms(X, Tbb, samples, K, dist, board_pts):
+def _reproj_rms(X, Tbb, samples, K, dist, board_pts, *, per_sample=False):
+    """Reprojection RMS over all corners across ``samples``.
+
+    When ``per_sample`` is ``True``, also returns a list[float] of per-sample
+    RMS values (one per element of ``samples``, in order) so the caller can
+    surface per-frame residuals without re-doing the projection math. Empty
+    ``samples`` returns ``(0.0, [])`` in that path to keep the contract total.
+    """
     sq = []
+    per_sample_vals = []
     for s in samples:
         T_cam_board = tf.invert(s.T_base_eef @ X) @ Tbb
         pred = hm.project_corners(board_pts[s.corner_idx], T_cam_board, K, dist)
-        sq.append(np.sum((pred - s.obs_px) ** 2, axis=1))
+        diff_sq = np.sum((pred - s.obs_px) ** 2, axis=1)
+        sq.append(diff_sq)
+        if per_sample:
+            per_sample_vals.append(float(np.sqrt(np.mean(diff_sq))) if diff_sq.size else 0.0)
+    if per_sample:
+        agg = float(np.sqrt(np.mean(np.concatenate(sq)))) if sq else 0.0
+        return agg, per_sample_vals
     return float(np.sqrt(np.mean(np.concatenate(sq))))
 
 
@@ -29,14 +43,23 @@ def _estimate_board_in_base(X, samples):
     return tf.se3_average([s.T_base_eef @ X @ s.T_cam_board for s in samples])
 
 
-def seed_handeye(samples, K, dist, board_pts):
-    """Run all OpenCV hand-eye methods, return the X with lowest reprojection RMS."""
+def seed_handeye(samples, K, dist, board_pts, *, methods=None):
+    """Run hand-eye methods, return the X with lowest reprojection RMS.
+
+    ``methods`` (optional): a dict[str, int] of {name: cv2.CALIB_HAND_EYE_*}
+    subset to run. ``None`` (default) preserves the historical behaviour of
+    running every entry in :data:`_METHODS` (all five OpenCV methods). Pass a
+    single-key dict to restrict to one specific method — the rest of the
+    pipeline (best-of, bundle-adjust, gate) treats that one method as the
+    sole candidate.
+    """
+    use_methods = _METHODS if methods is None else methods
     R_g2b = [np.asarray(s.T_base_eef)[:3, :3] for s in samples]
     t_g2b = [np.asarray(s.T_base_eef)[:3, 3] for s in samples]
     R_t2c = [np.asarray(s.T_cam_board)[:3, :3] for s in samples]
     t_t2c = [np.asarray(s.T_cam_board)[:3, 3] for s in samples]
     per_method = []
-    for name, flag in _METHODS.items():
+    for name, flag in use_methods.items():
         try:
             R_c2g, t_c2g = cv2.calibrateHandEye(R_g2b, t_g2b, R_t2c, t_t2c, method=flag)
         except cv2.error:
@@ -121,9 +144,13 @@ def gate(metrics):
     return "FAIL"
 
 
-def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0):
+def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *, methods=None):
+    """Full solve pipeline. ``methods`` is forwarded to :func:`seed_handeye`
+    so a single-method run (e.g. ``methods={"TSAI": cv2.CALIB_HAND_EYE_TSAI}``)
+    skips the multi-method best-of step; ``None`` keeps the default 5-method
+    sweep."""
     train, test = split_train_test(samples, heldout_frac, rng_seed)
-    X0, Tbb0, per_method = seed_handeye(train, K, dist, board_pts)
+    X0, Tbb0, per_method = seed_handeye(train, K, dist, board_pts, methods=methods)
     X, Tbb, _ = bundle_adjust(train, K, dist, board_pts, X0, Tbb0)
     train_m = evaluate(X, Tbb, train, K, dist, board_pts)
     held_m = evaluate(X, Tbb, test, K, dist, board_pts)

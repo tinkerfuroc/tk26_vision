@@ -24,7 +24,11 @@ _STR = [
     ("base_frame", "link_base"),
     ("eef_frame", "link_eef"),
     ("aruco_dict", "DICT_5X5_100"),
-    ("jointmove_action", "/xarm/joint_move"),
+    # Canonical action name as of 2026-06-20 (see commit 78cd535 in tk25
+    # for the BT migration). The legacy /xarm/joint_move endpoint was
+    # retired by tk25_manipulation — verified empty (0 servers) via
+    # `ros2 action info /xarm/joint_move`.
+    ("jointmove_action", "joint_move_action"),
     ("mount_to_color_xyz", "0 0 0"),
     ("mount_to_color_rpy", "0 0 0"),
 ]

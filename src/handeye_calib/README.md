@@ -70,11 +70,14 @@ pytest test/                          # unit suite (source the workspace first f
 
 ## UI
 
-The `handeye_web` tool is a single-page calibration UI with five tabs:
+The `handeye_web` tool is a single-page calibration UI with four tabs:
 
 - **Info** — camera / TF / robot / ChArUco board / safety envelope status, plus the `T_base_eef` matrix.
-- **Move** — joint editor (rad/deg toggle), Load-current / Zero / presets, with a live SafetyEnvelope verdict on the current EE pose before sending.
-- **Capture** — stability-gated capture (three steady frames at < 0.0003 m / 0.1° drift), sample gallery with per-capture thumbnails + per-sample delete, diversity meter (max pairwise rotation° / 30° target).
+- **Capture** — single-tab end-to-end authoring + capture workflow (mirrors `pan_tilt/calib_web`'s "xArm Waypoints" tab):
+  - Joint editor (rad/deg toggle), Load-current / Zero / Move (joints) / presets, with a live SafetyEnvelope verdict on the current EE pose before sending.
+  - Waypoints sub-panel: record an ordered list of arm poses, save/reload per-robot (see [Waypoints + auto-capture](#waypoints--auto-capture) below).
+  - Auto-capture sequence controls: Run / Run dry / Cancel + live progress + bounded log.
+  - Manual capture: stability-gated single-shot button (three steady frames at < 0.0003 m / 0.1° drift), sample gallery with per-capture thumbnails + per-sample delete, diversity meter (max pairwise rotation° / 30° target).
 - **Solve** — method picker (auto / TSAI / PARK / HORAUD / ANDREFF / DANIILIDIS), per-method reprojection comparison table, residual histogram + scatter, sample-coverage canvas, PASS / WARN / FAIL gate pill with mm / deg / px units.
 - **Promote** — side-by-side unified-diff preview for **both** `hand_eye.yaml` AND a per-robot `wrist_camera.xacro` override, ROBOT_NAME-scoped, confirm-before-apply, backup paths surfaced for each write. Reload-from-disk clears the cached solve so the operator can re-run.
 
@@ -125,9 +128,9 @@ preserving the rest of the override verbatim.
 The Capture tab supports an ordered list of arm waypoints and a one-click
 auto-capture sweep:
 
-1. Move the arm to a pose you want (xArm teach mode, or the Move tab's
-   joint editor). Click **+ Add current joints** to append the live
-   `xArm joints` to the waypoint list.
+1. Move the arm to a pose you want (xArm teach mode, or the Capture tab's
+   built-in joint editor at the top). Click **+ Add current joints** to
+   append the live `xArm joints` to the waypoint list.
 2. Repeat until you have 12-20 diverse poses (the diversity meter helps —
    you want > 30° of rotation spread).
 3. Click **Save to disk** — the list persists to
@@ -161,6 +164,16 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.5.1 (2026-06-20): **Move tab folded into Capture tab.** The standalone
+  "Move" tab was redundant — its joint editor + presets + live SafetyEnvelope
+  preview were the prerequisite for waypoint authoring, so the workflow felt
+  fragmented across two tabs. Merged: the Capture tab now mirrors
+  `pan_tilt/calib_web`'s "xArm Waypoints" tab layout — joint editor →
+  presets → waypoints sub-panel → auto-capture sequence controls → manual
+  capture + stability + gallery + diversity, all in one top-to-bottom scroll.
+  Tab count drops from five (Info / Move / Capture / Solve / Promote) to
+  four (Info / Capture / Solve / Promote). All DOM IDs (`move-*`,
+  `waypoint-*`, `sequence-*`, `capture-*`) unchanged — pure layout move.
 - 0.5.0 (2026-06-20): **Waypoint authoring + auto-capture sequence.** New backend module
   `waypoints.py` with `WaypointStore` + per-robot YAML persistence
   (`src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/handeye_waypoints.yaml`).

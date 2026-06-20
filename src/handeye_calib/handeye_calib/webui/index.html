@@ -26,7 +26,6 @@
 
     <nav class="side-tabs">
       <button class="side-tab active" data-tab="info">Info</button>
-      <button class="side-tab" data-tab="move">Move</button>
       <button class="side-tab" data-tab="capture">Capture</button>
       <button class="side-tab" data-tab="solve">Solve</button>
       <button class="side-tab" data-tab="promote">Promote</button>
@@ -68,12 +67,21 @@
       <h2>Safety envelope</h2>
       <pre class="matrix-block" id="info-safety">–</pre>
     </section>
-    <section class="side-panel-content" data-panel="move">
-      <!-- Joint editor. Mirrors src/pan_tilt/webui/index.html (xArm Waypoints
-           tab) verbatim — same unit-toggle radio group + joint-grid pattern,
-           same confirm() copy on Move (joints), same Load current / Zero all
-           buttons. Reusing the visual language so the two tools feel like
-           the same family. -->
+    <section class="side-panel-content" data-panel="capture">
+      <!-- Mirrors src/pan_tilt/webui (xArm Waypoints tab) layout — the entire
+           capture workflow lives in one tab, top-to-bottom:
+             1. Joint editor + Move (joints) + safety preview + presets
+                (former "Move" tab; merged here so the operator authors poses
+                 in the same place they collect them)
+             2. Waypoints sub-panel (list + add-current + save/reload)
+             3. Auto-capture sequence controls (run / dry / cancel + log)
+             4. Manual capture (stability gate + Capture pose button + status)
+             5. Diversity meter + sample gallery
+           Settle gate is the HARD pre-capture check — the manual Capture
+           button stays disabled until camera + intrinsics + detection +
+           steady all line up. -->
+
+      <!-- 1. Joint editor + Move (single) + presets -->
       <div class="move-panel">
         <p class="muted">
           Send a <code>tinker_arm_msgs/JointMove</code> goal to <code>/xarm/joint_move</code>.
@@ -110,18 +118,9 @@
           calibration session is recorded — see the TODO in <code>app.js</code>.
         </p>
       </div>
-    </section>
-    <section class="side-panel-content" data-panel="capture">
-      <!-- T4 Capture tab: settle-gated capture button, gallery of accepted
-           samples (with per-row thumbnail + delete), and a diversity meter
-           showing the max pairwise rotation spread across accepted poses.
-           The settle gate is the HARD pre-capture check — the button stays
-           disabled until camera + intrinsics + detection + steady all line
-           up, mirroring the v1 deferral closed in T4. -->
 
-      <!-- T2 Waypoints sub-panel: record a sequence of arm poses, save/reload
-           per-robot, then auto-capture will cycle through them. Goes ABOVE the
-           manual capture button. -->
+      <!-- 2. Waypoints sub-panel: record a sequence of arm poses, save/reload
+           per-robot, then auto-capture will cycle through them. -->
       <div class="waypoints-panel">
         <h3>Capture waypoints</h3>
         <p class="muted">

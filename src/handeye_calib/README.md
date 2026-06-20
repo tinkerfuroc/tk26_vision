@@ -120,6 +120,37 @@ header comment instructing the include + vendor-disable). When it does
 exist, the UI shows a **patch** of the existing file's `<origin>` only,
 preserving the rest of the override verbatim.
 
+## Waypoints + auto-capture
+
+The Capture tab supports an ordered list of arm waypoints and a one-click
+auto-capture sweep:
+
+1. Move the arm to a pose you want (xArm teach mode, or the Move tab's
+   joint editor). Click **+ Add current joints** to append the live
+   `xArm joints` to the waypoint list.
+2. Repeat until you have 12-20 diverse poses (the diversity meter helps —
+   you want > 30° of rotation spread).
+3. Click **Save to disk** — the list persists to
+   `src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/handeye_waypoints.yaml`
+   (atomic write with timestamped backup). Re-runs of the web server
+   reload the file on startup; you only record the sequence once per
+   robot.
+4. Click **Run dry** first to verify every waypoint is reachable
+   (move + settle, NO capture). The arm sweeps through the list; any
+   waypoint that times out on settle is logged and skipped. Cancel
+   stops the run after the current step.
+5. When the dry-run looks clean, click **Run sequence** for the real
+   thing. Each settled pose feeds the manual capture path — same
+   StabilityTracker gate, same SafetyEnvelope check, same sample
+   gallery population. The Solve tab is reachable as soon as ≥ 6
+   diverse samples are in the gallery.
+
+The sequence runner is single-instance — `Run sequence` is disabled
+while another run is in flight. **Cancel** is cooperative + immediate:
+the in-flight JointMove goal is cancelled and the runner exits at the
+next state transition (typically within 50 ms). Operator safety is on
+the arm driver + SafetyEnvelope, not on this UI.
+
 ## Acceptance gate
 
 Held-out poses must clear pan-tilt parity: translation < 3 mm, rotation < 0.5°,
@@ -130,6 +161,24 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.5.0 (2026-06-20): **Waypoint authoring + auto-capture sequence.** New backend module
+  `waypoints.py` with `WaypointStore` + per-robot YAML persistence
+  (`src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/handeye_waypoints.yaml`).
+  Auto-loaded on startup; refuses save when `ROBOT_NAME` unset.
+  - Capture tab gained a waypoints sub-panel: add-current / per-row load+delete /
+    save+reload buttons, and a sequence controls strip below it:
+    **Run sequence**, **Run dry**, **Cancel**, with a live progress line and
+    bounded log.
+  - New `CaptureSequenceRunner` daemon-thread state machine drives
+    move → settle → capture per waypoint. Reuses the existing JointMove
+    client + StabilityTracker + `do_capture` path — no fast path bypassing
+    the SafetyEnvelope. Cancel is cooperative + immediate (in-flight goal
+    cancelled, runner exits at next transition).
+  - New endpoints: `GET/POST /api/waypoints`, `DELETE /api/waypoints/{idx}`,
+    `POST /api/waypoints/save`, `POST /api/waypoints/reload`,
+    `POST /api/sequence/start` (body `{dry_run: bool}`),
+    `POST /api/sequence/cancel`. WS state extended with `state.waypoints`
+    + `state.sequence`.
 - 0.4.0 (2026-06-20): **handeye_web quality rewrite to pan_tilt parity.** The
   v1 inline ~30-line UI was replaced by a static `webui/` (index.html +
   style.css + app.js) bundle covering all five tabs. New surface:

@@ -705,9 +705,24 @@ if (WP_REL_BTN) WP_REL_BTN.addEventListener("click", async () => {
   }
 });
 
+// Cache the last-rendered waypoint signature so we only rewrite WP_LIST.innerHTML
+// when state.waypoints ACTUALLY changes. Without this guard, render() (called
+// from every 10 Hz WS push) destroys + recreates the list DOM 10 times/sec
+// unconditionally; per-row button clicks landing in the destroy/rebuild window
+// get suppressed by the browser (mousedown on old button, mouseup on new DOM
+// node = no click event fires), forcing the operator to "click multiple times".
+// pan_tilt's calib_web only re-renders its waypoint list after user actions for
+// the same reason. (See systematic-debugging session 2026-06-20.)
+let _lastWaypointsSig = null;
 function renderWaypointsList() {
   if (!WP_LIST) return;
   const wps = (state && Array.isArray(state.waypoints)) ? state.waypoints : [];
+  // Signature must include every field the render reads: idx + joints_rad
+  // (for the tooltip + Load) + abbrev (for the visible label). Stringify is
+  // ~1µs for typical N<30 — cheap relative to the innerHTML rewrite it saves.
+  const sig = JSON.stringify(wps);
+  if (sig === _lastWaypointsSig) return;
+  _lastWaypointsSig = sig;
   if (wps.length === 0) {
     WP_LIST.innerHTML = '<li class="waypoints-empty">no waypoints recorded yet</li>';
     return;

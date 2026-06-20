@@ -70,6 +70,51 @@ def test_delete_sample_by_idx_out_of_range():
         node.destroy_node()
 
 
+# ---------------------------------------------------------------------------
+# T3-seq: CaptureSequenceRunner state machine
+# ---------------------------------------------------------------------------
+
+def test_sequence_refuses_when_empty_waypoints():
+    """T3-seq: do_start_sequence must refuse when no waypoints are recorded.
+
+    The runner can't loop over an empty list; the auto-capture entry point
+    is the operator's only safe gate against starting an empty run."""
+    node = HandeyeWebNode()
+    try:
+        r = node.do_start_sequence(dry_run=False)
+        assert r["ok"] is False
+        assert "no waypoints" in r["reason"].lower()
+    finally:
+        node.destroy_node()
+
+
+def test_sequence_state_dict_shape():
+    """T3-seq: state.sequence dict has the contract keys (idle defaults).
+
+    Before any start, the runner may be ``None`` (lazy construction); the
+    idle-default dict is what the WS push emits via ``state.sequence`` so the
+    UI doesn't have to special-case "no runner yet"."""
+    node = HandeyeWebNode()
+    try:
+        s = node.sequence_runner.state_dict() if node.sequence_runner else {
+            "running": False, "dry_run": False, "current_idx": None,
+            "total": 0, "current_step": "idle", "log": []}
+        for k in ("running", "dry_run", "current_idx", "total", "current_step", "log"):
+            assert k in s, f"missing key {k!r} in sequence state dict: {s}"
+    finally:
+        node.destroy_node()
+
+
+def test_sequence_cancel_when_not_running_is_noop():
+    """T3-seq: cancel is idempotent — calling without a live runner returns ok=True."""
+    node = HandeyeWebNode()
+    try:
+        r = node.do_cancel_sequence()
+        assert r["ok"] is True
+    finally:
+        node.destroy_node()
+
+
 def test_safety_preview_graceful_degrades_without_tf():
     """T3: ``safety_preview()`` returns the right shape even without TF /
     cached pose so the UI can render the "unknown" branch instead of crashing.

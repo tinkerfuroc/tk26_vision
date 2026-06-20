@@ -192,12 +192,12 @@ def _make_node_class():
                 self.get_logger().warn(f"SafetyEnvelope unavailable ({exc}); skipping pose validation")
                 self._safety = None
 
-            self._image_topic = self._param("color_image_topic", "/xarm_camera/color/image_raw")
+            self._image_topic = self._param("color_image_topic", "/camera/xarm_camera/color/image_raw")
             self.create_subscription(
                 Image, self._image_topic,
                 self._on_image, qos_profile_sensor_data)
             self.create_subscription(
-                CameraInfo, self._param("camera_info_topic", "/xarm_camera/color/camera_info"),
+                CameraInfo, self._param("camera_info_topic", "/camera/xarm_camera/color/camera_info"),
                 self._on_info, qos_profile_sensor_data)
             self._jm = ActionClient(self, JointMove, self._param("jointmove_action", "/xarm/joint_move"))
 

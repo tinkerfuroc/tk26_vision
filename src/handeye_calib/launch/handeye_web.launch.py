@@ -15,8 +15,12 @@ from launch_ros.parameter_descriptions import ParameterValue
 _STR = [
     ("bind", "127.0.0.1"),
     ("robot_name", ""),
-    ("color_image_topic", "/xarm_camera/color/image_raw"),
-    ("camera_info_topic", "/xarm_camera/color/camera_info"),
+    # Matches the realsense2_camera launch convention used in this workspace
+    # (namespace=/camera, node=xarm_camera) — topics land at
+    # /camera/xarm_camera/color/*. Override via launch arg if the wrist camera
+    # is brought up under a different namespace.
+    ("color_image_topic", "/camera/xarm_camera/color/image_raw"),
+    ("camera_info_topic", "/camera/xarm_camera/color/camera_info"),
     ("base_frame", "link_base"),
     ("eef_frame", "link_eef"),
     ("aruco_dict", "DICT_5X5_100"),

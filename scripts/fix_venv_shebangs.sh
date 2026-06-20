@@ -35,6 +35,7 @@ DEFAULT_PACKAGES=(
     vision_track
     tk_vision_specialized
     restaurant_nav_test_web
+    handeye_calib
 )
 if [ -n "${PACKAGES:-}" ]; then
     # shellcheck disable=SC2206

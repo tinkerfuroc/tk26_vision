@@ -601,6 +601,108 @@ function render() {
   renderMoveSafety(state);
   // T4: Capture-tab stability badge + gallery + diversity meter.
   renderCaptureTab(state);
+  // T2: Waypoints sub-panel (above manual capture button).
+  renderWaypointsList();
+}
+
+// ---- T2: Waypoints sub-panel — list + add-current + delete + save/reload --
+// Lives in the Capture tab, above the manual capture button. Reads
+// state.waypoints (array of {idx, abbrev, joints_rad}) on every WS push.
+// Load fills the Move-tab joint inputs via writeMoveJoints(); Delete fires
+// DELETE /api/waypoints/{idx}; Save/Reload hit the matching POST endpoints.
+// All confirm()/status semantics copied verbatim from pan_tilt/webui/app.js.
+const WP_LIST     = document.getElementById("waypoints-list");
+const WP_ADD_BTN  = document.getElementById("waypoint-add-current-btn");
+const WP_SAVE_BTN = document.getElementById("waypoint-save-btn");
+const WP_REL_BTN  = document.getElementById("waypoint-reload-btn");
+
+if (WP_ADD_BTN) WP_ADD_BTN.addEventListener("click", async () => {
+  setStatus("waypoints-status", "adding…", "warn");
+  try {
+    const r = await fetch("/api/waypoints", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    const body = await r.json();
+    setStatus("waypoints-status",
+      body.ok ? `added — ${body.count} waypoint(s)` : `add failed: ${body.reason}`,
+      body.ok ? "ok" : "err");
+  } catch (e) {
+    setStatus("waypoints-status", "ERROR: " + e, "err");
+  }
+});
+
+if (WP_SAVE_BTN) WP_SAVE_BTN.addEventListener("click", async () => {
+  if (!confirm("Save the current waypoint sequence to disk?\n(Existing per-robot waypoints YAML will be backed up first.)")) return;
+  setStatus("waypoints-status", "saving…", "warn");
+  try {
+    const r = await fetch("/api/waypoints/save", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    const body = await r.json();
+    setStatus("waypoints-status",
+      body.ok ? `saved to ${body.path}` : `save failed: ${body.reason}`,
+      body.ok ? "ok" : "err");
+  } catch (e) {
+    setStatus("waypoints-status", "ERROR: " + e, "err");
+  }
+});
+
+if (WP_REL_BTN) WP_REL_BTN.addEventListener("click", async () => {
+  setStatus("waypoints-status", "reloading…", "warn");
+  try {
+    const r = await fetch("/api/waypoints/reload", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    const body = await r.json();
+    setStatus("waypoints-status",
+      body.ok ? `loaded ${body.count} waypoint(s) from ${body.path}` : `reload failed: ${body.reason}`,
+      body.ok ? "ok" : "err");
+  } catch (e) {
+    setStatus("waypoints-status", "ERROR: " + e, "err");
+  }
+});
+
+function renderWaypointsList() {
+  if (!WP_LIST) return;
+  const wps = (state && Array.isArray(state.waypoints)) ? state.waypoints : [];
+  if (wps.length === 0) {
+    WP_LIST.innerHTML = '<li class="waypoints-empty">no waypoints recorded yet</li>';
+    return;
+  }
+  WP_LIST.innerHTML = wps.map(w =>
+    `<li class="waypoint-row" data-idx="${w.idx}">
+       <span class="waypoint-idx">#${w.idx}</span>
+       <span class="waypoint-joints" title="${w.joints_rad.map(j => j.toFixed(4)).join(', ')} rad">${w.abbrev}</span>
+       <span class="waypoint-actions">
+         <button data-act="load" type="button">Load</button>
+         <button data-act="delete" type="button">Delete</button>
+       </span>
+     </li>`
+  ).join("");
+}
+
+// Delegate clicks for per-row buttons (Load fills the move-tab joint inputs;
+// Delete fires DELETE /api/waypoints/{idx}).
+if (WP_LIST) {
+  WP_LIST.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button[data-act]");
+    if (!btn) return;
+    const row = btn.closest("li[data-idx]");
+    if (!row) return;
+    const idx = parseInt(row.dataset.idx, 10);
+    if (btn.dataset.act === "load") {
+      const wp = state && Array.isArray(state.waypoints) && state.waypoints.find(w => w.idx === idx);
+      if (wp) {
+        writeMoveJoints(wp.joints_rad);
+        setStatus("waypoints-status", `loaded #${idx} into Move tab`, "");
+      }
+    } else if (btn.dataset.act === "delete") {
+      if (!confirm(`Delete waypoint #${idx}?`)) return;
+      try {
+        const r = await fetch(`/api/waypoints/${idx}`, {method: "DELETE"});
+        const body = await r.json();
+        setStatus("waypoints-status",
+          body.ok ? `deleted #${idx} — ${body.count} remaining` : `delete failed: ${body.reason}`,
+          body.ok ? "ok" : "err");
+      } catch (e) {
+        setStatus("waypoints-status", "ERROR: " + e, "err");
+      }
+    }
+  });
 }
 
 // ---- T5: Solve tab — method picker, comparison table, canvases -----------

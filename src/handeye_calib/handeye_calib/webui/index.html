@@ -118,6 +118,29 @@
            The settle gate is the HARD pre-capture check — the button stays
            disabled until camera + intrinsics + detection + steady all line
            up, mirroring the v1 deferral closed in T4. -->
+
+      <!-- T2 Waypoints sub-panel: record a sequence of arm poses, save/reload
+           per-robot, then auto-capture will cycle through them. Goes ABOVE the
+           manual capture button. -->
+      <div class="waypoints-panel">
+        <h3>Capture waypoints</h3>
+        <p class="muted">
+          Record a sequence of arm poses, save them to disk (per-robot), and the
+          auto-capture run-button below will cycle through them. Each move goes
+          through the same SafetyEnvelope + StabilityTracker the manual Capture
+          button does — settle failures skip a step but don't abort the run.
+        </p>
+        <div class="row">
+          <button id="waypoint-add-current-btn" type="button">+ Add current joints</button>
+          <button id="waypoint-save-btn" type="button">Save to disk</button>
+          <button id="waypoint-reload-btn" type="button">Reload from disk</button>
+        </div>
+        <div class="status-line" id="waypoints-status"></div>
+        <ul class="waypoints-list" id="waypoints-list">
+          <li class="waypoints-empty">no waypoints recorded yet</li>
+        </ul>
+      </div>
+
       <div class="capture-panel">
         <div class="stability-badge" id="capture-stability">stability: …</div>
         <button class="primary" id="capture-btn" type="button" disabled>Capture pose</button>

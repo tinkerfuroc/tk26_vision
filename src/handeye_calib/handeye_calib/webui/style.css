@@ -534,3 +534,28 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   margin-left: 6px;
   word-break: break-all;
 }
+
+/* ---- T2: Waypoints sub-panel (Capture tab, above manual capture) -------- */
+.waypoints-panel { margin-bottom: 20px; }
+.waypoints-list {
+  list-style: none; padding: 0; margin: 6px 0 0;
+  border: 1px solid var(--border); border-radius: 4px;
+  max-height: 220px; overflow-y: auto;
+}
+.waypoint-row {
+  display: grid;
+  grid-template-columns: 40px 1fr auto;
+  gap: 8px; align-items: center;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono); font-size: 12px;
+}
+.waypoint-row:last-child { border-bottom: none; }
+.waypoint-idx { color: var(--accent); font-weight: 600; }
+.waypoint-joints { color: var(--fg-muted); }
+.waypoint-actions button { padding: 2px 8px; font-size: 11px; }
+.waypoints-empty {
+  padding: 12px;
+  color: var(--fg-muted);
+  font-style: italic; text-align: center;
+}

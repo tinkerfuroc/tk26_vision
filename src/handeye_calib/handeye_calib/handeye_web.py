@@ -1264,20 +1264,61 @@ def _make_node_class():
                     or self._param("robot_name", "") or "")
 
         def _tk25_basic_repo_root(self):
-            """Locate ``tk25_basic`` by walking up from this source file.
+            """Locate the ``tk25_basic`` ROS package on disk.
 
-            Mirrors ``_hand_eye_path``'s parent-walk so the two resolvers
-            agree. Returns the ``Path`` to ``tk25_basic`` (the ROS package
-            root, NOT its inner ``src/``) or ``None`` if not found — in which
-            case the xacro half stays ``None`` with a ``tk25_basic repo root
-            not resolvable`` reason.
+            Resolution order (first hit wins):
+
+            1. Walk parents of THIS file, checking both ``<parent>/tk25_basic``
+               and ``<parent>/src/tk25_basic`` at each level. Covers source-tree
+               runs (handeye_web.py at ``src/tk26_vision/src/handeye_calib/...``)
+               where ``src/`` is a parent and ``src/tk25_basic`` sits beside us.
+            2. Walk parents of CWD with the same two prefixes. Covers
+               ``ros2 launch`` invoked from the workspace root.
+            3. Use ``ament_index_python`` to find the install share of
+               ``tinker_robot_config``, then walk up to ``install/``'s parent
+               (the workspace root) and check ``src/tk25_basic/...``. Covers
+               install-tree runs where this file lives in
+               ``install/handeye_calib/lib/.../site-packages/handeye_calib/``
+               — no parent of which contains ``tk25_basic`` directly.
+
+            Returns the ``Path`` to ``tk25_basic`` (the ROS package root, NOT
+            its inner ``src/``) or ``None`` if every resolver fails.
             """
             from pathlib import Path
+
+            def _check(parent):
+                for prefix in ("", "src"):
+                    base = parent / prefix if prefix else parent
+                    cand = base / "tk25_basic" / "src" / "tinker_robot_config"
+                    if cand.is_dir():
+                        return (base / "tk25_basic").resolve()
+                return None
+
+            # (1) file-relative
             here = Path(__file__).resolve()
             for parent in here.parents:
-                cand = parent / "tk25_basic" / "src" / "tinker_robot_config"
-                if cand.is_dir():
-                    return parent / "tk25_basic"
+                hit = _check(parent)
+                if hit is not None:
+                    return hit
+            # (2) cwd-relative
+            cwd = Path.cwd().resolve()
+            for parent in (cwd, *cwd.parents):
+                hit = _check(parent)
+                if hit is not None:
+                    return hit
+            # (3) ament_index → workspace root
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                share = Path(get_package_share_directory("tinker_robot_config")).resolve()
+                for parent in share.parents:
+                    if parent.name == "install":
+                        ws_root = parent.parent
+                        hit = _check(ws_root)
+                        if hit is not None:
+                            return hit
+                        break
+            except Exception:
+                pass
             return None
 
         def _mount_joint_name(self):
@@ -1574,17 +1615,18 @@ def _make_node_class():
             return T
 
         def _hand_eye_path(self, robot):
-            """Resolve <ws>/src/.../tinker_robot_config/robots/<robot>/hand_eye.yaml."""
-            from pathlib import Path
+            """Resolve <ws>/src/.../tinker_robot_config/robots/<robot>/hand_eye.yaml.
+
+            Delegates to ``_tk25_basic_repo_root`` so the source-tree /
+            install-tree / cwd resolution is uniform across save endpoints.
+            """
             if not robot:
                 return None
-            here = Path(__file__).resolve()
-            for parent in here.parents:
-                cand = (parent / "tk25_basic" / "src" / "tinker_robot_config"
-                        / "robots" / robot / "hand_eye.yaml")
-                if cand.parent.parent.is_dir():
-                    return cand
-            return None
+            basic_root = self._tk25_basic_repo_root()
+            if basic_root is None:
+                return None
+            return (basic_root / "src" / "tinker_robot_config"
+                    / "robots" / robot / "hand_eye.yaml")
 
         def _rclpy_time(self):
             import rclpy

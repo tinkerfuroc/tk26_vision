@@ -18,6 +18,9 @@
   --err: #ff7a7a;
   --border: #2c3140;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* T2: live camera panel width (resizable via #cam-resize handle). Persisted
+     to localStorage key `handeye-cam-w`; app.js restores on page load. */
+  --cam-w: 480px;
 }
 
 * { box-sizing: border-box; }
@@ -65,6 +68,83 @@ main {
   padding: 12px 16px;
   overflow-y: auto;
 }
+
+/* ---- T2: live frame panel (resizable, floats top-left) -------------- *
+ * Selectors copied from src/pan_tilt/webui/style.css ( .feed-col +     *
+ * .live-frame ) and renamed to .cam-panel for the handeye DOM ids the  *
+ * brief names. The pan_tilt visual layout (16:9 floating thumb, corner *
+ * resize handle, top-strip toolbar, bottom-left badge, dashed-border   *
+ * placeholder) is preserved verbatim — only selector names differ.     */
+.cam-panel {
+  float: left;
+  position: relative;
+  width: var(--cam-w);
+  aspect-ratio: 16 / 9;
+  margin: 0 16px 12px 0;
+  background: #0a0f18;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.cam-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+.cam-img:not([src]), .cam-img[src=""] { visibility: hidden; }
+
+.cam-resize {
+  position: absolute;
+  right: 0; bottom: 0;
+  width: 14px; height: 14px;
+  cursor: nwse-resize;
+  background: linear-gradient(135deg, transparent 45%, var(--border) 50%, transparent 55%);
+  z-index: 3;
+  touch-action: none;
+  user-select: none;
+}
+.cam-resize:hover,
+.cam-resize.dragging {
+  background: linear-gradient(135deg, transparent 45%, var(--accent) 50%, transparent 55%);
+}
+
+.frame-toolbar {
+  position: absolute; top: 0; left: 0; right: 0;
+  background: rgba(0, 0, 0, .65);
+  padding: 4px 8px;
+  display: flex; gap: 12px; flex-wrap: wrap;
+  z-index: 2;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--fg-muted);
+}
+.frame-toolbar label { cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
+.frame-toolbar input { accent-color: var(--accent); }
+
+.detection-badge {
+  position: absolute; bottom: 4px; left: 4px;
+  font-family: var(--mono); font-size: 11px;
+  background: rgba(0, 0, 0, .7);
+  padding: 4px 8px;
+  border-radius: 3px;
+  color: var(--fg-muted);
+  z-index: 2;
+}
+.detection-badge.ok  { color: var(--ok); }
+.detection-badge.err { color: var(--err); }
+
+.frame-placeholder {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  color: var(--fg-muted); font-family: var(--mono); font-size: 11px;
+  text-align: center; padding: 10px 14px;
+  border: 1px dashed var(--border); border-radius: 4px;
+  background: rgba(10, 15, 24, .8);
+  max-width: 90%;
+  display: none;
+  z-index: 1;
+}
+.cam-panel.no-frame .frame-placeholder { display: block; }
 
 /* ---- side tabs ------------------------------------------------------ */
 .side-tabs {

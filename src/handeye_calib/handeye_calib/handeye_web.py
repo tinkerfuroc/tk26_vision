@@ -67,6 +67,19 @@ def _make_node_class():
     from pan_tilt.calibration.aruco_detect import BoardSpec, build_board, build_detector
     from pan_tilt.calibration.safety import SafetyEnvelope
 
+    def _downscale(bgr, target_w: int = 960, cv2_mod=cv2):
+        """Downsize a BGR frame to ``target_w`` on the long edge for bandwidth.
+
+        Mirrors ``pan_tilt/pan_tilt/calib_web.py::_downscale`` byte-for-byte —
+        keep the two in sync if either tool's bandwidth budget changes. No-ops
+        when the image is already <= ``target_w`` wide.
+        """
+        h, w = bgr.shape[:2]
+        if w <= target_w:
+            return bgr
+        scale = target_w / w
+        return cv2_mod.resize(bgr, (target_w, int(h * scale)))
+
     class HandeyeWebNode(Node):
         def __init__(self):
             super().__init__("handeye_web")
@@ -447,15 +460,42 @@ def _make_node_class():
                     pass
             return out
 
-        def latest_jpeg(self):
+        def latest_jpeg(self, raw: bool = False):
+            """Latest camera frame encoded as JPEG.
+
+            ``raw=False`` (default): annotated overlay — green corner dots,
+            integer corner IDs, header bar with RMS + image_topic. ``raw=True``:
+            the raw BGR frame, no annotations. Always downscaled to 960 px wide
+            before encoding (mirrors pan_tilt's ``_downscale``) so the UI's
+            ~3 Hz polling stays cheap. Placeholder JPEG returned when no frame
+            has arrived yet.
+            """
             np = self._np
+            cv2 = self._cv2
             with self.lock:
                 if self._frame is None:
                     return ws.placeholder_jpeg("no camera")
                 frame = self._frame.copy()
                 corners = self._last_corners_xy
-            return ws.encode_jpeg(ws.draw_charuco_overlay(
-                frame, corners if corners is not None else np.empty((0, 2))))
+                last_det = self._last_det
+                cap = self._cap
+                image_topic = self._image_topic
+
+            if raw:
+                return ws.encode_jpeg(_downscale(frame, 960, cv2))
+
+            rms_px = None
+            if isinstance(last_det, dict):
+                rms_px = last_det.get("reproj_px")
+            ids = cap["corner_idx"] if (cap is not None and "corner_idx" in cap) else None
+            annotated = ws.draw_charuco_overlay(
+                frame,
+                corners if corners is not None else np.empty((0, 2)),
+                ids=ids,
+                rms_px=rms_px,
+                image_topic=image_topic,
+            )
+            return ws.encode_jpeg(_downscale(annotated, 960, cv2))
 
         # ---- commands --------------------------------------------------------
 
@@ -626,8 +666,9 @@ def make_app(node):
         return JSONResponse(node.get_state_dict())
 
     @app.get("/api/frame.jpg")
-    def frame():
-        return Response(content=node.latest_jpeg(), media_type="image/jpeg")
+    def frame(raw: int = 0):
+        """Latest camera frame as JPEG. ``?raw=1`` skips the overlay."""
+        return Response(content=node.latest_jpeg(raw=bool(raw)), media_type="image/jpeg")
 
     @app.post("/api/move")
     async def move(request: Request):

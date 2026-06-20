@@ -66,10 +66,54 @@ def placeholder_jpeg(text="no camera", size=(480, 640)):
     return encode_jpeg(img)
 
 
-def draw_charuco_overlay(bgr, corners_xy):
+def draw_charuco_overlay(bgr, corners_xy, ids=None, rms_px=None, image_topic=None):
+    """Render the detection overlay used by the live frame panel.
+
+    - Green dot at every corner (legacy behaviour, always on).
+    - When ``ids`` is provided, render the corresponding integer next to each
+      corner (cv2.putText, small cyan text so the green dot stays readable).
+    - When ``rms_px`` and/or ``image_topic`` are provided, render a translucent
+      header strip across the top with the relevant diagnostics ("rms=X.XXpx"
+      / "topic=..."). The header is rendered LAST so it stays legible regardless
+      of corner density.
+
+    Shape (HxWxC) is preserved — IDs and the header strip are drawn in-place,
+    no resize. The 960 px bandwidth downscale lives in ``HandeyeWebNode.latest_jpeg``
+    (matches pan_tilt's ``_downscale``) so callers asking for the overlay always
+    get the source resolution.
+    """
     out = bgr.copy()
-    for (x, y) in np.asarray(corners_xy, float).reshape(-1, 2):
+    corners = np.asarray(corners_xy, float).reshape(-1, 2)
+    # Green dots first so the IDs (if any) overlay them.
+    for (x, y) in corners:
         cv2.circle(out, (int(round(x)), int(round(y))), 4, (0, 255, 0), -1, cv2.LINE_AA)
+
+    if ids is not None and len(corners) > 0:
+        ids_flat = np.asarray(ids).reshape(-1).astype(int)
+        for (x, y), cid in zip(corners, ids_flat):
+            cv2.putText(out, str(int(cid)),
+                        (int(round(x)) + 6, int(round(y)) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1, cv2.LINE_AA)
+
+    # Header bar (top strip) — only when there's something to put in it.
+    header_parts = []
+    if rms_px is not None:
+        try:
+            header_parts.append(f"rms={float(rms_px):.2f}px")
+        except (TypeError, ValueError):
+            pass
+    if image_topic:
+        header_parts.append(f"topic={image_topic}")
+    if header_parts:
+        text = "  ".join(header_parts)
+        h, w = out.shape[:2]
+        bar_h = 18
+        # Translucent dark bar (blend with existing pixels so it doesn't wipe the frame).
+        overlay = out.copy()
+        cv2.rectangle(overlay, (0, 0), (w, bar_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.55, out, 0.45, 0, dst=out)
+        cv2.putText(out, text, (4, 13), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (220, 220, 220), 1, cv2.LINE_AA)
     return out
 
 

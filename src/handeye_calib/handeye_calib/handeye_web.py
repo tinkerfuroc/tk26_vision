@@ -634,11 +634,23 @@ def _make_node_class():
                 obj_pts, img_pts = self._board.matchImagePoints(ch_corners, ch_ids)
             except cv2.error:
                 return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
-            if obj_pts is None or len(obj_pts) < 4:
+            # SOLVEPNP_ITERATIVE uses DLT under the hood and requires >=6 point
+            # correspondences. With fewer points cv2.solvePnP throws an
+            # unrecoverable cv2.error that would otherwise propagate out of the
+            # image callback and kill the node — keep the overlay alive but
+            # skip the pose / capturable-sample branch.
+            if obj_pts is None or len(obj_pts) < 6:
                 return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
 
             dist = D if D is not None else np.zeros(5)
-            ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+            try:
+                ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+            except cv2.error as exc:
+                # Belt-and-suspenders: cv2 can still throw on degenerate point
+                # configurations even with >=6 corners (e.g. all collinear).
+                self.get_logger().warn(
+                    f"solvePnP failed ({exc})", throttle_duration_sec=5.0)
+                return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
             if not ok:
                 return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
 

@@ -16,7 +16,7 @@ def generate_launch_description():
     for name, default in [
         ("camera_profile", "d435"),
         ("stream_enabled", "false"),
-        ("stream_align_to_color", "true"),
+        ("stream_align_to_color", "false"),
         ("stream_qos_reliability", "reliable"),
         ("default_model_kind", "fast_trt"),
         ("default_trt_variant", "output_two_stage"),

@@ -68,6 +68,58 @@ python -m handeye_calib.synthetic     # prints recovered-X error + PASS
 pytest test/                          # unit suite (source the workspace first for test_import)
 ```
 
+## UI
+
+The `handeye_web` tool is a single-page calibration UI with five tabs:
+
+- **Info** — camera / TF / robot / ChArUco board / safety envelope status, plus the `T_base_eef` matrix.
+- **Move** — joint editor (rad/deg toggle), Load-current / Zero / presets, with a live SafetyEnvelope verdict on the current EE pose before sending.
+- **Capture** — stability-gated capture (three steady frames at < 0.0003 m / 0.1° drift), sample gallery with per-capture thumbnails + per-sample delete, diversity meter (max pairwise rotation° / 30° target).
+- **Solve** — method picker (auto / TSAI / PARK / HORAUD / ANDREFF / DANIILIDIS), per-method reprojection comparison table, residual histogram + scatter, sample-coverage canvas, PASS / WARN / FAIL gate pill with mm / deg / px units.
+- **Promote** — side-by-side unified-diff preview for **both** `hand_eye.yaml` AND a per-robot `wrist_camera.xacro` override, ROBOT_NAME-scoped, confirm-before-apply, backup paths surfaced for each write. Reload-from-disk clears the cached solve so the operator can re-run.
+
+Live state pushed via WebSocket at 5 Hz (no polling for state). The live camera feed polls `/api/frame.jpg` at ~3 Hz with an annotated / raw toggle and a resizable panel (width persisted in `localStorage`).
+
+## Per-robot xacro override (one-time setup)
+
+The wrist camera mount is defined in a **shared vendor xacro** at
+`src/tk25_manipulation/src/xarm_ros2/xarm_description/urdf/camera/realsense_d435i.urdf.xacro`
+(joint `camera_link_joint`). Patching the vendor file in place would
+overwrite tinker1's calibration when tinker2 calibrates and vice versa.
+
+Instead, `handeye_web` writes a **per-robot override** at:
+
+```
+src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/wrist_camera.xacro
+```
+
+For the override to actually take effect in the live URDF, the operator must
+do a **one-time** include from the main robot xacro (e.g.
+`src/tk25_basic/src/tinker_urdf/src/mobile_manipulator.urdf.xacro`):
+
+```xml
+<xacro:include filename="$(find tinker_robot_config)/robots/$(arg robot_name)/wrist_camera.xacro"/>
+```
+
+…and either remove the corresponding `<joint name="camera_link_joint">`
+block from the vendor d435i xacro, or guard it with
+`<xacro:unless value="$(arg use_handeye_override)">…</xacro:unless>`.
+This wiring happens once per workspace; afterwards every `handeye_web`
+calibration just overwrites the per-robot override file in place (with a
+timestamped backup).
+
+If `ROBOT_NAME` is unset when promoting, the UI offers **yaml-only
+promote** — the `hand_eye.yaml` is still written, but the xacro half is
+disabled with a banner explaining why. The promote endpoint will **refuse**
+to write the shared vendor xacro under any circumstance (path-prefix
+check; see `apply_promote` in `handeye_web.py`).
+
+When the per-robot override file does not yet exist, the UI's xacro diff
+shows the **seed** template (a complete one-joint `<robot>` body with a
+header comment instructing the include + vendor-disable). When it does
+exist, the UI shows a **patch** of the existing file's `<origin>` only,
+preserving the rest of the override verbatim.
+
 ## Acceptance gate
 
 Held-out poses must clear pan-tilt parity: translation < 3 mm, rotation < 0.5°,
@@ -78,13 +130,40 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
-- 0.4.0 (2026-06-20): handeye_web v2 — Solve tab (T5): method picker
-  (auto/TSAI/PARK/HORAUD/ANDREFF/DANIILIDIS), per-method comparison table,
-  residual histogram + scatter canvases, board-coverage canvas, mm/deg units
-  + PASS/WARN/FAIL gate pill. Added `web_support.solve_payload_v2` (renders
-  X_xyz_mm/X_rpy_deg + per-method summary + per-sample reproj_px),
-  `seed_handeye(methods=)` / `solve(methods=)` kwargs for single-method runs,
-  and `HandeyeWebNode.do_solve(method=)` forwarded from `POST /api/solve`.
+- 0.4.0 (2026-06-20): **handeye_web quality rewrite to pan_tilt parity.** The
+  v1 inline ~30-line UI was replaced by a static `webui/` (index.html +
+  style.css + app.js) bundle covering all five tabs. New surface:
+    - **Frontend**: WebSocket state stream (5 Hz, no polling for state);
+      tabbed layout (Info / Move / Capture / Solve / Promote); resizable
+      live frame with annotated / raw toggle and detection badge
+      (corners + RMS, colour-coded); per-tab content as listed under
+      `## UI` above.
+    - **Capture**: `StabilityTracker` is now the hard pre-capture gate
+      (closes the v1 deferral); sample gallery with thumbnails + per-sample
+      delete; diversity meter (max pairwise rotation° / 30° target).
+    - **Solve tab**: method picker (auto / TSAI / PARK / HORAUD / ANDREFF /
+      DANIILIDIS), per-method comparison table, residual histogram +
+      scatter canvases, board-coverage canvas, mm/deg units, PASS/WARN/FAIL
+      gate pill. New helpers `web_support.solve_payload_v2`,
+      `seed_handeye(methods=)` / `solve(methods=)` kwargs,
+      `HandeyeWebNode.do_solve(method=)`.
+    - **Promote tab**: side-by-side unified-diff preview for **both**
+      `hand_eye.yaml` AND a per-robot `wrist_camera.xacro` override
+      (ROBOT_NAME-scoped; refuses to overwrite the shared vendor xacro);
+      confirm-before-apply per half; backup paths surfaced. New
+      `apply_handeye` helpers `resolve_robot_xacro_path`,
+      `seed_handeye_override_xacro`; `write_with_backup` now returns the
+      backup path and `os.makedirs(parent, exist_ok=True)`s its target.
+      New `HandeyeWebNode.compute_promote_diff` / `apply_promote` /
+      `reload_promote` accessors; the v1 `do_promote` becomes a back-compat
+      shim onto `apply_promote(which='both')`.
+    - **Endpoints**: `/ws`, `/api/samples/{idx}/thumb.jpg`,
+      `DELETE /api/samples/{idx}`, `/api/promote/diff` (returns both
+      yaml + xacro halves), `/api/promote/apply` (accepts
+      `which ∈ {yaml,xacro,both}`), `/api/promote/reload`. `/api/solve`
+      accepts `{method}` body; `/api/frame.jpg` accepts `?raw=1`.
+    - **Per-robot xacro override** convention added (see
+      `## Per-robot xacro override (one-time setup)` above).
 - 0.3.0 (2026-06-15): handeye_web server implemented (live ChArUco overlay,
   capture/solve/promote) + launch file (handeye_web.launch.py).
 - 0.2.0 (2026-06-15): math core (transforms/model/solver/gates), synthetic harness,

@@ -1,4 +1,6 @@
+from pathlib import Path
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation as R
 from handeye_calib import transforms as tf
 from handeye_calib import apply_handeye as ah
@@ -43,3 +45,56 @@ def test_patch_urdf_origin(tmp_path):
     assert 'rpy="0.0 0.0 0.0"' in new
     assert '0.06746' not in new           # old value replaced
     assert new.count("<joint") == 1       # only the targeted joint touched
+
+
+# ---------------------------------------------------------------------------
+# T6: per-robot xacro override resolver + seed template + d435i-shape patch
+# ---------------------------------------------------------------------------
+
+def test_resolve_robot_xacro_path_for_tinker2(tmp_path):
+    # synthesize a basic-repo-shaped fixture
+    (tmp_path / "src/tinker_robot_config/robots/tinker2").mkdir(parents=True)
+    p = ah.resolve_robot_xacro_path("tinker2", tmp_path)
+    assert p == tmp_path / "src/tinker_robot_config/robots/tinker2/wrist_camera.xacro"
+
+
+def test_resolve_robot_xacro_path_for_tinker1(tmp_path):
+    (tmp_path / "src/tinker_robot_config/robots/tinker1").mkdir(parents=True)
+    p = ah.resolve_robot_xacro_path("tinker1", tmp_path)
+    assert p == tmp_path / "src/tinker_robot_config/robots/tinker1/wrist_camera.xacro"
+
+
+def test_resolve_robot_xacro_path_none_when_robot_unset(tmp_path):
+    assert ah.resolve_robot_xacro_path(None, tmp_path) is None
+    assert ah.resolve_robot_xacro_path("", tmp_path) is None
+
+
+def test_seed_handeye_override_xacro_well_formed():
+    body = ah.seed_handeye_override_xacro("camera_link_joint",
+                                          "0.07 -0.02 0.024", "3.14 -1.57 0")
+    assert "<?xml" in body
+    assert 'name="handeye_override"' in body
+    assert 'name="camera_link_joint"' in body
+    assert 'xyz="0.07 -0.02 0.024"' in body
+    assert 'rpy="3.14 -1.57 0"' in body
+    assert '<parent link="link_eef"' in body and '<child link="camera_link"' in body
+
+
+def test_patch_urdf_origin_against_realsense_d435i_shape():
+    sample = ('<robot><joint name="camera_link_joint" type="fixed">\n'
+              '  <parent link="link_eef"/><child link="camera_link"/>\n'
+              '  <origin xyz="0.06746 -0.0175 0.0237" rpy="3.14 -1.57 0"/>\n'
+              '</joint></robot>\n')
+    patched = ah.patch_urdf_origin(sample, "camera_link_joint",
+                                    [0.08, -0.01, 0.02], [3.1, -1.6, 0.0])
+    assert 'xyz="0.08 -0.01 0.02"' in patched
+    assert 'rpy="3.1 -1.6 0.0"' in patched
+    assert 'xyz="0.06746' not in patched
+
+
+def test_patch_urdf_origin_raises_valueerror_on_missing_joint():
+    """When the named joint isn't in the override file, raise ValueError so the
+    web layer can fall back to ``seed_handeye_override_xacro`` (mode='seed')."""
+    sample = '<robot><joint name="some_other_joint" type="fixed"><origin xyz="0 0 0" rpy="0 0 0"/></joint></robot>'
+    with pytest.raises(ValueError):
+        ah.patch_urdf_origin(sample, "camera_link_joint", [0, 0, 0], [0, 0, 0])

@@ -785,27 +785,321 @@ def _make_node_class():
             return {"ok": True, **ws.solve_payload_v2(res, samples, K, D, self._board_pts)}
 
         def do_promote(self):
-            import os
-            import yaml
-            if self.last_solve is None:
-                return {"ok": False, "reason": "run solve first"}
+            """Back-compat shim — POST /api/promote = apply_promote(which='both').
 
+            Older callers (tests, scripts) that POST'd ``/api/promote`` get the
+            new ``apply_promote`` shape; the brief's split into
+            ``/api/promote/diff`` + ``/api/promote/apply`` is the canonical
+            path going forward.
+            """
+            return self.apply_promote(which="both")
+
+        # ---- T6: per-robot xacro override + yaml-diff ------------------------
+
+        def _resolve_robot_name(self):
+            """ROBOT_NAME env var wins; falls back to the ``robot_name`` param.
+
+            Empty string => unset (UI shows the yaml-only banner). The env-var
+            precedence mirrors the existing ``_param("robot_name", os.environ
+            .get("ROBOT_NAME", ""))`` init pattern; we re-read both at call
+            time so the operator can ``export ROBOT_NAME=…`` and reload
+            without re-launching.
+            """
+            import os
+            return (os.environ.get("ROBOT_NAME", "")
+                    or self._param("robot_name", "") or "")
+
+        def _tk25_basic_repo_root(self):
+            """Locate ``tk25_basic`` by walking up from this source file.
+
+            Mirrors ``_hand_eye_path``'s parent-walk so the two resolvers
+            agree. Returns the ``Path`` to ``tk25_basic`` (the ROS package
+            root, NOT its inner ``src/``) or ``None`` if not found — in which
+            case the xacro half stays ``None`` with a ``tk25_basic repo root
+            not resolvable`` reason.
+            """
+            from pathlib import Path
+            here = Path(__file__).resolve()
+            for parent in here.parents:
+                cand = parent / "tk25_basic" / "src" / "tinker_robot_config"
+                if cand.is_dir():
+                    return parent / "tk25_basic"
+            return None
+
+        def _mount_joint_name(self):
+            """Joint name carrying the wrist-camera mount in the URDF.
+
+            Per the brief: ``camera_link_joint`` in the d435i vendor xacro is
+            the joint we override per-robot. Exposed as a launch param so a
+            future arm/camera swap (different joint name) only needs a
+            parameter override, not a code change.
+            """
+            return self._param("mount_joint_name", "camera_link_joint")
+
+        def _calibration_date_or_unset(self):
+            """T6: ISO date stamp for the yaml's calibration_date field.
+
+            Defaults to today (UTC). The v1 do_promote hard-coded
+            ``"unset"``; surfacing a real date lets the operator see staleness
+            at a glance.
+            """
+            import datetime
+            return datetime.date.today().isoformat()
+
+        def _format_xyz_str(self, T):
+            return " ".join(f"{float(v):.9g}" for v in T[:3, 3])
+
+        def _format_rpy_str(self, T):
+            from scipy.spatial.transform import Rotation as _R
+            rpy = _R.from_matrix(T[:3, :3]).as_euler('xyz')
+            return " ".join(f"{float(v):.9g}" for v in rpy)
+
+        def _latest_backup_for(self, path):
+            """Glob ``<path>.old-*`` and return the newest, or ``None``."""
+            from pathlib import Path
+            p = Path(path)
+            cands = sorted(p.parent.glob(p.name + ".old-*"))
+            return str(cands[-1]) if cands else None
+
+        def _yaml_half_for_diff(self):
+            """Build the yaml side of the promote diff (always computed)."""
+            import difflib
+            import yaml
             T_mount_color = self._mount_to_color_matrix()
             T_eef_mount = ah.compose_eef_to_mount(self.last_solve.X, T_mount_color)
-            d = ah.handeye_yaml_dict(
+            proposed_dict = ah.handeye_yaml_dict(
                 T_eef_mount, self.last_solve.X, len(self.session.samples),
-                self.last_solve.heldout_metrics, "unset", self._sq)
-            new_xyz = d["hand_eye"]["arm_to_camera_xyz"]
-            new_rpy = d["hand_eye"]["arm_to_camera_rpy"]
-            diff = diff_payload(old_xyz="(unknown)", new_xyz=new_xyz,
-                                old_rpy="(unknown)", new_rpy=new_rpy)
+                self.last_solve.heldout_metrics,
+                date=self._calibration_date_or_unset(),
+                square_len_m=self._sq,
+            )
+            proposed_yaml = yaml.safe_dump(proposed_dict, sort_keys=False)
+            robot = self._resolve_robot_name()
+            yaml_target = self._hand_eye_path(robot) if robot else None
+            current_yaml = (yaml_target.read_text()
+                            if yaml_target and yaml_target.exists() else "")
+            fromfile = (str(yaml_target) if yaml_target
+                        else "(set ROBOT_NAME=tinker1|tinker2 to resolve target)")
+            yaml_diff = "".join(difflib.unified_diff(
+                current_yaml.splitlines(keepends=True),
+                proposed_yaml.splitlines(keepends=True),
+                fromfile=fromfile, tofile="proposed", lineterm=""))
+            return {
+                "target_path": str(yaml_target) if yaml_target else "",
+                "current_text": current_yaml,
+                "proposed_text": proposed_yaml,
+                "diff": yaml_diff,
+                "mode": "patch",
+            }, T_eef_mount
 
-            robot = self._param("robot_name", "") or os.environ.get("ROBOT_NAME", "")
-            path = self._hand_eye_path(robot)
-            if robot and path is not None and path.parent.is_dir():
-                ah.write_with_backup(str(path), yaml.safe_dump(d))
-                return {"ok": True, "written_path": str(path), "diff": diff}
-            return {"ok": True, "preview": d, "diff": diff}
+        def _xacro_half_for_diff(self, T_eef_mount):
+            """Build the xacro side of the promote diff.
+
+            Returns either the populated half dict, or ``None`` when
+            ``ROBOT_NAME`` is unset / the basic repo root can't be located /
+            the resolved target points at the shared vendor xacro (in which
+            case we still return a dict, but mark it ``mode='refuse-vendor'``
+            so the UI can render a warning banner without enabling Apply).
+            """
+            import difflib
+            robot = self._resolve_robot_name()
+            if not robot:
+                return None
+            basic_root = self._tk25_basic_repo_root()
+            if basic_root is None:
+                return {
+                    "target_path": "",
+                    "current_text": "",
+                    "proposed_text": "",
+                    "diff": "",
+                    "mode": "refuse-vendor",
+                    "warning": "tk25_basic repo root not resolvable",
+                }
+            xacro_target = ah.resolve_robot_xacro_path(robot, basic_root)
+            if xacro_target is None:
+                return None
+            joint_name = self._mount_joint_name()
+            xyz_str = self._format_xyz_str(T_eef_mount)
+            rpy_str = self._format_rpy_str(T_eef_mount)
+            # Vendor-path refusal: even if some bug resolved us at the shared
+            # d435i xacro, refuse to seed/patch it. The Apply endpoint does
+            # the same check belt-and-suspenders.
+            if "xarm_description/urdf/camera/realsense_d435i.urdf.xacro" in str(xacro_target):
+                return {
+                    "target_path": str(xacro_target),
+                    "current_text": "",
+                    "proposed_text": "",
+                    "diff": "",
+                    "mode": "refuse-vendor",
+                    "warning": (f"refusing to write shared vendor xacro — "
+                                f"set up per-robot override at {xacro_target}"),
+                }
+            if xacro_target.exists():
+                current_xacro = xacro_target.read_text()
+                try:
+                    proposed_xacro = ah.patch_urdf_origin(
+                        current_xacro, joint_name,
+                        xyz_str.split(), rpy_str.split())
+                    mode = "patch"
+                except ValueError:
+                    # joint not in existing override file → re-seed it
+                    proposed_xacro = ah.seed_handeye_override_xacro(
+                        joint_name, xyz_str, rpy_str)
+                    mode = "seed"
+            else:
+                current_xacro = ""
+                proposed_xacro = ah.seed_handeye_override_xacro(
+                    joint_name, xyz_str, rpy_str)
+                mode = "seed"
+            xacro_diff = "".join(difflib.unified_diff(
+                current_xacro.splitlines(keepends=True),
+                proposed_xacro.splitlines(keepends=True),
+                fromfile=str(xacro_target), tofile="proposed", lineterm=""))
+            return {
+                "target_path": str(xacro_target),
+                "current_text": current_xacro,
+                "proposed_text": proposed_xacro,
+                "diff": xacro_diff,
+                "mode": mode,
+            }
+
+        def compute_promote_diff(self):
+            """T6: build both yaml + xacro halves of the promote unified-diff.
+
+            Returns one of:
+              * ``{"ok": False, "reason": "run solve first"}`` if no solve yet.
+              * ``{"ok": True, "yaml": {...}, "xacro": {...}|None,
+                   "robot_name": "tinker2"|None}``
+
+            ``xacro`` is ``None`` when ``ROBOT_NAME`` is unset (the UI shows a
+            yaml-only banner). Each half dict has keys
+            ``target_path / current_text / proposed_text / diff / mode``
+            (``mode ∈ {"patch", "seed", "refuse-vendor"}``) plus an optional
+            ``warning`` for vendor-path refusal so the UI can render a red
+            banner.
+            """
+            if self.last_solve is None:
+                return {"ok": False, "reason": "run solve first"}
+            yaml_half, T_eef_mount = self._yaml_half_for_diff()
+            xacro_half = self._xacro_half_for_diff(T_eef_mount)
+            robot = self._resolve_robot_name()
+            return {"ok": True, "yaml": yaml_half, "xacro": xacro_half,
+                    "robot_name": robot or None}
+
+        def apply_promote(self, which="both"):
+            """T6: apply the promote diff to disk, per-half, with backups.
+
+            ``which`` is one of:
+              * ``"yaml"`` — write the per-robot ``hand_eye.yaml`` only.
+              * ``"xacro"`` — write the per-robot ``wrist_camera.xacro`` only.
+              * ``"both"`` (default) — try yaml first, then xacro. If the yaml
+                write succeeds and the xacro write fails (e.g. vendor-path
+                refusal), the response is the partial-success shape
+                ``{ok: True, yaml: {...}, xacro: {ok: False, reason: ...}}``
+                so the operator sees both halves and isn't lied to about a
+                "successful" promote that only wrote half the state.
+
+            Per-half result shape:
+              * Success: ``{written_path, backup_path}`` (``backup_path`` may
+                be ``None`` if no prior file existed).
+              * Failure: ``{ok: False, reason: str}``.
+            """
+            if self.last_solve is None:
+                return {"ok": False, "reason": "run solve first"}
+            diff = self.compute_promote_diff()
+            if not diff["ok"]:
+                return diff
+            out = {"ok": True}
+
+            # Single-half "which" gets a top-level ok=False when that one
+            # half can't be written (e.g. ``which='xacro'`` with ROBOT_NAME
+            # unset). ``which='both'`` keeps top-level ok=True even on
+            # partial-failure so the operator sees both halves' results.
+
+            if which in ("yaml", "both") and diff["yaml"]:
+                y = diff["yaml"]
+                if not y["target_path"]:
+                    out["yaml"] = {
+                        "ok": False,
+                        "reason": ("ROBOT_NAME unset — cannot resolve "
+                                   "hand_eye.yaml target path"),
+                    }
+                else:
+                    try:
+                        backup = ah.write_with_backup(
+                            y["target_path"], y["proposed_text"])
+                        out["yaml"] = {"written_path": y["target_path"],
+                                       "backup_path": backup}
+                    except Exception as exc:
+                        out["yaml"] = {
+                            "ok": False,
+                            "reason": f"yaml write failed: {exc}",
+                        }
+
+            if which in ("xacro", "both"):
+                if diff["xacro"] is None:
+                    out["xacro"] = {
+                        "ok": False,
+                        "reason": ("ROBOT_NAME unset — cannot write per-robot "
+                                   "xacro override"),
+                    }
+                else:
+                    x = diff["xacro"]
+                    if x.get("mode") == "refuse-vendor":
+                        out["xacro"] = {
+                            "ok": False,
+                            "reason": (x.get("warning") or
+                                       "refusing to write shared vendor xacro"),
+                        }
+                    elif ("xarm_description/urdf/camera/realsense_d435i.urdf.xacro"
+                          in x["target_path"]):
+                        # Belt-and-suspenders: even if compute_promote_diff
+                        # didn't catch it, refuse here too.
+                        out["xacro"] = {
+                            "ok": False,
+                            "reason": ("refusing to write shared vendor xacro — "
+                                       "set up per-robot override at "
+                                       + x["target_path"]),
+                        }
+                    else:
+                        try:
+                            backup = ah.write_with_backup(
+                                x["target_path"], x["proposed_text"])
+                            out["xacro"] = {"written_path": x["target_path"],
+                                            "backup_path": backup}
+                        except Exception as exc:
+                            out["xacro"] = {
+                                "ok": False,
+                                "reason": f"xacro write failed: {exc}",
+                            }
+
+            # Single-half failure ⇒ surface at top-level so callers that only
+            # asked for one half don't have to dig into the sub-dict to find
+            # an ok:False. ``both`` keeps top-level ok=True so partial-success
+            # is visible (the brief's explicit shape).
+            if which == "yaml":
+                y_res = out.get("yaml", {})
+                if isinstance(y_res, dict) and y_res.get("ok") is False:
+                    return {"ok": False, "reason": y_res.get("reason", "yaml write failed"),
+                            "yaml": y_res}
+            if which == "xacro":
+                x_res = out.get("xacro", {})
+                if isinstance(x_res, dict) and x_res.get("ok") is False:
+                    return {"ok": False, "reason": x_res.get("reason", "xacro write failed"),
+                            "xacro": x_res}
+            return out
+
+        def reload_promote(self):
+            """T6: clear the cached solve so the operator can re-run solve.
+
+            The diff/apply endpoints both read ``self.last_solve``; this
+            reset lets the operator "reload from disk" without restarting
+            the node. (The yaml/xacro on disk are the source of truth after
+            a successful promote — there's nothing to reload back into RAM.)
+            """
+            with self.lock:
+                self.last_solve = None
+            return {"ok": True, "reason": "cached solve cleared"}
 
         # ---- internal helpers ------------------------------------------------
 
@@ -924,7 +1218,43 @@ def make_app(node):
 
     @app.post("/api/promote")
     def promote():
+        # Back-compat shim: equivalent to apply_promote(which="both"). The
+        # T6 brief's canonical surface is the three split routes below.
         return JSONResponse(node.do_promote())
+
+    @app.get("/api/promote/diff")
+    def promote_diff():
+        """T6: unified-diff preview for both yaml + xacro halves.
+
+        Returns ``{ok: False, reason: ...}`` until ``last_solve`` is set.
+        On success returns both halves; ``xacro`` is ``None`` when
+        ``ROBOT_NAME`` is unset (UI shows a yaml-only banner).
+        """
+        return JSONResponse(node.compute_promote_diff())
+
+    @app.post("/api/promote/apply")
+    async def promote_apply(request: Request):
+        """T6: write yaml and/or xacro to disk with timestamped backups.
+
+        Body: ``{which: "yaml"|"xacro"|"both"}`` (defaults to ``"both"``).
+        Partial-success is surfaced explicitly when one half succeeds and
+        the other fails; the operator must see both halves so a vendor-path
+        refusal never silently shadows a successful yaml write.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        which = str((body or {}).get("which", "both")).lower()
+        if which not in ("yaml", "xacro", "both"):
+            return JSONResponse(
+                {"ok": False, "reason": f"unknown which={which!r}"})
+        return JSONResponse(node.apply_promote(which=which))
+
+    @app.post("/api/promote/reload")
+    def promote_reload():
+        """T6: reset the cached ``last_solve`` so the operator can rerun."""
+        return JSONResponse(node.reload_promote())
 
     @app.websocket("/ws")
     async def ws_state(ws_conn: WebSocket):

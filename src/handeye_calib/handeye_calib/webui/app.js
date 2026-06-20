@@ -917,3 +917,239 @@ window.drawScatter = drawScatter;
 window.drawCoverage = drawCoverage;
 window.runSolve = runSolve;
 window.renderSolvePayload = renderSolvePayload;
+
+// ---- T6: Promote tab — yaml + xacro unified-diff preview + apply ---------
+// Two parallel renderers, one per half. Each Show button GETs
+// /api/promote/diff once and paints the appropriate half; the cached diff
+// is reused across both halves' Show clicks so the operator can flip back
+// and forth without re-fetching. Each Apply button confirm()s, POSTs
+// /api/promote/apply {which: 'yaml'|'xacro'}, then renders the backup-path
+// (server returns it as `body.<half>.backup_path`). Reload-from-disk hits
+// /api/promote/reload which clears last_solve so the operator can re-solve.
+//
+// Per the brief: the xacro half is ROBOT_NAME-scoped — when the server
+// returns `body.xacro === null` the half shows a yellow "ROBOT_NAME unset"
+// banner and its Apply button stays disabled. `mode === 'refuse-vendor'`
+// shows a red banner (vendor path refusal) and likewise locks Apply.
+const PROMOTE_YAML_DIFF_BTN  = $("#promote-yaml-diff-btn");
+const PROMOTE_YAML_APPLY_BTN = $("#promote-yaml-apply-btn");
+const PROMOTE_YAML_DIFF_PRE  = $("#promote-yaml-diff");
+const PROMOTE_YAML_TARGET    = $("#yaml-target");
+const PROMOTE_YAML_MODE      = $("#yaml-mode");
+const PROMOTE_YAML_STATUS    = "promote-yaml-status";
+const PROMOTE_YAML_BACKUP    = $("#promote-yaml-backup");
+
+const PROMOTE_XACRO_DIFF_BTN  = $("#promote-xacro-diff-btn");
+const PROMOTE_XACRO_APPLY_BTN = $("#promote-xacro-apply-btn");
+const PROMOTE_XACRO_DIFF_PRE  = $("#promote-xacro-diff");
+const PROMOTE_XACRO_TARGET    = $("#xacro-target");
+const PROMOTE_XACRO_MODE      = $("#xacro-mode");
+const PROMOTE_XACRO_WARN      = $("#xacro-warn");
+const PROMOTE_XACRO_STATUS    = "promote-xacro-status";
+const PROMOTE_XACRO_BACKUP    = $("#promote-xacro-backup");
+
+const PROMOTE_RELOAD_BTN     = $("#promote-reload-btn");
+const PROMOTE_RELOAD_STATUS  = "promote-reload-status";
+
+let lastPromoteDiff = null;  // last GET /api/promote/diff body
+
+function _renderDiffPre(preEl, diffText) {
+  // Cheap unified-diff highlighter: split lines, classify by prefix.
+  // No syntax-highlighter dependency; just three colour classes for
+  // additions / deletions / hunk headers. Lines starting with '---' / '+++'
+  // (the unified-diff file markers) are also classed as hunk-ish.
+  if (!preEl) return;
+  preEl.innerHTML = "";
+  if (!diffText) {
+    preEl.textContent = "(no changes — proposed matches current on disk)";
+    return;
+  }
+  const lines = diffText.split("\n");
+  const frag = document.createDocumentFragment();
+  for (const line of lines) {
+    const span = document.createElement("span");
+    if (line.startsWith("+++") || line.startsWith("---")) {
+      span.className = "diff-hunk";
+    } else if (line.startsWith("@@")) {
+      span.className = "diff-hunk";
+    } else if (line.startsWith("+")) {
+      span.className = "diff-add";
+    } else if (line.startsWith("-")) {
+      span.className = "diff-del";
+    }
+    span.textContent = line + "\n";
+    frag.appendChild(span);
+  }
+  preEl.appendChild(frag);
+}
+
+function _applyPromoteHalfUI(half, halfBody) {
+  // half ∈ {"yaml", "xacro"}; halfBody is one of body.yaml / body.xacro from
+  // GET /api/promote/diff (may be null when ROBOT_NAME is unset for the xacro
+  // half). Populates the badge, mode line, warn banner, diff pre, and the
+  // Apply button's disabled state for the named half.
+  const isYaml = half === "yaml";
+  const targetEl = isYaml ? PROMOTE_YAML_TARGET : PROMOTE_XACRO_TARGET;
+  const modeEl   = isYaml ? PROMOTE_YAML_MODE   : PROMOTE_XACRO_MODE;
+  const warnEl   = isYaml ? null                : PROMOTE_XACRO_WARN;
+  const preEl    = isYaml ? PROMOTE_YAML_DIFF_PRE : PROMOTE_XACRO_DIFF_PRE;
+  const applyBtn = isYaml ? PROMOTE_YAML_APPLY_BTN : PROMOTE_XACRO_APPLY_BTN;
+
+  if (warnEl) warnEl.hidden = true;
+  if (halfBody === null || halfBody === undefined) {
+    // ROBOT_NAME unset (xacro half) — yaml is always populated when
+    // ok=true, so this branch is xacro-only in practice.
+    if (targetEl) targetEl.textContent = "(unresolved)";
+    if (modeEl)   modeEl.textContent = "ROBOT_NAME unset — yaml-only promote";
+    if (preEl)    preEl.innerHTML = "";
+    if (applyBtn) applyBtn.disabled = true;
+    return;
+  }
+  if (targetEl) targetEl.textContent = halfBody.target_path || "(no path)";
+  const mode = halfBody.mode || "?";
+  const modeLabel =
+    mode === "patch" ? "mode: patch (existing file)"
+    : mode === "seed" ? "mode: seed (new per-robot xacro)"
+    : mode === "refuse-vendor" ? "mode: refused (shared vendor xacro)"
+    : `mode: ${mode}`;
+  if (modeEl) modeEl.textContent = modeLabel;
+  if (warnEl && halfBody.warning) {
+    warnEl.hidden = false;
+    warnEl.textContent = halfBody.warning;
+  }
+  _renderDiffPre(preEl, halfBody.diff || "");
+  // Enable Apply unless the diff is empty (nothing to write) or this is a
+  // vendor-path refusal. An empty diff is a no-op; the operator shouldn't
+  // even bother clicking, and the server would write an identical file
+  // with a fresh backup for no reason.
+  const hasChanges = !!(halfBody.diff && halfBody.diff.length > 0);
+  if (applyBtn) {
+    applyBtn.disabled = !(hasChanges && mode !== "refuse-vendor");
+  }
+}
+
+async function fetchPromoteDiff(quiet = false) {
+  if (!quiet) setStatus(PROMOTE_YAML_STATUS, "loading diff…", "warn");
+  try {
+    const r = await fetch("/api/promote/diff");
+    const body = await r.json();
+    if (!r.ok || !body.ok) {
+      setStatus(PROMOTE_YAML_STATUS,
+        "FAIL: " + (body.reason || ("HTTP " + r.status)), "err");
+      setStatus(PROMOTE_XACRO_STATUS,
+        "FAIL: " + (body.reason || ("HTTP " + r.status)), "err");
+      return null;
+    }
+    lastPromoteDiff = body;
+    _applyPromoteHalfUI("yaml", body.yaml);
+    _applyPromoteHalfUI("xacro", body.xacro);
+    if (!quiet) {
+      const robot = body.robot_name || "(ROBOT_NAME unset)";
+      setStatus(PROMOTE_YAML_STATUS, `diff loaded · robot=${robot}`, "ok");
+      setStatus(PROMOTE_XACRO_STATUS,
+        body.xacro === null
+          ? "ROBOT_NAME unset — yaml-only promote"
+          : `diff loaded · robot=${robot}`,
+        body.xacro === null ? "warn" : "ok");
+    }
+    return body;
+  } catch (e) {
+    setStatus(PROMOTE_YAML_STATUS, "ERROR: " + e, "err");
+    setStatus(PROMOTE_XACRO_STATUS, "ERROR: " + e, "err");
+    return null;
+  }
+}
+
+async function applyPromote(which) {
+  const diff = lastPromoteDiff || await fetchPromoteDiff(true);
+  if (!diff) return;
+  const half = which === "yaml" ? diff.yaml : diff.xacro;
+  if (!half || !half.target_path) {
+    const statusId = which === "yaml" ? PROMOTE_YAML_STATUS : PROMOTE_XACRO_STATUS;
+    setStatus(statusId, "no target path resolved", "err");
+    return;
+  }
+  if (!confirm(
+    `Overwrite ${half.target_path}?\n` +
+    `A timestamped backup will be made.`)) {
+    return;
+  }
+  const statusId = which === "yaml" ? PROMOTE_YAML_STATUS : PROMOTE_XACRO_STATUS;
+  const backupEl = which === "yaml" ? PROMOTE_YAML_BACKUP : PROMOTE_XACRO_BACKUP;
+  setStatus(statusId, "writing…", "warn");
+  try {
+    const r = await fetch("/api/promote/apply", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ which }),
+    });
+    const body = await r.json();
+    // Per-half result lives at body[which]; on a single-half failure the
+    // top-level body.ok may be false too (the server surfaces single-half
+    // failures at top-level for clarity).
+    const halfRes = body && body[which];
+    const ok = halfRes && halfRes.ok !== false && halfRes.written_path;
+    if (ok) {
+      setStatus(statusId, `wrote ${halfRes.written_path}`, "ok");
+      if (backupEl) {
+        backupEl.className = "status-line ok";
+        backupEl.textContent = halfRes.backup_path
+          ? `backup: ${halfRes.backup_path}`
+          : "(no prior file — no backup made)";
+      }
+      // Re-fetch the diff so the next Apply round sees the empty-diff state
+      // (and the Apply button auto-disables for a no-op).
+      await fetchPromoteDiff(true);
+    } else {
+      const reason = (halfRes && halfRes.reason)
+        || body.reason
+        || ("HTTP " + r.status);
+      setStatus(statusId, "FAIL: " + reason, "err");
+      if (backupEl) {
+        backupEl.className = "status-line";
+        backupEl.textContent = "";
+      }
+    }
+  } catch (e) {
+    setStatus(statusId, "ERROR: " + e, "err");
+  }
+}
+
+async function reloadPromote() {
+  setStatus(PROMOTE_RELOAD_STATUS, "reloading…", "warn");
+  try {
+    const r = await fetch("/api/promote/reload", { method: "POST" });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      setStatus(PROMOTE_RELOAD_STATUS,
+        "reload: " + (body.reason || "ok") + " — run solve again",
+        "ok");
+      lastPromoteDiff = null;
+      // Clear the per-half UI so stale diffs don't linger.
+      _applyPromoteHalfUI("yaml", null);
+      _applyPromoteHalfUI("xacro", null);
+      if (PROMOTE_YAML_DIFF_PRE)  PROMOTE_YAML_DIFF_PRE.innerHTML = "";
+      if (PROMOTE_XACRO_DIFF_PRE) PROMOTE_XACRO_DIFF_PRE.innerHTML = "";
+      if (PROMOTE_YAML_BACKUP)    { PROMOTE_YAML_BACKUP.textContent = ""; PROMOTE_YAML_BACKUP.className = "status-line"; }
+      if (PROMOTE_XACRO_BACKUP)   { PROMOTE_XACRO_BACKUP.textContent = ""; PROMOTE_XACRO_BACKUP.className = "status-line"; }
+      setStatus(PROMOTE_YAML_STATUS, "");
+      setStatus(PROMOTE_XACRO_STATUS, "");
+    } else {
+      setStatus(PROMOTE_RELOAD_STATUS,
+        "FAIL: " + (body.reason || body.detail || ("HTTP " + r.status)),
+        "err");
+    }
+  } catch (e) {
+    setStatus(PROMOTE_RELOAD_STATUS, "ERROR: " + e, "err");
+  }
+}
+
+if (PROMOTE_YAML_DIFF_BTN)   PROMOTE_YAML_DIFF_BTN.addEventListener("click", () => fetchPromoteDiff());
+if (PROMOTE_XACRO_DIFF_BTN)  PROMOTE_XACRO_DIFF_BTN.addEventListener("click", () => fetchPromoteDiff());
+if (PROMOTE_YAML_APPLY_BTN)  PROMOTE_YAML_APPLY_BTN.addEventListener("click", () => applyPromote("yaml"));
+if (PROMOTE_XACRO_APPLY_BTN) PROMOTE_XACRO_APPLY_BTN.addEventListener("click", () => applyPromote("xacro"));
+if (PROMOTE_RELOAD_BTN)      PROMOTE_RELOAD_BTN.addEventListener("click", reloadPromote);
+
+window.fetchPromoteDiff = fetchPromoteDiff;
+window.applyPromote = applyPromote;
+window.reloadPromote = reloadPromote;

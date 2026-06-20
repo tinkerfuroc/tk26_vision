@@ -59,6 +59,8 @@ def _make_node_class():
     from handeye_calib import apply_handeye as ah
     from handeye_calib import gates as hgates
     from handeye_calib.handeye_collect import CaptureSession
+    from handeye_calib import waypoints as hwp
+    from handeye_calib.waypoints import WaypointStore
     # Detection + safety reuse from pan_tilt. aruco_detect's Detection does NOT
     # surface per-corner charuco pixels/IDs (only pose + corner count + reproj
     # RMS), so for capture we call cv2.aruco.CharucoDetector.detectBoard directly
@@ -204,6 +206,17 @@ def _make_node_class():
             self._np = np
             self._cv2 = cv2
             self._R = _R
+
+            # Waypoint store — best-effort load on startup.
+            self.waypoint_store = WaypointStore()
+            try:
+                result = self.do_reload_waypoints()
+                if result["ok"]:
+                    self.get_logger().info(
+                        f"loaded {result['count']} waypoints from {result.get('path', '?')}")
+            except Exception as exc:
+                self.get_logger().warn(f"waypoint startup load skipped: {exc}")
+
             self.get_logger().info("handeye_web node ready")
 
         # ---- param helper ----------------------------------------------------
@@ -439,6 +452,11 @@ def _make_node_class():
             # have to duplicate the math in JS.
             safety_preview = self.safety_preview()
 
+            with self.lock:
+                waypoints_list = self.waypoint_store.list()
+            waypoints_meta = [ws.waypoint_metadata(i, w)
+                              for i, w in enumerate(waypoints_list)]
+
             return ws.enriched_state_payload(
                 camera_connected=camera_connected,
                 intrinsics_ok=intrinsics_ok,
@@ -459,6 +477,7 @@ def _make_node_class():
                 diversity=diversity,
                 last_solve=None,  # T5 populates this from the last solve result
                 safety_preview=safety_preview,
+                waypoints=waypoints_meta,
             )
 
         def safety_preview(self):
@@ -783,6 +802,89 @@ def _make_node_class():
             res = hs.solve(samples, K, D, self._board_pts, methods=methods_subset)
             self.last_solve = res
             return {"ok": True, **ws.solve_payload_v2(res, samples, K, D, self._board_pts)}
+
+        # ---- T1-wp: waypoint CRUD + per-robot YAML persistence ---------------
+
+        def do_add_waypoint(self):
+            """Append the current xArm joint positions as a new waypoint.
+
+            Returns ``{ok: False, reason: "no current joints"}`` when
+            ``_xarm_joint_positions`` is not yet cached (no /joint_states).
+            Returns ``{ok: True, count: N}`` on success.
+            """
+            with self.lock:
+                joints = (None if self._xarm_joint_positions is None
+                          else list(self._xarm_joint_positions))
+            if joints is None:
+                return {"ok": False, "reason": "no current joints — /joint_states not received yet"}
+            with self.lock:
+                idx = self.waypoint_store.add(joints)
+                count = len(self.waypoint_store.list())
+            return {"ok": True, "count": count, "idx": idx}
+
+        def do_delete_waypoint(self, idx: int):
+            """Delete waypoint at ``idx``.
+
+            Returns ``{ok: True|False, count: N, reason?}``.
+            """
+            with self.lock:
+                ok = self.waypoint_store.delete(int(idx))
+                count = len(self.waypoint_store.list())
+            if ok:
+                return {"ok": True, "count": count}
+            return {"ok": False, "count": count,
+                    "reason": f"idx {idx} out of range (store has {count} waypoints)"}
+
+        def do_save_waypoints(self):
+            """Persist the in-memory waypoint list to the per-robot YAML.
+
+            Refuses (mirrors T6 promote pattern) when ``ROBOT_NAME`` is unset.
+            Returns ``{ok: True, path: str, count: N}`` on success.
+            """
+            robot = self._resolve_robot_name()
+            if not robot:
+                return {"ok": False,
+                        "reason": "ROBOT_NAME unset — cannot save per-robot waypoints"}
+            basic_root = self._tk25_basic_repo_root()
+            if basic_root is None:
+                return {"ok": False,
+                        "reason": "tk25_basic repo root not resolvable — cannot save waypoints"}
+            from pathlib import Path
+            path = hwp.resolve_waypoints_path(robot, basic_root)
+            with self.lock:
+                store_snapshot = self.waypoint_store
+                count = len(store_snapshot.list())
+                try:
+                    store_snapshot.save_yaml(path, recorded_for_robot=robot)
+                except Exception as exc:
+                    return {"ok": False, "reason": f"save failed: {exc}"}
+            return {"ok": True, "path": str(path), "count": count}
+
+        def do_reload_waypoints(self):
+            """Re-read the per-robot YAML; replaces the in-memory list.
+
+            Returns ``{ok: True, count: N, path: str}`` on success,
+            ``{ok: False, reason: str}`` on failure (silently logged on startup).
+            """
+            robot = self._resolve_robot_name()
+            if not robot:
+                return {"ok": False,
+                        "reason": "ROBOT_NAME unset — no per-robot waypoints to load"}
+            basic_root = self._tk25_basic_repo_root()
+            if basic_root is None:
+                return {"ok": False,
+                        "reason": "tk25_basic repo root not resolvable"}
+            from pathlib import Path
+            path = hwp.resolve_waypoints_path(robot, basic_root)
+            if not path.exists():
+                return {"ok": False,
+                        "reason": f"no waypoints file at {path}"}
+            with self.lock:
+                try:
+                    count = self.waypoint_store.load_yaml(path)
+                except Exception as exc:
+                    return {"ok": False, "reason": f"load failed: {exc}"}
+            return {"ok": True, "count": count, "path": str(path)}
 
         def do_promote(self):
             """Back-compat shim — POST /api/promote = apply_promote(which='both').
@@ -1255,6 +1357,36 @@ def make_app(node):
     def promote_reload():
         """T6: reset the cached ``last_solve`` so the operator can rerun."""
         return JSONResponse(node.reload_promote())
+
+    # ---- T1-wp: waypoint CRUD + per-robot YAML persistence ------------------
+
+    @app.get("/api/waypoints")
+    def waypoints_list():
+        """GET /api/waypoints → {count, items: [waypoint_metadata(...)]}."""
+        from handeye_calib import web_support as _ws
+        items = [_ws.waypoint_metadata(i, w)
+                 for i, w in enumerate(node.waypoint_store.list())]
+        return JSONResponse({"count": len(items), "items": items})
+
+    @app.post("/api/waypoints")
+    def waypoints_add():
+        """POST /api/waypoints {} → do_add_waypoint()."""
+        return JSONResponse(node.do_add_waypoint())
+
+    @app.delete("/api/waypoints/{idx}")
+    def waypoints_delete(idx: int):
+        """DELETE /api/waypoints/{idx} → do_delete_waypoint(idx)."""
+        return JSONResponse(node.do_delete_waypoint(idx))
+
+    @app.post("/api/waypoints/save")
+    def waypoints_save():
+        """POST /api/waypoints/save → do_save_waypoints()."""
+        return JSONResponse(node.do_save_waypoints())
+
+    @app.post("/api/waypoints/reload")
+    def waypoints_reload():
+        """POST /api/waypoints/reload → do_reload_waypoints()."""
+        return JSONResponse(node.do_reload_waypoints())
 
     @app.websocket("/ws")
     async def ws_state(ws_conn: WebSocket):

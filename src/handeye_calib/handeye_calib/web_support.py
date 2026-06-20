@@ -250,6 +250,24 @@ def sample_metadata(idx, sample, prev_sample=None, *,
     }
 
 
+def waypoint_metadata(idx: int, joints_rad) -> dict:
+    """JSON-friendly per-waypoint dict for the Waypoints tab.
+
+    Keys:
+      ``idx``       — integer index in the store.
+      ``joints_rad``— list of 7 floats (radians).
+      ``abbrev``    — human-readable summary: first 3 joints rounded to 2 dp,
+                      followed by "…" (e.g. ``"0.42, -0.30, 1.57, …"``).
+    """
+    j = [float(v) for v in joints_rad]
+    abbrev = ", ".join(f"{v:.2f}" for v in j[:3]) + ", …"
+    return {
+        "idx": int(idx),
+        "joints_rad": j,
+        "abbrev": abbrev,
+    }
+
+
 def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
                            last_detection, status_msg,
                            frame_count, frame_hz, frame_age_sec,
@@ -257,7 +275,8 @@ def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
                            t_base_ee, xarm_joint_positions,
                            board, safety_envelope,
                            stability, samples, diversity, last_solve,
-                           safety_preview=None):
+                           safety_preview=None,
+                           waypoints=None):
     """v2 enriched state for the WebSocket push.
 
     Extends ``state_payload`` with everything the new static UI needs to
@@ -290,5 +309,6 @@ def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
         "diversity": dict(diversity),
         "last_solve": last_solve,
         "safety_preview": (None if safety_preview is None else dict(safety_preview)),
+        "waypoints": list(waypoints) if waypoints is not None else [],
     })
     return base

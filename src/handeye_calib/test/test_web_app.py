@@ -281,3 +281,54 @@ def test_state_payload_includes_safety_preview():
             assert "safe" in sp and "detail" in sp
     finally:
         node.destroy_node()
+
+
+# ---------------------------------------------------------------------------
+# T1-wp: waypoint CRUD + per-robot YAML persistence
+# ---------------------------------------------------------------------------
+
+def test_waypoint_add_returns_no_current_joints_in_test_env():
+    """Test env has no JointState → add must degrade gracefully."""
+    node, c = _client()
+    try:
+        r = c.post("/api/waypoints", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False and "current joints" in body["reason"].lower()
+    finally:
+        node.destroy_node()
+
+
+def test_waypoint_delete_out_of_range():
+    node, c = _client()
+    try:
+        r = c.delete("/api/waypoints/99")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert body["count"] == 0
+    finally:
+        node.destroy_node()
+
+
+def test_waypoint_save_refuses_without_robot_name(monkeypatch):
+    monkeypatch.delenv("ROBOT_NAME", raising=False)
+    node, c = _client()
+    try:
+        r = c.post("/api/waypoints/save", json={})
+        body = r.json()
+        assert body["ok"] is False and "ROBOT_NAME" in body["reason"]
+    finally:
+        node.destroy_node()
+
+
+def test_state_payload_includes_waypoints():
+    node, c = _client()
+    try:
+        r = c.get("/api/state")
+        assert r.status_code == 200
+        body = r.json()
+        assert "waypoints" in body
+        assert body["waypoints"] == []  # empty in test env
+    finally:
+        node.destroy_node()

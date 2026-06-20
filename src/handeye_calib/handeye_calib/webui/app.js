@@ -470,10 +470,17 @@ async function _deleteSample(idx) {
   }
 }
 
+// Same click-eat bug class as renderWaypointsList: every render() destroys
+// and rebuilds the gallery's per-row ✕ delete button. Cache a samples
+// signature so we only rebuild when state.samples actually changes.
+let _lastGallerySig = null;
 function _renderGallery(s) {
   const gal = document.getElementById("gallery");
   if (!gal) return;
   const samples = Array.isArray(s.samples) ? s.samples : [];
+  const sig = JSON.stringify(samples);
+  if (sig === _lastGallerySig) return;
+  _lastGallerySig = sig;
   if (samples.length === 0) {
     gal.innerHTML = '<div class="gallery-empty" id="gallery-empty">no samples captured yet</div>';
     return;
@@ -573,6 +580,11 @@ if (SEQ_CANCEL) SEQ_CANCEL.addEventListener("click", async () => {
   await fetch("/api/sequence/cancel", {method: "POST"});
 });
 
+// SEQ_LOG has no clickable items so it doesn't eat clicks, but rewriting
+// its innerHTML on every 10 Hz push is a needless CPU/bandwidth burn —
+// guard the log rewrite on a signature so it only fires when the bounded
+// runner-log actually changed.
+let _lastSeqLogSig = null;
 function renderSequenceUI() {
   if (!SEQ_RUN) return;
   const seq = (state && state.sequence) || {running: false, current_step: "idle", total: 0, log: []};
@@ -590,7 +602,11 @@ function renderSequenceUI() {
     SEQ_PROG.className = "status-line " + (seq.current_step === "done" ? "ok" :
                                              seq.current_step === "cancelled" ? "warn" : "");
   }
-  SEQ_LOG.innerHTML = seq.log.map(line => `<li>${line.replace(/</g, "&lt;")}</li>`).join("");
+  const logSig = JSON.stringify(seq.log);
+  if (logSig !== _lastSeqLogSig) {
+    _lastSeqLogSig = logSig;
+    SEQ_LOG.innerHTML = seq.log.map(line => `<li>${line.replace(/</g, "&lt;")}</li>`).join("");
+  }
 }
 
 // ---- render the info tab from state ---------------------------------------

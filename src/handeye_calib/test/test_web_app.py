@@ -1,3 +1,4 @@
+import numpy as np
 import rclpy
 from fastapi.testclient import TestClient
 from handeye_calib.handeye_web import HandeyeWebNode, make_app
@@ -183,6 +184,83 @@ def test_do_solve_accepts_method_kwarg():
             out = node.do_solve(method=method)
             assert out["ok"] is False
             assert "reason" in out
+    finally:
+        node.destroy_node()
+
+
+# ---------------------------------------------------------------------------
+# T6: Promote tab — diff endpoint returns BOTH yaml + xacro halves; apply with
+# no ROBOT_NAME refuses the xacro half; vendor-path refusal
+# ---------------------------------------------------------------------------
+
+def _forge_last_solve(node):
+    """Stamp ``node.last_solve`` with an identity-X SolveResult so the diff
+    path is reachable in a no-hardware test environment."""
+    from handeye_calib.handeye_solve import SolveResult
+    node.last_solve = SolveResult(
+        X=np.eye(4), Tbb=np.eye(4),
+        train_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
+        heldout_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
+        status="PASS", per_method=[])
+
+
+def test_promote_diff_no_solve_returns_ok_false():
+    node, c = _client()
+    try:
+        body = c.get("/api/promote/diff").json()
+        assert body["ok"] is False  # no solve run
+    finally:
+        node.destroy_node()
+
+
+def test_promote_diff_yaml_only_when_robot_name_unset(monkeypatch):
+    monkeypatch.delenv("ROBOT_NAME", raising=False)
+    node, c = _client()
+    try:
+        # forge a last_solve so the diff path is exercised
+        _forge_last_solve(node)
+        body = c.get("/api/promote/diff").json()
+        assert body["ok"] is True
+        assert body["xacro"] is None  # no ROBOT_NAME → no xacro half
+        assert body["yaml"] is not None
+        assert "target_path" in body["yaml"] and "diff" in body["yaml"]
+    finally:
+        node.destroy_node()
+
+
+def test_promote_apply_xacro_refuses_when_robot_unset(monkeypatch):
+    monkeypatch.delenv("ROBOT_NAME", raising=False)
+    node, c = _client()
+    try:
+        _forge_last_solve(node)
+        r = c.post("/api/promote/apply", json={"which": "xacro"})
+        body = r.json()
+        assert body["ok"] is False and "ROBOT_NAME" in body["reason"]
+    finally:
+        node.destroy_node()
+
+
+def test_promote_diff_endpoint_exists():
+    """Smoke: the new GET /api/promote/diff route is registered."""
+    node, c = _client()
+    try:
+        r = c.get("/api/promote/diff")
+        # whether or not a solve has run, the route should be reachable (200).
+        assert r.status_code == 200
+        body = r.json()
+        assert "ok" in body
+    finally:
+        node.destroy_node()
+
+
+def test_promote_reload_endpoint_exists():
+    """Smoke: POST /api/promote/reload returns JSON with ``ok``."""
+    node, c = _client()
+    try:
+        r = c.post("/api/promote/reload")
+        assert r.status_code == 200
+        body = r.json()
+        assert "ok" in body
     finally:
         node.destroy_node()
 

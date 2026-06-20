@@ -188,7 +188,45 @@
         <canvas id="coverage" width="600" height="400"></canvas>
       </div>
     </section>
-    <section class="side-panel-content" data-panel="promote"></section>
+    <section class="side-panel-content" data-panel="promote">
+      <!-- T6: Promote tab — side-by-side unified-diff preview for BOTH
+           hand_eye.yaml AND a per-robot wrist_camera.xacro override. Each
+           half has its own Show / Apply / status / backup-line. The xacro
+           half is gated on ROBOT_NAME (the UI shows a banner when unset,
+           offering yaml-only promote); refuses to overwrite the shared
+           vendor xacro. Confirm-before-apply on each half; backups are
+           written by the server (apply_handeye.write_with_backup) and the
+           returned backup_path is surfaced inline. -->
+      <div class="promote-panel">
+        <div class="diff-half">
+          <h3>hand_eye.yaml <span class="badge" id="yaml-target">–</span></h3>
+          <div class="status-line" id="yaml-mode">–</div>
+          <div class="row">
+            <button id="promote-yaml-diff-btn" type="button">Show diff</button>
+            <button class="primary" id="promote-yaml-apply-btn" type="button" disabled>Apply yaml</button>
+          </div>
+          <pre class="diff-block" id="promote-yaml-diff"></pre>
+          <div class="status-line" id="promote-yaml-status"></div>
+          <div class="status-line" id="promote-yaml-backup"></div>
+        </div>
+        <div class="diff-half">
+          <h3>wrist_camera.xacro <span class="badge" id="xacro-target">–</span></h3>
+          <div class="status-line" id="xacro-mode">–</div>
+          <div class="status-line diff-warn" id="xacro-warn" hidden></div>
+          <div class="row">
+            <button id="promote-xacro-diff-btn" type="button">Show diff</button>
+            <button class="primary" id="promote-xacro-apply-btn" type="button" disabled>Apply xacro</button>
+          </div>
+          <pre class="diff-block" id="promote-xacro-diff"></pre>
+          <div class="status-line" id="promote-xacro-status"></div>
+          <div class="status-line" id="promote-xacro-backup"></div>
+        </div>
+        <div class="row">
+          <button id="promote-reload-btn" type="button">Reload from disk</button>
+          <span class="status-line" id="promote-reload-status"></span>
+        </div>
+      </div>
+    </section>
   </main>
   <script src="/static/app.js"></script>
 </body>

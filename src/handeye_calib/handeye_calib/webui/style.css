@@ -465,3 +465,72 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   display: block;
   max-width: 100%;
 }
+
+/* ---- T6: Promote tab — side-by-side unified-diff blocks ------------ *
+ * Two diff-halves (yaml + xacro) stack at narrow widths and split to    *
+ * two columns at >=1200px so a desktop operator can compare both        *
+ * proposed writes at once. Each half gets its own Show/Apply button,    *
+ * status line, and backup-path line. The diff-block is a dark monospace *
+ * pre, with line classes (.diff-add / .diff-del / .diff-hunk) coloured  *
+ * for cheap unified-diff syntax highlighting. The badge next to each    *
+ * heading shows the resolved target path; the warn line surfaces the    *
+ * vendor-path refusal banner.                                          */
+.promote-panel {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  max-width: 1400px;
+}
+@media (min-width: 1200px) {
+  .promote-panel {
+    grid-template-columns: 1fr 1fr;
+  }
+  .promote-panel > .row {
+    grid-column: 1 / -1;
+  }
+}
+.diff-half {
+  background: var(--bg-panel);
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.diff-half h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.diff-block {
+  background: #0a0a0a;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  white-space: pre;
+  max-height: 50vh;
+  overflow: auto;
+  margin: 8px 0;
+}
+.diff-block:empty {
+  display: none;
+}
+.diff-block .diff-add  { color: var(--ok); }
+.diff-block .diff-del  { color: var(--err); }
+.diff-block .diff-hunk { color: var(--accent); }
+.diff-warn {
+  color: var(--err);
+  font-weight: 600;
+}
+.badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-muted);
+  background: #0a0a0a;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  word-break: break-all;
+}

@@ -55,3 +55,36 @@ def test_action_endpoints_degrade_gracefully():
         assert c.post("/api/move", json={"joints": [0, 0, 0]}).json()["ok"] is False
     finally:
         node.destroy_node()
+
+
+def test_static_index_served_from_disk():
+    node, c = _client()
+    try:
+        r = c.get("/")
+        assert r.status_code == 200 and "text/html" in r.headers["content-type"]
+        # the new static index must reference the static stylesheet path
+        assert "/static/style.css" in r.text
+    finally:
+        node.destroy_node()
+
+
+def test_static_assets_served():
+    node, c = _client()
+    try:
+        for asset, ct in (("style.css", "text/css"), ("app.js", "javascript")):
+            r = c.get(f"/static/{asset}")
+            assert r.status_code == 200, f"{asset} -> {r.status_code}"
+            assert ct in r.headers["content-type"]
+    finally:
+        node.destroy_node()
+
+
+def test_websocket_pushes_state():
+    node, c = _client()
+    try:
+        with c.websocket_connect("/ws") as ws_conn:
+            msg = ws_conn.receive_json()
+            for key in ("camera_connected", "frame_hz", "samples", "stability", "diversity"):
+                assert key in msg, f"missing {key} in WS message"
+    finally:
+        node.destroy_node()

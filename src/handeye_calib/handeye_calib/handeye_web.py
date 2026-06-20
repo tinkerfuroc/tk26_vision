@@ -39,6 +39,8 @@ def _make_node_class():
     loadable under a plain venv with no ROS on the path.
     """
     import os
+    import time
+    import collections
     import threading
     import numpy as np
     import cv2
@@ -47,7 +49,7 @@ def _make_node_class():
     from rclpy.action import ActionClient
     from tf2_ros import Buffer, TransformListener
     from cv_bridge import CvBridge
-    from sensor_msgs.msg import Image, CameraInfo
+    from sensor_msgs.msg import Image, CameraInfo, JointState
     from tinker_arm_msgs.action import JointMove
     from scipy.spatial.transform import Rotation as _R
 
@@ -55,6 +57,7 @@ def _make_node_class():
     from handeye_calib import handeye_model as hm
     from handeye_calib import handeye_solve as hs
     from handeye_calib import apply_handeye as ah
+    from handeye_calib import gates as hgates
     from handeye_calib.handeye_collect import CaptureSession
     # Detection + safety reuse from pan_tilt. aruco_detect's Detection does NOT
     # surface per-corner charuco pixels/IDs (only pose + corner count + reproj
@@ -87,7 +90,46 @@ def _make_node_class():
             self._last_corners_xy = None       # (M,2) px for overlay, or None
             self._cap = None                   # latest {T_cam_board, obs_px, corner_idx, reproj_px, area_frac}
 
-            self.session = CaptureSession(min_diversity_deg=float(self._param("min_diversity_deg", 30.0)))
+            # Frame-rate bookkeeping. Each _on_image bumps the counter and pushes
+            # a monotonic timestamp onto a rolling 30-sample deque; frame_hz is
+            # derived from the deque span (delta-time across all samples).
+            self._frame_count = 0
+            self._frame_ts = collections.deque(maxlen=30)
+            self._last_frame_monotonic = None
+            self._time = time
+
+            # Cached base->ee TF; refreshed lazily inside get_state_dict() with
+            # a 50ms timeout, so the WS push never blocks if TF is unavailable.
+            self._t_base_ee_cache = None
+
+            # /joint_states best-effort: subscribe and stash xArm joint positions.
+            # The xArm publishes 7 joints named joint1..joint7 (or with link_ prefix
+            # depending on URDF); we accept either, falling back to the raw list.
+            self._xarm_joint_positions = None
+            self._xarm_joint_names = tuple(
+                f"joint{i+1}" for i in range(7)
+            )
+            self.create_subscription(
+                JointState, self._param("joint_states_topic", "/joint_states"),
+                self._on_joint_state, qos_profile_sensor_data)
+
+            # Stability tracker (observable in T1; T4 promotes it to a hard gate).
+            self._stab_window = int(self._param("stability_window", 5))
+            self._stab_rot_tol_deg = float(self._param("stability_rot_tol_deg", 0.1))
+            self._stab_trans_tol_m = float(self._param("stability_trans_tol_m", 0.0003))
+            self._stability = hgates.StabilityTracker(
+                window=self._stab_window,
+                rot_tol_deg=self._stab_rot_tol_deg,
+                trans_tol_m=self._stab_trans_tol_m,
+            )
+            self._stability_steady = False
+            self._stability_since_frames = 0
+
+            # Diversity target (degrees). T4 will compute actual coverage from
+            # the accepted-sample rotation spread; T1 ships the field at 0.0.
+            self._diversity_target_deg = float(self._param("min_diversity_deg", 30.0))
+
+            self.session = CaptureSession(min_diversity_deg=self._diversity_target_deg)
             self.last_solve = None
 
             self._sx = int(self._param("squares_x", 5))
@@ -121,8 +163,9 @@ def _make_node_class():
                 self.get_logger().warn(f"SafetyEnvelope unavailable ({exc}); skipping pose validation")
                 self._safety = None
 
+            self._image_topic = self._param("color_image_topic", "/xarm_camera/color/image_raw")
             self.create_subscription(
-                Image, self._param("color_image_topic", "/xarm_camera/color/image_raw"),
+                Image, self._image_topic,
                 self._on_image, qos_profile_sensor_data)
             self.create_subscription(
                 CameraInfo, self._param("camera_info_topic", "/xarm_camera/color/camera_info"),
@@ -156,11 +199,29 @@ def _make_node_class():
 
             corners_xy, last_det, cap = self._detect(bgr, K, D)
 
+            # Frame-rate bookkeeping (monotonic clock, immune to wall-clock jumps).
+            now = self._time.monotonic()
+            # Stability tracker: feed the latest cam->board pose only when we
+            # have one; missing/lost detection resets the running window.
+            if cap is not None:
+                steady = self._stability.update(cap["T_cam_board"])
+            else:
+                self._stability.reset()
+                steady = False
+
             with self.lock:
                 self._frame = bgr
                 self._last_corners_xy = corners_xy
                 self._last_det = last_det
                 self._cap = cap
+                self._frame_count += 1
+                self._frame_ts.append(now)
+                self._last_frame_monotonic = now
+                if steady:
+                    self._stability_since_frames += 1
+                else:
+                    self._stability_since_frames = 0
+                self._stability_steady = steady
 
         def _on_info(self, msg):
             np = self._np
@@ -169,6 +230,29 @@ def _make_node_class():
             with self.lock:
                 self._K = K
                 self._D = D
+
+        def _on_joint_state(self, msg):
+            """Stash xArm joint positions (best-effort).
+
+            Multiple publishers feed /joint_states on Tinker (xArm + pan-tilt);
+            we only care about the 7 xArm joints. If the message contains the
+            named xArm joints, pull them in canonical order; otherwise — for
+            mock/single-publisher setups — accept the raw position vector when
+            it's exactly 7 long.
+            """
+            names = list(msg.name) if msg.name else []
+            positions = list(msg.position) if msg.position else []
+            xarm = []
+            if names and len(positions) == len(names):
+                lookup = {n: p for n, p in zip(names, positions)}
+                xarm = [lookup[j] for j in self._xarm_joint_names if j in lookup]
+                if len(xarm) != len(self._xarm_joint_names):
+                    xarm = []
+            if not xarm and len(positions) == 7:
+                xarm = list(positions)
+            if xarm:
+                with self.lock:
+                    self._xarm_joint_positions = list(map(float, xarm))
 
         # ---- detection -------------------------------------------------------
 
@@ -236,10 +320,132 @@ def _make_node_class():
         # ---- accessors -------------------------------------------------------
 
         def get_state_dict(self):
+            """Snapshot of the node state for the WS push + REST /api/state.
+
+            Composes :func:`web_support.enriched_state_payload` from cached
+            members plus a best-effort TF refresh (50 ms timeout). T1 wires the
+            full key surface; T4 populates ``samples``, T5 populates
+            ``last_solve``.
+            """
+            np = self._np
+            # Refresh the base->ee cache outside the lock to keep the WS push
+            # responsive even when TF is unavailable.
+            t_base_ee = self._refresh_t_base_ee_cache()
+
             with self.lock:
-                return ws.state_payload(
-                    self._frame is not None, self._K is not None,
-                    len(self.session.samples), self._last_det, "ok")
+                frame_count = self._frame_count
+                ts = list(self._frame_ts)
+                last_mono = self._last_frame_monotonic
+                steady = self._stability_steady
+                since = self._stability_since_frames
+                xarm = (None if self._xarm_joint_positions is None
+                        else list(self._xarm_joint_positions))
+                camera_connected = self._frame is not None
+                intrinsics_ok = self._K is not None
+                num_samples = len(self.session.samples)
+                last_det = self._last_det
+                image_topic = self._image_topic
+
+            # frame_hz: rolling rate across the deque. Need >= 2 timestamps to
+            # measure a delta; falls back to 0.0 on a cold start.
+            if len(ts) >= 2:
+                span = ts[-1] - ts[0]
+                frame_hz = (len(ts) - 1) / span if span > 0 else 0.0
+            else:
+                frame_hz = 0.0
+            frame_age_sec = (None if last_mono is None
+                             else max(0.0, self._time.monotonic() - last_mono))
+
+            ros_domain_id = int(os.environ.get("ROS_DOMAIN_ID", "0") or "0")
+
+            # Board spec dict — keep mirrored with BoardSpec fields the UI shows.
+            board = {
+                "squares_x": int(self._sx),
+                "squares_y": int(self._sy),
+                "square_len_m": float(self._sq),
+                "marker_len_m": float(self._marker_len),
+                "aruco_dict": str(self._aruco_dict_name),
+            }
+            # Safety envelope — surface only safe-to-serialise scalars / lists.
+            safety_envelope = self._safety_envelope_dict()
+
+            stability = {
+                "steady": bool(steady),
+                "since_frames": int(since),
+                "target_frames": int(self._stab_window),
+            }
+            # Diversity: T1 ships the wired field at 0.0 (no samples are added
+            # by the v1 capture path until T4 turns the gates on). target_deg
+            # reflects min_diversity_deg the session was constructed with.
+            diversity = {
+                "coverage_deg": 0.0,
+                "target_deg": float(self._diversity_target_deg),
+            }
+
+            return ws.enriched_state_payload(
+                camera_connected=camera_connected,
+                intrinsics_ok=intrinsics_ok,
+                num_samples=num_samples,
+                last_detection=last_det,
+                status_msg="ok",
+                frame_count=frame_count,
+                frame_hz=frame_hz,
+                frame_age_sec=frame_age_sec,
+                image_topic=image_topic,
+                ros_domain_id=ros_domain_id,
+                t_base_ee=t_base_ee,
+                xarm_joint_positions=xarm,
+                board=board,
+                safety_envelope=safety_envelope,
+                stability=stability,
+                samples=[],  # T4 populates this from session metadata
+                diversity=diversity,
+                last_solve=None,  # T5 populates this from the last solve result
+            )
+
+        def _refresh_t_base_ee_cache(self):
+            """Look up base->ee TF with a 50ms timeout; cache + invalidate on fail.
+
+            Returns the cached 4x4 (as a nested list) or ``None`` when no TF is
+            ever available. Repeat failures invalidate the cache so a stale
+            transform doesn't survive a teleport / driver restart.
+            """
+            np = self._np
+            try:
+                import rclpy
+                tfm = self.tf_buffer.lookup_transform(
+                    self._base_frame, self._eef_frame,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.05))
+                T = ws.tf_to_matrix(
+                    [tfm.transform.translation.x, tfm.transform.translation.y,
+                     tfm.transform.translation.z],
+                    [tfm.transform.rotation.x, tfm.transform.rotation.y,
+                     tfm.transform.rotation.z, tfm.transform.rotation.w])
+                self._t_base_ee_cache = [list(map(float, row)) for row in T]
+            except Exception:
+                # No TF (no robot in this env, or transform stale beyond 50ms);
+                # drop the cache so the UI shows "—" rather than a stale matrix.
+                self._t_base_ee_cache = None
+            return self._t_base_ee_cache
+
+        def _safety_envelope_dict(self):
+            """JSON-friendly snapshot of the SafetyEnvelope parameters."""
+            env = self._safety
+            if env is None:
+                return {}
+            out = {}
+            for name in ("z_floor_m", "mast_radius_m", "mast_z_max"):
+                v = getattr(env, name, None)
+                if v is not None:
+                    out[name] = float(v)
+            ctr = getattr(env, "mast_xy_center", None)
+            if ctr is not None:
+                try:
+                    out["mast_xy_center"] = [float(ctr[0]), float(ctr[1])]
+                except Exception:
+                    pass
+            return out
 
         def latest_jpeg(self):
             np = self._np
@@ -397,15 +603,23 @@ def make_app(node):
     delegates to the node's thread-safe accessors/commands, which already
     degrade gracefully (return {"ok": False, ...}) when no hardware is present.
     """
-    from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, Response, JSONResponse
-    from handeye_calib import web_support as ws
+    import asyncio
+    from pathlib import Path
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+    from fastapi.responses import FileResponse, Response, JSONResponse
+    from fastapi.staticfiles import StaticFiles
 
     app = FastAPI(title="handeye_web", docs_url="/api/docs")
 
-    @app.get("/", response_class=HTMLResponse)
+    # v2 static UI. webui/ ships next to handeye_web.py via setup.py's
+    # package_data hook (see setup.py), so `Path(__file__).parent / "webui"`
+    # resolves both from the source tree and the install tree.
+    webui_dir = Path(__file__).resolve().parent / "webui"
+    app.mount("/static", StaticFiles(directory=str(webui_dir)), name="static")
+
+    @app.get("/")
     def index():
-        return ws.INDEX_HTML
+        return FileResponse(str(webui_dir / "index.html"), media_type="text/html")
 
     @app.get("/api/state")
     def state():
@@ -431,6 +645,24 @@ def make_app(node):
     @app.post("/api/promote")
     def promote():
         return JSONResponse(node.do_promote())
+
+    @app.websocket("/ws")
+    async def ws_state(ws_conn: WebSocket):
+        """5 Hz state push for the static UI.
+
+        Pushes the enriched state payload every 200 ms. Cleanly handles client
+        disconnects; the surrounding try/except keeps a broken socket from
+        propagating an exception into uvicorn's task supervisor.
+        """
+        await ws_conn.accept()
+        try:
+            while True:
+                await ws_conn.send_json(node.get_state_dict())
+                await asyncio.sleep(0.2)  # 5 Hz
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            return
 
     return app
 

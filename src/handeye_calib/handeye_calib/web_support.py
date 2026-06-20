@@ -73,33 +73,45 @@ def draw_charuco_overlay(bgr, corners_xy):
     return out
 
 
-INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>handeye_web</title><style>
-body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee;display:flex;gap:16px;padding:16px}
-#left{flex:0 0 660px}#right{flex:1}img{width:640px;background:#000;border:1px solid #333}
-button{background:#2563eb;color:#fff;border:0;padding:8px 12px;border-radius:6px;margin:4px 0;cursor:pointer}
-textarea{width:100%;height:60px;background:#1b1b1b;color:#eee;border:1px solid #333}
-pre{background:#1b1b1b;padding:8px;border-radius:6px;white-space:pre-wrap;max-height:40vh;overflow:auto}
-#banner{font-size:20px;font-weight:700;padding:8px;border-radius:6px;text-align:center}
-.row{margin:8px 0}</style></head><body>
-<div id="left"><img id="cam" src="/api/frame.jpg"><div class="row" id="status">…</div>
-<div class="row"><textarea id="joints" placeholder="7 joint values, comma-separated"></textarea>
-<button onclick="move()">Move arm</button></div>
-<div class="row"><button onclick="post('/api/capture')">Capture pose</button>
-<button onclick="post('/api/solve')">Solve</button>
-<button onclick="post('/api/promote')">Promote</button></div>
-<div id="banner"></div></div>
-<div id="right"><h3>Result</h3><pre id="out">—</pre></div>
-<script>
-const out=document.getElementById('out'),banner=document.getElementById('banner');
-function show(o){out.textContent=JSON.stringify(o,null,2);
-  if(o.status){banner.textContent=o.status;
-    banner.style.background=o.status==='PASS'?'#1a9850':o.status==='WARN'?'#f59e0b':o.status==='FAIL'?'#d73027':'#444';}}
-async function post(u){try{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});show(await r.json());}catch(e){show({error:String(e)});}}
-async function move(){const j=document.getElementById('joints').value.split(',').map(Number);
-  const r=await fetch('/api/move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({joints:j})});show(await r.json());}
-async function poll(){try{const r=await fetch('/api/state');const s=await r.json();
-  document.getElementById('status').textContent=`camera:${s.camera_connected} K:${s.intrinsics_ok} samples:${s.num_samples} — ${s.status_msg}`;}catch(e){}}
-setInterval(()=>{document.getElementById('cam').src='/api/frame.jpg?t='+Date.now();},200);
-setInterval(poll,1000);poll();
-</script></body></html>"""
+def mm(x_m):
+    return round(float(x_m) * 1000.0, 4)
+
+
+def deg(x_rad):
+    import math
+    return round(float(x_rad) * 180.0 / math.pi, 4)
+
+
+def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
+                           last_detection, status_msg,
+                           frame_count, frame_hz, frame_age_sec,
+                           image_topic, ros_domain_id,
+                           t_base_ee, xarm_joint_positions,
+                           board, safety_envelope,
+                           stability, samples, diversity, last_solve):
+    """v2 enriched state for the WebSocket push.
+
+    Extends ``state_payload`` with everything the new static UI needs to
+    render the info / move / capture / solve / promote tabs. T1 wires every
+    field; T4/T5 populate ``samples`` and ``last_solve``.
+    """
+    base = state_payload(camera_connected, intrinsics_ok, num_samples,
+                         last_detection, status_msg)
+    base.update({
+        "frame_count": int(frame_count),
+        "frame_hz": float(frame_hz),
+        "frame_age_sec": (None if frame_age_sec is None else float(frame_age_sec)),
+        "image_topic": str(image_topic),
+        "ros_domain_id": int(ros_domain_id),
+        "t_base_ee": (None if t_base_ee is None else
+                      [list(map(float, row)) for row in t_base_ee]),
+        "xarm_joint_positions": (None if xarm_joint_positions is None else
+                                 [float(j) for j in xarm_joint_positions]),
+        "board": dict(board),
+        "safety_envelope": dict(safety_envelope),
+        "stability": dict(stability),
+        "samples": list(samples),
+        "diversity": dict(diversity),
+        "last_solve": last_solve,
+    })
+    return base

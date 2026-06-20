@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>handeye_web · calibrate</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="bg-panel">
+    <span class="title">handeye_calib · calibrate_web</span>
+    <span id="conn-indicator" class="conn-indicator">WS: connecting…</span>
+  </header>
+  <main>
+    <nav class="side-tabs">
+      <button class="side-tab active" data-tab="info">Info</button>
+      <button class="side-tab" data-tab="move">Move</button>
+      <button class="side-tab" data-tab="capture">Capture</button>
+      <button class="side-tab" data-tab="solve">Solve</button>
+      <button class="side-tab" data-tab="promote">Promote</button>
+    </nav>
+    <section class="side-panel-content active" data-panel="info">
+      <div class="status-line" id="info-camera">camera: …</div>
+      <div class="status-line" id="info-tf">tf: …</div>
+    </section>
+    <section class="side-panel-content" data-panel="move"></section>
+    <section class="side-panel-content" data-panel="capture"></section>
+    <section class="side-panel-content" data-panel="solve"></section>
+    <section class="side-panel-content" data-panel="promote"></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

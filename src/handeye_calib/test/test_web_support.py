@@ -84,6 +84,28 @@ def test_draw_overlay_preserves_shape_and_handles_empty():
     assert out2.shape == img.shape
 
 
-def test_index_html_is_nonempty_html():
-    assert isinstance(ws.INDEX_HTML, str) and "<html" in ws.INDEX_HTML.lower()
-    assert "/api/frame.jpg" in ws.INDEX_HTML  # the UI references the live frame
+def test_mm_and_deg_round_to_4dp():
+    assert ws.mm(0.0012345) == 1.2345
+    assert ws.deg(0.0174533) == 1.0  # 1 deg in rad -> ~= 1.0
+    assert ws.mm(-0.001) == -1.0
+
+
+def test_enriched_state_payload_has_all_keys():
+    d = ws.enriched_state_payload(
+        camera_connected=False, intrinsics_ok=False, num_samples=0,
+        last_detection=None, status_msg="idle",
+        frame_count=0, frame_hz=0.0, frame_age_sec=None,
+        image_topic="/foo", ros_domain_id=0,
+        t_base_ee=None, xarm_joint_positions=None,
+        board={"squares_x": 5}, safety_envelope={"z_floor_m": 0.0},
+        stability={"steady": False, "since_frames": 0, "target_frames": 3},
+        samples=[], diversity={"coverage_deg": 0.0, "target_deg": 30.0},
+        last_solve=None,
+    )
+    required = {
+        "camera_connected", "intrinsics_ok", "num_samples", "last_detection",
+        "status_msg", "frame_count", "frame_hz", "frame_age_sec", "image_topic",
+        "ros_domain_id", "t_base_ee", "xarm_joint_positions", "board",
+        "safety_envelope", "stability", "samples", "diversity", "last_solve",
+    }
+    assert set(d) >= required

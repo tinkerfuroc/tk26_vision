@@ -99,3 +99,21 @@ def test_websocket_pushes_state():
                 assert key in msg, f"missing {key} in WS message"
     finally:
         node.destroy_node()
+
+
+def test_state_payload_includes_safety_preview():
+    """T3: ``state.safety_preview`` is wired into the WS/state payload (likely
+    ``None`` here since there's no TF), so the Move tab's safety-status line can
+    read it without duplicating SafetyEnvelope math in JS."""
+    node, c = _client()
+    try:
+        r = c.get("/api/state")
+        assert r.status_code == 200
+        body = r.json()
+        assert "safety_preview" in body
+        # No TF in this env => the degraded shape: {"safe": None, "detail": str}
+        sp = body["safety_preview"]
+        if sp is not None:
+            assert "safe" in sp and "detail" in sp
+    finally:
+        node.destroy_node()

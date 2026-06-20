@@ -395,6 +395,11 @@ def _make_node_class():
                 "target_deg": float(self._diversity_target_deg),
             }
 
+            # T3: server-evaluated SafetyEnvelope check against the cached EE
+            # pose, surfaced as state.safety_preview so the Move tab doesn't
+            # have to duplicate the math in JS.
+            safety_preview = self.safety_preview()
+
             return ws.enriched_state_payload(
                 camera_connected=camera_connected,
                 intrinsics_ok=intrinsics_ok,
@@ -414,7 +419,48 @@ def _make_node_class():
                 samples=[],  # T4 populates this from session metadata
                 diversity=diversity,
                 last_solve=None,  # T5 populates this from the last solve result
+                safety_preview=safety_preview,
             )
+
+        def safety_preview(self):
+            """Live SafetyEnvelope verdict on the cached base->ee pose.
+
+            Returns ``{"safe": bool|None, "detail": str}``. ``safe`` is:
+              * ``True``  if the cached pose passes ``SafetyEnvelope.validate``;
+              * ``False`` if it fails (``detail`` carries the rejection reason);
+              * ``None``  when we can't decide — no cached TF, or no envelope
+                instance (``SafetyEnvelope`` construction failed at init).
+
+            This runs off the cached ``_t_base_ee_cache`` (refreshed on every
+            WS push by :func:`get_state_dict`) so the WS push stays cheap; it
+            never blocks on TF here. The UI reads this verbatim into the Move
+            tab's ``#move-safety-status`` line — same wording as the pan_tilt
+            ``evaluateSafetyEnvelope`` JS helper so the two tools speak the
+            same language.
+            """
+            np = self._np
+            env = self._safety
+            cache = self._t_base_ee_cache
+            if env is None:
+                return {"safe": None, "detail": "safety envelope unavailable"}
+            if cache is None:
+                return {"safe": None, "detail": "TF unavailable"}
+            try:
+                T = np.asarray(cache, float)
+                reason = env.validate(T)
+            except Exception as exc:  # pragma: no cover - permissive guard
+                return {"safe": None, "detail": f"safety check error: {exc}"}
+            if reason is None:
+                z = float(T[2, 3])
+                dx = float(T[0, 3] - env.mast_xy_center[0])
+                dy = float(T[1, 3] - env.mast_xy_center[1])
+                import math
+                r = math.hypot(dx, dy)
+                return {
+                    "safe": True,
+                    "detail": f"safe (z={z:.3f} m, r_mast={r:.3f} m)",
+                }
+            return {"safe": False, "detail": f"VIOLATION: {reason}"}
 
         def _refresh_t_base_ee_cache(self):
             """Look up base->ee TF with a 50ms timeout; cache + invalidate on fail.

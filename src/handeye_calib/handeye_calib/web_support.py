@@ -132,12 +132,20 @@ def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
                            image_topic, ros_domain_id,
                            t_base_ee, xarm_joint_positions,
                            board, safety_envelope,
-                           stability, samples, diversity, last_solve):
+                           stability, samples, diversity, last_solve,
+                           safety_preview=None):
     """v2 enriched state for the WebSocket push.
 
     Extends ``state_payload`` with everything the new static UI needs to
     render the info / move / capture / solve / promote tabs. T1 wires every
-    field; T4/T5 populate ``samples`` and ``last_solve``.
+    field; T3 adds ``safety_preview`` (server-evaluated SafetyEnvelope check
+    against the cached EE pose, ``{safe: bool|None, detail: str}``) so the
+    Move tab doesn't have to duplicate the safety math in JS; T4/T5 populate
+    ``samples`` and ``last_solve``.
+
+    ``safety_preview`` defaults to ``None`` for back-compat with T1/T2
+    callers; the field is always emitted (under that key) so the UI can branch
+    on its presence consistently.
     """
     base = state_payload(camera_connected, intrinsics_ok, num_samples,
                          last_detection, status_msg)
@@ -157,5 +165,6 @@ def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
         "samples": list(samples),
         "diversity": dict(diversity),
         "last_solve": last_solve,
+        "safety_preview": (None if safety_preview is None else dict(safety_preview)),
     })
     return base

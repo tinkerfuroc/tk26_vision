@@ -223,3 +223,83 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .gate-pill.pass { background: var(--ok);   color: #0e1014; }
 .gate-pill.warn { background: var(--warn); color: #0e1014; }
 .gate-pill.fail { background: var(--err);  color: #fff;     }
+
+/* ---- T3: Info tab kv-table + matrix block --------------------------- *
+ * Mirrors pan_tilt's `table.kv` and `pre` patterns so the two tools'    *
+ * Info tabs read identically. The label column is fixed-width muted     *
+ * mono; the value column wraps. The matrix-block is a monospace pre     *
+ * with the same panel chrome as the rest of the dark surfaces.         */
+.kv-table {
+  width: 100%;
+  max-width: 520px;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
+.kv-table td { padding: 3px 0; vertical-align: top; }
+.kv-table td:first-child { color: var(--fg-muted); width: 140px; }
+
+.matrix-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  border-radius: 3px;
+  overflow-x: auto;
+  max-width: 520px;
+  margin: 4px 0 12px;
+  white-space: pre;
+}
+
+/* ---- T3: Move tab — joint editor + unit toggle + presets ------------ *
+ * Mirrors pan_tilt's xArm Waypoints visual layout: a two-column joint   *
+ * grid of `J0..J6 [input]` rows, an inline rad/deg radio toggle, and a  *
+ * preset-bar grid for one-click jumps. Selectors are renamed to match   *
+ * the DOM ids the T3 brief names (#move-joint-inputs / #move-presets / *
+ * #move-unit-toggle) but the visual look is preserved verbatim.        */
+.move-panel { max-width: 520px; }
+
+.unit-toggle {
+  margin: 8px 0 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.unit-toggle label { margin-right: 16px; color: var(--fg-muted); cursor: pointer; }
+.unit-toggle input { accent-color: var(--accent); }
+
+.joint-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.joint-grid .joint-row { display: flex; align-items: center; gap: 8px; }
+.joint-grid .joint-row label {
+  font-family: var(--mono);
+  font-size: 12px;
+  width: 40px;
+  color: var(--fg-muted);
+}
+.joint-grid .joint-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+
+.preset-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+  max-width: 600px;
+  margin-top: 6px;
+}

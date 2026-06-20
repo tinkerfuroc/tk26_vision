@@ -79,30 +79,60 @@ main {
   align-items: flex-start;
 }
 
+/* ---- Left dock: sticky camera + joint editor stacked vertically --- *
+ * The whole dock is sticky as a unit. Cap its height at viewport so   *
+ * it scrolls internally if camera + joint editor combined exceed the  *
+ * screen (rare on a normal monitor — camera 270 px + joint editor    *
+ * ~300 px = ~570 px).                                                 */
+.left-dock {
+  position: sticky;
+  top: 0;
+  flex: 0 0 var(--cam-w);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+}
+
+.joint-dock {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+.joint-dock h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 .controls-col {
   flex: 1 1 0;
   min-width: 0;  /* allow children to shrink instead of overflowing the flex row */
 }
 
-/* ---- T2: live frame panel (resizable, sticky-left) ------------------ *
+/* ---- T2: live frame panel (resizable; inside .left-dock) ------------ *
  * Selectors copied from src/pan_tilt/webui/style.css ( .feed-col +     *
  * .live-frame ) and renamed to .cam-panel for the handeye DOM ids the  *
  * brief names. The pan_tilt visual layout (16:9 panel, corner resize   *
  * handle, top-strip toolbar, bottom-left badge, dashed-border          *
  * placeholder) is preserved verbatim — only selector names differ.     *
  *                                                                       *
- * 2026-06-20: switched from `float: left` to flex + `position: sticky` *
- * so the camera stays visible during long capture-tab scrolls.         */
+ * 2026-06-20: the cam-panel is now a child of .left-dock (which is the *
+ * sticky flex item); cam-panel itself is full-width inside that dock.  */
 .cam-panel {
-  position: sticky;
-  top: 0;
-  flex: 0 0 var(--cam-w);
-  width: var(--cam-w);
+  position: relative;
+  width: 100%;
   aspect-ratio: 16 / 9;
   background: #0a0f18;
   border: 1px solid var(--border);
   border-radius: 4px;
   overflow: hidden;
+  flex-shrink: 0;
 }
 .cam-img {
   display: block;
@@ -277,7 +307,11 @@ button:disabled { opacity: .5; cursor: not-allowed; }
  * preset-bar grid for one-click jumps. Selectors are renamed to match   *
  * the DOM ids the T3 brief names (#move-joint-inputs / #move-presets / *
  * #move-unit-toggle) but the visual look is preserved verbatim.        */
-.move-panel { max-width: 520px; }
+/* .move-panel removed 2026-06-20 — joint editor lives in .joint-dock
+   inside the sticky .left-dock; presets moved to .presets-panel on the
+   right. Selectors below are still consumed by the relocated DOM ids. */
+
+.presets-panel { margin-bottom: 16px; }
 
 .unit-toggle {
   margin: 8px 0 12px;

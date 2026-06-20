@@ -137,6 +137,44 @@ def test_enriched_state_payload_has_all_keys():
     assert set(d) >= required
 
 
+def test_solve_payload_v2_units_and_keys():
+    """T5: ``solve_payload_v2`` adds mm/deg rendered metrics, per-method summary,
+    per-sample reprojection list, and X_xyz_mm / X_rpy_deg keys. Works even when
+    ``samples`` is empty (smoke-test path: per_sample_reproj_px == [])."""
+    from handeye_calib.handeye_solve import SolveResult
+    res = SolveResult(
+        X=np.eye(4), Tbb=np.eye(4),
+        train_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.00174, "reproj_px": 0.3},
+        heldout_metrics={"trans_rmse_m": 0.002, "rot_rmse_rad": 0.00349, "reproj_px": 0.5},
+        status="PASS",
+        per_method=[{"name": "TSAI", "X": np.eye(4), "Tbb": np.eye(4), "reproj_px": 0.31}],
+    )
+    p = ws.solve_payload_v2(res, samples=[], K=np.eye(3), dist=None, board_pts=np.zeros((0, 3)))
+    assert p["status"] == "PASS"
+    assert p["X_xyz_mm"] == [0.0, 0.0, 0.0]
+    assert len(p["X_rpy_deg"]) == 3
+    assert p["train_metrics_mm_deg"]["trans_rmse_mm"] == 1.0
+    assert abs(p["train_metrics_mm_deg"]["rot_rmse_deg"] - 0.1) < 0.01
+    assert p["train_metrics_mm_deg"]["reproj_px"] == 0.3
+    assert p["heldout_metrics_mm_deg"]["trans_rmse_mm"] == 2.0
+    assert abs(p["heldout_metrics_mm_deg"]["rot_rmse_deg"] - 0.2) < 0.01
+    assert p["heldout_metrics_mm_deg"]["reproj_px"] == 0.5
+    assert p["per_method_summary"] == [{"name": "TSAI", "reproj_px": 0.31}]
+    assert isinstance(p["per_sample_reproj_px"], list)
+    assert p["per_sample_reproj_px"] == []
+
+
+def test_solve_payload_v2_per_sample_residuals_match_samples():
+    """T5: ``per_sample_reproj_px`` is a 1:1 list with the input samples."""
+    from handeye_calib import synthetic as syn, handeye_solve as hs
+    sc = syn.make_scenario(n_poses=12, pixel_noise=0.3, seed=7)
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts, heldout_frac=0.25, rng_seed=0)
+    p = ws.solve_payload_v2(res, samples=sc.samples, K=sc.K, dist=None, board_pts=sc.board_pts)
+    assert len(p["per_sample_reproj_px"]) == len(sc.samples)
+    assert all(isinstance(v, float) and v >= 0 for v in p["per_sample_reproj_px"])
+    assert {m["name"] for m in p["per_method_summary"]} <= {"TSAI", "PARK", "HORAUD", "ANDREFF", "DANIILIDIS"}
+
+
 def test_enriched_state_payload_safety_preview_roundtrip():
     """T3: ``safety_preview`` is a new optional kwarg that round-trips into the
     payload under the same key. Defaults to ``None`` for back-compat (T1/T2

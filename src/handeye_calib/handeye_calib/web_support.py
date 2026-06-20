@@ -52,6 +52,61 @@ def solve_payload(res):
     }
 
 
+def _metrics_mm_deg(m):
+    """Convert a ``{trans_rmse_m, rot_rmse_rad, reproj_px}`` block into the
+    mm/deg-rendered shape the Solve tab displays directly."""
+    if not m:
+        return {}
+    return {
+        "trans_rmse_mm": mm(m.get("trans_rmse_m", 0.0)),
+        "rot_rmse_deg": deg(m.get("rot_rmse_rad", 0.0)),
+        "reproj_px": float(m.get("reproj_px", 0.0)),
+    }
+
+
+def solve_payload_v2(res, samples, K, dist, board_pts):
+    """v2 solve payload for the Solve tab.
+
+    Adds, on top of :func:`solve_payload`:
+
+    * ``X_xyz_mm`` / ``X_rpy_deg``: ready-to-render mm/deg quantities so the JS
+      doesn't have to know about radians or metres.
+    * ``train_metrics_mm_deg`` / ``heldout_metrics_mm_deg``: same conversion
+      applied to the metric blocks (trans in mm, rot in deg, reproj_px unchanged).
+    * ``per_method_summary``: a compact ``[{name, reproj_px}, ...]`` projection of
+      ``res.per_method`` so the method-comparison table doesn't carry full 4x4s
+      across the wire.
+    * ``per_sample_reproj_px``: a list[float] aligned 1:1 with ``samples`` giving
+      the post-BA reprojection RMS for each sample — feeds the histogram /
+      scatter canvases. Empty list when ``samples`` is empty (smoke-test path).
+
+    The original ``train_metrics`` / ``heldout_metrics`` / ``X_xyz`` / ``X_rpy``
+    keys remain so callers can still inspect raw SI units; the ``*_mm_deg``
+    keys are additive.
+    """
+    base = solve_payload(res)
+    xyz_m, rpy_rad = matrix_to_xyz_rpy(res.X)
+    if samples is not None and len(samples) > 0:
+        from handeye_calib import handeye_solve as hs  # local import to keep ws ROS-free
+        _, per_sample = hs._reproj_rms(
+            res.X, res.Tbb, samples, K, dist, board_pts, per_sample=True)
+    else:
+        per_sample = []
+    base.update({
+        "X_xyz_mm": [mm(v) for v in xyz_m],
+        "X_rpy_deg": [deg(v) for v in rpy_rad],
+        "train_metrics_mm_deg": _metrics_mm_deg(res.train_metrics),
+        "heldout_metrics_mm_deg": _metrics_mm_deg(res.heldout_metrics),
+        "per_method_summary": [
+            {"name": str(m.get("name", "?")),
+             "reproj_px": float(m.get("reproj_px", 0.0))}
+            for m in (res.per_method or [])
+        ],
+        "per_sample_reproj_px": [float(v) for v in per_sample],
+    })
+    return base
+
+
 def encode_jpeg(bgr):
     ok, buf = cv2.imencode(".jpg", np.ascontiguousarray(bgr), [cv2.IMWRITE_JPEG_QUALITY, 80])
     if not ok:

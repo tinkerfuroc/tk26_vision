@@ -134,7 +134,60 @@
         </div>
       </div>
     </section>
-    <section class="side-panel-content" data-panel="solve"></section>
+    <section class="side-panel-content" data-panel="solve">
+      <!-- T5: Solve tab.
+           Method picker drives /api/solve {method: ...}; "auto" sweeps all
+           five OpenCV methods, the named options restrict to one. The
+           comparison table lists every method that ran with its reprojection
+           RMS, so an operator can see at a glance which method seeded the
+           winning solve. mm/deg/px units are pre-rendered server-side
+           (web_support.solve_payload_v2) so the JS doesn't have to know about
+           radians or metres. The three canvases are vanilla canvas2d (no chart
+           library): histogram + scatter of per-sample reproj_px, plus a
+           board-centroid coverage map drawn via K-pinhole projection. -->
+      <div class="solve-panel">
+        <div class="row">
+          <label>Method:
+            <select id="solve-method">
+              <option value="auto" selected>auto (best of all)</option>
+              <option>TSAI</option><option>PARK</option><option>HORAUD</option>
+              <option>ANDREFF</option><option>DANIILIDIS</option>
+            </select>
+          </label>
+          <button class="primary" id="solve-btn" type="button">Solve</button>
+        </div>
+        <div class="status-line" id="solve-status"></div>
+        <span class="gate-pill" id="solve-verdict" hidden></span>
+
+        <h3>Per-method comparison</h3>
+        <table class="method-table" id="method-table"></table>
+
+        <h3>Metrics</h3>
+        <table class="kv-table" id="solve-metrics">
+          <tr><td>train trans_rmse</td><td data-k="train_trans">–</td></tr>
+          <tr><td>train rot_rmse</td><td data-k="train_rot">–</td></tr>
+          <tr><td>train reproj</td><td data-k="train_reproj">–</td></tr>
+          <tr><td>heldout trans_rmse</td><td data-k="held_trans">–</td></tr>
+          <tr><td>heldout rot_rmse</td><td data-k="held_rot">–</td></tr>
+          <tr><td>heldout reproj</td><td data-k="held_reproj">–</td></tr>
+        </table>
+
+        <h3>X (T<sub>eef→cam</sub>)</h3>
+        <table class="kv-table" id="solve-X">
+          <tr><td>xyz (mm)</td><td data-k="X_xyz_mm">–</td></tr>
+          <tr><td>rpy (deg)</td><td data-k="X_rpy_deg">–</td></tr>
+        </table>
+
+        <h3>Per-sample residuals</h3>
+        <div class="canvas-row">
+          <canvas id="resid-hist" width="360" height="140"></canvas>
+          <canvas id="resid-scatter" width="360" height="140"></canvas>
+        </div>
+
+        <h3>Coverage (board centroids projected to image)</h3>
+        <canvas id="coverage" width="600" height="400"></canvas>
+      </div>
+    </section>
     <section class="side-panel-content" data-panel="promote"></section>
   </main>
   <script src="/static/app.js"></script>

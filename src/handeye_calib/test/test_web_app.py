@@ -145,6 +145,48 @@ def test_capture_rejected_without_settle():
         node.destroy_node()
 
 
+# ---------------------------------------------------------------------------
+# T5: solve method picker
+# ---------------------------------------------------------------------------
+
+def test_api_solve_accepts_method_param():
+    """T5: ``POST /api/solve`` accepts a JSON body ``{method: "auto"|"TSAI"|...}``.
+
+    Without any captured samples the call still has to degrade gracefully —
+    ``{"ok": False, "reason": ...}``. The contract is the route accepting the
+    ``method`` param and forwarding it to ``do_solve``, not a successful solve.
+    """
+    node, c = _client()
+    try:
+        for method in ("auto", "TSAI", "PARK", "HORAUD", "ANDREFF", "DANIILIDIS"):
+            r = c.post("/api/solve", json={"method": method})
+            assert r.status_code == 200, f"{method} -> HTTP {r.status_code}"
+            body = r.json()
+            assert body["ok"] is False
+            assert "reason" in body
+        # And the default (no body) still works
+        r = c.post("/api/solve", json={})
+        assert r.status_code == 200 and r.json()["ok"] is False
+    finally:
+        node.destroy_node()
+
+
+def test_do_solve_accepts_method_kwarg():
+    """T5: ``HandeyeWebNode.do_solve(method=...)`` is the contract /api/solve forwards to.
+
+    Calling with the canonical method strings must not raise even with no
+    samples — degraded shape only.
+    """
+    node, _ = _client()
+    try:
+        for method in ("auto", "TSAI", "PARK", "HORAUD", "ANDREFF", "DANIILIDIS"):
+            out = node.do_solve(method=method)
+            assert out["ok"] is False
+            assert "reason" in out
+    finally:
+        node.destroy_node()
+
+
 def test_state_payload_includes_safety_preview():
     """T3: ``state.safety_preview`` is wired into the WS/state payload (likely
     ``None`` here since there's no TF), so the Move tab's safety-status line can

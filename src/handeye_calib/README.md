@@ -78,6 +78,13 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.4.0 (2026-06-20): handeye_web v2 — Solve tab (T5): method picker
+  (auto/TSAI/PARK/HORAUD/ANDREFF/DANIILIDIS), per-method comparison table,
+  residual histogram + scatter canvases, board-coverage canvas, mm/deg units
+  + PASS/WARN/FAIL gate pill. Added `web_support.solve_payload_v2` (renders
+  X_xyz_mm/X_rpy_deg + per-method summary + per-sample reproj_px),
+  `seed_handeye(methods=)` / `solve(methods=)` kwargs for single-method runs,
+  and `HandeyeWebNode.do_solve(method=)` forwarded from `POST /api/solve`.
 - 0.3.0 (2026-06-15): handeye_web server implemented (live ChArUco overlay,
   capture/solve/promote) + launch file (handeye_web.launch.py).
 - 0.2.0 (2026-06-15): math core (transforms/model/solver/gates), synthetic harness,

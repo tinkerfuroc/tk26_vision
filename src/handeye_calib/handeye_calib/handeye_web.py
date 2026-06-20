@@ -82,6 +82,307 @@ def _make_node_class():
         scale = target_w / w
         return cv2_mod.resize(bgr, (target_w, int(h * scale)))
 
+    class CaptureSequenceRunner:
+        """T3-seq: auto-capture state machine — move → settle → capture loop.
+
+        Owns its own daemon thread + stop event + state dict + log deque. All
+        moves go through ``self.node.do_move`` and all captures through
+        ``self.node.do_capture`` — the runner is a pure coordinator and never
+        reimplements the SafetyEnvelope check or the StabilityTracker hard
+        gate.
+
+        Threading model
+        ---------------
+        ``HandeyeWebNode.main()`` spins the node on the main thread (single-
+        threaded). ``send_goal_async`` / ``get_result_async`` futures resolve
+        on that spin thread independent of this runner's daemon thread, which
+        mirrors the proven pattern in ``pan_tilt/calib_web.py::_run_action``:
+        the runner uses a ``time.sleep(0.05)`` polling loop on the futures so
+        it never blocks rclpy's executor and the stop event is observed at
+        every poll tick.
+
+        Cancel semantics
+        ----------------
+        ``cancel()`` sets the stop event AND (best-effort) cancels the
+        in-flight ``JointMove`` goal handle via ``cancel_goal_async`` — both
+        steps fire, in that order, so the arm doesn't keep completing a
+        now-stale target after the operator hits Cancel. The runner thread
+        then exits at its next stop-check tick.
+        """
+
+        STEP_IDLE = "idle"
+        STEP_STARTING = "starting"
+        STEP_MOVING = "moving"
+        STEP_SETTLING = "settling"
+        STEP_CAPTURING = "capturing"
+        STEP_DONE = "done"
+        STEP_CANCELLED = "cancelled"
+        STEP_ERROR = "error"
+
+        # Total budget for a single waypoint move (goal accept + execution).
+        MOVE_DEADLINE_S = 30.0
+        # Wait for goal acceptance before declaring "send timed out".
+        ACCEPT_DEADLINE_S = 5.0
+        # Settle poll period (10 Hz per the brief).
+        SETTLE_POLL_S = 0.1
+        # Need this many consecutive steady ticks before we call it settled.
+        SETTLE_STEADY_TICKS = 3
+
+        def __init__(self, node):
+            self.node = node
+            self._stop = threading.Event()
+            self._lock = threading.Lock()
+            self._thread = None
+            self._inflight_handle = None  # latest JointMove goal handle
+            self._state = {
+                "running": False,
+                "dry_run": False,
+                "current_idx": None,
+                "total": 0,
+                "current_step": self.STEP_IDLE,
+            }
+            self._log = collections.deque(maxlen=20)
+
+        # ---- public API --------------------------------------------------
+
+        def state_dict(self):
+            """Snapshot of runner state for the WS push (copied under lock)."""
+            with self._lock:
+                return {**self._state, "log": list(self._log)}
+
+        def start(self, dry_run: bool = False, settle_timeout_s: float = 5.0):
+            """Spawn the daemon thread that runs the move/settle/capture loop.
+
+            Returns ``{ok: True}`` immediately; the loop body runs on the
+            spawned thread. Refuses with ``{ok: False, reason: ...}`` if a
+            prior run is still live or if the waypoint store is empty (the
+            latter is also guarded one level up in ``do_start_sequence``).
+            """
+            with self._lock:
+                if self._state["running"]:
+                    return {"ok": False, "reason": "sequence already running"}
+                with self.node.lock:
+                    wps = self.node.waypoint_store.list()
+                if not wps:
+                    return {"ok": False, "reason": "no waypoints recorded"}
+                self._stop.clear()
+                self._state.update({
+                    "running": True,
+                    "dry_run": bool(dry_run),
+                    "current_idx": None,
+                    "total": len(wps),
+                    "current_step": self.STEP_STARTING,
+                })
+                self._log.clear()
+                self._append_log_locked(
+                    f"starting sequence ({len(wps)} waypoints, "
+                    f"dry_run={bool(dry_run)})")
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(wps, bool(dry_run), float(settle_timeout_s)),
+                daemon=True, name="capture-sequence")
+            self._thread.start()
+            return {"ok": True}
+
+        def cancel(self):
+            """Request shutdown: cancel in-flight goal FIRST, then set stop event.
+
+            The order matters — set the stop flag alone and the arm completes
+            its current goal before the runner notices. Calling cancel on a
+            done/idle runner is a harmless no-op (idempotent)."""
+            # Best-effort goal cancel — fire first so the arm doesn't keep
+            # moving toward the now-stale target while the loop spins.
+            handle = self._inflight_handle
+            if handle is not None:
+                try:
+                    handle.cancel_goal_async()
+                except Exception:
+                    pass
+            self._stop.set()
+            self._append_log("cancel requested")
+            return {"ok": True}
+
+        # ---- internals ---------------------------------------------------
+
+        def _set_state(self, **kwargs):
+            with self._lock:
+                self._state.update(kwargs)
+
+        def _append_log(self, msg):
+            with self._lock:
+                self._append_log_locked(msg)
+
+        def _append_log_locked(self, msg):
+            ts = time.strftime("%H:%M:%S")
+            self._log.append(f"[{ts}] {msg}")
+
+        def _await_future(self, future, deadline_s: float) -> bool:
+            """Poll-wait for ``future`` to complete, respecting the stop event.
+
+            Returns True when ``future.done()``; False on timeout or on stop.
+            The rclpy executor runs on the main spin thread, so we just sleep
+            briefly between checks instead of calling
+            ``spin_until_future_complete`` (which would re-enter the executor
+            and deadlock here — mirrors the calib_web ``_run_action`` pattern).
+            """
+            t0 = time.monotonic()
+            while not future.done():
+                if self._stop.is_set():
+                    return False
+                if time.monotonic() - t0 >= deadline_s:
+                    return False
+                time.sleep(0.05)
+            return True
+
+        def _do_move_wait(self, joints):
+            """Send a JointMove goal and wait for completion.
+
+            Returns ``{ok: bool, reason: str}``. Uses the same goal shape
+            ``do_move`` does (so we inherit the field name contract); the
+            SafetyEnvelope pre-check is reused via ``self.node.do_move`` ONLY
+            for its parameter validation — we then construct + send our own
+            goal so we can capture the goal handle for cancellation.
+            """
+            jm = self.node._jm
+            if not jm.wait_for_server(timeout_sec=0.5):
+                return {"ok": False, "reason": "arm action server unavailable"}
+            # SafetyEnvelope pre-check on current EE pose (best-effort,
+            # mirrors do_move; skipped silently when no TF / no envelope).
+            if self.node._safety is not None:
+                try:
+                    tfm = self.node.tf_buffer.lookup_transform(
+                        self.node._base_frame, self.node._eef_frame,
+                        self.node._rclpy_time())
+                    T = ws.tf_to_matrix(
+                        [tfm.transform.translation.x,
+                         tfm.transform.translation.y,
+                         tfm.transform.translation.z],
+                        [tfm.transform.rotation.x,
+                         tfm.transform.rotation.y,
+                         tfm.transform.rotation.z,
+                         tfm.transform.rotation.w])
+                    reason = self.node._safety.validate(T)
+                    if reason is not None:
+                        return {"ok": False, "reason": f"safety: {reason}"}
+                except Exception:
+                    pass
+            goal = JointMove.Goal()
+            j = [float(x) for x in joints]
+            goal.joint0, goal.joint1, goal.joint2, goal.joint3 = j[0], j[1], j[2], j[3]
+            goal.joint4, goal.joint5, goal.joint6 = j[4], j[5], j[6]
+            goal.add_octomap = False
+            send_fut = jm.send_goal_async(goal)
+            if not self._await_future(send_fut, self.ACCEPT_DEADLINE_S):
+                if self._stop.is_set():
+                    return {"ok": False, "reason": "cancelled before goal acceptance"}
+                return {"ok": False, "reason": "send_goal timed out"}
+            goal_handle = send_fut.result()
+            if goal_handle is None or not getattr(goal_handle, "accepted", False):
+                return {"ok": False, "reason": "goal rejected"}
+            self._inflight_handle = goal_handle
+            try:
+                result_fut = goal_handle.get_result_async()
+                if not self._await_future(result_fut, self.MOVE_DEADLINE_S):
+                    if self._stop.is_set():
+                        # Best-effort cancel — cancel() already fired its
+                        # cancel_goal_async, but re-issue here defensively
+                        # in case the stop event was set externally.
+                        try:
+                            goal_handle.cancel_goal_async()
+                        except Exception:
+                            pass
+                        return {"ok": False, "reason": "cancelled mid-move"}
+                    try:
+                        goal_handle.cancel_goal_async()
+                    except Exception:
+                        pass
+                    return {"ok": False,
+                            "reason": f"move timed out after {self.MOVE_DEADLINE_S:.0f}s"}
+                wrapped = result_fut.result()
+                result = getattr(wrapped, "result", wrapped)
+                ok = bool(getattr(result, "success", False))
+                return {"ok": ok,
+                        "reason": "ok" if ok else "arm reported success=False"}
+            finally:
+                self._inflight_handle = None
+
+        def _wait_for_settle(self, settle_timeout_s: float) -> bool:
+            """Poll the cached StabilityTracker verdict at 10 Hz.
+
+            Returns True when steady for ``SETTLE_STEADY_TICKS`` consecutive
+            ticks; False on timeout or on stop. Reuses ``_stability_steady``
+            written by ``_on_image`` — no fresh threshold tuning here per the
+            brief (T4 owns those thresholds)."""
+            t0 = time.monotonic()
+            consec = 0
+            while True:
+                if self._stop.is_set():
+                    return False
+                if time.monotonic() - t0 >= settle_timeout_s:
+                    return False
+                with self.node.lock:
+                    steady = self.node._stability_steady
+                if steady:
+                    consec += 1
+                    if consec >= self.SETTLE_STEADY_TICKS:
+                        return True
+                else:
+                    consec = 0
+                time.sleep(self.SETTLE_POLL_S)
+
+        def _run(self, waypoints, dry_run: bool, settle_timeout_s: float):
+            """The state-machine body. Runs on a daemon thread.
+
+            Iteration: ``moving`` → ``settling`` → ``capturing`` (skipped on
+            dry-run). Per-step failures (move failed, settle timeout) log +
+            ``continue`` to the next waypoint rather than abort the whole
+            sequence; an unhandled exception transitions to ``error``."""
+            try:
+                for idx, wp in enumerate(waypoints):
+                    if self._stop.is_set():
+                        break
+                    self._set_state(current_idx=idx, current_step=self.STEP_MOVING)
+                    self._append_log(
+                        f"#{idx}: moving to "
+                        f"[{wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}, ...]")
+                    move_res = self._do_move_wait(wp)
+                    if self._stop.is_set():
+                        break
+                    if not move_res["ok"]:
+                        self._append_log(
+                            f"#{idx}: move failed ({move_res['reason']}); skipping")
+                        continue
+
+                    self._set_state(current_step=self.STEP_SETTLING)
+                    self._append_log(f"#{idx}: settling …")
+                    settled = self._wait_for_settle(settle_timeout_s)
+                    if self._stop.is_set():
+                        break
+                    if not settled:
+                        self._append_log(
+                            f"#{idx}: settle timeout after {settle_timeout_s:.1f}s; skipping")
+                        continue
+
+                    if dry_run:
+                        self._append_log(
+                            f"#{idx}: dry-run — settled but skipping capture")
+                        continue
+
+                    self._set_state(current_step=self.STEP_CAPTURING)
+                    cap = self.node.do_capture()
+                    if cap.get("ok"):
+                        self._append_log(f"#{idx}: captured")
+                    else:
+                        self._append_log(
+                            f"#{idx}: capture skipped ({cap.get('reason', '?')})")
+                final_step = (self.STEP_CANCELLED if self._stop.is_set()
+                              else self.STEP_DONE)
+                self._set_state(running=False, current_step=final_step)
+                self._append_log(f"sequence {final_step}")
+            except Exception as exc:  # pragma: no cover - defensive
+                self._set_state(running=False, current_step=self.STEP_ERROR)
+                self._append_log(f"runner crashed: {exc!r}")
+
     class HandeyeWebNode(Node):
         def __init__(self):
             super().__init__("handeye_web")
@@ -216,6 +517,12 @@ def _make_node_class():
                         f"loaded {result['count']} waypoints from {result.get('path', '?')}")
             except Exception as exc:
                 self.get_logger().warn(f"waypoint startup load skipped: {exc}")
+
+            # T3-seq: auto-capture state machine. Lazily constructed on the
+            # first ``do_start_sequence`` so the idle state.sequence stays the
+            # canonical SEQUENCE_IDLE_DEFAULT (no leftover state from a prior
+            # run) and node construction stays cheap.
+            self.sequence_runner = None
 
             self.get_logger().info("handeye_web node ready")
 
@@ -457,6 +764,12 @@ def _make_node_class():
             waypoints_meta = [ws.waypoint_metadata(i, w)
                               for i, w in enumerate(waypoints_list)]
 
+            # T3-seq: auto-capture state. Idle default when no runner has
+            # been instantiated yet so the UI sees a stable shape from t=0.
+            sequence_state = (self.sequence_runner.state_dict()
+                              if self.sequence_runner is not None
+                              else dict(ws.SEQUENCE_IDLE_DEFAULT))
+
             return ws.enriched_state_payload(
                 camera_connected=camera_connected,
                 intrinsics_ok=intrinsics_ok,
@@ -478,6 +791,7 @@ def _make_node_class():
                 last_solve=None,  # T5 populates this from the last solve result
                 safety_preview=safety_preview,
                 waypoints=waypoints_meta,
+                sequence=sequence_state,
             )
 
         def safety_preview(self):
@@ -895,6 +1209,44 @@ def _make_node_class():
             path going forward.
             """
             return self.apply_promote(which="both")
+
+        # ---- T3-seq: auto-capture state machine ------------------------------
+
+        def do_start_sequence(self, dry_run: bool = False,
+                              settle_timeout_s: float = 5.0):
+            """Kick off the auto-capture state machine.
+
+            Refuses on empty waypoint list with ``{ok: False, reason: "no
+            waypoints recorded"}``. Otherwise lazily (re)constructs the
+            runner so prior state can't leak across runs, then delegates to
+            ``runner.start``. Returns immediately; the runner spins on its
+            own daemon thread.
+            """
+            with self.lock:
+                wp_count = len(self.waypoint_store.list())
+            if wp_count == 0:
+                return {"ok": False, "reason": "no waypoints recorded"}
+            # If a prior runner is still alive (running), refuse with the
+            # runner's own reason; otherwise rebuild fresh.
+            existing = self.sequence_runner
+            if existing is not None and existing.state_dict().get("running"):
+                return {"ok": False, "reason": "sequence already running"}
+            self.sequence_runner = CaptureSequenceRunner(self)
+            return self.sequence_runner.start(
+                dry_run=bool(dry_run),
+                settle_timeout_s=float(settle_timeout_s),
+            )
+
+        def do_cancel_sequence(self):
+            """Cancel the in-flight sequence (idempotent no-op if none running).
+
+            Always returns ``{ok: True}``; ``CaptureSequenceRunner.cancel`` is
+            itself idempotent (set-event semantics + best-effort goal cancel).
+            """
+            runner = self.sequence_runner
+            if runner is None:
+                return {"ok": True}
+            return runner.cancel()
 
         # ---- T6: per-robot xacro override + yaml-diff ------------------------
 
@@ -1387,6 +1739,29 @@ def make_app(node):
     def waypoints_reload():
         """POST /api/waypoints/reload → do_reload_waypoints()."""
         return JSONResponse(node.do_reload_waypoints())
+
+    # ---- T3-seq: auto-capture sequence endpoints ---------------------------
+
+    @app.post("/api/sequence/start")
+    async def sequence_start(request: Request):
+        """POST /api/sequence/start {dry_run?: bool} → do_start_sequence(...).
+
+        Body is optional; missing/malformed JSON is treated as the default
+        ``{dry_run: false}`` per the same degrade-rather-than-422 stance the
+        rest of the API uses."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        return JSONResponse(node.do_start_sequence(
+            dry_run=bool(body.get("dry_run", False))))
+
+    @app.post("/api/sequence/cancel")
+    def sequence_cancel():
+        """POST /api/sequence/cancel → do_cancel_sequence() (idempotent no-op)."""
+        return JSONResponse(node.do_cancel_sequence())
 
     @app.websocket("/ws")
     async def ws_state(ws_conn: WebSocket):

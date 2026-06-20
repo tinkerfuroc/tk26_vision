@@ -268,6 +268,16 @@ def waypoint_metadata(idx: int, joints_rad) -> dict:
     }
 
 
+SEQUENCE_IDLE_DEFAULT = {
+    "running": False,
+    "dry_run": False,
+    "current_idx": None,
+    "total": 0,
+    "current_step": "idle",
+    "log": [],
+}
+
+
 def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
                            last_detection, status_msg,
                            frame_count, frame_hz, frame_age_sec,
@@ -276,7 +286,8 @@ def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
                            board, safety_envelope,
                            stability, samples, diversity, last_solve,
                            safety_preview=None,
-                           waypoints=None):
+                           waypoints=None,
+                           sequence=None):
     """v2 enriched state for the WebSocket push.
 
     Extends ``state_payload`` with everything the new static UI needs to
@@ -289,6 +300,10 @@ def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
     ``safety_preview`` defaults to ``None`` for back-compat with T1/T2
     callers; the field is always emitted (under that key) so the UI can branch
     on its presence consistently.
+
+    ``sequence`` defaults to ``SEQUENCE_IDLE_DEFAULT`` when omitted (T3-seq
+    auto-capture runner state); always emitted under the ``sequence`` key so
+    the UI's renderer can branch on ``state.sequence.running`` unconditionally.
     """
     base = state_payload(camera_connected, intrinsics_ok, num_samples,
                          last_detection, status_msg)
@@ -310,5 +325,7 @@ def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
         "last_solve": last_solve,
         "safety_preview": (None if safety_preview is None else dict(safety_preview)),
         "waypoints": list(waypoints) if waypoints is not None else [],
+        "sequence": (dict(sequence) if sequence is not None
+                     else dict(SEQUENCE_IDLE_DEFAULT)),
     })
     return base

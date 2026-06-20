@@ -332,3 +332,51 @@ def test_state_payload_includes_waypoints():
         assert body["waypoints"] == []  # empty in test env
     finally:
         node.destroy_node()
+
+
+# ---------------------------------------------------------------------------
+# T3-seq: CaptureSequenceRunner endpoints
+# ---------------------------------------------------------------------------
+
+def test_sequence_start_refuses_empty():
+    """T3-seq: POST /api/sequence/start refuses when no waypoints are recorded."""
+    node, c = _client()
+    try:
+        r = c.post("/api/sequence/start", json={"dry_run": False})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert "reason" in body
+    finally:
+        node.destroy_node()
+
+
+def test_sequence_cancel_when_not_running():
+    """T3-seq: POST /api/sequence/cancel is idempotent when no runner is live."""
+    node, c = _client()
+    try:
+        r = c.post("/api/sequence/cancel", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+    finally:
+        node.destroy_node()
+
+
+def test_state_payload_includes_sequence():
+    """T3-seq: state.sequence is present in WS/state payload (idle defaults)."""
+    node, c = _client()
+    try:
+        r = c.get("/api/state")
+        assert r.status_code == 200
+        body = r.json()
+        assert "sequence" in body
+        seq = body["sequence"]
+        assert seq["running"] is False
+        assert seq["current_step"] == "idle"
+        assert seq["current_idx"] is None
+        assert seq["total"] == 0
+        assert seq["dry_run"] is False
+        assert seq["log"] == []
+    finally:
+        node.destroy_node()

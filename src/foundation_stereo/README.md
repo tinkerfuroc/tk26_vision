@@ -465,3 +465,26 @@ can stall the worker loop. Turn on selectively for debugging.
 * Design spec: [`docs/superpowers/specs/2026-05-24-foundation-stereo-design.md`](../../docs/superpowers/specs/2026-05-24-foundation-stereo-design.md)
 * Implementation plan: [`docs/superpowers/plans/2026-05-24-foundation-stereo.md`](../../docs/superpowers/plans/2026-05-24-foundation-stereo.md)
 * Bleed triage + rationale for `rs.align`: [`debug_renders/2026-05-25-fs-vs-native-alignment/TRIAGE_FINDINGS.md`](../../debug_renders/2026-05-25-fs-vs-native-alignment/TRIAGE_FINDINGS.md)
+
+## Changelog
+
+* **2026-06-20 — Streaming align-to-color startup race fixed.** The cold
+  TRT engine warmup (`_warmup_model`, ~2-5 s) used to run *synchronously*
+  in `__init__`, **before** `rclpy.spin()`. That blocked the executor, so
+  the latched `extrinsics`/`color_info` subscription callbacks couldn't
+  fire while the streaming worker's align-to-color readiness gate burned
+  down its 5 s budget — failing on **every** launch with
+  `stream_align_to_color=true but extrinsics or color_info not received
+  within 5.0 s; publisher not emitting` and killing the only stream thread
+  (no re-arm). Warmup now runs in a **background daemon thread**
+  (`_warmup_model_threaded`) kicked off in `__init__`, so `__init__`
+  returns and `spin()` starts in milliseconds; the executor then delivers
+  the live latched extrinsics + color_info right away and the gate passes
+  well inside its window. A `threading.Event` (`self._model_ready`) — set
+  by the warmup thread, pre-set when `warmup_on_launch=false` — gates the
+  stream worker's first inference so no depth is emitted before the engine
+  is loaded. Engine access stays serialized by `StereoRunner`'s existing
+  internal lock, so warm + use can't race. As margin,
+  `extrinsics_warmup_timeout_sec` raised 5.0 → 15.0 (param default +
+  `config/foundation_stereo.yaml`). QoS and the align-to-color
+  wiring/gate logic were unchanged.

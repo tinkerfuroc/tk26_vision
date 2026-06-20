@@ -151,10 +151,45 @@ def _resolve_stream_topics(node, align: bool) -> Tuple[str, str]:
     return "~/depth/image_rect_raw", "~/depth/camera_info"
 
 
+def _mem_report(node, tag):
+    """Intra-process GPU memory breakdown (gated by CUMOTION_MEM_PROFILE env).
+    live_tensors = torch.cuda.memory_allocated; torch_pool = memory_reserved;
+    ctx+libs+graphs = NVML_total - torch_pool (CUDA context, cuBLAS/cuDNN,
+    TensorRT engine, Warp) — the part torch's counters and external tools miss.
+    No-op unless CUMOTION_MEM_PROFILE is set."""
+    import os
+    if not os.environ.get('CUMOTION_MEM_PROFILE'):
+        return
+    import subprocess
+    try:
+        import torch
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / 2**20
+        resv = torch.cuda.memory_reserved() / 2**20
+        total = float('nan')
+        pid = os.getpid()
+        out = subprocess.run(
+            ['nvidia-smi', '--query-compute-apps=pid,used_memory',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5).stdout
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) == pid:
+                total = float(parts[1])
+                break
+        node.get_logger().info(
+            f'[MEMPROF {tag}] live_tensors={alloc:.0f}MB '
+            f'torch_pool={resv:.0f}MB(slack={resv - alloc:.0f}) '
+            f'nvsmi_total={total:.0f}MB ctx+libs+graphs={total - resv:.0f}MB')
+    except Exception as e:
+        node.get_logger().warn(f'[MEMPROF {tag}] failed: {e}')
+
+
 class FoundationStereoNode(Node):
 
     def __init__(self):
         super().__init__("foundation_stereo")
+        _mem_report(self, '00_init_start')
         self._declare_parameters()
         self._bridge = CvBridge()
 
@@ -173,6 +208,13 @@ class FoundationStereoNode(Node):
         self._aligner: Optional[RealsenseAligner] = None
         self._aligner_key: Optional[tuple] = None
 
+        # Set BEFORE _setup_stream() so the stream worker thread (which may
+        # start inside _setup_stream) can always reference it. Cleared while a
+        # background warmup is in flight; set once the model is loaded + warm
+        # (or immediately when warmup_on_launch is false, since the runner
+        # lazy-loads the engine on the first real infer() under its own lock).
+        self._model_ready = threading.Event()
+
         self._setup_subscribers()
         self._setup_service()
         self._setup_action()
@@ -185,7 +227,25 @@ class FoundationStereoNode(Node):
             self.get_logger().info(f"vision_log session dir: {self._log_dir}")
 
         if bool(self._p("warmup_on_launch")):
-            self._warmup_model()
+            # Run the cold TRT engine load (~2-5 s) OFF the synchronous init
+            # path in a background daemon thread so __init__ returns and
+            # main() reaches rclpy.spin() in milliseconds. With the executor
+            # live, the latched extrinsics + color_info subscription
+            # callbacks fire right away and the stream loop's align-to-color
+            # readiness gate passes well inside its window — instead of the
+            # gate's clock burning down during a blocking warmup. The worker
+            # sets self._model_ready when done; the stream loop waits on it
+            # before its first inference (see _stream_loop), and the runner's
+            # own lock serializes engine access so warm + use can't race.
+            self._warmup_thread = threading.Thread(
+                target=self._warmup_model_threaded,
+                name="fs-warmup", daemon=True,
+            )
+            self._warmup_thread.start()
+        else:
+            # No launch-time warmup: the runner lazy-loads on first infer()
+            # under its own lock, so the model is "ready" to be used now.
+            self._model_ready.set()
 
         self.get_logger().info(
             f"foundation_stereo ready: profile={self._p('camera_profile')}, "
@@ -194,6 +254,8 @@ class FoundationStereoNode(Node):
             f"stream_enabled={self._p('stream_enabled')}, "
             f"trt_variants={list(_sr.TRT_VARIANTS.keys())}"
         )
+
+        self.create_timer(5.0, lambda: _mem_report(self, 'periodic'))
 
     # ---------- parameters ----------
 
@@ -239,7 +301,7 @@ class FoundationStereoNode(Node):
         self.declare_parameter("output_frame_id", "")
         self.declare_parameter("stream_publish_vis", False)
         self.declare_parameter("stream_max_fps", 15.0)
-        self.declare_parameter("extrinsics_warmup_timeout_sec", 5.0)
+        self.declare_parameter("extrinsics_warmup_timeout_sec", 15.0)
         self.declare_parameter("stream_measure_forward_ms", False)
         # QoS reliability for the streaming depth + camera_info publishers.
         # 'reliable' (default) is a drop-in for realsense aligned_depth_to_color
@@ -342,6 +404,25 @@ class FoundationStereoNode(Node):
         R = np.asarray(msg.rotation, dtype=np.float32).reshape(3, 3)
         T = np.asarray(msg.translation, dtype=np.float32).reshape(3)
         self._extrinsics = (R, T)
+
+    def _warmup_model_threaded(self) -> None:
+        """Background-thread entry point for launch-time warmup.
+
+        Runs the (slow, cold) TRT engine load + first forward off the
+        synchronous __init__ path so main() reaches rclpy.spin()
+        immediately. Sets self._model_ready in a finally block so the
+        stream loop's model-ready gate is released whether the warmup
+        forward succeeds or fails — a genuine failure surfaces again on
+        the first real infer() (same as before), but we must never leave
+        the stream worker blocked forever. Engine access is serialized by
+        the runner's internal lock, so this thread and the stream worker
+        can't race on the TRT engine.
+        """
+        try:
+            self._warmup_model()
+            _mem_report(self, '01_after_model_load')
+        finally:
+            self._model_ready.set()
 
     def _warmup_model(self) -> None:
         """Load the default TRT engine + run one live forward so the
@@ -773,6 +854,21 @@ class FoundationStereoNode(Node):
                     "publisher not emitting."
                 )
                 return
+
+        # Inputs are ready; now block until the model is warmed before the
+        # first inference. With warmup_on_launch=true this waits on the
+        # background warmup thread (the cold TRT load runs off the init path,
+        # so the executor stayed live and the inputs gate above already
+        # passed); with warmup_on_launch=false the Event is pre-set, so this
+        # returns immediately and the runner lazy-loads under its own lock.
+        # This guarantees no inference output is emitted before the engine is
+        # actually loaded. Polled so _stream_stop can break a long warmup.
+        while not self._model_ready.is_set():
+            if self._stream_stop.is_set():
+                return
+            if self._model_ready.wait(timeout=0.1):
+                break
+        self.get_logger().info("stream worker: model ready, emitting depth")
 
         last_seq = None
         last_emit = 0.0

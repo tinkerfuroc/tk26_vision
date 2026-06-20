@@ -61,10 +61,12 @@ def main():
             self.tf_buffer = Buffer()
             TransformListener(self.tf_buffer, self)
             self.jm = ActionClient(self, JointMove, "/xarm/joint_move")
+            # Topics match the realsense2_camera launch convention used in
+            # this workspace (namespace=/camera, node=xarm_camera).
             self.sub = self.create_subscription(
-                Image, "/xarm_camera/color/image_raw", self._on_image, 1)
+                Image, "/camera/xarm_camera/color/image_raw", self._on_image, 1)
             self.info_sub = self.create_subscription(
-                CameraInfo, "/xarm_camera/color/camera_info", self._on_info, 1)
+                CameraInfo, "/camera/xarm_camera/color/camera_info", self._on_info, 1)
             self.stability = gates.StabilityTracker()
             self.K = None
             self.get_logger().info("handeye_collect ready")

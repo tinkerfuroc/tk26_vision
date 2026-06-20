@@ -12,6 +12,18 @@
     <span id="conn-indicator" class="conn-indicator">WS: connecting…</span>
   </header>
   <main>
+    <!-- Live frame panel: floats top-left, controls wrap around it. -->
+    <div class="cam-panel" id="cam-panel">
+      <img id="cam-img" class="cam-img" alt="">
+      <div class="cam-resize" id="cam-resize" title="drag to resize"></div>
+      <div class="frame-toolbar">
+        <label><input type="radio" name="frame-mode" value="annotated" checked> annotated</label>
+        <label><input type="radio" name="frame-mode" value="raw"> raw</label>
+      </div>
+      <div class="detection-badge" id="detection-badge">corners=0  NO DETECTION</div>
+      <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/xarm_camera/color/image_raw</span></div>
+    </div>
+
     <nav class="side-tabs">
       <button class="side-tab active" data-tab="info">Info</button>
       <button class="side-tab" data-tab="move">Move</button>

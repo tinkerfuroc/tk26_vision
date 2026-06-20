@@ -47,6 +47,17 @@ def test_frame_endpoint_returns_jpeg_placeholder():
         node.destroy_node()
 
 
+def test_frame_raw_query_returns_jpeg():
+    """T2: ?raw=1 returns a JPEG (placeholder is fine with no camera)."""
+    node, c = _client()
+    try:
+        r = c.get("/api/frame.jpg?raw=1")
+        assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+        assert r.content[:2] == b"\xff\xd8"
+    finally:
+        node.destroy_node()
+
+
 def test_action_endpoints_degrade_gracefully():
     node, c = _client()
     try:

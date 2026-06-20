@@ -84,6 +84,32 @@ def test_draw_overlay_preserves_shape_and_handles_empty():
     assert out2.shape == img.shape
 
 
+def test_overlay_with_indices_preserves_shape():
+    """T2: overlay accepts optional ids + rms + image_topic, shape stays the same.
+
+    The IDs annotate each corner; rms_px is rendered in a header bar; image_topic
+    is rendered in the header bar for diagnostics. None of these change the
+    BGR's HxWxC.
+    """
+    img = np.zeros((100, 200, 3), np.uint8)
+    out = ws.draw_charuco_overlay(
+        img,
+        corners_xy=np.array([[50, 50], [150, 80]]),
+        ids=np.array([3, 7]),
+        rms_px=0.42,
+        image_topic="/foo",
+    )
+    assert out.shape == img.shape
+
+
+def test_overlay_kwargs_optional_default_to_legacy_behavior():
+    """T2: omitting ids/rms_px/image_topic must behave like the v1 overlay."""
+    img = np.zeros((48, 64, 3), np.uint8)
+    out = ws.draw_charuco_overlay(img, np.array([[10.0, 20.0]]),
+                                  ids=None, rms_px=None, image_topic=None)
+    assert out.shape == img.shape
+
+
 def test_mm_and_deg_round_to_4dp():
     assert ws.mm(0.0012345) == 1.2345
     assert ws.deg(0.0174533) == 1.0  # 1 deg in rad -> ~= 1.0

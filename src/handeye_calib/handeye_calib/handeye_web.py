@@ -469,9 +469,19 @@ def main():
     t = threading.Thread(target=_serve, daemon=True, name="uvicorn")
     t.start()
     node.get_logger().info(f"handeye_web listening on http://{node.bind_host}:{node.bind_port}")
+    # SIGTERM (from `ros2 launch` teardown / `kill`) raises KeyboardInterrupt so it
+    # flows through the same clean-shutdown path as Ctrl-C (SIGINT) below.
+    import signal
+    def _on_sigterm(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    # Under `ros2 launch`, rclpy installs its own signal handlers, so SIGINT/SIGTERM
+    # surface as ExternalShutdownException from spin() rather than KeyboardInterrupt;
+    # catch both so the clean-shutdown `finally` runs and the process exits 0.
+    from rclpy.executors import ExternalShutdownException
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         server.should_exit = True

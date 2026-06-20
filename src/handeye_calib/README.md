@@ -47,6 +47,19 @@ Note: the camera's flexible support rings for ~1–2 s after each arm move, so c
 is gated by a settle delay **plus** a wait-until-stable check (consecutive frames must
 agree within tolerance) — a pose that never settles is rejected, not captured mid-ring.
 
+## Launch
+
+```bash
+ros2 launch handeye_calib handeye_web.launch.py port:=8766 robot_name:=tinker2
+```
+
+Brings up the `handeye_web` node (FastAPI UI + rclpy) with every ROS param exposed
+as a launch arg (`bind`, `port`, `robot_name`, camera topics, `base_frame`/`eef_frame`,
+`aruco_dict`, board geometry, `jointmove_action`, `mount_to_color_*`, `min_diversity_deg`).
+The RealSense camera (`realsense2_camera`, `camera_name:=xarm_camera`) must be launched
+**separately** — the UI shows `no camera` until color frames arrive. `ros2 launch`
+teardown (SIGINT/SIGTERM) shuts the server down cleanly.
+
 ## Verify without hardware
 
 The whole solver is provable on a laptop against synthetic ground truth:
@@ -65,6 +78,8 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.3.0 (2026-06-15): handeye_web server implemented (live ChArUco overlay,
+  capture/solve/promote) + launch file (handeye_web.launch.py).
 - 0.2.0 (2026-06-15): math core (transforms/model/solver/gates), synthetic harness,
   collection node, calib_web-style web tool, yaml/URDF persistence.
 - 0.1.0 (2026-06-15): package scaffold.

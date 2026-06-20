@@ -141,6 +141,18 @@
         </ul>
       </div>
 
+      <div class="sequence-controls">
+  <h3>Auto-capture sequence</h3>
+  <div class="row">
+    <button class="primary" id="sequence-run-btn" type="button" disabled>Run sequence</button>
+    <button id="sequence-dry-btn" type="button" disabled>Run dry (move + settle only)</button>
+    <button id="sequence-cancel-btn" type="button" disabled>Cancel</button>
+  </div>
+  <div class="status-line" id="sequence-progress">idle</div>
+  <div class="status-line" id="sequence-status"></div>
+  <ul class="sequence-log" id="sequence-log"></ul>
+</div>
+
       <div class="capture-panel">
         <div class="stability-badge" id="capture-stability">stability: …</div>
         <button class="primary" id="capture-btn" type="button" disabled>Capture pose</button>

@@ -135,3 +135,41 @@ def test_enriched_state_payload_has_all_keys():
         "safety_envelope", "stability", "samples", "diversity", "last_solve",
     }
     assert set(d) >= required
+
+
+def test_enriched_state_payload_safety_preview_roundtrip():
+    """T3: ``safety_preview`` is a new optional kwarg that round-trips into the
+    payload under the same key. Defaults to ``None`` for back-compat (T1/T2
+    callers omit the kwarg); when given a ``{safe, detail}`` dict it must show
+    up in the returned dict so the Move tab can render it without re-doing the
+    SafetyEnvelope math in JS.
+    """
+    # Back-compat: omitting the kwarg keeps the key present but ``None``.
+    d_default = ws.enriched_state_payload(
+        camera_connected=False, intrinsics_ok=False, num_samples=0,
+        last_detection=None, status_msg="idle",
+        frame_count=0, frame_hz=0.0, frame_age_sec=None,
+        image_topic="/foo", ros_domain_id=0,
+        t_base_ee=None, xarm_joint_positions=None,
+        board={}, safety_envelope={},
+        stability={"steady": False, "since_frames": 0, "target_frames": 3},
+        samples=[], diversity={"coverage_deg": 0.0, "target_deg": 30.0},
+        last_solve=None,
+    )
+    assert "safety_preview" in d_default
+    assert d_default["safety_preview"] is None
+
+    # When supplied, the dict round-trips verbatim.
+    sp = {"safe": True, "detail": "ok"}
+    d = ws.enriched_state_payload(
+        camera_connected=False, intrinsics_ok=False, num_samples=0,
+        last_detection=None, status_msg="idle",
+        frame_count=0, frame_hz=0.0, frame_age_sec=None,
+        image_topic="/foo", ros_domain_id=0,
+        t_base_ee=None, xarm_joint_positions=None,
+        board={}, safety_envelope={},
+        stability={"steady": False, "since_frames": 0, "target_frames": 3},
+        samples=[], diversity={"coverage_deg": 0.0, "target_deg": 30.0},
+        last_solve=None, safety_preview=sp,
+    )
+    assert d["safety_preview"] == sp

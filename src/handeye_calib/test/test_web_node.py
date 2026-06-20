@@ -34,3 +34,27 @@ def test_do_move_validates_joint_count():
         assert bad["ok"] is False
     finally:
         node.destroy_node()
+
+
+def test_safety_preview_graceful_degrades_without_tf():
+    """T3: ``safety_preview()`` returns the right shape even without TF /
+    cached pose so the UI can render the "unknown" branch instead of crashing.
+
+    Shape contract: ``{"safe": bool|None, "detail": str}``. With no robot in
+    this env, the cached ``_t_base_ee_cache`` is ``None`` after the first WS
+    state refresh, so ``safe`` must be ``None`` and ``detail`` a human-readable
+    string explaining why (TF unavailable).
+    """
+    node = HandeyeWebNode()
+    try:
+        # Force the cache into the "no TF" state — the TF refresh inside
+        # get_state_dict() would also do this, but be explicit to keep the
+        # assertion local to safety_preview's degraded path.
+        node._t_base_ee_cache = None
+        sp = node.safety_preview()
+        assert isinstance(sp, dict)
+        assert set(sp) >= {"safe", "detail"}
+        assert sp["safe"] is None
+        assert isinstance(sp["detail"], str) and sp["detail"]
+    finally:
+        node.destroy_node()

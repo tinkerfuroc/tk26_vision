@@ -8,8 +8,19 @@ class StabilityTracker:
 
     Absorbs the 1-2 s mount ring: feed live PnP poses; capture only when it
     returns True (or treat repeated False past a timeout as 'did not settle').
+
+    Default thresholds are calibrated for camera-only ChArUco PnP at typical
+    handeye distances (~30-60 cm):
+      - ``trans_tol_m=0.003`` (3 mm): single-pixel charuco corner noise on a
+        ~5 mm square at ~500 mm yields ~2-5 mm depth noise. Sub-mm thresholds
+        (e.g. 0.3 mm) are unreachable without dead-still optical conditions
+        and would report ``not steady`` even on a perfectly stationary arm.
+      - ``rot_tol_deg=0.5``: corresponds to the rotation jitter induced by
+        the same sub-pixel corner noise around the optical axis.
+    Override via the ``stability_trans_tol_m`` / ``stability_rot_tol_deg``
+    ROS params if your setup is dramatically tighter (or noisier).
     """
-    def __init__(self, window=5, rot_tol_deg=0.1, trans_tol_m=0.0003):
+    def __init__(self, window=5, rot_tol_deg=0.5, trans_tol_m=0.003):
         self.window = window
         self.rot_tol_deg = rot_tol_deg
         self.trans_tol_m = trans_tol_m

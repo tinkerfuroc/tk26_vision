@@ -28,8 +28,20 @@ _STR = [
     ("mount_to_color_xyz", "0 0 0"),
     ("mount_to_color_rpy", "0 0 0"),
 ]
-_INT = [("port", "8766"), ("squares_x", "5"), ("squares_y", "5")]
-_FLOAT = [("square_len_m", "0.04"), ("marker_len_m", "0.03"), ("min_diversity_deg", "30.0")]
+_INT = [
+    ("port", "8766"),
+    ("squares_x", "5"), ("squares_y", "5"),
+    # StabilityTracker window — see gates.StabilityTracker docstring.
+    ("stability_window", "5"),
+]
+_FLOAT = [
+    ("square_len_m", "0.04"), ("marker_len_m", "0.03"), ("min_diversity_deg", "30.0"),
+    # Settle-gate thresholds. Defaults tuned for camera-only ChArUco PnP at
+    # ~30-60 cm. Tighten only if your optical conditions are dramatically
+    # quieter than typical (or your noise budget is dramatically smaller).
+    ("stability_rot_tol_deg", "0.5"),
+    ("stability_trans_tol_m", "0.003"),
+]
 
 
 def generate_launch_description():

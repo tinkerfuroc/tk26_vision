@@ -425,9 +425,15 @@ def _make_node_class():
             self._xarm_joint_names = tuple(
                 f"joint{i+1}" for i in range(7)
             )
+            # /joint_states publishers (joint_state_publisher / xarm driver) use
+            # the default RELIABLE / VOLATILE QoS — match it with depth=10
+            # instead of qos_profile_sensor_data (BEST_EFFORT). FastDDS sometimes
+            # fails to match a BEST_EFFORT sub to a RELIABLE pub on low-rate
+            # topics, surfacing as a permanent "joint_states not yet received"
+            # state. pan_tilt/calib_web uses the same depth=10 pattern.
             self.create_subscription(
                 JointState, self._param("joint_states_topic", "/joint_states"),
-                self._on_joint_state, qos_profile_sensor_data)
+                self._on_joint_state, 10)
 
             # Stability tracker (observable in T1; T4 promotes it to a hard gate).
             self._stab_window = int(self._param("stability_window", 5))
@@ -1823,17 +1829,22 @@ def make_app(node):
 
     @app.websocket("/ws")
     async def ws_state(ws_conn: WebSocket):
-        """5 Hz state push for the static UI.
+        """10 Hz state push for the static UI.
 
-        Pushes the enriched state payload every 200 ms. Cleanly handles client
-        disconnects; the surrounding try/except keeps a broken socket from
-        propagating an exception into uvicorn's task supervisor.
+        Pushes the enriched state payload every 100 ms. The previous 5 Hz
+        rate made waypoint-list / sequence-progress updates feel sluggish
+        (up to 200 ms lag between an operator click and the UI rendering
+        the new server state). 100 ms is below the human-perception
+        threshold and bandwidth is negligible (~5-10 KB JSON × 10 Hz).
+        Cleanly handles client disconnects; the surrounding try/except
+        keeps a broken socket from propagating an exception into uvicorn's
+        task supervisor.
         """
         await ws_conn.accept()
         try:
             while True:
                 await ws_conn.send_json(node.get_state_dict())
-                await asyncio.sleep(0.2)  # 5 Hz
+                await asyncio.sleep(0.1)  # 10 Hz
         except WebSocketDisconnect:
             return
         except Exception:

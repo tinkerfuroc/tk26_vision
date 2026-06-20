@@ -215,6 +215,17 @@ class FoundationStereoNode(Node):
         # lazy-loads the engine on the first real infer() under its own lock).
         self._model_ready = threading.Event()
 
+        # Set once both `_extrinsics` and `_color_info` have arrived. The
+        # latched (TRANSIENT_LOCAL) realsense topics deliver them within ms
+        # of `rclpy.spin()` starting, so in practice this Event is set well
+        # before the first request lands. Used by the stream worker as its
+        # align-to-color readiness gate; the standalone watcher thread set
+        # up below ensures the gate runs even when streaming is disabled or
+        # streaming is non-aligned (default), so a srv/action caller asking
+        # for color-aligned depth doesn't race the subscriptions on first
+        # call.
+        self._extrinsics_ready = threading.Event()
+
         self._setup_subscribers()
         self._setup_service()
         self._setup_action()
@@ -247,6 +258,20 @@ class FoundationStereoNode(Node):
             # under its own lock, so the model is "ready" to be used now.
             self._model_ready.set()
 
+        # Run the extrinsics + color_info readiness watcher regardless of
+        # stream config — the stream worker used to be the only thing that
+        # waited for these, but now that the stream defaults to IR1 (no
+        # alignment) and the srv/action handlers always color-align, a
+        # caller's first request could race the latched TRANSIENT_LOCAL
+        # subscriptions. The watcher sets `self._extrinsics_ready` on
+        # success and just logs a warning on timeout — it never blocks
+        # `__init__` or `spin()`.
+        self._extrinsics_warmup_thread = threading.Thread(
+            target=self._extrinsics_warmup_threaded,
+            name="fs-extrinsics-warmup", daemon=True,
+        )
+        self._extrinsics_warmup_thread.start()
+
         self.get_logger().info(
             f"foundation_stereo ready: profile={self._p('camera_profile')}, "
             f"trt_variant={self._p('default_trt_variant')}, "
@@ -274,7 +299,7 @@ class FoundationStereoNode(Node):
         # init). Disable with -p warmup_on_launch:=false for fast dev
         # iteration when you don't care about first-call latency.
         self.declare_parameter("warmup_on_launch", True)
-        self.declare_parameter("default_scale", 0.5)
+        self.declare_parameter("default_scale", 1.0)
         self.declare_parameter("default_iters", 0)
         self.declare_parameter("default_z_far", 10.0)
 
@@ -294,7 +319,7 @@ class FoundationStereoNode(Node):
         # Streaming-mode params — declared even when stream_enabled=false
         # so the launch file can preset them uniformly.
         self.declare_parameter("stream_enabled", False)
-        self.declare_parameter("stream_align_to_color", True)
+        self.declare_parameter("stream_align_to_color", False)
         self.declare_parameter("stream_depth_topic", "")
         self.declare_parameter("stream_info_topic", "")
         self.declare_parameter("stream_dtype", "16UC1_mm")
@@ -482,6 +507,35 @@ class FoundationStereoNode(Node):
             self.get_logger().error(
                 f"warmup FAILED (variant={variant}): {exc}. The first "
                 f"real request will pay cold-load cost instead.")
+
+    def _extrinsics_warmup_threaded(self) -> None:
+        """Background-thread watcher for the latched color_info + extrinsics
+        TRANSIENT_LOCAL subscriptions.
+
+        Polls until both `_color_info` and `_extrinsics` are populated, or
+        the configured warm-up window elapses. Sets `_extrinsics_ready` on
+        success (consumed by the stream worker when align-to-color is on).
+        Runs unconditionally — independent of `stream_enabled` and
+        `stream_align_to_color` — so that service+action callers asking
+        for color-aligned depth (now the default) don't race the latched
+        subscriptions on first invocation. On timeout, logs once at WARN
+        and exits; downstream handlers still guard against missing inputs.
+        """
+        timeout = float(self._p("extrinsics_warmup_timeout_sec"))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._extrinsics is not None and self._color_info is not None:
+                self._extrinsics_ready.set()
+                self.get_logger().info(
+                    "extrinsics + color_info latched; align-to-color ready"
+                )
+                return
+            time.sleep(0.1)
+        self.get_logger().warn(
+            "extrinsics or color_info not received within "
+            f"{timeout:.1f}s; srv/action align-to-color calls will return "
+            "status=3 until the realsense extrinsics topic publishes."
+        )
 
     def _get_aligner(self, *, K_ir: np.ndarray, ir_info: CameraInfo,
                      ir_hw: Tuple[int, int]) -> RealsenseAligner:
@@ -707,7 +761,7 @@ class FoundationStereoNode(Node):
             z_far=float(req.z_far) if req.z_far > 0 else float(self._p("default_z_far")),
             want_pointcloud=bool(req.want_pointcloud),
             want_debug_jpeg=bool(req.want_debug_jpeg),
-            align_to_color=bool(req.align_to_color),
+            align_to_color=True,
         )
 
         resp.status = result["status"]
@@ -765,7 +819,7 @@ class FoundationStereoNode(Node):
             z_far=float(req.z_far) if req.z_far > 0 else float(self._p("default_z_far")),
             want_pointcloud=bool(req.want_pointcloud),
             want_debug_jpeg=bool(req.want_debug_jpeg),
-            align_to_color=bool(req.align_to_color),
+            align_to_color=True,
             on_stage=fb,
         )
 
@@ -837,17 +891,21 @@ class FoundationStereoNode(Node):
         min_period = (1.0 / max_fps) if max_fps > 0 else 0.0
         measure_fwd = bool(self._p("stream_measure_forward_ms"))
 
-        # Extrinsics warm-up runs here so rclpy.spin()'s executor is
-        # already running in the main thread and the latched extrinsics +
-        # color_info callbacks can fire.
+        # The standalone watcher thread (`_extrinsics_warmup_threaded`,
+        # launched in __init__) drives `_extrinsics_ready` regardless of
+        # stream config. Here we just wait on it when the operator opted
+        # into color-aligned streaming. Polled in 0.1 s slices so
+        # `_stream_stop` can break a long warmup.
         if align:
             warmup = float(self._p("extrinsics_warmup_timeout_sec"))
             deadline = time.time() + warmup
-            while time.time() < deadline and not self._stream_stop.is_set():
-                if self._extrinsics is not None and self._color_info is not None:
+            while not self._extrinsics_ready.is_set():
+                if self._stream_stop.is_set():
+                    return
+                if time.time() >= deadline:
                     break
-                time.sleep(0.1)
-            if self._extrinsics is None or self._color_info is None:
+                self._extrinsics_ready.wait(timeout=0.1)
+            if not self._extrinsics_ready.is_set():
                 self.get_logger().error(
                     "stream_align_to_color=true but extrinsics or "
                     f"color_info not received within {warmup} s; "

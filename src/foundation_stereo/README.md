@@ -13,7 +13,7 @@ intentionally rejected at the request layer — see [§ TRT-only enforcement](#t
 |---|---|---|
 | Service `/foundation_stereo/get_depth` | a client call | one-shot depth, lowest-latency way to get a single result |
 | Action `/foundation_stereo/infer_depth` | a client goal | one-shot depth + per-stage feedback + cancellation |
-| Streaming publisher | `stream_enabled:=true` | continuous depth at the IR frame rate, mimics realsense `aligned_depth_to_color/image_rect_raw` |
+| Streaming publisher | `stream_enabled:=true` | continuous IR1-frame depth at the IR sync rate; opt into color-aligned via `stream_align_to_color:=true` (drop-in for realsense `aligned_depth_to_color/image_rect_raw`) |
 
 ## Why a separate venv
 
@@ -85,7 +85,10 @@ source install/setup.bash
 # Default: service + action only, no streaming, warmup at launch.
 ros2 launch foundation_stereo foundation_stereo.launch.py
 
-# Streaming, aligned to colour (recommended for D435).
+# Streaming, IR1 frame (the default when stream_enabled is on).
+ros2 launch foundation_stereo foundation_stereo.launch.py stream_enabled:=true
+
+# Streaming, aligned to colour (opt-in — same wire format as realsense aligned_depth_to_color).
 ros2 launch foundation_stereo foundation_stereo.launch.py \
     stream_enabled:=true stream_align_to_color:=true
 
@@ -146,7 +149,7 @@ Interface: `tinker_vision_msgs_26/srv/FoundationStereoDepth`
 | `z_far` | `float32` | 0 = `default_z_far` param | Depth clamp in metres. Pixels with greater Z are written as 0 (invalid). |
 | `want_pointcloud` | `bool` | false | Emit `sensor_msgs/PointCloud2` alongside the depth image. |
 | `want_debug_jpeg` | `bool` | false | Emit a `sensor_msgs/CompressedImage` with a turbo-colourised disparity preview. |
-| `align_to_color` | `bool` | false | If true, output depth is in the colour optical frame via `RealsenseAligner`. If false, output depth is in the IR1 optical frame at the engine's scaled resolution. |
+| `align_to_color` | `bool` | (ignored) | **The service always returns color-aligned depth.** This field was per-call in earlier revisions but the default is now color-aligned and the field is no longer consulted — use the streaming publisher (`stream_enabled:=true`, default IR1) if you need IR1-frame depth. |
 
 ### Response
 
@@ -188,7 +191,7 @@ The action additionally provides:
   starting.
 
 Use this instead of the service when you want progress visibility or
-the ability to abort a long request.
+the ability to abort a long request. Like the service, the action ignores `goal.align_to_color` and always returns color-aligned depth — use the streaming publisher for IR1.
 
 ## Streaming mode
 
@@ -198,7 +201,10 @@ every new synced stereo frame:
 1. Runs inference (always with the node's default model kind / variant /
    scale / iters / z_far).
 2. Optionally aligns to colour via `RealsenseAligner` (gated by
-   `stream_align_to_color`).
+   `stream_align_to_color` — **default `false` since 2026-06-20**, so the
+   stream emits depth in the IR1 optical frame at engine resolution out
+   of the box; flip to `true` to get the realsense-style color-aligned
+   output).
 3. Publishes the depth image + camera_info on `stream_depth_topic` /
    `stream_info_topic`. QoS reliability is set by `stream_qos_reliability`
    (default `reliable`); see the note below.
@@ -215,8 +221,8 @@ every new synced stereo frame:
 
 | Param | Default topic | Type | Notes |
 |---|---|---|---|
-| `stream_depth_topic` | `~/aligned_depth_to_color/image_rect_raw` | `sensor_msgs/Image` | Encoding controlled by `stream_dtype`. |
-| `stream_info_topic` | `~/aligned_depth_to_color/camera_info` | `sensor_msgs/CameraInfo` | |
+| `stream_depth_topic` | `~/depth/image_rect_raw` (or `~/aligned_depth_to_color/image_rect_raw` when `stream_align_to_color:=true`) | `sensor_msgs/Image` | Encoding controlled by `stream_dtype`. Default frame_id is IR1 (`xarm_camera_infra1_optical_frame` on D435 — see [§ D435 frame-name caveat](#d435-frame-name-caveat)). |
+| `stream_info_topic` | `~/depth/camera_info` (or `~/aligned_depth_to_color/camera_info` when `stream_align_to_color:=true`) | `sensor_msgs/CameraInfo` | |
 | (vis, if `stream_publish_vis=true`) | `~/aligned_depth_to_color/debug_jpeg` | `sensor_msgs/CompressedImage` | Turbo-colourised disparity preview. |
 
 ### Stream parameters
@@ -224,7 +230,7 @@ every new synced stereo frame:
 | Param | Default | Effect |
 |---|---|---|
 | `stream_enabled` | `false` | Master switch. |
-| `stream_align_to_color` | `true` | Route output through `RealsenseAligner`. When false, output is in IR1 frame at engine-scaled resolution. |
+| `stream_align_to_color` | `false` | Route output through `RealsenseAligner` to the colour frame. **Default `false` since 2026-06-20** — the stream emits depth in the IR1 frame at engine-scaled resolution. Set `true` to get the realsense-style color-aligned output (and the `aligned_depth_to_color/*` topic names). |
 | `stream_depth_topic`, `stream_info_topic` | empty (= node default) | Override the published topic names. |
 | `stream_dtype` | `"16UC1_mm"` | Either `"16UC1_mm"` (millimetre Z16, matches realsense convention) or `"32FC1"` (metres, more precision). |
 | `stream_qos_reliability` | `"reliable"` | QoS reliability for the depth + camera_info publishers: `reliable` (drop-in for realsense, default RViz-visible) or `best_effort` (lower-overhead sensor stream). See the QoS gotcha above. |
@@ -274,7 +280,7 @@ the D405 baseline baked in.
 | `default_model_kind` | `"fast_trt"` | **Ignored.** Kept for backwards compatibility; the node only serves `fast_trt`. |
 | `default_trt_variant` | `"output_two_stage"` | Which compiled engine to use as default. Engines are auto-discovered under `weights_root/Fast-FoundationStereo/`. |
 | `warmup_on_launch` | `true` | Load + run one forward through the default TRT engine at startup. See [§ Startup warmup](#startup-warmup). |
-| `default_scale` | `0.5` | Default pre-resize factor (ignored by `fast_trt` — engine input shape is baked). |
+| `default_scale` | `1.0` | Default pre-resize factor (ignored by `fast_trt` — engine input shape is baked). Pre-2026-06-20 this was 0.5; the IR-frame stream default now publishes at full IR resolution. |
 | `default_iters` | `0` | Default iteration count override (ignored by `fast_trt`). |
 | `default_z_far` | `10.0` | Default depth clamp (m). |
 | `left_topic`, `right_topic`, `left_info_topic`, `color_info_topic`, `extrinsics_topic` | empty | Topic overrides; empty means use the camera_profile default. |
@@ -382,6 +388,8 @@ or 3-pass dilate) before any per-pixel processing.
 
 ## D435 frame-name caveat
 
+This caveat now affects the streaming default path. With the 2026-06-20 IR1-default flip, the streaming publisher emits depth in the IR1 optical frame, which on D435 is `xarm_camera_infra1_optical_frame` (driver name) — not the URDF's `xarm_camera_left_ir_optical_frame`. Pick one of the three workarounds below, **or** opt back into colour-aligned streaming with `stream_align_to_color:=true` (the frame becomes `xarm_camera_color_optical_frame`, which agrees between driver and URDF).
+
 `realsense2_camera` publishes the left IR optical frame as
 `xarm_camera_infra1_optical_frame`. The xarm URDF declares it as
 `xarm_camera_left_ir_optical_frame`. No `static_transform_publisher`
@@ -468,6 +476,22 @@ can stall the worker loop. Turn on selectively for debugging.
 
 ## Changelog
 
+* **2026-06-20 — Streaming default flipped to IR1; srv/action always
+  color-aligned.** The streaming publisher now defaults to emitting
+  IR1-frame depth on `~/depth/image_rect_raw` + `~/depth/camera_info` —
+  the realsense-aligned mimic moves behind `stream_align_to_color:=true`.
+  Service `~/get_depth` and action `~/infer_depth` now **always** return
+  color-aligned depth and silently ignore the request's `align_to_color`
+  field (use the stream for IR1). `default_scale` raised 0.5 → 1.0, so
+  the IR-frame stream publishes at full engine resolution (480×848 on
+  D435) instead of the previous half-res 240×424. The
+  `extrinsics`/`color_info` warm-up wait was decoupled from the stream
+  worker into a standalone background daemon (`_extrinsics_warmup_threaded`,
+  `_extrinsics_ready` Event), so srv/action callers asking for
+  color-aligned depth on first invocation don't race the latched
+  TRANSIENT_LOCAL subscriptions even when streaming is off or non-aligned.
+  Existing callers that explicitly set `stream_align_to_color:=true` (e.g.
+  `vision_bringup/vision_driver.launch.py`) are unaffected.
 * **2026-06-20 — Streaming align-to-color startup race fixed.** The cold
   TRT engine warmup (`_warmup_model`, ~2-5 s) used to run *synchronously*
   in `__init__`, **before** `rclpy.spin()`. That blocked the executor, so

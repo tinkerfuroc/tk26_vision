@@ -7,7 +7,7 @@ foundation_stereo:
     # backwards-compat but ignored; non-fast_trt requests are rejected.
     default_model_kind: "fast_trt"
     default_trt_variant: "output_two_stage"
-    default_scale: 0.5
+    default_scale: 1.0
     default_iters: 0
     default_z_far: 10.0
     # Pre-load + run one live forward through the default TRT variant
@@ -29,7 +29,7 @@ foundation_stereo:
 
     # Streaming
     stream_enabled: false
-    stream_align_to_color: true
+    stream_align_to_color: false
     stream_depth_topic: ""
     stream_info_topic: ""
     stream_dtype: "16UC1_mm"

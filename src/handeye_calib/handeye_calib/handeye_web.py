@@ -389,22 +389,96 @@ def _make_node_class():
     return HandeyeWebNode
 
 
+def make_app(node):
+    """Build the FastAPI app bound to a HandeyeWebNode.
+
+    fastapi imports live inside the body so `import handeye_calib.handeye_web`
+    stays ROS-/web-free for the unit-tested helpers above. Every endpoint
+    delegates to the node's thread-safe accessors/commands, which already
+    degrade gracefully (return {"ok": False, ...}) when no hardware is present.
+    """
+    from fastapi import FastAPI, Request
+    from fastapi.responses import HTMLResponse, Response, JSONResponse
+    from handeye_calib import web_support as ws
+
+    app = FastAPI(title="handeye_web", docs_url="/api/docs")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index():
+        return ws.INDEX_HTML
+
+    @app.get("/api/state")
+    def state():
+        return JSONResponse(node.get_state_dict())
+
+    @app.get("/api/frame.jpg")
+    def frame():
+        return Response(content=node.latest_jpeg(), media_type="image/jpeg")
+
+    @app.post("/api/move")
+    async def move(request: Request):
+        body = await request.json()
+        return JSONResponse(node.do_move(body.get("joints")))
+
+    @app.post("/api/capture")
+    def capture():
+        return JSONResponse(node.do_capture())
+
+    @app.post("/api/solve")
+    def solve():
+        return JSONResponse(node.do_solve())
+
+    @app.post("/api/promote")
+    def promote():
+        return JSONResponse(node.do_promote())
+
+    return app
+
+
 def main():
-    # Mirrors pan_tilt/calib_web.py main(): build rclpy node, start uvicorn worker,
-    # serve the authoring/run/verify/promote UI. Hardware-tier; see README.
-    # Replaced in Task 3 with the full FastAPI + uvicorn wiring.
+    # Mirrors pan_tilt/calib_web.py main(): build the rclpy node, start a uvicorn
+    # worker thread for the FastAPI authoring/run/verify/promote UI, and spin the
+    # node on the main thread. The server starts WITHOUT hardware — all endpoints
+    # degrade gracefully when no camera / arm is present.
     #
-    # ROS / web imports are deferred (HandeyeWebNode is built lazily) so that
+    # ROS / web imports are deferred (HandeyeWebNode is built lazily via the
+    # module __getattr__ below, and uvicorn/rclpy import inside this body) so that
     # `import handeye_calib.handeye_web` stays ROS-free for the unit-tested
     # helpers above.
+    import os
+    os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
+    os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
     import rclpy
     rclpy.init()
-    node = HandeyeWebNode()  # noqa: F821 — provided via module __getattr__ below
+    # Module __getattr__ only fires for *attribute access* on the module object,
+    # not for bare-name lookups inside a function (those go global-dict -> builtins
+    # and would raise NameError). Resolve the lazily-built class via the module
+    # attribute so the __getattr__ -> _make_node_class() hook runs.
+    import sys
+    HandeyeWebNode = getattr(sys.modules[__name__], "HandeyeWebNode")
+    node = HandeyeWebNode()
+    app = make_app(node)
+    import uvicorn, threading, asyncio
+    config = uvicorn.Config(app, host=node.bind_host, port=node.bind_port,
+                            log_level="info", access_log=False, loop="asyncio")
+    server = uvicorn.Server(config)
+
+    def _serve():
+        asyncio.run(server.serve())
+
+    t = threading.Thread(target=_serve, daemon=True, name="uvicorn")
+    t.start()
+    node.get_logger().info(f"handeye_web listening on http://{node.bind_host}:{node.bind_port}")
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
+        server.should_exit = True
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+        t.join(timeout=2.0)
 
 
 def __getattr__(name):

@@ -301,6 +301,7 @@ def test_waypoint_add_returns_no_current_joints_in_test_env():
 
 def test_waypoint_delete_out_of_range():
     node, c = _client()
+    node.waypoint_store.clear()  # isolate from any persisted per-robot YAML
     try:
         r = c.delete("/api/waypoints/99")
         assert r.status_code == 200
@@ -324,12 +325,13 @@ def test_waypoint_save_refuses_without_robot_name(monkeypatch):
 
 def test_state_payload_includes_waypoints():
     node, c = _client()
+    node.waypoint_store.clear()  # isolate from any persisted per-robot YAML
     try:
         r = c.get("/api/state")
         assert r.status_code == 200
         body = r.json()
         assert "waypoints" in body
-        assert body["waypoints"] == []  # empty in test env
+        assert body["waypoints"] == []  # empty after isolation
     finally:
         node.destroy_node()
 
@@ -341,6 +343,7 @@ def test_state_payload_includes_waypoints():
 def test_sequence_start_refuses_empty():
     """T3-seq: POST /api/sequence/start refuses when no waypoints are recorded."""
     node, c = _client()
+    node.waypoint_store.clear()  # isolate from any persisted per-robot YAML
     try:
         r = c.post("/api/sequence/start", json={"dry_run": False})
         assert r.status_code == 200

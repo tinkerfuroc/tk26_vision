@@ -60,7 +60,7 @@ def main():
             self.bridge = CvBridge()
             self.tf_buffer = Buffer()
             TransformListener(self.tf_buffer, self)
-            self.jm = ActionClient(self, JointMove, "/xarm/joint_move")
+            self.jm = ActionClient(self, JointMove, "joint_move_action")
             # Topics match the realsense2_camera launch convention used in
             # this workspace (namespace=/camera, node=xarm_camera).
             self.sub = self.create_subscription(

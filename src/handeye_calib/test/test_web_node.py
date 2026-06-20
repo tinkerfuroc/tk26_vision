@@ -80,6 +80,7 @@ def test_sequence_refuses_when_empty_waypoints():
     The runner can't loop over an empty list; the auto-capture entry point
     is the operator's only safe gate against starting an empty run."""
     node = HandeyeWebNode()
+    node.waypoint_store.clear()  # isolate from any persisted per-robot YAML
     try:
         r = node.do_start_sequence(dry_run=False)
         assert r["ok"] is False

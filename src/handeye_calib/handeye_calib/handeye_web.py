@@ -506,7 +506,7 @@ def _make_node_class():
             self.create_subscription(
                 CameraInfo, self._param("camera_info_topic", "/camera/xarm_camera/color/camera_info"),
                 self._on_info, qos_profile_sensor_data)
-            self._jm = ActionClient(self, JointMove, self._param("jointmove_action", "/xarm/joint_move"))
+            self._jm = ActionClient(self, JointMove, self._param("jointmove_action", "joint_move_action"))
 
             self._np = np
             self._cv2 = cv2

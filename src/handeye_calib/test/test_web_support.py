@@ -173,3 +173,62 @@ def test_enriched_state_payload_safety_preview_roundtrip():
         last_solve=None, safety_preview=sp,
     )
     assert d["safety_preview"] == sp
+
+
+# ---------------------------------------------------------------------------
+# T4: diversity meter + per-sample metadata helpers
+# ---------------------------------------------------------------------------
+
+def test_compute_diversity_zero_for_zero_or_one_sample():
+    from handeye_calib import handeye_model as hm
+    assert ws.compute_diversity_deg([]) == 0.0
+    s = hm.Sample(np.eye(4), np.eye(4), np.zeros((0, 2)), np.zeros((0,), int))
+    assert ws.compute_diversity_deg([s]) == 0.0
+
+
+def test_compute_diversity_max_pairwise_deg():
+    from handeye_calib import handeye_model as hm
+
+    def mk(rpy_deg):
+        T = np.eye(4)
+        T[:3, :3] = R.from_euler('xyz', rpy_deg, degrees=True).as_matrix()
+        return hm.Sample(T, np.eye(4), np.zeros((0, 2)), np.zeros((0,), int))
+
+    samples = [mk([0, 0, 0]), mk([45, 0, 0]), mk([0, 30, 0])]
+    cov = ws.compute_diversity_deg(samples)
+    assert cov >= 45.0  # at least the 0->45 about X
+
+
+def test_sample_metadata_shape_first_sample():
+    """First accepted sample has angular_delta_deg=None (no predecessor)."""
+    from handeye_calib import handeye_model as hm
+    T = np.eye(4)
+    T[:3, 3] = [0.1, 0.2, 0.3]
+    s = hm.Sample(T, np.eye(4), np.zeros((0, 2)), np.zeros((0,), int))
+    md = ws.sample_metadata(0, s, prev_sample=None, n_corners=12,
+                            reproj_px=0.4, area_frac=0.08,
+                            joint_positions=None, ts=1234.5)
+    assert md["idx"] == 0
+    assert md["n_corners"] == 12
+    assert md["reproj_px"] == 0.4
+    assert md["area_frac"] == 0.08
+    assert md["angular_delta_deg"] is None
+    assert md["joint_positions"] is None
+    assert md["ts"] == 1234.5
+
+
+def test_sample_metadata_angular_delta_vs_prev():
+    """Second sample reports the rotation angle vs its predecessor."""
+    from handeye_calib import handeye_model as hm
+    T0 = np.eye(4)
+    T1 = np.eye(4)
+    T1[:3, :3] = R.from_euler('x', 45, degrees=True).as_matrix()
+    s0 = hm.Sample(T0, np.eye(4), np.zeros((0, 2)), np.zeros((0,), int))
+    s1 = hm.Sample(T1, np.eye(4), np.zeros((0, 2)), np.zeros((0,), int))
+    md = ws.sample_metadata(1, s1, prev_sample=s0, n_corners=10,
+                            reproj_px=0.5, area_frac=0.1,
+                            joint_positions=[0.0] * 7, ts=2.0)
+    assert md["idx"] == 1
+    assert md["angular_delta_deg"] is not None
+    assert abs(md["angular_delta_deg"] - 45.0) < 1e-6
+    assert md["joint_positions"] == [0.0] * 7

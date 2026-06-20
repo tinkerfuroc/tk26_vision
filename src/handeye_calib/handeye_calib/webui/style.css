@@ -303,3 +303,112 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   max-width: 600px;
   margin-top: 6px;
 }
+
+/* ---- T4: Capture tab — settle badge, diversity meter, gallery ------- *
+ * Mirrors pan_tilt's calib gallery visual language (dark surface tiles, *
+ * monospace metadata strip, single primary action button, small        *
+ * destructive "x" button) so the two tools' capture flows look the     *
+ * same. The diversity-meter is a slim coloured bar at the top of the   *
+ * gallery — green when coverage_deg >= target, warn at half, err below.*/
+.capture-panel { max-width: 600px; }
+
+.stability-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg-muted);
+  margin: 0 0 8px;
+}
+.stability-badge.ok   { color: var(--ok);   border-color: var(--ok); }
+.stability-badge.warn { color: var(--warn); border-color: var(--warn); }
+.stability-badge.err  { color: var(--err);  border-color: var(--err); }
+
+.diversity-meter {
+  margin: 10px 0 14px;
+}
+.diversity-meter .bar {
+  width: 100%;
+  height: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.diversity-meter .fill {
+  height: 100%;
+  width: 0%;
+  background: var(--err);
+  transition: width 0.2s ease-out, background 0.2s ease-out;
+}
+.diversity-meter .fill.warn { background: var(--warn); }
+.diversity-meter .fill.ok   { background: var(--ok); }
+.diversity-meter .label {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  margin-top: 4px;
+}
+
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+  margin-top: 6px;
+}
+.gallery-empty {
+  grid-column: 1 / -1;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  text-align: center;
+}
+.gallery-item {
+  position: relative;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.gallery-item .gallery-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: #000;
+  border-radius: 3px;
+}
+.gallery-item .gallery-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  line-height: 1.3;
+}
+.gallery-item .gallery-meta .gallery-idx {
+  color: var(--accent);
+  font-weight: 600;
+}
+.gallery-item .gallery-delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--err);
+  border: 1px solid var(--err);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1;
+}
+.gallery-item .gallery-delete:hover {
+  background: var(--err);
+  color: #fff;
+}

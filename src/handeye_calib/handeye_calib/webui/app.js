@@ -389,6 +389,163 @@ function renderMoveSafety(s) {
             sp.safe ? "ok" : "err");
 }
 
+// ---- T4: Capture tab — settle gate, gallery, diversity meter ---------------
+// The capture button is HARD-gated by state.stability.steady (the v1 deferral
+// the brief closes): the operator can't even fire the request until camera +
+// intrinsics + detection + steady all line up. On accept the gallery refreshes
+// from the next WS push; per-sample delete sends DELETE /api/samples/{idx} and
+// also relies on the WS push to update the diversity meter + meta strip.
+const CAPTURE_BTN = $("#capture-btn");
+const CAPTURE_STAB = $("#capture-stability");
+
+function _renderCaptureStability(s) {
+  if (!CAPTURE_STAB) return;
+  const stab = s.stability || {};
+  const steady = !!stab.steady;
+  const target = Number.isFinite(stab.target_frames) ? stab.target_frames : 0;
+  const since = Number.isFinite(stab.since_frames) ? stab.since_frames : 0;
+  CAPTURE_STAB.classList.remove("ok", "warn", "err");
+  if (steady) {
+    CAPTURE_STAB.textContent = `stability: steady ✓ (${since}/${target})`;
+    CAPTURE_STAB.classList.add("ok");
+  } else if (target > 0) {
+    CAPTURE_STAB.textContent = `stability: stabilizing… ${since}/${target}`;
+    CAPTURE_STAB.classList.add("warn");
+  } else {
+    CAPTURE_STAB.textContent = "stability: waiting for camera";
+    CAPTURE_STAB.classList.add("err");
+  }
+}
+
+function _captureReady(s) {
+  // Mirror the server's HARD gate so the button never sends a doomed POST:
+  // camera_connected && intrinsics_ok && last_detection.corners>0 && steady.
+  if (!s) return false;
+  if (!s.camera_connected) return false;
+  if (!s.intrinsics_ok) return false;
+  const ld = s.last_detection;
+  if (!ld || !Number.isFinite(ld.corners) || ld.corners <= 0) return false;
+  const stab = s.stability || {};
+  return !!stab.steady;
+}
+
+if (CAPTURE_BTN) {
+  CAPTURE_BTN.addEventListener("click", async () => {
+    setStatus("capture-status", "capturing…", "warn");
+    try {
+      const r = await fetch("/api/capture", { method: "POST" });
+      const body = await r.json();
+      if (r.ok && body.ok) {
+        setStatus("capture-status",
+                  `accepted: ${body.reason || "ok"} (${body.num_samples} total)`,
+                  "ok");
+      } else {
+        setStatus("capture-status",
+                  `rejected: ${body.reason || ("HTTP " + r.status)}`,
+                  "err");
+      }
+    } catch (e) {
+      setStatus("capture-status", "ERROR: " + e, "err");
+    }
+  });
+}
+
+async function _deleteSample(idx) {
+  if (!confirm(`Delete sample #${idx}?`)) return;
+  setStatus("capture-status", `deleting #${idx}…`, "warn");
+  try {
+    const r = await fetch(`/api/samples/${idx}`, { method: "DELETE" });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      setStatus("capture-status",
+                `deleted #${idx} (${body.num_samples} remaining)`,
+                "ok");
+    } else {
+      setStatus("capture-status",
+                `delete failed: ${body.reason || ("HTTP " + r.status)}`,
+                "err");
+    }
+  } catch (e) {
+    setStatus("capture-status", "ERROR: " + e, "err");
+  }
+}
+
+function _renderGallery(s) {
+  const gal = document.getElementById("gallery");
+  if (!gal) return;
+  const samples = Array.isArray(s.samples) ? s.samples : [];
+  if (samples.length === 0) {
+    gal.innerHTML = '<div class="gallery-empty" id="gallery-empty">no samples captured yet</div>';
+    return;
+  }
+  // Build new rows, then swap in-place so the operator's scroll position
+  // and any in-flight image loads survive a WS push.
+  const frag = document.createDocumentFragment();
+  for (const m of samples) {
+    const idx = Number(m.idx);
+    const item = document.createElement("div");
+    item.className = "gallery-item";
+    const thumb = document.createElement("img");
+    thumb.className = "gallery-thumb";
+    thumb.alt = `sample ${idx}`;
+    thumb.loading = "lazy";
+    thumb.src = `/api/samples/${idx}/thumb.jpg`;
+    thumb.addEventListener("error", () => { thumb.style.visibility = "hidden"; });
+    item.appendChild(thumb);
+
+    const meta = document.createElement("div");
+    meta.className = "gallery-meta";
+    const corners = Number.isFinite(m.n_corners) ? m.n_corners : "?";
+    const rms = Number.isFinite(m.reproj_px) ? m.reproj_px.toFixed(2) + "px" : "—";
+    const area = Number.isFinite(m.area_frac)
+      ? (m.area_frac * 100).toFixed(1) + "%"
+      : "—";
+    const ang = Number.isFinite(m.angular_delta_deg)
+      ? "Δ" + m.angular_delta_deg.toFixed(1) + "°"
+      : "Δ—";
+    meta.innerHTML =
+      `<span class="gallery-idx">#${idx}</span> · corners ${corners}<br>` +
+      `rms ${rms} · area ${area} · ${ang}`;
+    item.appendChild(meta);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "gallery-delete";
+    del.title = `delete sample ${idx}`;
+    del.textContent = "✕";
+    del.addEventListener("click", () => _deleteSample(idx));
+    item.appendChild(del);
+
+    frag.appendChild(item);
+  }
+  gal.innerHTML = "";
+  gal.appendChild(frag);
+}
+
+function _renderDiversityMeter(s) {
+  const fill = document.getElementById("diversity-fill");
+  const label = document.getElementById("diversity-label");
+  if (!fill || !label) return;
+  const d = s.diversity || {};
+  const cov = Number.isFinite(d.coverage_deg) ? d.coverage_deg : 0;
+  const target = Number.isFinite(d.target_deg) && d.target_deg > 0
+    ? d.target_deg
+    : 30;
+  const pct = Math.max(0, Math.min(100, (cov / target) * 100));
+  fill.style.width = pct + "%";
+  fill.classList.remove("ok", "warn");
+  if (pct >= 100) fill.classList.add("ok");
+  else if (pct >= 50) fill.classList.add("warn");
+  label.textContent = `${cov.toFixed(1)}° / ${target.toFixed(0)}°`;
+}
+
+function renderCaptureTab(s) {
+  _renderCaptureStability(s);
+  if (CAPTURE_BTN) CAPTURE_BTN.disabled = !_captureReady(s);
+  _renderDiversityMeter(s);
+  _renderGallery(s);
+}
+
 // ---- render the info tab from state ---------------------------------------
 function render() {
   if (!state) return;
@@ -442,4 +599,6 @@ function render() {
   // T3: Info-tab kv-tables / matrix / board / safety + Move-tab safety line.
   renderInfoTab(state);
   renderMoveSafety(state);
+  // T4: Capture-tab stability badge + gallery + diversity meter.
+  renderCaptureTab(state);
 }

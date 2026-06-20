@@ -101,6 +101,50 @@ def test_websocket_pushes_state():
         node.destroy_node()
 
 
+# ---------------------------------------------------------------------------
+# T4: capture gallery thumbnails + per-sample delete
+# ---------------------------------------------------------------------------
+
+def test_sample_thumb_404_for_missing_idx():
+    """T4: GET /api/samples/{idx}/thumb.jpg returns 404 when no such sample."""
+    node, c = _client()
+    try:
+        r = c.get("/api/samples/0/thumb.jpg")
+        assert r.status_code == 404
+    finally:
+        node.destroy_node()
+
+
+def test_delete_sample_endpoint_returns_json():
+    """T4: DELETE /api/samples/{idx} returns JSON with ok+num_samples even
+    when idx is out of range (graceful degradation, mirrors do_delete_sample)."""
+    node, c = _client()
+    try:
+        r = c.delete("/api/samples/99")
+        assert r.status_code == 200
+        body = r.json()
+        assert "ok" in body and "num_samples" in body
+        assert body["ok"] is False
+    finally:
+        node.destroy_node()
+
+
+def test_capture_rejected_without_settle():
+    """T4: /api/capture must reject when the StabilityTracker is not steady.
+    With no camera in this env the tracker is never steady, so we expect the
+    settle-gate rejection reason ('not stable yet ...') rather than the v1
+    'no camera frame' / 'no board detection' message."""
+    node, c = _client()
+    try:
+        r = c.post("/api/capture", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert "stab" in body["reason"].lower()
+    finally:
+        node.destroy_node()
+
+
 def test_state_payload_includes_safety_preview():
     """T3: ``state.safety_preview`` is wired into the WS/state payload (likely
     ``None`` here since there's no TF), so the Move tab's safety-status line can

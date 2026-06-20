@@ -111,7 +111,29 @@
         </p>
       </div>
     </section>
-    <section class="side-panel-content" data-panel="capture"></section>
+    <section class="side-panel-content" data-panel="capture">
+      <!-- T4 Capture tab: settle-gated capture button, gallery of accepted
+           samples (with per-row thumbnail + delete), and a diversity meter
+           showing the max pairwise rotation spread across accepted poses.
+           The settle gate is the HARD pre-capture check — the button stays
+           disabled until camera + intrinsics + detection + steady all line
+           up, mirroring the v1 deferral closed in T4. -->
+      <div class="capture-panel">
+        <div class="stability-badge" id="capture-stability">stability: …</div>
+        <button class="primary" id="capture-btn" type="button" disabled>Capture pose</button>
+        <div class="status-line" id="capture-status"></div>
+
+        <div class="diversity-meter">
+          <div class="bar"><div id="diversity-fill" class="fill"></div></div>
+          <div class="label" id="diversity-label">0° / 30°</div>
+        </div>
+
+        <h3>Captured samples</h3>
+        <div class="gallery" id="gallery">
+          <div class="gallery-empty" id="gallery-empty">no samples captured yet</div>
+        </div>
+      </div>
+    </section>
     <section class="side-panel-content" data-panel="solve"></section>
     <section class="side-panel-content" data-panel="promote"></section>
   </main>

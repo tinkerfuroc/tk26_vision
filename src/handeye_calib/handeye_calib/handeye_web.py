@@ -145,6 +145,22 @@ def _make_node_class():
             self.session = CaptureSession(min_diversity_deg=self._diversity_target_deg)
             self.last_solve = None
 
+            # T4: per-sample sidecars (kept parallel to ``self.session.samples``).
+            # ``_thumbs[idx]`` is a downscaled (~320 px wide) JPEG of the
+            # frame+overlay at capture time, served via /api/samples/{idx}/thumb.jpg.
+            # ``_sample_joints[idx]`` is the xArm joint snapshot at capture time
+            # (or None when /joint_states hasn't arrived yet).
+            # ``_sample_ts[idx]`` is a monotonic timestamp for the gallery row.
+            # All three are recompacted on delete so the keys stay 0..N-1.
+            self._thumbs = {}
+            self._sample_joints = {}
+            self._sample_ts = {}
+            # reproj_px + area_frac are scalars from the per-frame detection;
+            # the Sample dataclass doesn't keep them. Stash here for the
+            # gallery row so the operator can see quality at a glance.
+            self._sample_reproj_px = {}
+            self._sample_area_frac = {}
+
             self._sx = int(self._param("squares_x", 5))
             self._sy = int(self._param("squares_y", 5))
             self._sq = float(self._param("square_len_m", 0.04))
@@ -355,9 +371,16 @@ def _make_node_class():
                         else list(self._xarm_joint_positions))
                 camera_connected = self._frame is not None
                 intrinsics_ok = self._K is not None
-                num_samples = len(self.session.samples)
+                samples_snapshot = list(self.session.samples)
+                num_samples = len(samples_snapshot)
                 last_det = self._last_det
                 image_topic = self._image_topic
+                # T4: paired sidecars at snapshot time so per-sample metadata
+                # stays consistent with the samples list under concurrent ops.
+                joints_by_idx = dict(self._sample_joints)
+                ts_by_idx = dict(self._sample_ts)
+                reproj_by_idx = dict(self._sample_reproj_px)
+                area_by_idx = dict(self._sample_area_frac)
 
             # frame_hz: rolling rate across the deque. Need >= 2 timestamps to
             # measure a delta; falls back to 0.0 on a cold start.
@@ -387,13 +410,29 @@ def _make_node_class():
                 "since_frames": int(since),
                 "target_frames": int(self._stab_window),
             }
-            # Diversity: T1 ships the wired field at 0.0 (no samples are added
-            # by the v1 capture path until T4 turns the gates on). target_deg
-            # reflects min_diversity_deg the session was constructed with.
+            # T4: diversity = max pairwise rotation between any two accepted
+            # T_base_eef rotations across the session. target_deg reflects
+            # min_diversity_deg the session was constructed with.
             diversity = {
-                "coverage_deg": 0.0,
+                "coverage_deg": float(ws.compute_diversity_deg(samples_snapshot)),
                 "target_deg": float(self._diversity_target_deg),
             }
+
+            # T4: per-sample metadata list for the Capture-tab gallery. Each
+            # entry mirrors web_support.sample_metadata's keys; the n_corners/
+            # reproj_px/area_frac fields aren't stored on Sample so we re-derive
+            # them from the array shapes / cap dict where possible.
+            samples_metadata = []
+            for i, s in enumerate(samples_snapshot):
+                prev = samples_snapshot[i - 1] if i > 0 else None
+                samples_metadata.append(ws.sample_metadata(
+                    i, s, prev_sample=prev,
+                    n_corners=int(len(s.corner_idx)),
+                    reproj_px=reproj_by_idx.get(i),
+                    area_frac=area_by_idx.get(i),
+                    joint_positions=joints_by_idx.get(i),
+                    ts=ts_by_idx.get(i),
+                ))
 
             # T3: server-evaluated SafetyEnvelope check against the cached EE
             # pose, surfaced as state.safety_preview so the Move tab doesn't
@@ -416,7 +455,7 @@ def _make_node_class():
                 board=board,
                 safety_envelope=safety_envelope,
                 stability=stability,
-                samples=[],  # T4 populates this from session metadata
+                samples=samples_metadata,
                 diversity=diversity,
                 last_solve=None,  # T5 populates this from the last solve result
                 safety_preview=safety_preview,
@@ -580,23 +619,49 @@ def _make_node_class():
             self._jm.send_goal_async(goal)
             return {"ok": True, "reason": "sent"}
 
-        def do_capture(self):
+        def is_steady(self):
+            """T4: latest StabilityTracker verdict (cached by ``_on_image``)."""
             with self.lock:
-                cap, K, frame = self._cap, self._K, self._frame
-            if frame is None:
-                return {"ok": False, "reason": "no camera frame"}
-            if K is None:
-                return {"ok": False, "reason": "no camera intrinsics"}
-            if cap is None:
-                return {"ok": False, "reason": "no board detection"}
+                return bool(self._stability_steady)
 
-            # NOTE: a settle gate (gates.StabilityTracker) is deferred to a later
-            # iteration — this is a single-frame capture for v1.
+        def do_capture(self):
+            # T4 HARD GATE: must run BEFORE the v1 "no camera / no K / no cap"
+            # branches so the operator sees a settle rejection even when a
+            # board pose is in fact available but not yet steady. This closes
+            # the v1 deferral noted in the prior comment.
+            with self.lock:
+                steady = self._stability_steady
+                since = self._stability_since_frames
+                target = self._stab_window
+                cap, K, frame = self._cap, self._K, self._frame
+                joints_snapshot = (None if self._xarm_joint_positions is None
+                                   else list(self._xarm_joint_positions))
+                now_mono = self._last_frame_monotonic
+            if not steady:
+                return {
+                    "ok": False,
+                    "reason": (f"not stable yet ({int(since)}/{int(target)} "
+                               f"steady frames)"),
+                    "num_samples": len(self.session.samples),
+                }
+            if frame is None:
+                return {"ok": False, "reason": "no camera frame",
+                        "num_samples": len(self.session.samples)}
+            if K is None:
+                return {"ok": False, "reason": "no camera intrinsics",
+                        "num_samples": len(self.session.samples)}
+            if cap is None:
+                return {"ok": False, "reason": "no board detection",
+                        "num_samples": len(self.session.samples)}
+
             try:
                 tfm = self.tf_buffer.lookup_transform(
                     self._base_frame, self._eef_frame, self._rclpy_time())
             except Exception as exc:
-                return {"ok": False, "reason": f"TF {self._base_frame}->{self._eef_frame} unavailable: {exc}"}
+                return {"ok": False,
+                        "reason": (f"TF {self._base_frame}->{self._eef_frame}"
+                                   f" unavailable: {exc}"),
+                        "num_samples": len(self.session.samples)}
             T_base_eef = ws.tf_to_matrix(
                 [tfm.transform.translation.x, tfm.transform.translation.y,
                  tfm.transform.translation.z],
@@ -607,7 +672,86 @@ def _make_node_class():
                 T_base_eef, cap["T_cam_board"], cap["obs_px"], cap["corner_idx"],
                 n_corners=len(cap["corner_idx"]), reproj_px=cap["reproj_px"],
                 area_frac=cap["area_frac"])
-            return {"ok": ok, "reason": reason, "num_samples": len(self.session.samples)}
+            if ok:
+                # Cache a downscaled JPEG of the overlayed frame + the joint
+                # snapshot for the new sample. Index matches session.samples[-1].
+                idx = len(self.session.samples) - 1
+                try:
+                    annotated = ws.draw_charuco_overlay(
+                        frame, cap["obs_px"], ids=cap["corner_idx"],
+                        rms_px=cap["reproj_px"], image_topic=self._image_topic)
+                    jpg = ws.encode_jpeg(_downscale(annotated, 320, self._cv2))
+                except Exception as exc:  # pragma: no cover - thumb is best-effort
+                    self.get_logger().warn(
+                        f"thumb encode failed for sample {idx} ({exc})")
+                    jpg = None
+                with self.lock:
+                    if jpg is not None:
+                        self._thumbs[idx] = jpg
+                    self._sample_joints[idx] = joints_snapshot
+                    self._sample_ts[idx] = (float(now_mono) if now_mono is not None
+                                            else float(self._time.monotonic()))
+                    self._sample_reproj_px[idx] = float(cap["reproj_px"])
+                    self._sample_area_frac[idx] = float(cap["area_frac"])
+            return {"ok": ok, "reason": reason,
+                    "num_samples": len(self.session.samples)}
+
+        def do_delete_sample(self, idx):
+            """Pop sample idx + recompact thumbnail/joint sidecars.
+
+            ``num_samples`` is returned even on failure so the UI can refresh
+            its counter unconditionally. Recompacts the sidecar dicts so all
+            keys stay contiguous 0..N-1 after the pop — the gallery never has
+            to handle "holes" in the index space.
+            """
+            with self.lock:
+                samples = self.session.samples
+                if not isinstance(idx, int):
+                    try:
+                        idx = int(idx)
+                    except (TypeError, ValueError):
+                        return {"ok": False,
+                                "reason": f"bad idx {idx!r}",
+                                "num_samples": len(samples)}
+                if idx < 0 or idx >= len(samples):
+                    return {"ok": False,
+                            "reason": (f"idx {idx} out of range "
+                                       f"(0..{len(samples) - 1})"),
+                            "num_samples": len(samples)}
+                samples.pop(idx)
+                # Recompact thumbnails + joint snapshots + ts: shift down
+                # every key > idx, drop the popped one.
+                self._thumbs = {
+                    (k if k < idx else k - 1): v
+                    for k, v in self._thumbs.items() if k != idx
+                }
+                self._sample_joints = {
+                    (k if k < idx else k - 1): v
+                    for k, v in self._sample_joints.items() if k != idx
+                }
+                self._sample_ts = {
+                    (k if k < idx else k - 1): v
+                    for k, v in self._sample_ts.items() if k != idx
+                }
+                self._sample_reproj_px = {
+                    (k if k < idx else k - 1): v
+                    for k, v in self._sample_reproj_px.items() if k != idx
+                }
+                self._sample_area_frac = {
+                    (k if k < idx else k - 1): v
+                    for k, v in self._sample_area_frac.items() if k != idx
+                }
+                num = len(samples)
+            return {"ok": True, "num_samples": num}
+
+        def sample_thumb(self, idx):
+            """Return the cached JPEG bytes for sample ``idx`` or ``None``."""
+            with self.lock:
+                try:
+                    idx = int(idx)
+                except (TypeError, ValueError):
+                    return None
+                return self._thumbs.get(idx)
 
         def do_solve(self):
             with self.lock:
@@ -724,6 +868,28 @@ def make_app(node):
     @app.post("/api/capture")
     def capture():
         return JSONResponse(node.do_capture())
+
+    @app.get("/api/samples/{idx}/thumb.jpg")
+    def sample_thumb(idx: int):
+        """T4: per-sample gallery thumbnail (downscaled JPEG of the frame+overlay).
+
+        Returns 404 when the index is unknown (deleted or never captured) so
+        the UI can drop stale gallery entries on the next render.
+        """
+        jpg = node.sample_thumb(idx)
+        if jpg is None:
+            return Response(status_code=404)
+        return Response(content=jpg, media_type="image/jpeg")
+
+    @app.delete("/api/samples/{idx}")
+    def delete_sample(idx: int):
+        """T4: remove a captured sample by index; recompact sidecar dicts.
+
+        Always returns 200 with ``{ok, num_samples, reason?}`` so the UI's
+        delete handler doesn't have to special-case HTTP errors against the
+        usual ``{ok: False, reason}`` flow.
+        """
+        return JSONResponse(node.do_delete_sample(idx))
 
     @app.post("/api/solve")
     def solve():

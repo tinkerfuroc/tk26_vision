@@ -36,6 +36,40 @@ def test_do_move_validates_joint_count():
         node.destroy_node()
 
 
+# ---------------------------------------------------------------------------
+# T4: settle gate + per-sample delete
+# ---------------------------------------------------------------------------
+
+def test_capture_blocked_when_not_steady():
+    """T4 HARD gate: do_capture returns ok=False with a 'stab...' reason when
+    the StabilityTracker has not yet declared the board steady, regardless of
+    whether camera/intrinsics/board-detection are otherwise available."""
+    node = HandeyeWebNode()
+    try:
+        # Default state of a fresh node: _stability_steady=False, _frame=None,
+        # _K=None, _cap=None.  The HARD settle gate must fire BEFORE the v1
+        # 'no camera frame' / 'no intrinsics' / 'no board detection' branches
+        # so the operator sees a stability rejection even when a board pose
+        # is in fact available but not yet steady.
+        node._stability_steady = False
+        r = node.do_capture()
+        assert r["ok"] is False
+        assert "stab" in r["reason"].lower()
+    finally:
+        node.destroy_node()
+
+
+def test_delete_sample_by_idx_out_of_range():
+    """T4: do_delete_sample(99) on an empty session returns ok=False."""
+    node = HandeyeWebNode()
+    try:
+        r = node.do_delete_sample(99)
+        assert r["ok"] is False
+        assert "num_samples" in r
+    finally:
+        node.destroy_node()
+
+
 def test_safety_preview_graceful_degrades_without_tf():
     """T3: ``safety_preview()`` returns the right shape even without TF /
     cached pose so the UI can render the "unknown" branch instead of crashing.

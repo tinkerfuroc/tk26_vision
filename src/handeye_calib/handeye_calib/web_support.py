@@ -126,6 +126,75 @@ def deg(x_rad):
     return round(float(x_rad) * 180.0 / math.pi, 4)
 
 
+# ---------------------------------------------------------------------------
+# T4: diversity meter + per-sample metadata
+# ---------------------------------------------------------------------------
+
+def _rotation_angle_deg(R_a, R_b):
+    """Geodesic angle (deg) between two 3x3 rotation matrices.
+
+    Uses the trace formula ``arccos((tr(R_a.T R_b) - 1) / 2)`` with a
+    clip to dodge numerical overshoot. Pure numpy — no scipy dep on the
+    diversity hot path. Returns 0.0 when either input is degenerate
+    (numerical noise on small angles is fine).
+    """
+    Ra = np.asarray(R_a, float).reshape(3, 3)
+    Rb = np.asarray(R_b, float).reshape(3, 3)
+    M = Ra.T @ Rb
+    tr = float(M[0, 0] + M[1, 1] + M[2, 2])
+    c = max(-1.0, min(1.0, (tr - 1.0) / 2.0))
+    return float(np.degrees(np.arccos(c)))
+
+
+def compute_diversity_deg(samples):
+    """Max pairwise rotation-angle (deg) between any two ``T_base_eef[:3,:3]``.
+
+    Operates on a list of :class:`handeye_calib.handeye_model.Sample`.
+    Returns ``0.0`` when there are fewer than two samples (no pair).
+    """
+    if not samples or len(samples) < 2:
+        return 0.0
+    Rs = [np.asarray(s.T_base_eef, float)[:3, :3] for s in samples]
+    best = 0.0
+    n = len(Rs)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a = _rotation_angle_deg(Rs[i], Rs[j])
+            if a > best:
+                best = a
+    return float(best)
+
+
+def sample_metadata(idx, sample, prev_sample=None, *,
+                    n_corners=None, reproj_px=None, area_frac=None,
+                    joint_positions=None, ts=None):
+    """JSON-friendly per-sample dict for the Capture-tab gallery row.
+
+    Composed off the accepted :class:`Sample` plus the original
+    capture-time scalars (which aren't stored on the dataclass).
+    ``angular_delta_deg`` is the rotation between this sample's
+    ``T_base_eef[:3,:3]`` and ``prev_sample.T_base_eef[:3,:3]`` (or
+    ``None`` for the first sample).
+    """
+    if prev_sample is None:
+        ang = None
+    else:
+        ang = _rotation_angle_deg(
+            np.asarray(prev_sample.T_base_eef, float)[:3, :3],
+            np.asarray(sample.T_base_eef, float)[:3, :3],
+        )
+    return {
+        "idx": int(idx),
+        "n_corners": (None if n_corners is None else int(n_corners)),
+        "reproj_px": (None if reproj_px is None else float(reproj_px)),
+        "area_frac": (None if area_frac is None else float(area_frac)),
+        "angular_delta_deg": (None if ang is None else float(ang)),
+        "joint_positions": (None if joint_positions is None
+                            else [float(j) for j in joint_positions]),
+        "ts": (None if ts is None else float(ts)),
+    }
+
+
 def enriched_state_payload(*, camera_connected, intrinsics_ok, num_samples,
                            last_detection, status_msg,
                            frame_count, frame_hz, frame_age_sec,

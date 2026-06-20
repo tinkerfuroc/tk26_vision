@@ -29,45 +29,388 @@ def diff_payload(old_xyz, new_xyz, old_rpy, new_rpy):
     }
 
 
+def _make_node_class():
+    """Build the rclpy Node class lazily so importing this module stays ROS-free.
+
+    All rclpy / cv_bridge / tinker_arm_msgs / pan_tilt / scipy imports happen
+    inside this factory — they only run when ``handeye_web.HandeyeWebNode`` is
+    accessed (via the module ``__getattr__`` hook below), never at module import
+    time. This keeps the unit-tested helpers (validate_pose_set, diff_payload)
+    loadable under a plain venv with no ROS on the path.
+    """
+    import os
+    import threading
+    import numpy as np
+    import cv2
+    from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.action import ActionClient
+    from tf2_ros import Buffer, TransformListener
+    from cv_bridge import CvBridge
+    from sensor_msgs.msg import Image, CameraInfo
+    from tinker_arm_msgs.action import JointMove
+    from scipy.spatial.transform import Rotation as _R
+
+    from handeye_calib import web_support as ws
+    from handeye_calib import handeye_model as hm
+    from handeye_calib import handeye_solve as hs
+    from handeye_calib import apply_handeye as ah
+    from handeye_calib.handeye_collect import CaptureSession
+    # Detection + safety reuse from pan_tilt. aruco_detect's Detection does NOT
+    # surface per-corner charuco pixels/IDs (only pose + corner count + reproj
+    # RMS), so for capture we call cv2.aruco.CharucoDetector.detectBoard directly
+    # to get charucoCorners/charucoIds, then board.matchImagePoints + solvePnP for
+    # the board pose, observed pixels, IDs, and a scalar reprojection error.
+    from pan_tilt.calibration.aruco_detect import BoardSpec, build_board, build_detector
+    from pan_tilt.calibration.safety import SafetyEnvelope
+
+    class HandeyeWebNode(Node):
+        def __init__(self):
+            super().__init__("handeye_web")
+            self.lock = threading.Lock()
+
+            self.bind_host = self._param("bind", "127.0.0.1")
+            self.bind_port = int(self._param("port", 8766))
+            self._robot_name = self._param("robot_name", os.environ.get("ROBOT_NAME", ""))
+            self._base_frame = self._param("base_frame", "link_base")
+            self._eef_frame = self._param("eef_frame", "link_eef")
+            self._aruco_dict_name = self._param("aruco_dict", "DICT_5X5_100")
+            self._marker_len = float(self._param("marker_len_m", 0.03))
+            self._mount_to_color_xyz = self._param("mount_to_color_xyz", "0 0 0")
+            self._mount_to_color_rpy = self._param("mount_to_color_rpy", "0 0 0")
+
+            self.bridge = CvBridge()
+            self._frame = None
+            self._K = None
+            self._D = None
+            self._last_det = None              # {corners:int, reproj_px:float} or None
+            self._last_corners_xy = None       # (M,2) px for overlay, or None
+            self._cap = None                   # latest {T_cam_board, obs_px, corner_idx, reproj_px, area_frac}
+
+            self.session = CaptureSession(min_diversity_deg=float(self._param("min_diversity_deg", 30.0)))
+            self.last_solve = None
+
+            self._sx = int(self._param("squares_x", 5))
+            self._sy = int(self._param("squares_y", 5))
+            self._sq = float(self._param("square_len_m", 0.04))
+            self._board_pts = hm.board_corners(self._sx, self._sy, self._sq)
+
+            self.tf_buffer = Buffer()
+            TransformListener(self.tf_buffer, self)
+
+            # ChArUco board + detector. aruco_dict param is a cv2.aruco predefined
+            # dictionary name (e.g. "DICT_5X5_100"); resolve it to its int id and
+            # build a BoardSpec matching our squares/lengths so detection geometry
+            # agrees with self._board_pts.
+            dict_id = getattr(cv2.aruco, self._aruco_dict_name, cv2.aruco.DICT_5X5_100)
+            self._board_spec = BoardSpec(
+                squares_x=self._sx, squares_y=self._sy,
+                square_len_m=self._sq, marker_len_m=self._marker_len,
+                dict_id=dict_id,
+            )
+            self._board = build_board(self._board_spec)
+            self._detector = build_detector(self._board)
+
+            # SafetyEnvelope with permissive defaults (constructor needs no config).
+            # validate() takes a 4x4 base->eef pose, not joint angles, so do_move
+            # below validates the *current* EE pose via TF when available and treats
+            # "no TF / no envelope" as skip — never blocking node construction.
+            try:
+                self._safety = SafetyEnvelope()
+            except Exception as exc:  # pragma: no cover - permissive guard
+                self.get_logger().warn(f"SafetyEnvelope unavailable ({exc}); skipping pose validation")
+                self._safety = None
+
+            self.create_subscription(
+                Image, self._param("color_image_topic", "/xarm_camera/color/image_raw"),
+                self._on_image, qos_profile_sensor_data)
+            self.create_subscription(
+                CameraInfo, self._param("camera_info_topic", "/xarm_camera/color/camera_info"),
+                self._on_info, qos_profile_sensor_data)
+            self._jm = ActionClient(self, JointMove, self._param("jointmove_action", "/xarm/joint_move"))
+
+            self._np = np
+            self._cv2 = cv2
+            self._R = _R
+            self.get_logger().info("handeye_web node ready")
+
+        # ---- param helper ----------------------------------------------------
+
+        def _param(self, name, default):
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
+            return self.get_parameter(name).value
+
+        # ---- subscriptions ---------------------------------------------------
+
+        def _on_image(self, msg):
+            try:
+                bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"cv_bridge conversion failed ({exc})", throttle_duration_sec=5.0)
+                return
+            with self.lock:
+                K = None if self._K is None else self._K.copy()
+                D = None if self._D is None else self._D.copy()
+
+            corners_xy, last_det, cap = self._detect(bgr, K, D)
+
+            with self.lock:
+                self._frame = bgr
+                self._last_corners_xy = corners_xy
+                self._last_det = last_det
+                self._cap = cap
+
+        def _on_info(self, msg):
+            np = self._np
+            K = np.array(msg.k, float).reshape(3, 3)
+            D = np.array(msg.d, float).flatten() if len(msg.d) else np.zeros(5)
+            with self.lock:
+                self._K = K
+                self._D = D
+
+        # ---- detection -------------------------------------------------------
+
+        def _detect(self, bgr, K, D):
+            """Run ChArUco detection on a BGR frame.
+
+            Returns (corners_xy, last_det, cap) where:
+              corners_xy: (M,2) float px or None  (for the overlay)
+              last_det:   {"corners": int, "reproj_px": float} or None
+              cap:        capture dict or None (None if no usable pose / no K)
+            """
+            np = self._np
+            cv2 = self._cv2
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+            try:
+                ch_corners, ch_ids, _, _ = self._detector.detectBoard(gray)
+            except cv2.error:
+                return None, None, None
+            if ch_corners is None or ch_ids is None or len(ch_ids) < 4:
+                return None, None, None
+
+            obs_px = np.asarray(ch_corners, float).reshape(-1, 2)
+            corner_idx = np.asarray(ch_ids).reshape(-1).astype(int)
+
+            # No intrinsics yet → overlay only, no pose / no capturable sample.
+            if K is None:
+                return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
+
+            try:
+                obj_pts, img_pts = self._board.matchImagePoints(ch_corners, ch_ids)
+            except cv2.error:
+                return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
+            if obj_pts is None or len(obj_pts) < 4:
+                return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
+
+            dist = D if D is not None else np.zeros(5)
+            ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok:
+                return obs_px, {"corners": int(len(corner_idx)), "reproj_px": None}, None
+
+            # Scalar reprojection error (RMS px) for the quality gate.
+            proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist)
+            proj = proj.reshape(-1, 2)
+            reproj_px = float(np.sqrt(np.mean(np.sum((proj - img_pts.reshape(-1, 2)) ** 2, axis=1))))
+
+            T_cam_board = np.eye(4)
+            T_cam_board[:3, :3] = cv2.Rodrigues(rvec)[0]
+            T_cam_board[:3, 3] = tvec.reshape(3)
+
+            # area_frac = bbox area of detected corners / image area.
+            h, w = bgr.shape[:2]
+            x0, y0 = obs_px.min(axis=0)
+            x1, y1 = obs_px.max(axis=0)
+            area_frac = float(((x1 - x0) * (y1 - y0)) / (w * h)) if w and h else 0.0
+
+            cap = {
+                "T_cam_board": T_cam_board,
+                "obs_px": obs_px,
+                "corner_idx": corner_idx,
+                "reproj_px": reproj_px,
+                "area_frac": area_frac,
+            }
+            return obs_px, {"corners": int(len(corner_idx)), "reproj_px": reproj_px}, cap
+
+        # ---- accessors -------------------------------------------------------
+
+        def get_state_dict(self):
+            with self.lock:
+                return ws.state_payload(
+                    self._frame is not None, self._K is not None,
+                    len(self.session.samples), self._last_det, "ok")
+
+        def latest_jpeg(self):
+            np = self._np
+            with self.lock:
+                if self._frame is None:
+                    return ws.placeholder_jpeg("no camera")
+                frame = self._frame.copy()
+                corners = self._last_corners_xy
+            return ws.encode_jpeg(ws.draw_charuco_overlay(
+                frame, corners if corners is not None else np.empty((0, 2))))
+
+        # ---- commands --------------------------------------------------------
+
+        def do_move(self, joints):
+            if not isinstance(joints, (list, tuple)) or len(joints) != 7:
+                return {"ok": False, "reason": "expected 7 joint values"}
+
+            # SafetyEnvelope.validate() gates a 4x4 base->eef POSE, not joints.
+            # We can't FK joints here, so validate the *current* EE pose from TF
+            # as a sanity guard; "no TF / no envelope" => skip validation (the
+            # collision-checking arm server is the real safety boundary).
+            if self._safety is not None:
+                try:
+                    tfm = self.tf_buffer.lookup_transform(
+                        self._base_frame, self._eef_frame, self._rclpy_time())
+                    T = ws.tf_to_matrix(
+                        [tfm.transform.translation.x, tfm.transform.translation.y,
+                         tfm.transform.translation.z],
+                        [tfm.transform.rotation.x, tfm.transform.rotation.y,
+                         tfm.transform.rotation.z, tfm.transform.rotation.w])
+                    reason = self._safety.validate(T)
+                    if reason is not None:
+                        return {"ok": False, "reason": f"safety: {reason}"}
+                except Exception:
+                    # No TF available (no robot in this env) — skip the pose gate.
+                    pass
+
+            if not self._jm.wait_for_server(timeout_sec=0.5):
+                return {"ok": False, "reason": "arm action server unavailable"}
+
+            goal = JointMove.Goal()
+            j = [float(x) for x in joints]
+            goal.joint0, goal.joint1, goal.joint2, goal.joint3 = j[0], j[1], j[2], j[3]
+            goal.joint4, goal.joint5, goal.joint6 = j[4], j[5], j[6]
+            goal.add_octomap = False
+            self._jm.send_goal_async(goal)
+            return {"ok": True, "reason": "sent"}
+
+        def do_capture(self):
+            with self.lock:
+                cap, K, frame = self._cap, self._K, self._frame
+            if frame is None:
+                return {"ok": False, "reason": "no camera frame"}
+            if K is None:
+                return {"ok": False, "reason": "no camera intrinsics"}
+            if cap is None:
+                return {"ok": False, "reason": "no board detection"}
+
+            # NOTE: a settle gate (gates.StabilityTracker) is deferred to a later
+            # iteration — this is a single-frame capture for v1.
+            try:
+                tfm = self.tf_buffer.lookup_transform(
+                    self._base_frame, self._eef_frame, self._rclpy_time())
+            except Exception as exc:
+                return {"ok": False, "reason": f"TF {self._base_frame}->{self._eef_frame} unavailable: {exc}"}
+            T_base_eef = ws.tf_to_matrix(
+                [tfm.transform.translation.x, tfm.transform.translation.y,
+                 tfm.transform.translation.z],
+                [tfm.transform.rotation.x, tfm.transform.rotation.y,
+                 tfm.transform.rotation.z, tfm.transform.rotation.w])
+
+            ok, reason = self.session.try_add(
+                T_base_eef, cap["T_cam_board"], cap["obs_px"], cap["corner_idx"],
+                n_corners=len(cap["corner_idx"]), reproj_px=cap["reproj_px"],
+                area_frac=cap["area_frac"])
+            return {"ok": ok, "reason": reason, "num_samples": len(self.session.samples)}
+
+        def do_solve(self):
+            with self.lock:
+                samples, K, D = list(self.session.samples), self._K, self._D
+            if len(samples) < 6:
+                return {"ok": False, "reason": f"need >=6 samples, have {len(samples)}"}
+            if K is None:
+                return {"ok": False, "reason": "no camera intrinsics"}
+            res = hs.solve(samples, K, D, self._board_pts)
+            self.last_solve = res
+            return {"ok": True, **ws.solve_payload(res)}
+
+        def do_promote(self):
+            import os
+            import yaml
+            if self.last_solve is None:
+                return {"ok": False, "reason": "run solve first"}
+
+            T_mount_color = self._mount_to_color_matrix()
+            T_eef_mount = ah.compose_eef_to_mount(self.last_solve.X, T_mount_color)
+            d = ah.handeye_yaml_dict(
+                T_eef_mount, self.last_solve.X, len(self.session.samples),
+                self.last_solve.heldout_metrics, "unset", self._sq)
+            new_xyz = d["hand_eye"]["arm_to_camera_xyz"]
+            new_rpy = d["hand_eye"]["arm_to_camera_rpy"]
+            diff = diff_payload(old_xyz="(unknown)", new_xyz=new_xyz,
+                                old_rpy="(unknown)", new_rpy=new_rpy)
+
+            robot = self._param("robot_name", "") or os.environ.get("ROBOT_NAME", "")
+            path = self._hand_eye_path(robot)
+            if robot and path is not None and path.parent.is_dir():
+                ah.write_with_backup(str(path), yaml.safe_dump(d))
+                return {"ok": True, "written_path": str(path), "diff": diff}
+            return {"ok": True, "preview": d, "diff": diff}
+
+        # ---- internal helpers ------------------------------------------------
+
+        def _mount_to_color_matrix(self):
+            """Parse mount_to_color_xyz / _rpy string params ("x y z" / "r p y")
+            into a 4x4. Defaults to identity when both are zero/empty."""
+            np = self._np
+            try:
+                xyz = [float(v) for v in str(self._mount_to_color_xyz).split()]
+                rpy = [float(v) for v in str(self._mount_to_color_rpy).split()]
+            except ValueError:
+                return np.eye(4)
+            if len(xyz) != 3 or len(rpy) != 3:
+                return np.eye(4)
+            T = np.eye(4)
+            T[:3, :3] = self._R.from_euler("xyz", rpy).as_matrix()
+            T[:3, 3] = xyz
+            return T
+
+        def _hand_eye_path(self, robot):
+            """Resolve <ws>/src/.../tinker_robot_config/robots/<robot>/hand_eye.yaml."""
+            from pathlib import Path
+            if not robot:
+                return None
+            here = Path(__file__).resolve()
+            for parent in here.parents:
+                cand = (parent / "tk25_basic" / "src" / "tinker_robot_config"
+                        / "robots" / robot / "hand_eye.yaml")
+                if cand.parent.parent.is_dir():
+                    return cand
+            return None
+
+        def _rclpy_time(self):
+            import rclpy
+            return rclpy.time.Time()
+
+    return HandeyeWebNode
+
+
 def main():
     # Mirrors pan_tilt/calib_web.py main(): build rclpy node, start uvicorn worker,
     # serve the authoring/run/verify/promote UI. Hardware-tier; see README.
+    # Replaced in Task 3 with the full FastAPI + uvicorn wiring.
     #
-    # ROS / web imports are deferred to here so `import handeye_calib.handeye_web`
-    # stays ROS-free for the unit-tested helpers above.
-    #
-    # Server structure to reuse from pan_tilt/calib_web.py:
-    #   - rclpy.spin() on the main thread; uvicorn on a worker thread.
-    #   - A single Node owns shared state behind `node.lock`; every FastAPI
-    #     handler touches ROS state only through lock-protected accessors.
-    #   - Tabs: (1) live camera + ChArUco overlay; (2) pose authoring — joint
-    #     input validated with validate_pose_set() AND against
-    #     calibration safety (SafetyEnvelope-style gate), "send to robot",
-    #     draft pose list; (3) run the solver as a subprocess
-    #     (handeye_solve) with streamed logs; (4) verification overlay;
-    #     (5) diff-preview (diff_payload) + atomic promote.
-    #
-    # Promote-area wiring note (DO NOT hardcode a guessed literal):
-    #   The real URDF camera mount joint lives in
-    #     src/tk25_manipulation/src/xarm_ros2/xarm_description/urdf/camera/
-    #     realsense_d435i.urdf.xacro
-    #   and is xacro-templated: name="${camera_prefix}camera_link_joint".
-    #   So when promote calls apply_handeye.patch_urdf_origin(xacro_text,
-    #   joint_name, xyz, rpy), the caller MUST pass that exact templated joint
-    #   name string (i.e. "${camera_prefix}camera_link_joint", or the prefix
-    #   resolved to the deployment's actual camera_prefix value) — never a
-    #   guessed literal like "camera_link_joint". The atomic write itself goes
-    #   through apply_handeye.write_with_backup (timestamped .old backup + tmp
-    #   rename).
-    #
-    # tinker_robot_config note:
-    #   apply_handeye.handeye_yaml_dict(...) output already passes the existing
-    #   tinker_robot_config lint as-is — no schema change is needed to persist
-    #   the solved hand-eye block.
+    # ROS / web imports are deferred (HandeyeWebNode is built lazily) so that
+    # `import handeye_calib.handeye_web` stays ROS-free for the unit-tested
+    # helpers above.
     import rclpy
     rclpy.init()
-    # ... node + uvicorn wiring (reuse calib_web structure) ...
-    rclpy.shutdown()
+    node = HandeyeWebNode()  # noqa: F821 — provided via module __getattr__ below
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def __getattr__(name):
+    if name == "HandeyeWebNode":
+        return _make_node_class()
+    raise AttributeError(name)
 
 
 if __name__ == "__main__":

@@ -431,8 +431,12 @@ def _make_node_class():
 
             # Stability tracker (observable in T1; T4 promotes it to a hard gate).
             self._stab_window = int(self._param("stability_window", 5))
-            self._stab_rot_tol_deg = float(self._param("stability_rot_tol_deg", 0.1))
-            self._stab_trans_tol_m = float(self._param("stability_trans_tol_m", 0.0003))
+            # Defaults loosened 2026-06-20 from 0.1° / 0.3 mm to physically
+            # realistic camera-PnP noise floors at typical calibration
+            # distances. See gates.StabilityTracker docstring for the
+            # underlying noise-budget rationale.
+            self._stab_rot_tol_deg = float(self._param("stability_rot_tol_deg", 0.5))
+            self._stab_trans_tol_m = float(self._param("stability_trans_tol_m", 0.003))
             self._stability = hgates.StabilityTracker(
                 window=self._stab_window,
                 rot_tol_deg=self._stab_rot_tol_deg,

@@ -559,3 +559,16 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   color: var(--fg-muted);
   font-style: italic; text-align: center;
 }
+
+/* ---- T4: Auto-capture sequence controls (below waypoints, above capture) */
+.sequence-controls { margin-top: 16px; }
+.sequence-log {
+  list-style: none; padding: 6px 10px; margin: 6px 0 0;
+  background: var(--bg);
+  border: 1px solid var(--border); border-radius: 3px;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--fg-muted);
+  max-height: 180px; overflow-y: auto;
+}
+.sequence-log li { padding: 2px 0; border-bottom: 1px solid var(--border); }
+.sequence-log li:last-child { border-bottom: none; }

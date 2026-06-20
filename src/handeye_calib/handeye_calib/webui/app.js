@@ -546,6 +546,53 @@ function renderCaptureTab(s) {
   _renderGallery(s);
 }
 
+// ---- T4: Auto-capture sequence UI — run / dry-run / cancel + live progress -
+// Three buttons + a progress text line + a scrollable log.  State comes from
+// state.sequence (pushed by T3 CaptureSequenceRunner via WS):
+//   {running, dry_run, current_idx, total, current_step, log: list[str]}
+const SEQ_RUN    = $("#sequence-run-btn");
+const SEQ_DRY    = $("#sequence-dry-btn");
+const SEQ_CANCEL = $("#sequence-cancel-btn");
+const SEQ_PROG   = $("#sequence-progress");
+const SEQ_LOG    = $("#sequence-log");
+
+async function startSequence(dryRun) {
+  const total = (state.waypoints || []).length;
+  const verb = dryRun ? "dry-run (move + settle only)" : "RUN CAPTURE";
+  if (!confirm(`${verb} the ${total}-waypoint sequence?\nThe arm will move to each pose in order. Click Cancel to stop.`)) return;
+  setStatus("sequence-status", "starting…", "warn");
+  const r = await fetch("/api/sequence/start", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({dry_run: dryRun})});
+  const body = await r.json();
+  if (!body.ok) setStatus("sequence-status", `start failed: ${body.reason}`, "err");
+}
+
+if (SEQ_RUN)    SEQ_RUN.addEventListener("click", () => startSequence(false));
+if (SEQ_DRY)    SEQ_DRY.addEventListener("click", () => startSequence(true));
+if (SEQ_CANCEL) SEQ_CANCEL.addEventListener("click", async () => {
+  setStatus("sequence-status", "cancelling…", "warn");
+  await fetch("/api/sequence/cancel", {method: "POST"});
+});
+
+function renderSequenceUI() {
+  if (!SEQ_RUN) return;
+  const seq = (state && state.sequence) || {running: false, current_step: "idle", total: 0, log: []};
+  const wps = (state && state.waypoints) || [];
+  const canRun = wps.length > 0 && !seq.running;
+  SEQ_RUN.disabled    = !canRun;
+  SEQ_DRY.disabled    = !canRun;
+  SEQ_CANCEL.disabled = !seq.running;
+  if (seq.running) {
+    SEQ_PROG.textContent = `${seq.current_step} — #${seq.current_idx ?? "?"} / ${seq.total}`;
+    SEQ_PROG.className = "status-line warn";
+  } else {
+    SEQ_PROG.textContent = seq.current_step === "done" ? "done" :
+                           seq.current_step === "cancelled" ? "cancelled" : "idle";
+    SEQ_PROG.className = "status-line " + (seq.current_step === "done" ? "ok" :
+                                             seq.current_step === "cancelled" ? "warn" : "");
+  }
+  SEQ_LOG.innerHTML = seq.log.map(line => `<li>${line.replace(/</g, "&lt;")}</li>`).join("");
+}
+
 // ---- render the info tab from state ---------------------------------------
 function render() {
   if (!state) return;
@@ -603,6 +650,8 @@ function render() {
   renderCaptureTab(state);
   // T2: Waypoints sub-panel (above manual capture button).
   renderWaypointsList();
+  // T4: Auto-capture sequence UI (below waypoints, above manual capture).
+  renderSequenceUI();
 }
 
 // ---- T2: Waypoints sub-panel — list + add-current + delete + save/reload --

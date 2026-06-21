@@ -38,7 +38,9 @@ def test_quality_ok_reasons():
 
 
 def test_quality_ok_board_too_small():
-    ok, reason = gates.quality_ok(n_corners=16, reproj_px=0.8, area_frac=0.01)
+    # area_frac well below the (now-0.01) floor — board so distant the
+    # bbox spans <10% of one image dimension.
+    ok, reason = gates.quality_ok(n_corners=16, reproj_px=0.8, area_frac=0.005)
     assert not ok and "board too small" in reason
 
 

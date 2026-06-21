@@ -5,18 +5,30 @@ import cv2
 
 
 def board_corners(squares_x=5, squares_y=5, square_len=0.04):
-    """Inner ChArUco corner positions (meters), board-centered, z=0 plane.
+    """Inner ChArUco corner positions (meters), z=0 plane.
 
-    Order is row-major over the (squares_x-1) x (squares_y-1) inner grid, matching
-    cv2.aruco CharucoBoard chessboard-corner ordering.
+    Origin is at the board's bottom-left corner, MATCHING OpenCV's
+    ``cv2.aruco.CharucoBoard.getChessboardCorners()`` convention. The first
+    inner corner is at ``(square_len, square_len, 0)``.
+
+    Order is row-major over the (squares_x-1) x (squares_y-1) inner grid.
+
+    History: prior to 2026-06-21 this function CENTERED the grid at origin,
+    which conflicted with OpenCV's bottom-left-origin convention. Per-frame
+    PnP uses ``board.matchImagePoints`` which returns OpenCV-coord object
+    points, so it succeeded with sub-pixel reproj — but the bundle adjust
+    later mixed OpenCV-frame ``T_cam_board`` with our-frame ``board_pts``
+    and every projection was off by a constant ``(square_len * (nx-1) / 2,
+    square_len * (ny-1) / 2)`` in board frame. For a 5x5x40mm board that
+    constant offset is ``sqrt(80² + 80²)/2 ≈ 141 mm``, which exactly
+    matched the operator's reported 142mm train_trans_rmse — a frame
+    misalignment masquerading as a calibration failure.
     """
     nx, ny = squares_x - 1, squares_y - 1
     xs = (np.arange(1, squares_x)) * square_len
     ys = (np.arange(1, squares_y)) * square_len
-    pts = np.array([[xs[i], ys[j], 0.0] for j in range(ny) for i in range(nx)], float)
-    pts[:, 0] -= pts[:, 0].mean()
-    pts[:, 1] -= pts[:, 1].mean()
-    return pts
+    return np.array(
+        [[xs[i], ys[j], 0.0] for j in range(ny) for i in range(nx)], float)
 
 
 def project_corners(board_pts, T_cam_board, K, dist=None):

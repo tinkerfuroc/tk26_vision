@@ -394,6 +394,7 @@ def _make_node_class():
 
             self.bridge = CvBridge()
             self._frame = None
+            self._frame_stamp = None   # ROS stamp of the most recent image
             self._K = None
             self._D = None
             self._last_det = None              # {corners:int, reproj_px:float} or None
@@ -591,6 +592,11 @@ def _make_node_class():
 
             with self.lock:
                 self._frame = bgr
+                # Cache the source image's ROS stamp so do_capture can look
+                # up TF AT THE IMAGE TIME (not "now") — eliminates the up-to-
+                # ~250ms skew between the image (cap["T_cam_board"]) and the
+                # arm pose (T_base_eef) when capture fires post-settle.
+                self._frame_stamp = msg.header.stamp
                 self._last_corners_xy = corners_xy
                 self._last_det = last_det
                 self._cap = cap
@@ -1000,6 +1006,7 @@ def _make_node_class():
                 since = self._stability_since_frames
                 target = self._stab_window
                 cap, K, frame = self._cap, self._K, self._frame
+                frame_stamp = self._frame_stamp
                 joints_snapshot = (None if self._xarm_joint_positions is None
                                    else list(self._xarm_joint_positions))
                 now_mono = self._last_frame_monotonic
@@ -1020,14 +1027,34 @@ def _make_node_class():
                 return {"ok": False, "reason": "no board detection",
                         "num_samples": len(self.session.samples)}
 
+            # Look up TF AT THE IMAGE TIME so T_base_eef matches the arm
+            # pose that produced cap["T_cam_board"]. Falls back to "latest
+            # available" if the image stamp is unset (defensive — should not
+            # happen post-_on_image but keeps the path robust). The TF
+            # buffer's default cache is ~10s which covers the up-to-~250ms
+            # window between image capture and do_capture firing.
+            from rclpy.time import Time as _RclpyTime
+            tf_time = (_RclpyTime.from_msg(frame_stamp) if frame_stamp is not None
+                       else self._rclpy_time())
             try:
                 tfm = self.tf_buffer.lookup_transform(
-                    self._base_frame, self._eef_frame, self._rclpy_time())
+                    self._base_frame, self._eef_frame, tf_time)
             except Exception as exc:
-                return {"ok": False,
-                        "reason": (f"TF {self._base_frame}->{self._eef_frame}"
-                                   f" unavailable: {exc}"),
-                        "num_samples": len(self.session.samples)}
+                # If the precise image-time lookup fails (TF buffer doesn't
+                # extrapolate by default), fall back to "latest available"
+                # rather than refusing the whole capture — pre-fix behavior.
+                try:
+                    tfm = self.tf_buffer.lookup_transform(
+                        self._base_frame, self._eef_frame, self._rclpy_time())
+                    self.get_logger().warn(
+                        f"TF at image stamp unavailable ({exc}); "
+                        "fell back to latest — sample may be temporally skewed",
+                        throttle_duration_sec=10.0)
+                except Exception as exc2:
+                    return {"ok": False,
+                            "reason": (f"TF {self._base_frame}->{self._eef_frame}"
+                                       f" unavailable: {exc2}"),
+                            "num_samples": len(self.session.samples)}
             T_base_eef = ws.tf_to_matrix(
                 [tfm.transform.translation.x, tfm.transform.translation.y,
                  tfm.transform.translation.z],

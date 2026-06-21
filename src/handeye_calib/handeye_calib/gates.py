@@ -53,11 +53,17 @@ def is_diverse(T_base_eef_new, accepted, min_deg=30.0):
 
 
 def quality_ok(n_corners, reproj_px, area_frac,
-               min_corners=10, max_reproj_px=1.5, min_area_frac=0.05):
+               min_corners=10, max_reproj_px=1.5, min_area_frac=0.01):
+    # ``min_area_frac`` is the corner-bbox area / full-image area. At handeye
+    # distances (60-80 cm) on a 1280x720 stream a fully-visible 5x5 board
+    # bboxes to ~0.03-0.04 of the frame, so a 0.05 floor rejected poses where
+    # every corner was in frame. 0.01 still catches the genuinely under-
+    # resolved regime (~10%x10% of the frame, ~128x72 px on 720p) where
+    # sub-pixel corner noise dominates PnP depth.
     if n_corners < min_corners:
         return False, f"too few corners ({n_corners}<{min_corners})"
     if reproj_px > max_reproj_px:
         return False, f"reproj too high ({reproj_px:.2f}>{max_reproj_px})"
     if area_frac < min_area_frac:
-        return False, f"board too small ({area_frac:.2f}<{min_area_frac})"
+        return False, f"board too small ({area_frac:.3f}<{min_area_frac})"
     return True, "ok"

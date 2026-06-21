@@ -439,7 +439,20 @@ def _make_node_class():
             # the accepted-sample rotation spread; T1 ships the field at 0.0.
             self._diversity_target_deg = float(self._param("min_diversity_deg", 30.0))
 
-            self.session = CaptureSession(min_diversity_deg=self._diversity_target_deg)
+            # Per-sample quality gates (gates.quality_ok). Exposed as ROS
+            # params so the operator can dial without rebuilding when the
+            # board / camera geometry differs from the 5x5-40mm @ 1280x720
+            # baseline the defaults assume.
+            self._min_corners = int(self._param("min_corners", 10))
+            self._max_reproj_px = float(self._param("max_reproj_px", 1.5))
+            self._min_area_frac = float(self._param("min_area_frac", 0.01))
+
+            self.session = CaptureSession(
+                min_diversity_deg=self._diversity_target_deg,
+                min_corners=self._min_corners,
+                max_reproj_px=self._max_reproj_px,
+                min_area_frac=self._min_area_frac,
+            )
             self.last_solve = None
 
             # T4: per-sample sidecars (kept parallel to ``self.session.samples``).

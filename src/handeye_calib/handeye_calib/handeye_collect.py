@@ -13,7 +13,11 @@ from handeye_calib import gates
 
 class CaptureSession:
     def __init__(self, min_diversity_deg=30.0,
-                 min_corners=10, max_reproj_px=1.5, min_area_frac=0.05):
+                 min_corners=10, max_reproj_px=1.5, min_area_frac=0.01):
+        # min_area_frac default lowered 2026-06-21 from 0.05 to 0.01 — at
+        # typical handeye distances on HD streams a fully-visible 5x5 board
+        # only spans 0.03-0.04 of the frame, so 0.05 rejected fully-detected
+        # poses. See gates.quality_ok docstring for the noise floor argument.
         self.min_diversity_deg = min_diversity_deg
         self.q = dict(min_corners=min_corners, max_reproj_px=max_reproj_px,
                       min_area_frac=min_area_frac)

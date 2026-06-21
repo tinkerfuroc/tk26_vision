@@ -1201,6 +1201,15 @@ def _make_node_class():
                                   "translation) and re-solve"}
             self.last_solve = res
             payload = ws.solve_payload_v2(res, samples, K, D, self._board_pts)
+            # Surface outlier-rejection results at the top level — the
+            # per_method_summary projection only carries (name, reproj_px),
+            # so the rejected_indices field gets dropped silently.
+            rej_idx = []
+            for m in (res.per_method or []):
+                if m.get("name") == "rejected_indices":
+                    rej_idx = list(m.get("rejected_indices") or [])
+                    break
+            payload["rejected_indices"] = rej_idx
             # Per-sample diagnostic to stderr so the operator can spot data-side
             # outliers (one bad sample dragging RMSE up) without UI changes.
             # Format: "[handeye] per-sample reproj_px: [1.2, 8.5, ...]" — easy
@@ -1219,12 +1228,15 @@ def _make_node_class():
                 d_fmt = ", ".join(f"{d:.3f}" for d in dists)
                 d_min, d_max = (min(dists), max(dists)) if dists else (0, 0)
                 d_spread_pct = 100.0 * (d_max - d_min) / max(d_min, 1e-6)
+                rej_str = (f" | rejected_indices={payload['rejected_indices']}"
+                           if payload.get("rejected_indices") else "")
                 self.get_logger().info(
                     f"solve: N={len(samples)} method={method_str} "
                     f"train_trans={payload['train_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm "
                     f"held_trans={payload['heldout_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm | "
                     f"per-sample reproj_px=[{fmt}] | "
-                    f"cam-board-dist_m=[{d_fmt}] (spread {d_spread_pct:.1f}%)")
+                    f"cam-board-dist_m=[{d_fmt}] (spread {d_spread_pct:.1f}%)"
+                    f"{rej_str}")
             except Exception:
                 pass  # diagnostic only — never fail the solve over a log line
             return {"ok": True, **payload}

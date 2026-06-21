@@ -39,7 +39,13 @@ _INT = [
     ("stability_window", "5"),
 ]
 _FLOAT = [
-    ("square_len_m", "0.04"), ("marker_len_m", "0.03"), ("min_diversity_deg", "30.0"),
+    ("square_len_m", "0.04"), ("marker_len_m", "0.03"),
+    # min_diversity_deg lowered 2026-06-21 from 30 → 5. The all-vs-all 30°
+    # rule rejected ~half of any 20+ waypoint set due to SO(3) packing
+    # limits — wrong semantic for hand-eye, which only needs the *set* to
+    # span rotation. 5° still dedups camera-shake duplicates. Set to 0 to
+    # disable the gate entirely (gate.is_diverse short-circuits).
+    ("min_diversity_deg", "5.0"),
     # Settle-gate thresholds. Defaults tuned for camera-only ChArUco PnP at
     # ~30-60 cm. Tighten only if your optical conditions are dramatically
     # quieter than typical (or your noise budget is dramatically smaller).

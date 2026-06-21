@@ -1150,7 +1150,7 @@ def _make_node_class():
                     return None
                 return self._thumbs.get(idx)
 
-        def do_solve(self, method: str = "auto"):
+        def do_solve(self, method: str = "auto", reject_sigma: float = None):
             """Run the hand-eye solve with optional method picker.
 
             ``method`` is one of ``"auto"`` (default — sweep all five OpenCV
@@ -1178,7 +1178,10 @@ def _make_node_class():
                 # philosophy as do_capture's "no detection" fallthrough.
                 methods_subset = None
             try:
-                res = hs.solve(samples, K, D, self._board_pts, methods=methods_subset)
+                res = hs.solve(samples, K, D, self._board_pts,
+                               methods=methods_subset,
+                               reject_sigma=(float(reject_sigma)
+                                             if reject_sigma is not None else None))
             except Exception as exc:
                 # seed_handeye raises when every OpenCV method fails (e.g. all
                 # samples colinear); bundle_adjust may also blow up on a
@@ -1832,7 +1835,19 @@ def make_app(node):
             body = await request.json()
         except Exception:
             body = {}
-        return JSONResponse(node.do_solve(method=(body or {}).get("method", "auto")))
+        body_d = body or {}
+        # Optional outlier rejection: {reject_sigma: float} — when set, the
+        # solver iteratively drops train samples whose post-BA reproj
+        # exceeds reject_sigma × median. Useful when the operator's
+        # physical setup produces bimodal per-sample reproj.
+        rs = body_d.get("reject_sigma")
+        try:
+            rs = float(rs) if rs is not None else None
+        except (TypeError, ValueError):
+            rs = None
+        return JSONResponse(node.do_solve(
+            method=body_d.get("method", "auto"),
+            reject_sigma=rs))
 
     @app.post("/api/promote")
     def promote():

@@ -144,14 +144,63 @@ def gate(metrics):
     return "FAIL"
 
 
-def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *, methods=None):
+def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
+          methods=None, reject_sigma=None, max_reject_frac=0.5):
     """Full solve pipeline. ``methods`` is forwarded to :func:`seed_handeye`
     so a single-method run (e.g. ``methods={"TSAI": cv2.CALIB_HAND_EYE_TSAI}``)
     skips the multi-method best-of step; ``None`` keeps the default 5-method
-    sweep."""
+    sweep.
+
+    ``reject_sigma``: when set, iteratively drop samples whose post-BA
+    per-sample reprojection RMS exceeds ``reject_sigma × median`` and re-solve.
+    Loop terminates when no further outliers exceed the threshold OR when
+    cumulative drops reach ``max_reject_frac`` (default 50%). Mirrors the
+    polish-phase rejection in pan_tilt's calibration. Use when the operator's
+    physical setup yields a bimodal per-sample reproj (some good, some bad)
+    — the rejection isolates the consistent-data subset so the calibration
+    is usable even before the mechanical disturbance is found and fixed.
+    ``rejected_indices`` (indices into the original ``samples``) is attached
+    to the returned ``SolveResult.per_method[-1]`` for operator visibility.
+    """
     train, test = split_train_test(samples, heldout_frac, rng_seed)
     X0, Tbb0, per_method = seed_handeye(train, K, dist, board_pts, methods=methods)
     X, Tbb, _ = bundle_adjust(train, K, dist, board_pts, X0, Tbb0)
+
+    rejected = []
+    if reject_sigma is not None and len(train) >= 6:
+        # Iterative MAD-based outlier rejection on the TRAIN set only —
+        # held-out stays intact as the honest evaluator.
+        active = list(range(len(train)))
+        n_orig = len(train)
+        for _ in range(20):  # safety cap on iterations
+            _, per_sample = _reproj_rms(X, Tbb, [train[i] for i in active],
+                                        K, dist, board_pts, per_sample=True)
+            arr = np.asarray(per_sample, float)
+            if arr.size < 6:
+                break
+            med = float(np.median(arr))
+            keep_mask = arr <= max(med * float(reject_sigma), 1e-6)
+            n_drop = int((~keep_mask).sum())
+            cumulative_drop = n_orig - int(keep_mask.sum())
+            if n_drop == 0:
+                break
+            if cumulative_drop > int(max_reject_frac * n_orig):
+                break
+            new_active = [active[i] for i, k in enumerate(keep_mask) if k]
+            if len(new_active) == len(active):
+                break
+            rejected.extend([active[i] for i, k in enumerate(keep_mask) if not k])
+            active = new_active
+            sub = [train[i] for i in active]
+            X0r, Tbb0r, _ = seed_handeye(sub, K, dist, board_pts, methods=methods)
+            X, Tbb, _ = bundle_adjust(sub, K, dist, board_pts, X0r, Tbb0r)
+        train = [train[i] for i in active]
+
     train_m = evaluate(X, Tbb, train, K, dist, board_pts)
     held_m = evaluate(X, Tbb, test, K, dist, board_pts)
+    if rejected:
+        per_method = list(per_method) + [{"name": "rejected_indices",
+                                          "rejected_indices": sorted(rejected),
+                                          "X": X, "Tbb": Tbb,
+                                          "reproj_px": float("nan")}]
     return SolveResult(X, Tbb, train_m, held_m, gate(held_m), per_method)

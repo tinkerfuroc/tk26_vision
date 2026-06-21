@@ -592,11 +592,15 @@ def _make_node_class():
 
             with self.lock:
                 self._frame = bgr
-                # Cache the source image's ROS stamp so do_capture can look
-                # up TF AT THE IMAGE TIME (not "now") — eliminates the up-to-
-                # ~250ms skew between the image (cap["T_cam_board"]) and the
-                # arm pose (T_base_eef) when capture fires post-settle.
-                self._frame_stamp = msg.header.stamp
+                # Stamp the image with ROS-time AT RECEIPT, NOT msg.header.stamp.
+                # realsense2_camera (and many other drivers) populate
+                # header.stamp from the camera HW clock, which drifts seconds
+                # from ROS time on this workstation (observed: image stamp
+                # 1.82s ahead of /tf latest, breaking TF lookup with
+                # "extrapolation into future" errors). ROS-now() at receipt
+                # carries ~5-20ms of USB+ROS-pub latency, which is the right
+                # answer for "when was this image captured, in TF clock".
+                self._frame_stamp = self.get_clock().now().to_msg()
                 self._last_corners_xy = corners_xy
                 self._last_det = last_det
                 self._cap = cap

@@ -126,6 +126,8 @@ def _make_node_class():
         # Settle poll period (10 Hz per the brief).
         SETTLE_POLL_S = 0.1
         # Need this many consecutive steady ticks before we call it settled.
+        # These class defaults are overridable per-instance from the node's ROS
+        # params (see HandeyeWebNode init: ``settle_steady_ticks``).
         SETTLE_STEADY_TICKS = 3
 
         def __init__(self, node):
@@ -134,6 +136,13 @@ def _make_node_class():
             self._lock = threading.Lock()
             self._thread = None
             self._inflight_handle = None  # latest JointMove goal handle
+            # Per-instance overrides — pulled from the node's ROS params so an
+            # operator can ``-p settle_steady_ticks:=8 -p settle_poll_s:=0.2``
+            # without rebuilding. Class-level constants remain as fallbacks.
+            self.steady_ticks = int(getattr(node, "_settle_steady_ticks",
+                                            self.SETTLE_STEADY_TICKS))
+            self.poll_s = float(getattr(node, "_settle_poll_s",
+                                        self.SETTLE_POLL_S))
             self._state = {
                 "running": False,
                 "dry_run": False,
@@ -291,12 +300,13 @@ def _make_node_class():
                 self._inflight_handle = None
 
         def _wait_for_settle(self, settle_timeout_s: float) -> bool:
-            """Poll the cached StabilityTracker verdict at 10 Hz.
+            """Poll the cached StabilityTracker verdict at ``1/poll_s`` Hz.
 
-            Returns True when steady for ``SETTLE_STEADY_TICKS`` consecutive
-            ticks; False on timeout or on stop. Reuses ``_stability_steady``
-            written by ``_on_image`` — no fresh threshold tuning here per the
-            brief (T4 owns those thresholds)."""
+            Returns True when steady for ``self.steady_ticks`` consecutive
+            ticks; False on timeout or on stop. Both knobs are pulled from
+            the node's ROS params at construction so operators can dial
+            without rebuilding. Reuses ``_stability_steady`` written by
+            ``_on_image``."""
             t0 = time.monotonic()
             consec = 0
             while True:
@@ -308,11 +318,11 @@ def _make_node_class():
                     steady = self.node._stability_steady
                 if steady:
                     consec += 1
-                    if consec >= self.SETTLE_STEADY_TICKS:
+                    if consec >= self.steady_ticks:
                         return True
                 else:
                     consec = 0
-                time.sleep(self.SETTLE_POLL_S)
+                time.sleep(self.poll_s)
 
         def _run(self, waypoints, dry_run: bool, settle_timeout_s: float):
             """The state-machine body. Runs on a daemon thread.
@@ -450,6 +460,16 @@ def _make_node_class():
             self._min_corners = int(self._param("min_corners", 10))
             self._max_reproj_px = float(self._param("max_reproj_px", 1.5))
             self._min_area_frac = float(self._param("min_area_frac", 0.01))
+
+            # Auto-capture sequence settle knobs (CaptureSequenceRunner).
+            # Defaults bumped 2026-06-21 at operator request for "longer
+            # settle". Override per run via ROS params:
+            #   settle_timeout_s     — wall-clock budget waiting for steady
+            #   settle_steady_ticks  — N consecutive steady reads to confirm
+            #   settle_poll_s        — poll period (10 Hz default)
+            self._settle_timeout_s = float(self._param("settle_timeout_s", 10.0))
+            self._settle_steady_ticks = int(self._param("settle_steady_ticks", 5))
+            self._settle_poll_s = float(self._param("settle_poll_s", 0.1))
 
             self.session = CaptureSession(
                 min_diversity_deg=self._diversity_target_deg,
@@ -1244,14 +1264,15 @@ def _make_node_class():
         # ---- T3-seq: auto-capture state machine ------------------------------
 
         def do_start_sequence(self, dry_run: bool = False,
-                              settle_timeout_s: float = 5.0):
+                              settle_timeout_s: float = None):
             """Kick off the auto-capture state machine.
 
-            Refuses on empty waypoint list with ``{ok: False, reason: "no
-            waypoints recorded"}``. Otherwise lazily (re)constructs the
-            runner so prior state can't leak across runs, then delegates to
-            ``runner.start``. Returns immediately; the runner spins on its
-            own daemon thread.
+            ``settle_timeout_s=None`` (default) uses the ``settle_timeout_s``
+            ROS param (default 10.0). Pass an explicit float to override
+            per-call. Refuses on empty waypoint list with ``{ok: False,
+            reason: "no waypoints recorded"}``. Otherwise lazily (re)
+            constructs the runner so prior state can't leak across runs,
+            then delegates to ``runner.start``.
             """
             with self.lock:
                 wp_count = len(self.waypoint_store.list())
@@ -1262,10 +1283,12 @@ def _make_node_class():
             existing = self.sequence_runner
             if existing is not None and existing.state_dict().get("running"):
                 return {"ok": False, "reason": "sequence already running"}
+            timeout = (float(settle_timeout_s) if settle_timeout_s is not None
+                       else float(self._settle_timeout_s))
             self.sequence_runner = CaptureSequenceRunner(self)
             return self.sequence_runner.start(
                 dry_run=bool(dry_run),
-                settle_timeout_s=float(settle_timeout_s),
+                settle_timeout_s=timeout,
             )
 
         def do_cancel_sequence(self):
@@ -1838,8 +1861,16 @@ def make_app(node):
             body = {}
         if not isinstance(body, dict):
             body = {}
+        # ``settle_timeout_s`` is optional; if absent or non-numeric the node
+        # falls back to its ROS-param default (default 10s).
+        try:
+            settle = (None if "settle_timeout_s" not in body
+                      else float(body.get("settle_timeout_s")))
+        except (TypeError, ValueError):
+            settle = None
         return JSONResponse(node.do_start_sequence(
-            dry_run=bool(body.get("dry_run", False))))
+            dry_run=bool(body.get("dry_run", False)),
+            settle_timeout_s=settle))
 
     @app.post("/api/sequence/cancel")
     def sequence_cancel():

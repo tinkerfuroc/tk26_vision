@@ -44,9 +44,20 @@ class StabilityTracker:
         return True
 
 
-def is_diverse(T_base_eef_new, accepted, min_deg=30.0):
-    """True if the new flange orientation differs from every accepted pose by >= min_deg."""
-    if not accepted:
+def is_diverse(T_base_eef_new, accepted, min_deg=5.0):
+    """True if the new flange orientation differs from EVERY accepted pose by >= min_deg.
+
+    NOTE on default: the original 30° threshold was wrong for hand-eye
+    calibration. SO(3) packing puts an upper bound of ~12-15 mutually-
+    30°-separated rotations in the reachable manifold, so a 30° all-vs-all
+    gate would reject ~half of any operator-authored 20+ waypoint set
+    regardless of how diverse the input actually was. The hand-eye solver
+    needs the *accepted set* to span SO(3) (so the linear system has rank),
+    not that every pair exceeds a large threshold. 5° is enough to dedup
+    near-duplicates (camera shake of the same pose) while letting genuinely
+    distinct poses through. Set ``min_deg=0`` to disable the gate entirely.
+    """
+    if not accepted or min_deg <= 0:
         return True
     Rn = np.asarray(T_base_eef_new)[:3, :3]
     return all(tf.rotation_angle_deg(np.asarray(T)[:3, :3], Rn) >= min_deg for T in accepted)

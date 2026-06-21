@@ -435,9 +435,13 @@ def _make_node_class():
             self._stability_steady = False
             self._stability_since_frames = 0
 
-            # Diversity target (degrees). T4 will compute actual coverage from
-            # the accepted-sample rotation spread; T1 ships the field at 0.0.
-            self._diversity_target_deg = float(self._param("min_diversity_deg", 30.0))
+            # Diversity threshold for the per-sample dedup gate (gates.is_diverse).
+            # Default lowered 2026-06-21 from 30° -> 5° because the all-vs-all
+            # 30° rule rejected ~half of any 20+ waypoint set regardless of
+            # actual input diversity (SO(3) packing limits). 5° still catches
+            # camera-shake duplicates of the same authored pose; set to 0 to
+            # disable the gate entirely.
+            self._diversity_target_deg = float(self._param("min_diversity_deg", 5.0))
 
             # Per-sample quality gates (gates.quality_ok). Exposed as ROS
             # params so the operator can dial without rebuilding when the

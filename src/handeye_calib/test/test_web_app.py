@@ -396,7 +396,7 @@ def test_json_response_scrubs_nan_inf():
     """
     node, c = _client()
     try:
-        node.do_solve = lambda method="auto": {
+        node.do_solve = lambda method="auto", reject_sigma=None: {
             "ok": True,
             "X_xyz_mm": [1.0, float("nan"), float("inf")],
             "train_metrics": {"trans_rmse_m": float("nan"), "reproj_px": 0.5},

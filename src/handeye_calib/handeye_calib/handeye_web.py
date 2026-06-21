@@ -1205,11 +1205,23 @@ def _make_node_class():
             try:
                 ps = payload.get("per_sample_reproj_px", [])
                 fmt = ", ".join(f"{v:.2f}" for v in ps if np.isfinite(v))
+                # Per-sample camera-to-board distance (norm of T_cam_board
+                # translation). When board geometry matches the configured
+                # square_len_m, this clusters tightly around the physical
+                # distance (~0.5m typical). When square_len is wrong, PnP
+                # returns scale-wrong poses whose magnitude varies sample-
+                # to-sample with the detected corner subset — values will
+                # spread 20%+. Operator-facing root-cause hint.
+                dists = [float(np.linalg.norm(s.T_cam_board[:3, 3])) for s in samples]
+                d_fmt = ", ".join(f"{d:.3f}" for d in dists)
+                d_min, d_max = (min(dists), max(dists)) if dists else (0, 0)
+                d_spread_pct = 100.0 * (d_max - d_min) / max(d_min, 1e-6)
                 self.get_logger().info(
                     f"solve: N={len(samples)} method={method_str} "
                     f"train_trans={payload['train_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm "
                     f"held_trans={payload['heldout_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm | "
-                    f"per-sample reproj_px=[{fmt}]")
+                    f"per-sample reproj_px=[{fmt}] | "
+                    f"cam-board-dist_m=[{d_fmt}] (spread {d_spread_pct:.1f}%)")
             except Exception:
                 pass  # diagnostic only — never fail the solve over a log line
             return {"ok": True, **payload}

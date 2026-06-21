@@ -1193,7 +1193,22 @@ def _make_node_class():
                                   "diverse waypoints (vary EE rotation, not just "
                                   "translation) and re-solve"}
             self.last_solve = res
-            return {"ok": True, **ws.solve_payload_v2(res, samples, K, D, self._board_pts)}
+            payload = ws.solve_payload_v2(res, samples, K, D, self._board_pts)
+            # Per-sample diagnostic to stderr so the operator can spot data-side
+            # outliers (one bad sample dragging RMSE up) without UI changes.
+            # Format: "[handeye] per-sample reproj_px: [1.2, 8.5, ...]" — easy
+            # to eyeball; an outlier > 5x median is almost certainly the cause.
+            try:
+                ps = payload.get("per_sample_reproj_px", [])
+                fmt = ", ".join(f"{v:.2f}" for v in ps if np.isfinite(v))
+                self.get_logger().info(
+                    f"solve: N={len(samples)} method={method_str} "
+                    f"train_trans={payload['train_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm "
+                    f"held_trans={payload['heldout_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm | "
+                    f"per-sample reproj_px=[{fmt}]")
+            except Exception:
+                pass  # diagnostic only — never fail the solve over a log line
+            return {"ok": True, **payload}
 
         # ---- T1-wp: waypoint CRUD + per-robot YAML persistence ---------------
 

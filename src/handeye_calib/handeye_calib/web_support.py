@@ -1,7 +1,32 @@
 """Pure, ROS-free helpers + inline UI for handeye_web. No rclpy/fastapi here."""
+import math
 import numpy as np
 import cv2
 from scipy.spatial.transform import Rotation as R
+
+
+def json_safe(obj):
+    """Recursively replace non-finite floats (NaN/Inf) with ``None``.
+
+    Starlette's ``JSONResponse.render`` calls ``json.dumps(..., allow_nan=False)``
+    which raises ``ValueError`` on NaN/Inf, and FastAPI then surfaces a
+    plain-text ``Internal Server Error`` 500 — the browser's ``JSON.parse``
+    chokes on that body at "line 1 column 1". Scrub at the response boundary
+    so a stray non-finite (degenerate solve, empty-stat divide-by-zero, etc.)
+    renders as a blank field in the UI instead of breaking the whole response.
+    Numpy scalars are coerced to Python floats so ``json.dumps`` handles them.
+    """
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, (np.floating,)):
+        obj = float(obj)
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    return obj
 
 
 def tf_to_matrix(translation_xyz, quaternion_xyzw):

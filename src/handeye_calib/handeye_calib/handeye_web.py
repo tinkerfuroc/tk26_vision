@@ -1109,7 +1109,25 @@ def _make_node_class():
                 # Unknown method: degrade to auto rather than 422; same
                 # philosophy as do_capture's "no detection" fallthrough.
                 methods_subset = None
-            res = hs.solve(samples, K, D, self._board_pts, methods=methods_subset)
+            try:
+                res = hs.solve(samples, K, D, self._board_pts, methods=methods_subset)
+            except Exception as exc:
+                # seed_handeye raises when every OpenCV method fails (e.g. all
+                # samples colinear); bundle_adjust may also blow up on a
+                # singular Jacobian. Surface the failure as a JSON-safe ok:False
+                # rather than a 500 the UI would render as a JSON.parse crash.
+                return {"ok": False,
+                        "reason": f"solve failed ({type(exc).__name__}): {exc} — "
+                                  "try collecting more diverse poses (vary EE rotation, "
+                                  "not just translation)"}
+            if not (np.all(np.isfinite(res.X)) and np.all(np.isfinite(res.Tbb))):
+                # Numerically valid (no exception) but the recovered transform
+                # is non-finite — JSONResponse would render plain-text 500.
+                # Don't cache it (Promote tab must not diff against NaN).
+                return {"ok": False,
+                        "reason": "solve produced non-finite transform — add more "
+                                  "diverse waypoints (vary EE rotation, not just "
+                                  "translation) and re-solve"}
             self.last_solve = res
             return {"ok": True, **ws.solve_payload_v2(res, samples, K, D, self._board_pts)}
 
@@ -1642,8 +1660,18 @@ def make_app(node):
     import asyncio
     from pathlib import Path
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-    from fastapi.responses import FileResponse, Response, JSONResponse
+    from fastapi.responses import FileResponse, Response
+    from fastapi.responses import JSONResponse as _RawJSONResponse
     from fastapi.staticfiles import StaticFiles
+    from handeye_calib import web_support as ws
+
+    def JSONResponse(content, *args, **kwargs):
+        # Boundary scrub: Starlette renders with ``allow_nan=False`` so a
+        # stray NaN/Inf anywhere in the payload triggers a plain-text 500
+        # the browser reports as ``JSON.parse: unexpected character at
+        # line 1 column 1``. Sanitize to ``None`` so the UI shows a blank
+        # field instead. Cheap (O(payload size), pure-python walk).
+        return _RawJSONResponse(ws.json_safe(content), *args, **kwargs)
 
     app = FastAPI(title="handeye_web", docs_url="/api/docs")
 
@@ -1817,7 +1845,11 @@ def make_app(node):
         await ws_conn.accept()
         try:
             while True:
-                await ws_conn.send_json(node.get_state_dict())
+                # Same NaN/Inf scrub as the HTTP responses — Starlette's
+                # ``send_json`` uses ``allow_nan=False``, so a non-finite
+                # in stability/diversity/safety would otherwise drop the
+                # socket every cycle.
+                await ws_conn.send_json(ws.json_safe(node.get_state_dict()))
                 await asyncio.sleep(0.1)  # 10 Hz
         except WebSocketDisconnect:
             return

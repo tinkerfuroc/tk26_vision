@@ -383,3 +383,30 @@ def test_state_payload_includes_sequence():
         assert seq["log"] == []
     finally:
         node.destroy_node()
+
+
+def test_json_response_scrubs_nan_inf():
+    """A NaN/Inf in any do_* return must not break the wire.
+
+    Starlette's ``JSONResponse.render`` calls ``json.dumps(allow_nan=False)``;
+    pre-fix a non-finite float triggered a plain-text 500 the browser surfaced
+    as ``JSON.parse: unexpected character at line 1 column 1``. The boundary
+    scrub in ``make_app`` must turn NaN/Inf into ``null`` so the call stays
+    200 + parseable JSON.
+    """
+    node, c = _client()
+    try:
+        node.do_solve = lambda method="auto": {
+            "ok": True,
+            "X_xyz_mm": [1.0, float("nan"), float("inf")],
+            "train_metrics": {"trans_rmse_m": float("nan"), "reproj_px": 0.5},
+            "per_sample_reproj_px": [0.1, float("nan"), 0.2],
+        }
+        r = c.post("/api/solve", json={"method": "auto"})
+        assert r.status_code == 200
+        body = r.json()  # would raise pre-fix
+        assert body["X_xyz_mm"] == [1.0, None, None]
+        assert body["train_metrics"]["trans_rmse_m"] is None
+        assert body["per_sample_reproj_px"][1] is None
+    finally:
+        node.destroy_node()

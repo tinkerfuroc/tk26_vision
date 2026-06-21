@@ -170,6 +170,11 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
     if reject_sigma is not None and len(train) >= 6:
         # Iterative MAD-based outlier rejection on the TRAIN set only —
         # held-out stays intact as the honest evaluator.
+        #
+        # Threshold: median + sigma * MAD (one-sided, since reproj is
+        # bounded below by zero — only the high tail is "outlier"). MAD
+        # is robust to existing outliers (unlike stdev), so the metric
+        # stays stable as the rejection loop iterates.
         active = list(range(len(train)))
         n_orig = len(train)
         for _ in range(20):  # safety cap on iterations
@@ -179,7 +184,11 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
             if arr.size < 6:
                 break
             med = float(np.median(arr))
-            keep_mask = arr <= max(med * float(reject_sigma), 1e-6)
+            mad = float(np.median(np.abs(arr - med)))
+            # Floor MAD at a tiny value so a perfectly-clean active set
+            # doesn't divide-by-zero on the next-round threshold.
+            threshold = med + float(reject_sigma) * max(mad, 1e-6)
+            keep_mask = arr <= threshold
             n_drop = int((~keep_mask).sum())
             cumulative_drop = n_orig - int(keep_mask.sum())
             if n_drop == 0:

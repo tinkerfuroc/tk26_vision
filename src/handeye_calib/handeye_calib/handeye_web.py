@@ -1375,6 +1375,127 @@ def _make_node_class():
                 return {"ok": True}
             return runner.cancel()
 
+        # ---- mount rigidity test ---------------------------------------------
+
+        def do_mount_test(self, pose_idx: int = 0, n_visits: int = 5,
+                          scramble_pose_idx: int = None,
+                          settle_timeout_s: float = None):
+            """Verify whether the camera mount is rigid.
+
+            Moves the arm repeatedly to the same target pose (waypoint
+            ``pose_idx``), interleaving each visit with a scramble pose
+            (default: roughly antipodal in the waypoint list) so the wrist
+            has to traverse different orientations between visits. Captures
+            ``T_cam_board`` at each visit and reports the spread.
+
+            Interpretation: if the camera is rigidly bolted to the arm and
+            the board is fixed in base frame, ``T_base_eef`` repeats exactly
+            (FK is deterministic) so ``T_cam_board`` must repeat too —
+            within sub-pixel PnP noise (~0.2-0.5 mm translation, ~0.05 deg
+            rotation). Any larger spread is direct evidence of mechanical
+            compliance somewhere in the chain (mount, bracket, board flex).
+
+            Returns ``{ok, trans_std_mm, trans_max_offset_mm, rot_std_deg,
+            rot_max_deg, per_visit}``. ``per_visit`` carries each visit's
+            T_cam_board translation + reproj_px so the operator can dig in.
+            """
+            with self.lock:
+                waypoints = list(self.waypoint_store.list())
+            if not waypoints:
+                return {"ok": False, "reason": "no waypoints recorded"}
+            if pose_idx < 0 or pose_idx >= len(waypoints):
+                return {"ok": False, "reason":
+                        f"pose_idx {pose_idx} out of range (store has {len(waypoints)})"}
+            if scramble_pose_idx is None:
+                scramble_pose_idx = (pose_idx + len(waypoints) // 2) % len(waypoints)
+                if scramble_pose_idx == pose_idx and len(waypoints) >= 2:
+                    scramble_pose_idx = (pose_idx + 1) % len(waypoints)
+            if scramble_pose_idx < 0 or scramble_pose_idx >= len(waypoints):
+                return {"ok": False, "reason":
+                        f"scramble_pose_idx {scramble_pose_idx} out of range"}
+            n_visits = max(2, int(n_visits))
+            timeout = (float(settle_timeout_s) if settle_timeout_s is not None
+                       else float(self._settle_timeout_s))
+            target_joints = list(waypoints[pose_idx].joints)
+            scramble_joints = list(waypoints[scramble_pose_idx].joints)
+
+            # Reuse CaptureSequenceRunner's helpers (move + settle) so we
+            # don't re-implement the rclpy async patterns. The runner stores
+            # nothing on session.samples — captures are pulled directly from
+            # node._cap after each settle.
+            runner = CaptureSequenceRunner(self)
+
+            visits = []
+            for i in range(n_visits):
+                # Scramble first so the arm always APPROACHES target from
+                # a different starting orientation (catches direction-
+                # dependent backlash too).
+                move_res = runner._do_move_wait(scramble_joints)
+                if not move_res["ok"]:
+                    return {"ok": False, "reason":
+                            f"visit {i}: scramble move failed: {move_res['reason']}"}
+                if not runner._wait_for_settle(timeout):
+                    return {"ok": False, "reason":
+                            f"visit {i}: scramble settle timed out after {timeout:.1f}s"}
+                # Move to target and capture
+                move_res = runner._do_move_wait(target_joints)
+                if not move_res["ok"]:
+                    return {"ok": False, "reason":
+                            f"visit {i}: target move failed: {move_res['reason']}"}
+                if not runner._wait_for_settle(timeout):
+                    return {"ok": False, "reason":
+                            f"visit {i}: target settle timed out after {timeout:.1f}s"}
+                with self.lock:
+                    cap = self._cap
+                if cap is None:
+                    return {"ok": False, "reason":
+                            f"visit {i}: no board detection at target"}
+                T = np.asarray(cap["T_cam_board"])
+                visits.append({
+                    "trans_m": T[:3, 3].tolist(),
+                    "R": T[:3, :3].tolist(),
+                    "reproj_px": float(cap["reproj_px"]),
+                })
+
+            # Spread metrics — translation std (3D distance from mean) +
+            # rotation spread (angular distance from first visit, since
+            # there's no straightforward SO(3) mean for small N).
+            trans = np.asarray([v["trans_m"] for v in visits])
+            trans_mean = trans.mean(axis=0)
+            trans_offsets_m = np.linalg.norm(trans - trans_mean, axis=1)
+            R0 = np.asarray(visits[0]["R"])
+            # Angular distance via rotvec — numerically stable vs arccos-of-trace.
+            def _rot_angle(Ra, Rb):
+                return float(np.degrees(np.linalg.norm(
+                    _R.from_matrix(Ra.T @ Rb).as_rotvec())))
+            rot_devs_deg = [_rot_angle(R0, np.asarray(v["R"])) for v in visits]
+            log = self.get_logger()
+            log.info(
+                f"mount_test: pose={pose_idx} scramble={scramble_pose_idx} "
+                f"N={n_visits} | "
+                f"trans_std={trans_offsets_m.std()*1000:.2f}mm "
+                f"trans_max_offset={trans_offsets_m.max()*1000:.2f}mm | "
+                f"rot_std={float(np.std(rot_devs_deg)):.3f}deg "
+                f"rot_max={float(np.max(rot_devs_deg)):.3f}deg")
+            return {
+                "ok": True,
+                "pose_idx": int(pose_idx),
+                "scramble_pose_idx": int(scramble_pose_idx),
+                "n_visits": int(n_visits),
+                "trans_std_mm": float(trans_offsets_m.std() * 1000.0),
+                "trans_max_offset_mm": float(trans_offsets_m.max() * 1000.0),
+                "rot_std_deg": float(np.std(rot_devs_deg)),
+                "rot_max_deg": float(np.max(rot_devs_deg)),
+                "per_visit": [{
+                    "trans_mm": [v["trans_m"][0]*1000, v["trans_m"][1]*1000,
+                                 v["trans_m"][2]*1000],
+                    "reproj_px": v["reproj_px"],
+                    "offset_from_mean_mm": float(np.linalg.norm(
+                        np.asarray(v["trans_m"]) - trans_mean) * 1000.0),
+                    "rot_from_first_deg": float(d),
+                } for v, d in zip(visits, rot_devs_deg)],
+            }
+
         # ---- T6: per-robot xacro override + yaml-diff ------------------------
 
         def _resolve_robot_name(self):
@@ -1961,6 +2082,46 @@ def make_app(node):
     def sequence_cancel():
         """POST /api/sequence/cancel → do_cancel_sequence() (idempotent no-op)."""
         return JSONResponse(node.do_cancel_sequence())
+
+    @app.post("/api/mount_test")
+    async def mount_test(request: Request):
+        """Camera-mount rigidity diagnostic.
+
+        Body (all optional):
+          {pose_idx: int = 0,              # target waypoint index
+           n_visits: int = 5,              # visits to the target
+           scramble_pose_idx: int = None,  # waypoint to scramble through;
+                                           # defaults to ~antipodal in list
+           settle_timeout_s: float = None} # falls back to ROS param
+
+        Blocks the request for ~(n_visits * 2 * settle_s) seconds. Runs
+        the actual work in a worker thread so the asyncio event loop
+        (uvicorn) stays responsive for WS state push + other clients.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        kwargs = {
+            "pose_idx": int(body.get("pose_idx", 0)),
+            "n_visits": int(body.get("n_visits", 5)),
+        }
+        if body.get("scramble_pose_idx") is not None:
+            try:
+                kwargs["scramble_pose_idx"] = int(body["scramble_pose_idx"])
+            except (TypeError, ValueError):
+                pass
+        if body.get("settle_timeout_s") is not None:
+            try:
+                kwargs["settle_timeout_s"] = float(body["settle_timeout_s"])
+            except (TypeError, ValueError):
+                pass
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None,
+            lambda: node.do_mount_test(**kwargs))
+        return JSONResponse(result)
 
     @app.websocket("/ws")
     async def ws_state(ws_conn: WebSocket):

@@ -1,0 +1,12 @@
+# Packages NOT in uv.lock because uv can't resolve them from a public
+# index (custom CUDA build, NVIDIA Omniverse, deprecated alias, etc.).
+# Install these by hand after `uv sync --frozen` succeeds.
+#
+# tensorrt_cu12==10.16.1.11
+#   NVIDIA TensorRT (cu12). Install via `pip install --extra-index-url https://pypi.nvidia.com tensorrt-cu12==<ver>` after torch lands.
+
+# tensorrt_cu12_bindings==10.16.1.11
+#   Bundled with tensorrt-cu12; installed automatically by that package's wheel.
+
+# tensorrt_cu12_libs==10.16.1.11
+#   Bundled with tensorrt-cu12; installed automatically by that package's wheel.

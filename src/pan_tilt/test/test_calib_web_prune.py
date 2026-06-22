@@ -324,7 +324,7 @@ def test_phase2_grid_apply_emits_grid_pairs(fake_robot):
     # Each kept pair lies on the original grid.
     for pan, tilt in sd["collector"]["phase2_grid_pairs"]:
         assert pan in (-30.0, 0.0, 30.0)
-        assert tilt in (15.0, 30.0, 45.0)
+        assert tilt in (10.0, 20.0, 30.0)
 
 
 def test_unknown_predictor_choice_rejected(fake_robot):

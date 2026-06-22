@@ -1016,9 +1016,14 @@ class CalibWebNode(Node):
         )
         return bool(resp.success), resp.message or ("ok" if resp.success else "failed")
 
-    def call_joint_move(self, angles_rad, env_points=None) -> tuple[bool, str]:
+    def call_joint_move(self, angles_rad, add_octomap: bool = False) -> tuple[bool, str]:
         """Send a JointMove action goal. angles_rad is padded/truncated to 7 floats
         (joint0..joint6) to match the tinker_arm_msgs action definition.
+
+        `add_octomap` (default False) controls the server-side dynamic scene
+        layer. For calibration we want a clean planner state — the EE is in
+        known free space and the marker board / fixture should NOT be added
+        as obstacles, since they'd make the planner reject the move.
         """
         if self._joint_move_client is None:
             return False, "tinker_arm_msgs not available on the Python path"
@@ -1036,7 +1041,7 @@ class CalibWebNode(Node):
         goal.joint4 = float(a[4])
         goal.joint5 = float(a[5])
         goal.joint6 = float(a[6])
-        goal.env_points = env_points if env_points is not None else _empty_pointcloud()
+        goal.add_octomap = bool(add_octomap)
 
         return self._run_action(self._joint_move_client, goal, action_name)
 
@@ -1998,7 +2003,7 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         # params choice is checked per-request below.
         "validate":        ["phase4_validation.json"],
         # collection subcommands -> calibrate_collect.py (moves the robot)
-        "collect_phase1":         [],     # canonical level park (pan=0, tilt=+45)
+        "collect_phase1":         [],     # canonical level park (pan=0, tilt=+30)
         "collect_phase1_custom":  [],     # operator-chosen park, see /api/calib/phase1_custom_park
         "collect_dry_run":        [],     # preflight: validate motion only, no image capture
         "collect_phase2": ["phase1_handeye.json"],  # not technically required,

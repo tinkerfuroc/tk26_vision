@@ -74,10 +74,10 @@ class CollectConfig:
     board: BoardSpec = field(default_factory=BoardSpec)
     safety: SafetyEnvelope = field(default_factory=SafetyEnvelope)
 
-    phase1_waypoints: list = field(default_factory=list)   # list of joint-angle lists (rad), used at firmware (pan=0, tilt=+45) (level)
+    phase1_waypoints: list = field(default_factory=list)   # list of joint-angle lists (rad), used at firmware (pan=0, tilt=+30) (level)
     phase1_waypoints_custom: list = field(default_factory=list)  # used at the operator-chosen custom park
     # Custom Phase-1 park pose (firmware degrees). Defaults to (0, 0) so old
-    # behavior (camera looking 45° down) holds for unconfigured installs.
+    # behavior (camera looking 30° down) holds for unconfigured installs.
     phase1_custom_park_pan_deg: float = 0.0
     phase1_custom_park_tilt_deg: float = 0.0
     phase2_waypoints: list = field(default_factory=list)
@@ -112,9 +112,10 @@ class CollectConfig:
     # parks at whatever (pan, tilt) is demanded. Set > 0 to re-enable a
     # per-axis overshoot-then-return pass; the soft envelope below clamps
     # the intermediate so it never asks for an unreachable angle. Defaults
-    # match the operator-declared envelope: pan ±30, tilt ≤+45 (the
+    # match the operator-declared envelope: pan ±30, tilt ≤+30 (the
     # "physical level" ceiling -- anything above points the camera at the
-    # ceiling).
+    # ceiling). The controller's hard clamp at tilt_max_deg=30 will reject
+    # any over-bound intermediate as well.
     servo_backlash_overshoot_deg: float = 0.0
     servo_backlash_pause_sec: float = 0.2
     pan_overshoot_max_deg: float = 30.0
@@ -714,7 +715,6 @@ class CalibrateCollectNode(Node):
             )
             return False
 
-        from sensor_msgs.msg import PointCloud2, PointField
         goal = self._joint_move_type.Goal()
         a = list(angles_rad) + [0.0] * max(0, 7 - len(angles_rad))
         goal.joint0 = float(a[0])
@@ -724,24 +724,11 @@ class CalibrateCollectNode(Node):
         goal.joint4 = float(a[4])
         goal.joint5 = float(a[5])
         goal.joint6 = float(a[6])
-        # pick_and_place runs pcl::fromROSMsg + tf2 lookupTransform on
-        # env_points, so a default-constructed PointCloud2 would trip on
-        # missing x/y/z fields and empty frame_id. Build a zero-point cloud
-        # in base_link so the server short-circuits the transform step.
-        env = PointCloud2()
-        env.header.frame_id = "base_link"
-        env.height = 1
-        env.width = 0
-        env.is_bigendian = False
-        env.is_dense = True
-        env.point_step = 12
-        env.row_step = 0
-        env.fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-        ]
-        goal.env_points = env
+        # JointMove's env_points field was replaced by add_octomap (bool).
+        # Stay False: during calibration the planner should not pull a fresh
+        # octomap from sensors -- the EE / marker board / fixture would all
+        # become obstacles and reject otherwise-feasible waypoints.
+        goal.add_octomap = False
 
         timeout = float(self._cfg.arm_action_timeout_sec)
         send_fut = self._joint_move_client.send_goal_async(goal)

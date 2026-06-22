@@ -38,7 +38,7 @@ Fitted parameters (13 DOF baseline):
 | `T_B` translation | 3 | tilt-end → head_camera_link |
 | `T_B` rotation | 3 | mounted camera twist — this robot has ~90° about X |
 | `T_ee_marker` | 6 | xArm EE flange → ChArUco origin (unknown mount on the EE) |
-| `θ_t_offset` | 1 | firmware tilt zero → physical tilt = 0 (default −π/4 because firmware zero parks the camera 45° down) |
+| `θ_t_offset` | 1 | firmware tilt zero → physical tilt = 0 (default −π/6 because firmware zero parks the camera ~30° down after the 2026 head remount; was −π/4 pre-remount) |
 
 `θ_p_offset` (pan bias) is opt-in via `--fit-pan-offset`.
 
@@ -362,7 +362,7 @@ The state-publisher offsets in `pan_tilt.yaml` and the URDF's `camera_mount_join
 ### 9. Verify
 
 1. Launch the updated stack: `ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0`.
-2. Visual check in RViz: at `pan=0, tilt=0` the camera frustum should match what you see — tilted ~45° down on this robot.
+2. Visual check in RViz: at `pan=0, tilt=0` the camera frustum should match what you see — tilted ~30° down on this robot (post-2026 head remount; was ~45° down before).
 3. Back-project test with the ChArUco still on the EE: pick an xArm pose that wasn't in the collection set, query the expected camera view of the board vs what's actually detected. Disagreement < 5 mm on-image is expected.
 4. Follow-head sanity: `ros2 run pan_tilt follow_head` and have a person walk across the camera's FoV. No systematic lag or directional bias should be visible.
 
@@ -403,7 +403,7 @@ Reading the output: per-axis std (`trans_std_xyz_m`) localises the failure. Z-do
 | Phase 1 rejects many samples for "too few detections" | Board too small in frame, or motion blur | Move xArm closer; lock RGB exposure < 10 ms; verify board isn't warped |
 | Phase 1 hand-eye RMSE > 5 mm | Insufficient orientation diversity, or flexing mount | Recapture with ≥ 60° orientation change between consecutive poses; re-tighten board mount |
 | Phase 2 chain RMSE much worse than Phase 1 | Backlash, servo zero drift, or tilt-range too narrow | Check `tilt_grid_deg` spans ≥ ±25°; ensure each grid cell uses overshoot-return (default); run a sanity bracket |
-| Chain fit `theta_t_offset` differs from −π/4 by >> 1° | Zero-set (`T:502`) was not where you thought it was | This is normal and what `theta_t_offset` is for. Fitted value is authoritative |
+| Chain fit `theta_t_offset` differs from −π/6 by >> 1° | Zero-set (`T:502`) was not where you thought it was | This is normal and what `theta_t_offset` is for. Fitted value is authoritative |
 | Chain fit `theta_p_offset` lands near ±180° | Two-basin warm-start picked the π basin — pan firmware sign is opposite the FK convention on this hardware | Not a problem; the chosen basin is logged at run time. Both basins are fitted; only the better one is saved |
 | Chain fit `t_b_rotvec` norm ≈ 1.57 rad | Expected: the ~90° physical mount | Not a problem. The warm-start put it there on purpose |
 | Polish residuals worse than chain residuals | Local minimum in the joint fit; T_B rotation unlock found an alias | Re-run polish with `--fit-pan-offset` off; or trust `chain.json` and skip polish |

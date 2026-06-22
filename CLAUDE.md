@@ -166,7 +166,7 @@ Integration smoke suite at `scripts/tests/`, four tiers each gated by the previo
 
 Two-phase solver with xArm FK as the ground-truth anchor and a ChArUco board on the EE as the observation target.
 
-**Hardware note.** The camera is mounted at roughly 90° to the tilt arm — at firmware `tilt = 45°` (arm pointing straight up) the optical axis is horizontal; at firmware `tilt = 0°` (servo-zero set via `T:502`) it points ~45° down. This means T_B has a **large non-identity rotation** (~π/2 about X in tilt_link coordinates), not a small mount-tolerance correction. The calibration handles this by warm-starting T_B from the Phase-1 reference pose rather than from the URDF's stale rpy.
+**Hardware note.** The camera is mounted at roughly 90° to the tilt arm — at firmware `tilt = 30°` (arm pointing up to the new mechanical stop) the optical axis is horizontal; at firmware `tilt = 0°` (servo-zero set via `T:502`) it points ~30° down. The 2026 head remount shrank the usable tilt sweep from [0°, +45°] to [0°, +30°] and moved the `theta_t_offset` warm-start from `-π/4` to `-π/6`; the controller now hard-clamps at `tilt_max_deg = 30.0`. This means T_B still has a **large non-identity rotation** (~π/2 about X in tilt_link coordinates), not a small mount-tolerance correction. The calibration handles this by warm-starting T_B from the Phase-1 reference pose rather than from the URDF's stale rpy.
 
 Parameters fit:
 
@@ -176,7 +176,7 @@ Parameters fit:
 | T_B trans (tilt_end→camera_link body) | 3 | from warm-start | yes | |
 | T_B rotation (rotvec) | 3 | from warm-start | **no** (Phase-2) / yes (polish) | Y-component is degenerate with θ_t_offset; unlock only in joint polish where Phase-1 data breaks the degeneracy |
 | T_ee_marker | 6 | identity | Phase-1 only | Phase-1 hand-eye then frozen |
-| θ_t_offset | 1 | −π/4 | yes | absorbs servo-zero-set noise |
+| θ_t_offset | 1 | −π/6 | yes | absorbs servo-zero-set noise (was −π/4 pre-2026 remount) |
 
 Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13–14.
 
@@ -230,7 +230,7 @@ Total Phase-2 DOF: 7 (or 8 with `--fit-pan-offset`). Polish phase raises to 13�
 - Sanity-pose bracket (start vs end) < 2 mm / 0.2°
 - **Phase 4 end-to-end** (recommended after polish, before `apply_to_urdf`): self-consistency trans RMSE < 5 mm / rot RMSE < 0.5° (PASS), 10 mm / 1° (WARN). xArm-independent: place a ChArUco board anywhere stationary in `base_link` (tripod, fixture, taped to a wall), sweep the pan-tilt over N held-out `(θ_p, θ_t)`, and check that the base-frame marker pose is consistent across views. `python -m pan_tilt.calibration.run_calibration validate --phase4 phase4_validation.json --params polish.json --out <session>` — see `src/pan_tilt/pan_tilt/calibration/readme.md § Phase 4`.
 
-> **Don't move the board between phase-1 collects.** `T_ee_marker` is the rigid pose of the marker on the EE flange — both `handeye.json` (canonical 45°) and `handeye_custom.json` (operator-chosen park) describe the *same* physical board, so the two solves must agree. The handeye solver cross-checks them and refuses to write if they disagree by more than 5 mm / 1°. Recovery: re-collect *both* phase-1 datasets in one sitting without touching the board, the EE, or the xArm zero. If you intentionally remounted the board (e.g. swapping marker prints for evaluation), pass `--allow-t-ee-marker-mismatch` on the handeye CLI to bypass the gate.
+> **Don't move the board between phase-1 collects.** `T_ee_marker` is the rigid pose of the marker on the EE flange — both `handeye.json` (canonical 30°) and `handeye_custom.json` (operator-chosen park) describe the *same* physical board, so the two solves must agree. The handeye solver cross-checks them and refuses to write if they disagree by more than 5 mm / 1°. Recovery: re-collect *both* phase-1 datasets in one sitting without touching the board, the EE, or the xArm zero. If you intentionally remounted the board (e.g. swapping marker prints for evaluation), pass `--allow-t-ee-marker-mismatch` on the handeye CLI to bypass the gate.
 
 ### Robustness measures baked in
 

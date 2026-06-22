@@ -43,7 +43,7 @@ def _make_truth() -> tuple[PanTiltParams, np.ndarray]:
         t_a=np.array([-0.28, -0.02, 1.55]),
         t_b_trans=np.array([-0.07, -0.01, 0.08]),
         t_b_rotvec=np.zeros(3),
-        theta_t_offset=-np.pi / 4 + np.deg2rad(1.2),  # 1.2 deg away from the nominal
+        theta_t_offset=-np.pi / 6 + np.deg2rad(1.2),  # 1.2 deg away from the nominal
         theta_p_offset=np.deg2rad(0.4),               # small pan bias
         l_pan=0.135,
     )
@@ -195,7 +195,7 @@ def test_chain_with_90deg_mount_and_warm_start():
         t_a=np.array([-0.28, -0.02, 1.55]),
         t_b_trans=np.array([-0.07, -0.01, 0.08]),
         t_b_rotvec=np.array([np.pi / 2, 0.0, 0.0]),  # 90 deg about X
-        theta_t_offset=-np.pi / 4 + np.deg2rad(1.0),
+        theta_t_offset=-np.pi / 6 + np.deg2rad(1.0),
         theta_p_offset=np.deg2rad(0.3),
         l_pan=0.135,
     )
@@ -213,7 +213,7 @@ def test_chain_with_90deg_mount_and_warm_start():
     initial = warm_start_t_b_rotation(PanTiltParams(), t_base_cam_ref)
     # Warm start should put T_B_rotvec close to truth (pi/2 about X).
     # (Some Y-component may leak in because warm-start uses the default
-    # theta_t_offset of -pi/4 which differs from truth.)
+    # theta_t_offset of -pi/6 which differs from truth.)
     assert abs(np.linalg.norm(initial.t_b_rotvec) - np.pi / 2) < 0.05
 
     params, report = fit_chain(
@@ -245,7 +245,7 @@ def test_joint_polish_tightens_result():
         t_b_trans=PanTiltParams().t_b_trans.copy(),
         t_ee_marker_rotvec=Rotation.from_matrix(t_ee_solved[:3, :3]).as_rotvec(),
         t_ee_marker_trans=t_ee_solved[:3, 3].copy(),
-        theta_t_offset=-np.pi / 4,
+        theta_t_offset=-np.pi / 6,
     )
     chain_params, _ = fit_chain(
         phase2, t_ee_marker=t_ee_solved, initial=seed, fit_pan_offset=True,
@@ -1052,7 +1052,7 @@ def test_chain_fit_allow_flipped_camera_admits_pi_solution():
         t_a=np.array([-0.28, -0.02, 1.55]),
         t_b_trans=np.array([-0.07, -0.01, 0.08]),
         t_b_rotvec=np.array([0.0, 0.0, flipped_yaw_truth]),
-        theta_t_offset=-np.pi / 4 + np.deg2rad(0.5),
+        theta_t_offset=-np.pi / 6 + np.deg2rad(0.5),
         theta_p_offset=np.deg2rad(0.2),
         l_pan=0.135,
     )
@@ -1325,12 +1325,12 @@ def test_state_publisher_applies_offsets():
     offset-corrected values through R_z(-pan_joint) and R_y(+tilt_joint),
     matching the calibration FK exactly."""
     out = _run_state_publisher_round_trip(
-        pan_offset_rad=0.10, tilt_offset_rad=-np.pi / 4,
+        pan_offset_rad=0.10, tilt_offset_rad=-np.pi / 6,
         pan_in=0.5, tilt_in=0.3, suffix='offset',
     )
     assert out.name == ['pan_joint', 'tilt_joint']
     assert out.position[0] == pytest.approx(0.5 + 0.10, abs=1e-9)
-    assert out.position[1] == pytest.approx(0.3 - np.pi / 4, abs=1e-9)
+    assert out.position[1] == pytest.approx(0.3 - np.pi / 6, abs=1e-9)
 
 
 def test_state_publisher_zero_offsets_passthrough():
@@ -1523,7 +1523,7 @@ def test_apply_to_urdf_main_writes_both_files(tmp_path):
             "t_b_trans": [-0.08, -0.01, 0.08],
             "t_b_rotvec": [0.0, 0.0, -0.05],
             "theta_p_offset_rad": 0.012345,
-            "theta_t_offset_rad": -0.785398,
+            "theta_t_offset_rad": -0.523599,
         }
     }
     results_path = tmp_path / "polish.json"
@@ -1541,7 +1541,7 @@ def test_apply_to_urdf_main_writes_both_files(tmp_path):
     # YAML rewritten with the matching offsets (10-decimal precision).
     new_yaml = yaml_path.read_text()
     assert "pan_offset_rad: 0.0123450000" in new_yaml
-    assert "tilt_offset_rad: -0.7853980000" in new_yaml
+    assert "tilt_offset_rad: -0.5235990000" in new_yaml
     # Comments preserved.
     assert "# Source values from polish.json after every calibration." in new_yaml
 
@@ -1583,7 +1583,7 @@ def test_apply_to_urdf_main_yaml_idempotent(tmp_path):
             "t_b_trans": [-0.08, -0.01, 0.08],
             "t_b_rotvec": [0.0, 0.0, -0.05],
             "theta_p_offset_rad": 0.012345,
-            "theta_t_offset_rad": -0.785398,
+            "theta_t_offset_rad": -0.523599,
         }
     }))
 

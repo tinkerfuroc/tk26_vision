@@ -37,11 +37,11 @@ collector:
   - 15.0
   - 30.0
   tilt_grid_deg:
-  - 5.0
-  - 11.0
-  - 17.0
-  - 23.0
-  - 29.0
+  - 2.0
+  - 8.0
+  - 14.0
+  - 20.0
+  - 26.0
   phase1_waypoints:
   - - -0.08727518924597644
     - 0.9705339638027468
@@ -374,7 +374,7 @@ collector:
     - -0.8726646259971648
     - 0.5236616074513706
   phase1_custom_park_pan_deg: 0.0
-  phase1_custom_park_tilt_deg: 15.0
+  phase1_custom_park_tilt_deg: 5.0
   phase2_waypoints:
   - - -0.08726646259971647
     - 1.1449202813450123

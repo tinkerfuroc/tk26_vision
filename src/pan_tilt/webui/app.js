@@ -3,6 +3,20 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
+// FastAPI returns plain-text "Internal Server Error" on unhandled 500s, which
+// crashes raw `r.json()` with "Unexpected token 'I'... is not valid JSON".
+// Read once as text, JSON-parse if possible, otherwise wrap the text under
+// `.detail` so callers' `body.detail` rendering still works.
+async function readBody(r) {
+  const text = await r.text();
+  if (!text) return {};
+  try { return JSON.parse(text); }
+  catch { return { detail: text }; }
+}
+// Alias for older call sites that referenced a `readJsonResponse` helper
+// that was never defined in this file. Same shape, same fallback.
+const readJsonResponse = readBody;
+
 // ---- side-panel tabs --------------------------------------------------------
 
 function activateSideTab(name) {
@@ -121,7 +135,7 @@ if (BTN_RESUB) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ image_topic: topic }),
       });
-      const body = await r.json();
+      const body = await readBody(r);
       if (r.ok && body.ok) {
         status.textContent = `subscribed → image: ${body.image_topic}  info: ${body.camera_info_topic}`;
         status.className = 'status-line ok';
@@ -405,7 +419,7 @@ $('#btn-xarm-move').addEventListener('click', async () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ angles_rad: angles }),
     });
-    const body = await r.json();
+    const body = await readBody(r);
     if (r.ok && body.ok) {
       status.textContent = 'move complete: ' + body.message;
       status.className = 'status-line ok';
@@ -493,7 +507,7 @@ $('#btn-cart-move').addEventListener('click', async () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ target_pose: pose }),
     });
-    const body = await r.json();
+    const body = await readBody(r);
     if (r.ok && body.ok) {
       status.textContent = 'move complete: ' + body.message;
       status.className = 'status-line ok';
@@ -512,14 +526,14 @@ $('#btn-cart-move').addEventListener('click', async () => {
 const PHASES = [
   {
     key: 'phase1_waypoints',
-    label: 'Phase 1 — hand-eye (LEVEL, tilt=+45)',
-    hint: 'Head parks at (pan=0, tilt=+45 firmware) = physically level. Record 12–15 distinct xArm EE poses; aim for ≥60° orientation change between consecutive poses. Compact configs (wrist near base) minimise gravity sag. Gate: trans RMSE < 3 mm, rot RMSE < 0.5°.',
+    label: 'Phase 1 — hand-eye (LEVEL, tilt=+30)',
+    hint: 'Head parks at (pan=0, tilt=+30 firmware) = physically level. Record 12–15 distinct xArm EE poses; aim for ≥60° orientation change between consecutive poses. Compact configs (wrist near base) minimise gravity sag. Gate: trans RMSE < 3 mm, rot RMSE < 0.5°.',
   },
   {
     key: 'phase1_waypoints_custom',
     label: 'Phase 1 — hand-eye (CUSTOM)',
     customParkControls: true,
-    hint: 'OPTIONAL second hand-eye dataset. Pick park (pan, tilt) below to match your robot geometry, then add xArm poses that keep the marker in the camera FoV at that head pose. Pan range ±30°, tilt range 0..+45° firmware (where +45 = level, 0 = 45° down). Solving hand-eye on this set independently and comparing T_ee_marker vs the LEVEL solve is a powerful cross-check — they must agree to ~mm/°.',
+    hint: 'OPTIONAL second hand-eye dataset. Pick park (pan, tilt) below to match your robot geometry, then add xArm poses that keep the marker in the camera FoV at that head pose. Pan range ±30°, tilt range 0..+30° firmware (where +30 = level, 0 = 30° down). Solving hand-eye on this set independently and comparing T_ee_marker vs the LEVEL solve is a powerful cross-check — they must agree to ~mm/°.',
   },
   {
     key: 'phase2_waypoints',
@@ -606,7 +620,7 @@ async function fetchWaypoints() {
   try {
     const r = await fetch('/api/waypoints');
     if (r.ok) {
-      wpState = await r.json();
+      wpState = await readBody(r);
       renderWaypoints();
     }
   } catch (e) {
@@ -659,7 +673,7 @@ $('#btn-save').addEventListener('click', async () => {
   status.className = 'status-line warn';
   try {
     const r = await fetch('/api/waypoints/save', { method: 'POST' });
-    const body = await r.json();
+    const body = await readBody(r);
     if (r.ok && body.ok) {
       status.textContent = 'wrote ' + body.path;
       status.className = 'status-line ok';
@@ -677,7 +691,7 @@ async function loadBoardSpec() {
   try {
     const r = await fetch('/api/board');
     if (!r.ok) return;
-    const b = await r.json();
+    const b = await readBody(r);
     const set = (id, v) => { const el = $('#' + id); if (el) el.textContent = v; };
     set('s-board-grid',    `${b.squares_x} × ${b.squares_y} squares`);
     set('s-board-square',  `${(b.square_len_m * 1000).toFixed(1)} mm`);
@@ -706,7 +720,7 @@ async function _fetchPhase1CustomPark() {
   try {
     const r = await fetch('/api/calib/phase1_custom_park');
     if (!r.ok) return;
-    _phase1CustomPark = await r.json();
+    _phase1CustomPark = await readBody(r);
     _updateCustomParkUI();
   } catch (e) { /* ignore */ }
 }
@@ -767,7 +781,7 @@ async function loadWaypointPaths() {
   try {
     const r = await fetch('/api/waypoints/paths');
     if (!r.ok) return;
-    const body = await r.json();
+    const body = await readBody(r);
     const setCell = (id, v) => { const el = $('#' + id); if (el) el.textContent = v || '(unresolved)'; };
     setCell('wp-path-draft', body.draft);
     setCell('wp-path-promote', body.promote);
@@ -786,7 +800,7 @@ if (BTN_PROMOTE) BTN_PROMOTE.addEventListener('click', async () => {
   status.className = 'status-line warn';
   try {
     const r = await fetch('/api/waypoints/promote', { method: 'POST' });
-    const body = await r.json();
+    const body = await readBody(r);
     if (r.ok && body.ok) {
       status.textContent = 'wrote ' + body.path + (body.backup ? '  (backup: ' + body.backup + ')' : '  (no prior file existed)');
       status.className = 'status-line ok';
@@ -810,7 +824,7 @@ if (BTN_DEDUPE) BTN_DEDUPE.addEventListener('click', async () => {
   status.className = 'status-line warn';
   try {
     const r = await fetch('/api/waypoints/dedupe', { method: 'POST' });
-    const body = await r.json();
+    const body = await readBody(r);
     if (r.ok && body.ok) {
       const removed = body.removed || {};
       const entries = Object.entries(removed);
@@ -843,7 +857,13 @@ async function _reloadWaypointsFromSource(source, confirmMsg) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ source }),
     });
-    const body = await r.json();
+    // FastAPI returns plain-text "Internal Server Error" on unhandled 500s.
+    // Read once as text, then try JSON; otherwise wrap the text so the
+    // real backend message lands in the status line.
+    const text = await r.text();
+    let body;
+    try { body = text ? JSON.parse(text) : {}; }
+    catch { body = { detail: text }; }
     if (r.ok && body.ok) {
       const counts = Object.entries(body.counts || {})
         .map(([k, v]) => `${k}=${v}`).join(', ') || '(no waypoint sections)';
@@ -851,7 +871,7 @@ async function _reloadWaypointsFromSource(source, confirmMsg) {
       status.className = 'status-line ok';
       await fetchWaypoints();
     } else {
-      status.textContent = 'FAIL: ' + (body.detail || JSON.stringify(body));
+      status.textContent = `FAIL [${r.status}]: ` + (body.detail || JSON.stringify(body));
       status.className = 'status-line err';
     }
   } catch (e) {
@@ -884,7 +904,7 @@ async function ptMove(panDeg, tiltDeg) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ pan_deg: panDeg, tilt_deg: tiltDeg }),
     });
-    const body = await r.json();
+    const body = await readBody(r);
     status.textContent = body.message || 'ok';
     status.className = 'status-line ok';
   } catch (e) {
@@ -1044,7 +1064,7 @@ const CALIB_CANCEL_BTN = $('#calib-cancel-btn');
 async function calibLoadSessions() {
   try {
     const r = await fetch('/api/calib/sessions');
-    const body = await r.json();
+    const body = await readJsonResponse(r);
     CALIB.sessionsDir = body.sessions_dir;
     const sdirEl = $('#calib-sessions-dir');
     if (sdirEl) sdirEl.textContent = body.sessions_dir || '—';
@@ -1092,7 +1112,7 @@ $('#calib-new-session-btn').addEventListener('click', async () => {
       method: 'POST', headers: {'content-type': 'application/json'},
       body: JSON.stringify({name}),
     });
-    const body = await r.json();
+    const body = await readJsonResponse(r);
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
     CALIB_SESSION_STATUS.textContent = 'created ' + body.path;
     CALIB_SESSION_STATUS.className = 'status-line ok';
@@ -1110,7 +1130,7 @@ $('#calib-new-session-btn').addEventListener('click', async () => {
 
 async function calibLoadSessionDetail(name) {
   const r = await fetch('/api/calib/session/' + encodeURIComponent(name));
-  const body = await r.json();
+  const body = await readJsonResponse(r);
   if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
   const files = body.files || {};
   CALIB.lastFiles = files;
@@ -1177,7 +1197,7 @@ async function calibFetchFile(session, filename) {
   if (CALIB.fileCache[filename]) return CALIB.fileCache[filename];
   const r = await fetch(`/api/calib/session/${encodeURIComponent(session)}/file/${filename}`);
   if (!r.ok) return null;
-  const body = await r.json();
+  const body = await readJsonResponse(r);
   CALIB.fileCache[filename] = body;
   return body;
 }
@@ -1312,7 +1332,7 @@ async function calibRun(cmd, flags) {
   // so a stray click doesn't kick off a 20-minute sweep.
   if (cmd.startsWith('collect_')) {
     const human = {
-      collect_phase1:        'Phase 1 LEVEL (pan=0, tilt=+45 — head horizontal, uses phase1_waypoints)',
+      collect_phase1:        'Phase 1 LEVEL (pan=0, tilt=+30 — head horizontal, uses phase1_waypoints)',
       collect_phase1_custom: `Phase 1 CUSTOM (pan=${_phase1CustomPark.pan_deg}°, tilt=${_phase1CustomPark.tilt_deg}°, uses phase1_waypoints_custom)`,
       collect_dry_run:       'Dry-run waypoint validation (NO image capture, NO pan-tilt motion). Sends each xArm waypoint via JointMove and reports which ones fail. Cheap; safe to run before a full collect.',
       collect_phase2:        'Phase 2 (pan-tilt grid sweep at each xArm anchor)',
@@ -1361,7 +1381,7 @@ async function calibRun(cmd, flags) {
       method: 'POST', headers: {'content-type': 'application/json'},
       body: JSON.stringify(reqBody),
     });
-    const body = await r.json();
+    const body = await readJsonResponse(r);
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
     CALIB.activeRunId = body.run_id;
     CALIB_CANCEL_BTN.disabled = false;
@@ -1474,7 +1494,7 @@ async function calibRenderCoverage() {
   try {
     const r = await fetch(`/api/calib/session/${encodeURIComponent(CALIB.currentSession)}/coverage`);
     if (!r.ok) { _ctxNote(c, '(no coverage data)'); return; }
-    body = await r.json();
+    body = await readJsonResponse(r);
   } catch (e) { _ctxNote(c, '(fetch failed)'); return; }
 
   const allSamples = body.samples || [];
@@ -1735,7 +1755,7 @@ function _drawScatter(c, values, unit) {
 async function calibLoadUrdfTargets() {
   try {
     const r = await fetch('/api/calib/urdf_targets');
-    const body = await r.json();
+    const body = await readJsonResponse(r);
     CALIB.urdfTargets = body.targets || [];
     const sel = $('#calib-urdf-target');
     sel.innerHTML = CALIB.urdfTargets
@@ -1764,7 +1784,7 @@ $('#calib-urdf-diff-btn').addEventListener('click', async () => {
       method: 'POST', headers: {'content-type': 'application/json'},
       body: JSON.stringify({session: CALIB.currentSession, xacro_path: xacroPath, results_file: resultsFile}),
     });
-    const body = await r.json();
+    const body = await readJsonResponse(r);
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
     const urdfDiff = body.diff || '(no URDF changes)';
     const yamlDiff = body.yaml_diff || '';
@@ -1826,7 +1846,7 @@ $('#calib-urdf-apply-btn').addEventListener('click', async () => {
       method: 'POST', headers: {'content-type': 'application/json'},
       body: JSON.stringify({session: CALIB.currentSession, xacro_path: xacroPath, results_file: resultsFile}),
     });
-    const body = await r.json();
+    const body = await readJsonResponse(r);
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
     if (!body.applied) {
       statusEl.textContent = body.reason || 'no change — xacro already matches calibration';
@@ -1877,7 +1897,7 @@ $('#calib-urdf-apply-btn').addEventListener('click', async () => {
 async function calibLoadCommands() {
   try {
     const r = await fetch('/api/calib/commands');
-    const body = await r.json();
+    const body = await readJsonResponse(r);
     if (!r.ok) throw new Error(body.detail || 'commands fetch failed');
     CALIB.prereqs = body.prereqs || {};
     CALIB.collectEnabled = !!body.collect_enabled;
@@ -2052,7 +2072,7 @@ async function pruneLoadInputs() {
   try {
     const r = await fetch(`/api/calib/prune_inputs?phase=${encodeURIComponent(phase)}`);
     if (!r.ok) throw new Error(await r.text());
-    const data = await r.json();
+    const data = await readJsonResponse(r);
     PRUNE.defaultsByPhase[phase] = data.default_factors;
     prunePopulateFactors(data.default_factors);
 
@@ -2094,7 +2114,7 @@ async function pruneLoadPaths() {
   try {
     const r = await fetch('/api/waypoints/paths');
     if (!r.ok) throw new Error(await r.text());
-    const data = await r.json();
+    const data = await readJsonResponse(r);
     if (data.promote) {
       src.textContent = data.promote;
       bak.textContent = data.promote.replace(/\.yaml$/, '.yaml.old-<YYYYmmdd_HHMMSS>');
@@ -2132,7 +2152,7 @@ async function prunePreview() {
       body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(await r.text());
-    const data = await r.json();
+    const data = await readJsonResponse(r);
     PRUNE.lastPayload = body;
     PRUNE.lastResponse = data;
     $('#prune-status').textContent = 'preview ready — Apply (sidecar) or Overwrite (replace source yaml)';
@@ -2168,7 +2188,7 @@ async function pruneApply() {
       body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(await r.text());
-    const data = await r.json();
+    const data = await readJsonResponse(r);
     PRUNE.lastResponse = data;
     pruneRenderDiagnostics(data);
     pruneRenderTable(data);
@@ -2214,7 +2234,7 @@ async function pruneOverwrite() {
       body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(await r.text());
-    const data = await r.json();
+    const data = await readJsonResponse(r);
     PRUNE.lastResponse = data;
     pruneRenderDiagnostics(data);
     pruneRenderTable(data);

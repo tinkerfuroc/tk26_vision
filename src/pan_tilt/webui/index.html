@@ -192,8 +192,8 @@
       <h2>Jog to absolute (pan, tilt) in degrees</h2>
       <p class="muted">
         All angles are <b>firmware degrees</b>. <b>+firmware tilt = tilt up</b>.
-        Servo zero parks 45° below level, so <b>level = firmware +45°</b>,
-        and <code>physical-tilt-above-level = firmware − 45</code>.
+        Servo zero parks 30° below level, so <b>level = firmware +30°</b>,
+        and <code>physical-tilt-above-level = firmware − 30</code>.
       </p>
       <div class="jog">
         <label>pan (deg)  <input id="jog-pan" type="number" step="1" value="0"></label>
@@ -211,8 +211,8 @@
 
       <h3>Quick actions</h3>
       <div class="jog-buttons">
-        <button data-pan="0" data-tilt="45" title="physical level (horizontal)">Level (0, +45)</button>
-        <button data-pan="0" data-tilt="0" title="servo zero; camera points 45° down">Home (0, 0)</button>
+        <button data-pan="0" data-tilt="30" title="physical level (horizontal)">Level (0, +30)</button>
+        <button data-pan="0" data-tilt="0" title="servo zero; camera points 30° down">Home (0, 0)</button>
       </div>
       <h3>Grid corners</h3>
       <div class="jog-buttons" id="grid-corner-buttons"></div>
@@ -311,7 +311,7 @@
       </p>
       <div class="joint-controls" id="calib-run-buttons-collect">
         <button data-calib-cmd="collect_dry_run"       type="button" title="Send each xArm waypoint with no image capture and no pan-tilt motion. Reports which fail so you can fix the yaml before a real collect.">Validate waypoints (dry run)</button>
-        <button data-calib-cmd="collect_phase1"        type="button">Collect Phase 1 — level (pan=0, tilt=+45)</button>
+        <button data-calib-cmd="collect_phase1"        type="button">Collect Phase 1 — level (pan=0, tilt=+30)</button>
         <button data-calib-cmd="collect_phase1_custom" type="button" id="calib-collect-phase1-custom">Collect Phase 1 — custom</button>
         <button data-calib-cmd="collect_phase2"        type="button">Collect Phase 2 (sweep)</button>
         <button data-calib-cmd="collect_sanity"      type="button">Collect sanity pose</button>

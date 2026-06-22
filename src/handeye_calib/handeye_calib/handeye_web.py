@@ -1416,8 +1416,9 @@ def _make_node_class():
             n_visits = max(2, int(n_visits))
             timeout = (float(settle_timeout_s) if settle_timeout_s is not None
                        else float(self._settle_timeout_s))
-            target_joints = list(waypoints[pose_idx].joints)
-            scramble_joints = list(waypoints[scramble_pose_idx].joints)
+            # WaypointStore.list() returns list[list[float]] (raw joint vectors).
+            target_joints = list(waypoints[pose_idx])
+            scramble_joints = list(waypoints[scramble_pose_idx])
 
             # Reuse CaptureSequenceRunner's helpers (move + settle) so we
             # don't re-implement the rclpy async patterns. The runner stores

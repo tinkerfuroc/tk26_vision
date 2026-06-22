@@ -9,6 +9,7 @@ from typing import Optional
 import rclpy
 import serial
 from rclpy.node import Node
+from std_srvs.srv import Trigger
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 from tinker_vision_msgs_26.srv import SetTorque, SetZero
 
@@ -84,6 +85,9 @@ class PanTiltControllerNode(Node):
         self.create_subscription(PanTiltCommand, '~/cmd', self._handle_command, 10)
         self.create_service(SetTorque, '~/set_torque', self._handle_set_torque)
         self.create_service(SetZero, '~/set_zero', self._handle_set_zero)
+        self.create_service(
+            Trigger, '~/remap_servo_ids', self._handle_remap_servo_ids,
+        )
         self.create_timer(
             1.0 / max(self._state_publish_rate_hz, 1.0),
             self._publish_state,
@@ -186,6 +190,8 @@ class PanTiltControllerNode(Node):
         request: SetZero.Request,
         response: SetZero.Response,
     ):
+        logger = self.get_logger()
+        logger.info(f'[set_zero] service called with axis={request.axis}')
         axis_ids = []
         if request.axis == SetZero.Request.BOTH:
             axis_ids = [1, 2]
@@ -194,20 +200,63 @@ class PanTiltControllerNode(Node):
         elif request.axis == SetZero.Request.PAN:
             axis_ids = [2]
         else:
+            logger.error(f'[set_zero] unsupported axis value: {request.axis}')
             response.success = False
             response.message = f'Unsupported axis value: {request.axis}'
             return response
 
+        if not self._serial_connected:
+            logger.error('[set_zero] serial device not connected; cannot send T:502')
+            response.success = False
+            response.message = 'Serial device not connected.'
+            return response
+
         try:
             for axis_id in axis_ids:
-                self._send_payload({'T': 502, 'id': axis_id})
+                payload = {'T': 502, 'id': axis_id}
+                logger.info(f'[set_zero] writing serial: {payload}')
+                self._send_payload(payload)
         except serial.SerialException as exc:
+            logger.error(f'[set_zero] serial write failed: {exc}')
             response.success = False
             response.message = str(exc)
             return response
 
+        logger.info(f'[set_zero] T:502 sent for axis_ids={axis_ids}')
         response.success = True
-        response.message = 'Zero command sent.'
+        response.message = f'Zero command sent for axis_ids={axis_ids}.'
+        return response
+
+    def _handle_remap_servo_ids(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ):
+        """Send `{'T':501,'raw':1,'new':2}` — middle step of the zero-state
+        wizard. Operator must physically disconnect the second motor before
+        triggering this; the command renumbers the remaining (still-attached)
+        servo from raw_id=1 to new_id=2 so the subsequent T:502 pass can
+        address each motor individually.
+        """
+        logger = self.get_logger()
+        logger.info('[remap_servo_ids] Trigger service called')
+        if not self._serial_connected:
+            logger.error('[remap_servo_ids] serial device not connected; cannot send T:501')
+            response.success = False
+            response.message = 'Serial device not connected.'
+            return response
+        payload = {'T': 501, 'raw': 1, 'new': 2}
+        try:
+            logger.info(f'[remap_servo_ids] writing serial: {payload}')
+            self._send_payload(payload)
+        except serial.SerialException as exc:
+            logger.error(f'[remap_servo_ids] serial write failed: {exc}')
+            response.success = False
+            response.message = str(exc)
+            return response
+        logger.info('[remap_servo_ids] T:501 sent')
+        response.success = True
+        response.message = 'T:501 raw=1 new=2 sent.'
         return response
 
     def _send_motion_command(

@@ -96,8 +96,8 @@ class PanTiltParams:
     t_ee_marker_trans: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     # Firmware-reported angles have constant offsets from physical angles.
-    # theta_t_off ~= -pi/4 because the T:502 zero-set parked the mechanism looking 45 deg down.
-    theta_t_offset: float = -np.pi / 4.0
+    # theta_t_off ~= -pi/6 because the T:502 zero-set parked the mechanism looking 30 deg down.
+    theta_t_offset: float = -np.pi / 6.0
     theta_p_offset: float = 0.0
 
     # Fixed geometry (not optimized).

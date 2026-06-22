@@ -330,7 +330,7 @@ def cmd_handeye(args):
     out_path = Path(args.out) / out_name
 
     # T_ee_marker is the pose of the marker on the xArm flange — a fixed
-    # mechanical attachment. Both `handeye.json` (canonical 45° park) and
+    # mechanical attachment. Both `handeye.json` (canonical 30° park) and
     # `handeye_custom.json` (operator-chosen park) describe the SAME physical
     # board, so their solved T_ee_markers must agree within solver noise.
     # When they don't, it almost always means: (a) the board was re-mounted

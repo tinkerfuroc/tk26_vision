@@ -1,0 +1,18 @@
+{
+  "names": [
+    "John",
+    "lily"
+  ],
+  "features": [
+    "She is a girl with blond hair and black jacket",
+    "He is male, he is approximately twenty years-old, he has short black hair and no glasses. He is wearing a dark t-shirt and dark pants."
+  ],
+  "known_seats": [
+    "left stool",
+    "front middle stool",
+    "right stool",
+    "left spot on sofa",
+    "middle spot on sofa",
+    "right spot on sofa"
+  ]
+}

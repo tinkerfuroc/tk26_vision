@@ -79,6 +79,79 @@ else
     skip "T3.4" "no valid OPENROUTER_API_KEY"
 fi
 
+section "T3.5 — /object_match_all ↔ /object_detection_yolo response-shape parity"
+# Clones the T3.1/T3.4 pattern but uses both detection endpoints against the
+# same scene and asserts compatible response shapes. We do NOT assert that
+# the two endpoints detect the same objects (that's a T4 hardware concern).
+# With DASHSCOPE_API_KEY=fake the object_match_all pipeline will get auth
+# failures per batch and return status=1 — same response shape as the
+# empty-scene yolo case, which is the parity claim under test.
+start_node yolo_specialist_t3.5 object_detection_new yolo_seg_node
+if wait_for_service /object_detection_yolo 20; then
+    DASHSCOPE_API_KEY=fake start_node object_match_all_t3.5 \
+        tk_vision_specialized object_match_all_server
+    if wait_for_service /object_match_all 30; then
+        sleep 5  # warmup: pair color + depth/PC for both nodes
+        # ObjectDetection.srv response shape
+        out_yolo="$LOG_DIR/T3.5_yolo.svcout"
+        timeout 30 ros2 service call /object_detection_yolo \
+            tinker_vision_msgs_26/srv/ObjectDetection \
+            "{camera: 'orbbec', prompt: 'bottle', flags: '', target_frame: '', category: ''}" 2>&1 \
+            | head -c 6000 >"$out_yolo" || true
+        # ObjectMatchAll.srv response shape
+        out_match="$LOG_DIR/T3.5_match.svcout"
+        timeout 30 ros2 service call /object_match_all \
+            tinker_vision_msgs_26/srv/ObjectMatchAll \
+            "{camera: 'orbbec', category_filter: [], target_frame: '', sort_closest: false, sort_highest: false, return_rgb_image: false, return_depth_image: false, return_segments: false}" 2>&1 \
+            | head -c 6000 >"$out_match" || true
+
+        bad=0
+        # Both responses must contain the SHARED ObjectDetection-superset
+        # fields: status, error_msg, person_id, objects[], rgb_image,
+        # depth_image, segments. ObjectMatchAll additionally carries
+        # detection_source — the asymmetric field — and we assert it on the
+        # match side only (ObjectDetection.srv doesn't define it). This is
+        # the response-shape parity claim from ObjectMatchAll.srv's docstring:
+        # "this response's field set is a superset of ObjectDetection.srv's".
+        # ros2 service call text-formats the response as 'field=value' pairs.
+        # Nested Object fields (cls/conf/centroid) only appear inside
+        # objects=[...] when at least one object is present; under empty
+        # scene we only assert the array marker is there.
+        shared_fields=('status=[01]' "error_msg='?[^,]*" 'person_id=[0-9]+' 'objects=\[' 'rgb_image=' 'depth_image=' 'segments=\[')
+        for tag_out in "yolo:$out_yolo" "match:$out_match"; do
+            tag="${tag_out%%:*}"; f="${tag_out##*:}"
+            if grep -qE 'Traceback' "$f"; then
+                fail "T3.5 [$tag]" "traceback in response"
+                bad=1; continue
+            fi
+            missing=()
+            for pat in "${shared_fields[@]}"; do
+                grep -qE "$pat" "$f" || missing+=("$pat")
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+                fail "T3.5 [$tag]" "missing fields: ${missing[*]} | head: $(head -c 400 "$f")"
+                bad=1
+            fi
+        done
+        # Match-side asymmetric field
+        if [ "$bad" -eq 0 ] && ! grep -qE "detection_source='" "$out_match"; then
+            fail "T3.5 [match]" "missing asymmetric field detection_source | head: $(head -c 400 "$out_match")"
+            bad=1
+        fi
+        if [ "$bad" -eq 0 ]; then
+            match_src=$(grep -oE "detection_source='[^']*'" "$out_match" | head -1)
+            yolo_status=$(grep -oE 'status=[01]' "$out_yolo" | head -1)
+            match_status=$(grep -oE 'status=[01]' "$out_match" | head -1)
+            pass "T3.5 response-shape parity: yolo=$yolo_status match=$match_status,$match_src"
+        fi
+    else
+        skip "T3.5" "/object_match_all not advertised (log tail: $(tail -5 "$LAST_LOG" | tr '\n' '|'))"
+    fi
+else
+    skip "T3.5" "yolo_seg_node didn't advertise /object_detection_yolo"
+fi
+stop_all_nodes
+
 section "T3.3 — pan_tilt stack TF + follow_head"
 if [ -c "$SERVO_DEVICE" ]; then
     start_launch ctrl_t3 pan_tilt pan_tilt.launch.py "device:=$SERVO_DEVICE"

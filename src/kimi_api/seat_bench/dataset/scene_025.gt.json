@@ -1,0 +1,40 @@
+{
+  "id": "scene_025",
+  "image_wh": [
+    1280,
+    720
+  ],
+  "seats": [
+    {
+      "label": "leftmost chair",
+      "occupied": false,
+      "cushion_bbox": [
+        355,
+        251,
+        541,
+        598
+      ]
+    },
+    {
+      "label": "middlemost chair",
+      "occupied": true,
+      "cushion_bbox": [
+        559,
+        260,
+        716,
+        600
+      ]
+    },
+    {
+      "label": "rightmost chair",
+      "occupied": false,
+      "cushion_bbox": [
+        722,
+        260,
+        887,
+        610
+      ]
+    }
+  ],
+  "gt_source": "s1_qwen (user-verified 2026-06-02)"
+}

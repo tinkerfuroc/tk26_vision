@@ -208,4 +208,40 @@ stop_all_nodes
 # Negative-path VLM call (out-of-vocab + fallback under no key → OPENROUTER_API_KEY
 # error) requires live cameras to get past the recent-frame wait, so it lives in T2.
 
+section "T1.13 — object_match_all_server: negative + positive"
+# Negative: no key. The node constructs QwenMatchClient at __init__, which
+# raises RuntimeError when neither DASHCOPE_API_KEY nor DASHSCOPE_API_KEY
+# is set. Note that vlm_match_client.py calls load_dotenv(override=False) at
+# module import time, so if the workspace .env carries either key it gets
+# auto-populated and the negative path is not exercisable here — we fall
+# through to skip, mirroring T1.7/T1.8/T1.9.
+unset DASHCOPE_API_KEY DASHSCOPE_API_KEY
+start_node T1.13_neg tk_vision_specialized object_match_all_server
+sleep 5
+if grep -qE 'DashScope API key not found|RuntimeError' "$LAST_LOG"; then
+    pass "T1.13 negative: RuntimeError about missing DashScope key"
+elif wait_for_service /object_match_all 2; then
+    skip "T1.13 negative" "workspace .env provided key; cannot exercise negative path here"
+else
+    fail "T1.13 negative" "no RuntimeError, no service (log tail: $(tail -5 "$LAST_LOG" | tr '\n' '|'))"
+fi
+stop_all_nodes
+
+# Positive: smoke key. Node startup is heavier than object_match_server
+# (SamPredictor + warm-up + dual camera subscribers), so allow a longer
+# wait for the service to advertise.
+DASHSCOPE_API_KEY=smoke start_node T1.13_pos tk_vision_specialized object_match_all_server
+if wait_for_service /object_match_all 20; then
+    pass "T1.13 positive: /object_match_all advertised"
+else
+    fail "T1.13 positive" "service not advertised (log tail: $(tail -5 "$LAST_LOG" | tr '\n' '|'))"
+fi
+stop_all_nodes
+
+section "T1.fs — foundation_stereo advertises srv + action"
+t1_check_multi T1.fs foundation_stereo foundation_stereo_node \
+    s:/foundation_stereo/get_depth \
+    a:/foundation_stereo/infer_depth \
+    --
+
 summary

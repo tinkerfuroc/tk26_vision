@@ -2,7 +2,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 import numpy as np
 import cv2
 from pathlib import Path
@@ -11,13 +11,14 @@ import copy
 import os
 import torch
 import time
+from typing import Optional, Tuple
 
 # ROS2 messages
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from std_msgs.msg import Header
 import geometry_msgs.msg
 from tinker_vision_msgs_26.msg import Object, Objects
-from tinker_vision_msgs_26.srv import ObjectDetection
+from tinker_vision_msgs_26.srv import ObjectDetection, FoundationStereoDepth
 
 # TF2 for coordinate transformations
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
@@ -74,6 +75,20 @@ class YOLOSegmentationNode(Node):
         # Thread locks for data protection
         self.lock_msg = threading.Lock()
         self.lock_info = threading.Lock()
+
+        # FoundationStereo client — lazy-init on first use. Lives on its own
+        # ReentrantCallbackGroup so the executor can process the FFS response
+        # on a different thread while the detection service callback (on a
+        # MutuallyExclusiveCallbackGroup) is blocked waiting on the future.
+        self._ffs_cli = None
+        self._ffs_cb_group = ReentrantCallbackGroup()
+        # Last wall-clock time we emitted the rate-limited "FFS unavailable,
+        # falling back to native depth" warn — see `_warn_fallback_throttled`.
+        self._ffs_fallback_last_warn = 0.0
+
+        # Per-call audit: filled by `_acquire_depth`; consumed by the sidecar
+        # JSON writer downstream. 'native' until FFS path runs once.
+        self._last_depth_source: str = 'native'
 
         # Camera data storage (per camera type)
         self.camera_intrinsic = {
@@ -143,6 +158,17 @@ class YOLOSegmentationNode(Node):
         # Default empty; specialist entry point overrides to ['person'] so a
         # custom-trained competition model never emits people.
         self.declare_parameter('excluded_classes', [''])
+
+        # FoundationStereo depth fallback. When prefer_ffs=True (default) the
+        # node queries the FFS depth service first and falls back to the native
+        # camera depth only if the call fails or times out. Set prefer_ffs=False
+        # to skip FFS and use native depth unconditionally.
+        self.declare_parameter('prefer_ffs', True)
+        self.declare_parameter('ffs_service', '/foundation_stereo/get_depth')
+        self.declare_parameter('ffs_wait_for_service_s', 0.2)
+        self.declare_parameter('ffs_call_timeout_s', 8.0)
+        self.declare_parameter('ffs_align_to_color', True)
+        self.declare_parameter('ffs_fallback_log_period_s', 30.0)
 
         self.get_logger().info('Parameters declared successfully')
 
@@ -404,13 +430,125 @@ class YOLOSegmentationNode(Node):
 
         return depth_img, valid_mask
 
+    def _warn_fallback_throttled(self) -> None:
+        """Emit the "FFS unavailable, falling back to native depth" warning at
+        most once per `ffs_fallback_log_period_s` seconds.
+
+        We rate-limit because a healthy fallback path can fire on every
+        service call (e.g. FFS node down for the whole session) and we don't
+        want to spam stderr. The first failure always logs immediately;
+        subsequent failures within the window stay silent.
+        """
+        period = float(self.get_parameter('ffs_fallback_log_period_s').value)
+        now = time.monotonic()
+        if now - self._ffs_fallback_last_warn >= period:
+            self.get_logger().warn(
+                'FFS depth unavailable; falling back to native realsense depth'
+            )
+            self._ffs_fallback_last_warn = now
+
+    def _try_ffs_depth(self) -> Optional[np.ndarray]:
+        """Call the FoundationStereo depth service. Returns float32 depth in
+        meters (already aligned to color when `ffs_align_to_color=True`), or
+        ``None`` on any failure (service unavailable, timeout, non-zero
+        status, future failure, decode error).
+
+        Concurrency: this runs on the detection service callback's thread (a
+        `MutuallyExclusiveCallbackGroup`), so we use the
+        `threading.Event`+`add_done_callback` pattern to block this thread
+        without deadlocking the executor — the FFS client lives on a
+        `ReentrantCallbackGroup`, letting the response be processed by a
+        different executor worker.
+        """
+        # Lazy-init the client. Topic is read per-call so `ros2 param set`
+        # can swap it without restarting the node, but the rclpy client
+        # itself is cached after the first use.
+        service_name = str(self.get_parameter('ffs_service').value)
+        if self._ffs_cli is None or self._ffs_cli.srv_name != service_name:
+            try:
+                if self._ffs_cli is not None:
+                    self.destroy_client(self._ffs_cli)
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            self._ffs_cli = self.create_client(
+                FoundationStereoDepth,
+                service_name,
+                callback_group=self._ffs_cb_group,
+            )
+
+        wait_s = float(self.get_parameter('ffs_wait_for_service_s').value)
+        if not self._ffs_cli.wait_for_service(timeout_sec=wait_s):
+            return None
+
+        req = FoundationStereoDepth.Request()
+        req.align_to_color = bool(self.get_parameter('ffs_align_to_color').value)
+
+        fut = self._ffs_cli.call_async(req)
+        event = threading.Event()
+        fut.add_done_callback(lambda _f: event.set())
+
+        timeout_s = float(self.get_parameter('ffs_call_timeout_s').value)
+        if not event.wait(timeout=timeout_s):
+            try:
+                self._ffs_cli.remove_pending_request(fut)
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+
+        try:
+            resp = fut.result()
+        except Exception as exc:  # noqa: BLE001 — log + fall back
+            self.get_logger().warn(f'FFS call raised: {exc}')
+            return None
+
+        if resp is None or resp.status != 0:
+            return None
+
+        try:
+            depth = self.bridge.imgmsg_to_cv2(resp.depth_image, 'passthrough')
+        except Exception as exc:  # noqa: BLE001 — bad encoding → fall back
+            self.get_logger().warn(f'FFS depth decode failed: {exc}')
+            return None
+
+        # Service guarantees `32FC1` meters; coerce defensively so downstream
+        # math doesn't get a surprise dtype.
+        return depth.astype(np.float32, copy=False)
+
+    def _acquire_depth(self, depth_msg: Image) -> Tuple[np.ndarray, str]:
+        """Acquire a realsense depth image in meters, preferring the
+        FoundationStereo service when ``prefer_ffs`` is enabled.
+
+        Returns ``(depth_meters_float32, source)`` where ``source`` is
+        ``'ffs'`` (the FFS service answered with status=0) or ``'native'``
+        (FFS disabled, unavailable, or failed and we fell back to the
+        synced realsense depth message). The native branch handles the
+        `16UC1` mm → float meters conversion that previously lived inline
+        in `_process_realsense_data`; FFS output is already `32FC1` meters
+        and is returned unchanged.
+
+        Param reads are per-call so `ros2 param set prefer_ffs false` /
+        `... true` flips take effect on the next service call without a
+        node restart.
+        """
+        if bool(self.get_parameter('prefer_ffs').value):
+            ffs_depth = self._try_ffs_depth()
+            if ffs_depth is not None:
+                return ffs_depth, 'ffs'
+            self._warn_fallback_throttled()
+
+        native = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        return native.astype(float) / 1000.0, 'native'
+
     def _process_realsense_data(self, rgb_msg: Image, depth_msg: Image,
                                 intrinsic: CameraInfo) -> tuple:
         """Process realsense RGB-D data into usable format."""
-        
+
         rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-        depth_img = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
-        depth_img = depth_img.astype(float) / 1000.0  # mm to meters
+        depth_img, depth_source = self._acquire_depth(depth_msg)
+        # Stash on the node so the sidecar JSON writer downstream can include
+        # which depth source served this call. Per-call, overwritten on every
+        # `_process_realsense_data`.
+        self._last_depth_source = depth_source
 
         H, W = depth_img.shape
         fx, fy, cx, cy = tuple(intrinsic.k[[0, 4, 2, 5]])
@@ -1193,6 +1331,7 @@ class YOLOSegmentationNode(Node):
                         'target_frame': request.target_frame,
                         'sort_mode': sort_mode,
                         'n_all_detections': len(self._last_detection_info_all),
+                        'depth_source': self._last_depth_source,
                     },
                     branch='yolo',
                     timings={'yolo': time.perf_counter() - _t0},
@@ -1220,6 +1359,7 @@ class YOLOSegmentationNode(Node):
                         'target_frame': request.target_frame,
                         'sort_mode': sort_mode,
                         'error': str(e),
+                        'depth_source': self._last_depth_source,
                     },
                     branch='error',
                     timings={'yolo': time.perf_counter() - _t0},

@@ -47,6 +47,14 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 
+try:
+    # Optional at import time so unit tests / tooling can load this module
+    # without the workspace fully installed. Resolution failures fall back
+    # to an empty default — operators must then pass `-p config:=…`.
+    from tinker_robot_config import resolver as _trc_resolver
+except ImportError:  # pragma: no cover
+    _trc_resolver = None
+
 from .calibration.aruco_detect import (
     BoardSpec,
     build_board,
@@ -65,6 +73,22 @@ from .calibration.utils import (
 
 # tinker_arm_msgs is imported lazily at node construction so this module stays
 # importable on hosts without the tinker_manipulation stack installed.
+
+
+def _default_calib_config_path() -> str:
+    """Resolve calibration.yaml via tinker_robot_config; fallback to legacy.
+
+    Returns the absolute install-share path for the per-robot
+    ``pan_tilt/calibration.yaml``. Returns ``''`` if the resolver isn't
+    available or fails — operators must then pass ``-p config:=…``.
+    Operator-supplied non-empty values are always respected over this default.
+    """
+    if _trc_resolver is None:
+        return ''
+    try:
+        return str(_trc_resolver.load().path('pan_tilt/calibration.yaml'))
+    except Exception:  # pragma: no cover - resolver error path
+        return ''
 
 
 # ---- config -----------------------------------------------------------------
@@ -275,7 +299,11 @@ class CalibrateCollectNode(Node):
     def __init__(self):
         super().__init__("calibrate_collect")
 
-        self.declare_parameter("config", "")
+        # Default resolves the per-robot calibration.yaml via
+        # tinker_robot_config (uses $ROBOT_NAME). Override with -p config:=…
+        # to point at a custom file (e.g. a pruned sidecar produced by
+        # calib_web).
+        self.declare_parameter("config", _default_calib_config_path())
         self.declare_parameter("out_dir", "calibration_data")
         self.declare_parameter("phase", "both")  # both | phase1 | phase1_custom | phase2 | sanity | phase4_validation | dry_run
 

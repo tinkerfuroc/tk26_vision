@@ -1,0 +1,12 @@
+{
+  "id": "scene_035",
+  "image_wh": [1280, 720],
+  "seats": [
+    {"label": "left stool", "occupied": false, "cushion_bbox": [30, 420, 195, 540]},
+    {"label": "front middle stool", "occupied": true, "cushion_bbox": [380, 440, 640, 580]},
+    {"label": "right stool", "occupied": true, "cushion_bbox": [730, 400, 970, 540]},
+    {"label": "left spot on sofa", "occupied": true, "cushion_bbox": [235, 320, 480, 420]},
+    {"label": "middle spot on sofa", "occupied": false, "cushion_bbox": [450, 310, 660, 415]},
+    {"label": "right spot on sofa", "occupied": false, "cushion_bbox": [630, 305, 820, 410]}
+  ]
+}

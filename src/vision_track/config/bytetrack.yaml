@@ -1,0 +1,11 @@
+# Project ByteTrack config for vision_track person tracking.
+# Decouples detection conf (passed to model.track) from ByteTrack's two-stage
+# association so low-confidence (partially-occluded) operator boxes survive into
+# the second association stage instead of being prefiltered away.
+tracker_type: bytetrack
+track_high_thresh: 0.2    # first-association (high-conf) gate
+track_low_thresh: 0.1     # second-association (low-conf recovery) gate
+new_track_thresh: 0.25    # min conf to spawn a brand-new track
+track_buffer: 45          # frames a lost track is retained before deletion
+match_thresh: 0.8         # IoU match threshold for association
+fuse_score: true          # fuse detection conf into association cost

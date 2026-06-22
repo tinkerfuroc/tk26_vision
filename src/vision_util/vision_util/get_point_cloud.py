@@ -89,23 +89,23 @@ class GetPointCloudService(Node):
 
         self.get_logger().info('Point-cloud relay service initialized.')
 
-    async def camera_info_realsense_callback(self, info):
+    def camera_info_realsense_callback(self, info):
         with self.lock_info:
             self.camera_info['realsense'] = info
 
-    async def camera_info_orbbec_callback(self, info):
+    def camera_info_orbbec_callback(self, info):
         with self.lock_info:
             self.camera_info['orbbec'] = info
 
-    async def img_realsense_callback(self, color_msg, depth_msg):
+    def img_realsense_callback(self, color_msg, depth_msg):
         with self.lock_img:
             self.recent_img['realsense'] = (color_msg, depth_msg)
 
-    async def img_orbbec_callback(self, color_msg, depth_msg):
+    def img_orbbec_callback(self, color_msg, depth_msg):
         with self.lock_img:
             self.recent_img['orbbec'] = (color_msg, depth_msg)
 
-    async def get_point_cloud_callback(
+    def get_point_cloud_callback(
         self,
         request: GetPointCloud.Request,
         response: GetPointCloud.Response,

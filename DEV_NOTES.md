@@ -12,7 +12,1011 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 | Node startup, interface advertisement, clean SIGTERM | `scripts/tests/t1_startup.sh` | ✅ passing |
 | Live-camera single-call per node (empty scene) | `scripts/tests/t2_live.sh` | ✅ passing (with skips — see below) |
 | Cross-node interaction (client ↔ server) | `scripts/tests/t3_interaction.sh` | ✅ passing |
-| Hardware-in-the-loop with staged scenes | `scripts/tests/t4_hardware.sh` | ⏳ **not yet run** (needs operator) |
+| Hardware-in-the-loop with staged scenes | `scripts/tests/t4_hardware.sh` | ⏳ **not yet run** (needs operator) — incl. new `person_phase2` scenario |
+
+---
+
+## 2026-06-10 — follow-demo debugging round (reacquire, announce, stop-all, dashboard lag, launch crash)
+
+Operator ran the full Follow Demo (`track_web_control.launch.py` + the webui
+Bringup card starting audio/dummy_nav/bt) and reported four problems. All
+root-caused systematically; the BT-side fixes live in `tk25_decision`, the
+tracker/webui fix here. **Hardware-free reproduction** was achieved for every
+one (throwaway `/track_person` servers + a mock `/announce`), so the diagnoses
+are evidence-backed, not guesses.
+
+- **Reacquire failed after loss when BT-driven (worked standalone).** Root cause:
+  the follow tree sent `TrackPerson.Goal.target_frame="map"` while the webui
+  sends `""`. A non-empty frame makes the tracker do a **blocking TF lookup
+  (~0.2 s) every tracked frame**; the demo has no `map` frame (dummy_nav is a
+  stub, no nav stack), so the loop collapsed ~30 Hz → ~5 Hz and ReID
+  reacquisition starved. Fixed in `tk25_decision` (`8c9b154`): default
+  `target_frame=""`. Confirmed 30 Hz restored on the robot.
+
+- **No voice announcement.** NOT a software bug. Proved end-to-end that the live
+  `follow-person` BT relays NEEDS_HELP → calls the real `/announce` → audible
+  prompt (operator heard it; `status=0`). The demo silence was a **speaker
+  power/battery issue** (hit 3× live during diagnosis). `/announce` is
+  `tinker_audio_msgs/srv/TextToSpeech`, advertised by the always-on audio
+  launch; the BT's announce client type matches. No code change.
+
+- **"Stop All" left the TrackPerson goal running.** Root cause: ProcessManager
+  stops the BT with **SIGTERM**, which Python kills on without raising, so
+  `run_tree`'s graceful-shutdown `finally` (the only thing that cancels the goal)
+  never ran — and even when it did, `tree.shutdown()` destroyed the node before
+  the async `cancel_goal_async()` flushed. Fixed in `tk25_decision` (`a0604c9`):
+  SIGTERM→KeyboardInterrupt handler + an explicit cancel-and-flush spin before
+  node destruction. Verified: `killpg(SIGTERM)` now produces a server-side
+  cancellation; pre-fix it did not.
+
+- **Dashboard state panel + gallery froze ~10 s after goal start (video was
+  immediate).** Tracker-side. Three gaps in the search phase: `~/debug_gallery`
+  only published post-lock; the init `'initializing'` `~/debug_state` payload
+  carried no rendered fields (looked dead); and a post-goal-accept warmup
+  blackout (idle timer off, CUDA warmup holding `lock_tracker`) published
+  nothing. Fixed here (`298786d`, subagent-driven): emit an empty `{"version":0,
+  "thumbs":[]}` "searching" gallery once per goal; publish `'initializing'`
+  state up front *before* the warmup; add `search_started_ts` to the init
+  payload and render an animated "Searching for target… Ns" banner in the webui.
+  Verified (camera-less, private ns): `debug_gallery` (v0) + `debug_state`
+  (`initializing`, with `search_started_ts`) both arrive ~300 ms after
+  goal-accept, before any lock. 17 focused tests pass + 2 new contract tests.
+
+- **Launch crash: `PackageNotFoundError: No package metadata was found for
+  vision-track`.** Build-hygiene, not code. `vision_track`'s install had a stale
+  `--symlink-install` **egg-link** (pointing at `build/vision_track`) instead of
+  a real `*-py3.10.egg-info`; the setuptools console scripts use
+  `importlib.metadata`, which **cannot read egg-links**, so every vision_track
+  node died at import. Caused by mixing `scripts/build.sh` (`--symlink-install`)
+  with `tkbuild` (regular install) across incremental builds. Fixed with a clean
+  rebuild: `rm -rf build/vision_track install/vision_track && tkbuild tk26_vision
+  --packages-select vision_track` → real egg-info restored; `track_web` +
+  `person_track_server` start clean. Prefer `tkbuild` over `build.sh` for
+  tk26_vision to avoid recreating the egg-link.
+
+**Still needs operator-in-the-loop:** with powered speakers, run the full demo
+and confirm (a) reacquire after a real loss, (b) the spoken PASSIVE/NEEDS_HELP
+prompts, (c) "Stop All" stops the tracker, (d) the dashboard shows
+"Searching… Ns" + "0 views" within ~1 s of goal start (no 10 s freeze).
+
+---
+
+## 2026-06-10 — track_web bringup control (launch BT + audio + dummy nav from the webui)
+
+The `track_web` dashboard can now start/stop the follow-person demo components on
+demand, plus a `track_web_control.launch.py` brings up the tracker + upgraded
+webui. Built via subagent-driven-development (4 tasks). Commits `84e79d7`
+(ProcessManager), `09d0909` (endpoints+bridge), `928dae5` (Bringup panel),
+`47f6e26` (control launch), `1b10d3c` (spec/plan).
+
+- **ProcessManager** (`vision_track/process_manager.py`): fixed-allowlist
+  supervisor (audio → `ros2 launch audio_pakage audio.launch.py`, dummy_nav →
+  `ros2 run behavior_tree dummy-nav`, bt → `ros2 run behavior_tree
+  follow-person`). API takes a *name*, never a command. Children spawn in their
+  own process group, killed group-wide SIGTERM→SIGKILL; start idempotent; status
+  reaps+caches returncode; `shutdown_all()` on dashboard exit; thread-safe.
+- **Endpoints + bridge**: `POST /api/proc/{name}/start|stop`, `GET
+  /api/proc/status`; `/ws/state` pushes `{"type":"proc"}` on change; `TrackWebNode`
+  owns the manager and calls `shutdown_all()` in `main()`'s `finally`.
+- **Bringup panel** (webui): per-component start/stop toggles + status dots;
+  manual goal-Start disabled while `bt` runs (the BT owns the `/track_person`
+  goal).
+- **`track_web_control.launch.py`**: cleanup + `person_track_server` (debug_* ON,
+  `launch_tracker` toggle) + `track_web`; args launch_tracker/with_waving/
+  kill_stale/bind/port/perf_logging.
+
+Verified here: `tkbuild tk26_vision --packages-select vision_track` clean; 18 unit
+tests pass (process_manager 6 + track_web_app 12); `--show-args` lists all 6 args;
+launch + upgraded webui install to `share/`.
+
+**Operator (T4) checks before relying on it:** (1) build `behavior_tree` +
+`audio_pakage` into `tk25_ws/install` via `tkbuild tk25_decision` +
+`tkbuild tk_24_audio` so the Bringup spawns resolve; (2) click each toggle →
+component starts, dot turns green, stop kills it; (3) start `bt` → manual Start
+disables + the follow demo runs (announcements via the `announce` TTS service,
+`/follow_target` logged by dummy_nav); (4) close the dashboard → all spawned
+children die (no orphans).
+
+## 2026-06-10 — PERSON TRACKING FINALIZED
+
+`vision_track/person_track_server` is finalized for the arena (unit suite green,
+builds, pushed to `dev`). The complete 2026-06-10 changeset (see the detailed
+entry below + the `readme.md` Changelog):
+
+- **Passive recovery after NEEDS_HELP** — wall-clock 5 s escalation
+  (`active_help_after_sec`, not frame count) + relaxed lone auto re-lock (0.62,
+  12-of-16) gated on latched NEEDS_HELP + single visible person (`1817a48`).
+- **Premature-abort regression fixed** — the FSM recovery-cap no longer aborts the
+  goal while active help is enabled; the goal coasts to the NEEDS_HELP hold
+  (`ebcdb5a`).
+- **Re-acquisition id-churn fix** — the N-of-M confirm window survives ByteTrack
+  `track_id` churn during a loss+reappearance while latched in NEEDS_HELP, so a
+  lone returning operator re-locks (`d195c4e`).
+- **Gallery admission gate** — upright (bbox w/h ≤ 0.5) AND clean
+  (mask-fill > 0.35), both launch-adjustable (`dceeca4`).
+- **Seg model** — default `yolo11m-seg` (5.5 ms @736 fp16; benchmark
+  `scripts/bench_yolo_seg.py`); TRT optional (`bfa68c2`).
+
+**Still requires operator-in-the-loop (T4) sign-off** before competition (these
+are validated by unit/integration tests with monkeypatched similarity, not yet on
+a live robot): (1) >5 s out-and-back auto re-lock without a wave + web box turns
+green; (2) re-lock fires within ~12-16 frames despite real id churn (check `reid
+candidates` logs); (3) m-seg sustains ~30 Hz end-to-end with full ReID; (4) m-seg
+weight cached on the arena robots (offline); (5) optional: if real recovery
+similarity sits below 0.62 in sparse-gallery scenes, relax `gallery_max_aspect_ratio`
+0.5→~0.7 (recall tuning, not a fix).
+
+## 2026-06-10 — passive recovery (wall-clock + post-NEEDS_HELP auto re-lock) + mask-fill gallery gate + m-seg default
+
+Four tracker changes from a systematic-debugging + subagent-driven session.
+Commits: `1817a48` (Issue 1), `0cfbb08` (Issue 3), `415f78c` (Issue 4),
+`69865be`/`a369802` (spec/plan). Spec/plan:
+`docs/superpowers/{specs,plans}/2026-06-09-passive-recovery-bg-parity-upright-gallery.md`.
+
+- **Issue 1 — passive recovery after NEEDS_HELP.** (a) While *latched* in
+  NEEDS_HELP with exactly one person visible, the lone re-ID commit bar relaxes
+  0.72 → `single_person_commit_bar_help` (0.62), needing 12 of the last 16 frames
+  (`needs_help_confirm_frames`/`needs_help_commit_window`) — auto re-lock without a
+  wave. Strict path byte-for-byte unchanged outside the gate; relaxed commit does
+  a real `target_track_id` swap so the latch clears. (b) **NEEDS_HELP escalation
+  is now WALL-CLOCK** (`active_help_after_sec`, default 5.0 s) instead of frame
+  count (was `active_help_after_frames=45`) — frame rate is unreliable under
+  tournament GPU contention. Anchored by `self._last_confirmed_time`, refreshed
+  only on a true re-lock (never a provisional coast) — abort-mid-reacquire
+  protection intact. **Regression follow-up (same day):** moving the latch to 5 s
+  decoupled it from the lock-FSM recovery cap (`max_recovery_frames` ~1.5 s),
+  which still fired `hard_lost` → the goal aborted in the `[~1.5 s, 5 s]` window
+  before reaching the hold. Fixed with a pure `lost_should_abort(...)` helper: the
+  recovery-cap abort now applies ONLY when active help is disabled
+  (`active_help_after_sec <= 0`); with help enabled the goal coasts to the hold
+  (`lost_timeout` ceiling preserved). Regression test
+  `test_needs_help_no_premature_abort.py`.
+- **Issue 2 — OSNet background parity: NO code change.** Investigated; the query
+  already uses the real seg mask at every call site (plumbing verified). The
+  first-draft ellipse pseudo-mask was reverted — fabricating a mask papers over a
+  non-problem; fewer maskless frames come from the bigger model (Issue 4).
+- **Issue 3 — gallery gate on BOTH bbox w/h ratio AND mask-fill** (revised
+  2026-06-10). Admission requires upright AND clean: `gallery_max_aspect_ratio`
+  (default 0.5 — operator is taller-than-wide ~0.4; square/wide rejected) AND
+  `gallery_min_mask_fill` (default 0.35 = mask_px/bbox_area; merged/low-fill
+  rejected). `crop_quality_ok` ANDs both; both adjustable at launch. Admission-
+  only. (First draft was mask-fill-only with aspect relaxed to 2.0; operator opted
+  to keep the upright w/h gate too — trade-off: a clipped-square upright operator
+  in a dense crowd waits for a cleaner view before enriching the gallery.)
+- **Issue 4 — tracker seg model → `yolo11m-seg` default.** Benchmark
+  (`scripts/bench_yolo_seg.py`, imgsz 736 fp16, RTX 5070 Ti): s=4.0 / **m=5.5** /
+  l=7.0 / x=9.5 ms — all far under the 33 ms 30 Hz budget *in plain PyTorch*, so
+  TRT is optional, not required. m-seg = better/more-frequent masks feeding Issues
+  2 & 3. Verified it resolves to the cached weight at startup.
+
+Verification done here: full unit suite green (261 passed, 1 skipped; the 2
+package-wide `test_flake8`/`test_pep257` failures are pre-existing, from unrelated
+uncommitted WIP files); zero net-new flake8 on touched lines; `vision_track`
+builds; m-seg latency benchmarked; m-seg weight resolves.
+
+**Still needs operator-in-the-loop (T4):** (1) walk the operator out of frame >5 s
+then back in — confirm auto re-lock post-NEEDS_HELP without a wave, and that the
+web box turns green (not stuck yellow). (2) Confirm the
+gallery enriches from upright operator views and does NOT admit square/wide or
+low-fill boxes; in a dense crowd watch for gallery starvation (clipped-square
+operator) — loosen `gallery_max_aspect_ratio` at launch if needed. (3) Confirm
+m-seg sustains ~30 Hz end-to-end with the full ReID pipeline on live cameras (the
+raw model is 5.5 ms; the OSNet-per-candidate cost is the real budget). (4) Confirm
+the m-seg weight is cached on the actual arena robots (offline).
+
+## 2026-06-09 — host-RAM leak ROOT CAUSE FOUND + FIXED: 14 GB-per-write uint8-mask blend in vision_logging
+
+Follow-up to the entry below (which had flagged "confirm with a memory logger
+whether a single fresh bench still climbs"). I ran it. **It climbed: one fresh
+tracker, no orphans, went RSS 2.4 GB → ~28 GB in ~4 min** (live `/tmp/mem_watch.log`),
+usedMem 30/31 GB, GPU flat — so there WAS a fast host-RAM leak, and the
+orphan-guard (`7891661`) + per-id-dict bound (`cf20b21`) were necessary but
+SECONDARY. This is the primary cause of the ssh-drops and the Orbbec depthengine
+SIGSEGV.
+
+**Root cause (tracemalloc-proven), fixed in `1fa01241`:**
+`vision_util/vision_logging.py` `VisionLogger.write()` blended the seg-mask
+overlay with `overlay[mask]`, but `mask` is a **uint8 0/1** array (from
+`core/result_parser.py:98` `(mask>0.5).astype(uint8)`), NOT boolean. So
+`overlay[mask]` is **integer fancy-indexing along axis 0** → shape `(H,W,W,3)` →
+a **~14 GB float32 transient per masked log write** at 720p (vs ~5.5 MB for a
+correct boolean mask), and it also corrupted the overlay (rewrote rows 0/1). It
+runs off-loop on a single-worker `ThreadPoolExecutor` with an **unbounded queue**,
+so each lost/reclaim transition queued ~14 GB writes that took ~14 s each and
+backed up — the RSS ratchet + oscillation. A swallowing `try/except` hid it.
+
+Decisive evidence (instrumented repro, isolated ROS_DOMAIN_ID=44, person in view):
+- tracemalloc top grower = `vision_logging.py:243` at **26.4 GiB** (next line 20 MiB).
+- `MALLOC_ARENA_MAX=2` + trim → **no effect** (rules out glibc fragmentation).
+- `vision_logging_enabled:=false` (telemetry still ON) → **leak gone, flat 2.37 GB**.
+
+**Attribution:** pre-existing — the bad blend landed in commit `d11f80c9`
+(2026-04-23); the uint8 mask in `39ae85b0` (2025-12-01). NOT introduced by this
+session's tracker work, but the 2026-06-09 reseed/look-alike changes increased
+lost↔reclaim churn → fired the buggy write far more often → surfaced it hard now.
+
+**Fix (`1fa01241`, central, spec✅ + quality-APPROVED):** a shared
+`_apply_mask_overlay(overlay, mask, color, alpha)` helper coerces the mask to
+boolean (`m = mask if dtype==bool else np.asarray(mask)!=0`) + shape-guards
+before indexing; the orange blend is bit-identical for alpha=0.5. Because
+`VisionLogger.write` is the shared sink, this protects EVERY mask-logging node
+(person_track, yolo_seg, generalist, waving, object_match, placing_location).
+The other `mask_overlay[mask]` site (`object_seg_yolo.py:1162`) already coerces
+to bool, so no leak there. 6 TDD tests (fail on old code, pass after); tkbuild
+`vision_util` clean.
+
+**Optional defense-in-depth (not done, low value now):** bound the off-loop log
+writer queue (`person_track_node.py` `ThreadPoolExecutor(max_workers=1)` is
+unbounded). With 5.5 MB transients a backed-up queue is harmless, so the boolean
+coercion alone resolves it; the queue bound would only guard a future slow-disk
+scenario.
+
+**Test-debt (minor, follow-up):** `test_no_fancy_index_explosion_on_full_size_mask`
+in `test_mask_overlay.py` doesn't actually pin the explosion (the explosion is a
+transient alloc, not a persistent shape change; it passes on the old code too) —
+the regression IS covered by the other 5 tests; rename/strengthen when convenient.
+
+**Recommended validation:** re-run a 2-3 min bench WITH a person and
+`vision_logging_enabled` ON (default) and confirm tracker RSS now stays flat
+(~2.4 GB) instead of climbing.
+
+## 2026-06-09 — Orbbec camera SIGSEGV + ssh-disconnect: one root cause (memory/swap exhaustion)
+
+Operator report: Orbbec `camera_container` dies with `exit code 11` (SIGSEGV)
+after recurring `Failed to TemperatureUpdate1: Resource busy!`; separately, "the
+tracker causes ssh to disconnect after a while." **Both are the same root
+cause: host memory exhaustion → swap-thrash.**
+
+Evidence (captured live on the host):
+- Swap **6.6 GiB/8 used**, 15-min **load average 63** (1-min 0.64 — it collapsed
+  once procs died). Classic thrash: when RAM fills, every process stalls on
+  swap IO, **sshd can't service the session → ssh times out/drops**, and native
+  worker threads get starved/fail.
+- The crash trace (`Log/camera_crash_stack_trace_2026_06_09_19_53_50.log`) faults
+  **inside `libdepthengine.so`** (Femto Bolt closed-source depth engine) called
+  from `libOrbbecSDK.so.2` — NO temperature/ROS-node frames. So it's the vendor
+  depth engine faulting under host starvation, not an Orbbec logic bug.
+- `TemperatureUpdate1: Resource busy` is a **red herring** — the diagnostic
+  updater's control-channel temperature poll colliding with streaming
+  (`ob_camera_node.cpp:2346 onTemperatureUpdate`); benign.
+
+Dominant contributor found: **orphaned `person_track_server` pileup.** Three
+were live (PID 96309/98259/99886, all `PPID=1`, on the `/replay/` perf-test
+topics), each squatting **~672 MiB GPU** — leftover from bench/perf-test runs
+whose launcher died ungracefully (children reparent to init and never exit).
+Operator confirmed only "tracker + camera bench" runs when ssh drops, so a
+single healthy tracker (~3-5 GB) reaching 37 GB means trackers accumulate across
+restarts. Manual cleanup run this session: SIGTERM'd the 3 orphans (GPU
+**2185→153 MiB**), cleared 16 stale FastDDS `/dev/shm` segments, swap recovered
+**6.6 GiB→<1 GiB**.
+
+Fixes (subagent-driven, Opus; two-stage reviewed):
+- **`7891661`** — idempotent `track_web_bench` startup. New `kill_stale` launch
+  arg (default on) SIGTERMs stale bench execs via narrow `lib/<pkg>/`-scoped
+  patterns BEFORE relaunch (nodes start after cleanup via `OnProcessExit`);
+  `scripts/kill_stale_bench.sh` mirrors it for manual use. SIGTERM not `-9`;
+  patterns scoped so editors/greps/the parent `ros2 launch` are never matched.
+  So a restart can never leave duplicates — kills the pileup at the source.
+- **`cf20b21`** — bound per-track-id state. `candidate_consistency` +
+  `relative_positions` kept one entry per ByteTrack id for the process lifetime
+  (ids grow forever) — a slow secondary leak. Lazily evict gone ids past
+  `MAX_TRACK_STATE_IDS` (256); current ids never evicted, scoring unchanged for
+  normal scenes. (Audit: `scene_center_history` already capped to 3;
+  `target_velocity_history` is dead/never-appended.)
+
+**Still to confirm (operator):** run a memory logger alongside ONE fresh bench
+(`while true; do date +%T; ps -eo rss,comm --sort=-rss|head -8; free -m|awk '/Mem|Swap/'; sleep 15; done | tee ~/mem_watch.log`).
+If a single tracker session's RSS still climbs steadily, there is a remaining
+fast per-frame leak the above two fixes won't catch (hunt it then); if it stays
+flat, the pileup+slow-dict fixes were the whole story. The depthengine SIGSEGV
+itself is a vendor crash — relieving host memory pressure is the mitigation.
+
+## 2026-06-09 — tracker: yellow-box fix + reseed confirmation gate + look-alike pursuit
+
+Three operator-reported issues, each root-caused by a separate read-only
+investigation and implemented subagent-driven (Opus implementer + spec-review +
+quality-review per phase; controller drove git/build/review). Spec + plan:
+`docs/superpowers/specs/2026-06-09-tracker-viz-reseed-gate-lookalike-recovery.md`
+(and the sibling `plans/` file). Phases each landed as one commit.
+
+- **`f571b95` Issue 1 — yellow box during TRACKING (viz only).** `_draw_debug_info`
+  greened on `target_result.track_id`, which `_with_original_id` rewrites to the
+  FROZEN `original_track_id`, while the per-box ids are LIVE ByteTrack ids — they
+  diverge after any reacquire, so the locked target stuck YELLOW. Fix: green ⇔
+  live `target_track_id` match AND `last_lock_decision.state=='tracking'`; yellow ⇔
+  same id but not committed. No behavior/threshold change.
+- **`f375997` Issue 2 — gate reseed (manual click + waving auto-reseed).** Both
+  triggers share `~/reseed_target`→`_apply_reseed`, which instant-locked on a
+  single IoU frame (no appearance check). Now reseed SEEDS a probation
+  (`start_probation` enters the FSM `reidentifying`, not `tracking`); the seeded
+  id must be present AND ReID-confirmed (`sim≥reid_threshold`) for
+  `reseed_confirmation_frames` (default **5**) consecutive frames before the lock
+  commits. During probation `target_lost=True` (YELLOW via Issue 1); a miss
+  resets, an absent id abandons. Help-latch preserved (probation is target_lost).
+- **`4a99c8f` Issue 3 — don't give up on look-alikes in passive reacq.** The lone
+  returner (ReID ~0.55–0.71) was discarded every frame at the single-candidate
+  0.72 wall and the commit streak reset on any dip. Now: a lone candidate in
+  `[single_person_pursue_floor 0.55, 0.72)` is PURSUED (reidentifying) instead of
+  dropped, and commit uses **N-of-M** (12 hits within `provisional_commit_window`
+  18) so dips don't wipe accumulated evidence — in both the pipeline
+  `_confirm_reid_candidate` and the FSM provisional streak. **Precision invariant
+  held:** the lone COMMIT bar stays 0.72 via `single_person_commit_bar`; pursuit
+  never reports "found", so a lone <0.72 candidate is pursued but never committed.
+  Option D (relaxing the color veto / `DEEP_CONFIDENT_BYPASS`) was **dropped** per
+  operator — `reid/reid.py` is untouched.
+
+**Precision leak caught in spec-review and fixed (in the same Phase-3 commit).**
+The new pursue floor first let `_confirm_reid_candidate` ARM `pending_reid_match`
+at `reid_threshold`; once armed, **Stage 1** (`track_by_id`→`_confirm_pending_reid`)
+adopted the id and committed at ~0.50 — silently locking a lone <0.72 candidate.
+Fix: arm only on commit-bar hits (`sum(window) >= reid_preconfirm_frames`), so a
+lone sub-0.72 candidate never arms → Stage 1 never adopts it. A full-`update_tracker`
+loop test (`test_full_loop_lone_below_bar_never_arms_or_locks`) now pins this — it
+FAILED before the fix, PASSES after. A unit test that had encoded the leaky
+behavior was inverted (with a rationale comment).
+
+New ROS params on `person_track_server`: `reseed_confirmation_frames=5`,
+`single_person_pursue_floor=0.55`, `single_person_commit_bar=0.72`,
+`provisional_commit_window=18`. No existing threshold changed (`high_bar=0.72`,
+`reid_threshold=0.55`, deep-ratio 0.92, margins 0.10/0.15,
+`MIN_REID_SIMILARITY_RAW=0.40`, `DEEP_CONFIDENT_BYPASS=0.70` all intact).
+
+Verification: full unit suite **239 passed, 1 skipped** (the 2 reds are the
+pre-existing repo-wide `test_flake8`/`test_pep257` baseline — zero new lint on
+touched lines); `tkbuild tk26_vision --packages-select vision_track` clean. A
+final whole-implementation review confirmed READY-TO-MERGE with no integration
+regressions and the precision invariant holding on every path.
+
+**Minor follow-ups (non-blocking, flagged in quality review):**
+1. `reid_fit_streak` in `_confirm_reid_candidate` is now vestigial (commit
+   authority is `sum(window)`) — kept only for candidate-id-change detection; its
+   comment should be relabeled or the field removed.
+2. `consecutive_reid_frames` carries two meanings — Stage-2 mirror of
+   `sum(window)` vs Stage-1 strict present-frame count. Mutually-exclusive paths,
+   so safe, but a future-edit seam worth a one-line warm-start note.
+3. `window[-M:]` is a no-op at `provisional_commit_window=0` (unbounded growth);
+   unreachable with the default 18, but a `max(1, M)` clamp would harden it.
+
+**Pending operator-in-the-loop checks (t4_hardware `person_phase*`):**
+- Issue 1: a real reclaim flips YELLOW→GREEN at the moment of true lock (no stuck
+  yellow; no false green during probation/pursuit).
+- Issue 2: a wave/click reclaim now takes ~5 confirmed frames to lock (and
+  rejects a click that lands on a bystander).
+- Issue 3: a lone operator returning under lighting/pose change re-locks without a
+  wave (the look-alike is pursued then committed once it clears 0.72), and no
+  bystander look-alike ever commits.
+
+## 2026-06-09 — ReID precision: deep-feature segmentation + deep-gated color veto + transparent crops
+
+Operator report: ReID too strict (the dashboard's YELLOW "YOLO_TARGET" box is
+often the correct person but never goes GREEN), and the gallery can lock onto a
+bystander sharing the box. Spec:
+`src/vision_track/docs/specs/2026-06-09-reid-segmentation-and-deep-gated-veto.md`.
+Built subagent-driven (implementer + adversarial review per task; controller did
+git/build).
+
+Two linked root causes (parallel investigation, bag-log corroborated):
+- **Deep OSNet embedding from the RAW bbox crop** (`reid/reid.py:253` single +
+  the batch forward) → gallery baked in background + co-bbox bystander → locks
+  onto others AND drops same-person cosine when the scene changes (forcing the
+  strict bars to over-reject). Fix `b17b8db`: `_segment_crop_for_reid` —
+  dilate mask → tight-crop → soft-blur background, applied identically on single
+  + batch (row-equivalence). OSNet takes RGB so this is the deep-feature
+  equivalent of a transparent background. No thresholds changed.
+- **Hard color veto** (`reid.py` body/upper/lower `< 0.40 → return 0.0`)
+  force-zeroed a strong deep match on color drift — the top cause of "yellow
+  never green". Fix `cbe7a4e`: `DEEP_CONFIDENT_BYPASS = 0.70` — a confident deep
+  cosine bypasses the color veto; bystanders (deep ~0.47-0.57) still get vetoed.
+  Raw-deep floor, distinctiveness margin, deep-ratio gate all unchanged.
+
+**Perf regression + fix (`95f8062`).** The deep-crop segmentation
+(`_segment_crop_for_reid`) initially ran `cv2.GaussianBlur(sigma=9)` on
+full-resolution crops ~2×/person/frame → tracking loop dropped to **13.2 Hz**
+(pipeline 56 ms), making the web feed laggy. Fixed by (1) doing the dilate/blur at
+the fixed OSNet input size (128×256, constant ~0.3 ms — the model resizes there
+anyway) and (2) `extract_features(compute_reid=False)` in the batch path to stop a
+redundant per-detection deep forward that was discarded. Pipeline **56 → 15 ms**;
+reacquisition + row-equivalence re-verified. Lesson: any per-detection CV op added
+to `extract_features`/`_batch` runs in the 30 Hz loop — keep it at OSNet input
+scale, and don't let the batch path re-run the per-detection deep pass.
+
+Plus operator request `d292471`: **transparent person-only crops** — gallery
+thumbnails are BGRA (mask alpha, tight-crop), published PNG to the dashboard and
+written to `vision_log` as transparent PNGs (gated by `gallery_keep_crops`).
+
+Verification: full suite **202 passed / 1 skip** (flake8 baseline 532, no new
+lint); each precision change adversarially reviewed (incl. a mutation test for the
+veto gate, row-equivalence for the segmentation). Bag `--loop` smoke on the
+canonical `/install`: no tracebacks, deep-gate active, **4 reclaims, 0 aborts**
+(matches the pre-change baseline — no reacquisition regression). **Operator check
+on-robot:** the yellow-correct case should now go green (re-lock) under
+lighting/pose change, and the tracker should not lock onto a bystander sharing the
+box. NOTE: restart any running bench to load the new ReID code.
+
+---
+
+## 2026-06-09 — help-hold latch saga + verified multi-reclaim on the bag
+
+Code review of the two prior fixes (passive-reacquire + reseed) came back APPROVE
+(no thresholds changed, real regression tests). Bag-replay testing then exposed a
+deeper bug that made auto-reclaim impossible, fixed in two more commits:
+
+- **Hold aborted mid-reappearance (`3022719`).** When the operator reappears,
+  `_confirm_reid_candidate` resets `frames_lost=0` on every pre-commit frame
+  (before the ~12-frame re-lock). `_handle_lost_frame`'s hold/abort gate keyed on
+  the instantaneous `frames_lost`, so the reset flipped `_is_awaiting_help` False
+  and — FSM still `'lost'` (`hard_lost`) — fired the abort before the reclaim
+  could commit. Fix: `_is_awaiting_help` **latches** the escalation
+  (`_help_latched`).
+- **Latch cleared on provisional frames (`11fd2b6`).** First bag `--loop` test
+  still aborted ~3s in. The latch predicate was correct in isolation (empirically
+  `(45)→True` then `(0)→True`), so something cleared it: `_handle_tracked_frame`
+  cleared `_help_latched` UNCONDITIONALLY, but during a hold a provisional/partial
+  recovery frame surfaces there with `target_lost` STILL True (FSM `'lost'`) — not
+  a real re-lock. Fix: clear the latch only when `feedback.target_lost` is False
+  (a true re-lock) or on cleanup.
+
+Full chain for "reacquire always on": `f76e6ad` (re-arm FSM on committed swap) +
+`3022719` (latch) + `11fd2b6` (clear-on-true-re-lock).
+
+**Verification — multi-reclaim on the recorded bag.** Replayed
+`track_20260608_205842` with `ros2 bag play --loop` (operator present at start,
+leaves near the end → >45-frame loss/hold, bag loops to frame 0 → operator
+reappears → reclaim). Result over ~180 s (~4 loops): **RECLAIMS (Confirmed ReID)
+= 4, Aborts = 0**, holds entered = 30, sync-stalls = 0, no tracebacks. The goal
+survived every loss and reclaimed the operator on each loop. (The raw bag has
+only one natural loss late in the clip — `--loop` is what manufactures repeated
+loss→reclaim cycles.) Unit: full suite 189 passed / 1 skip; flake8 baseline 534
+unchanged. Deployed to `/home/tinker/tk25_ws/install` via `tkbuild tk26_vision`.
+
+**Operator check still pending on-robot:** live leave/re-enter (no wave) should
+auto-reclaim within ~1 s; repeat several times.
+
+---
+
+## 2026-06-08 (cont.) — always-on passive reacquisition + single-waver reseed fix
+
+Two bench-found fixes (spec: `src/vision_track/docs/specs/2026-06-08-passive-reacq-and-reseed-fix.md`).
+Operator decisions baked in: passive reacquire **always on** even while awaiting
+help; **no thresholds changed** (precision sacred). Systematic debug via two
+parallel investigation agents; both root causes verified against source.
+
+- **Passive reacquire never fired during the hold (`f76e6ad`).** The lock FSM
+  (`core/lock_state_machine.py`) latches terminal `'lost'` after
+  `max_recovery_frames`=45 and `step()` then short-circuits `'lost'` every frame.
+  The gallery re-ID search keeps running the whole hold (gated at
+  `max_frames_lost`=600) and `_confirm_reid_candidate` still commits an id-swap
+  when the operator reappears — but the committed-swap FSM step ran while still
+  `'lost'`, squashing the re-lock to `target_lost=True`. So only a wave→reseed
+  worked (reseed alone called `lock_state_machine.start()`). Fix: re-arm the FSM
+  (`fsm.start(target_track_id)`) on a committed passive swap, mirroring reseed.
+  Operator walking back in now auto-re-locks after the existing 12-frame ReID
+  confirmation. Also fixed a latent bug: FSM `committed_id` was never re-synced
+  after any id-swap. Test: `test_passive_reacq.py`.
+- **Single-waver reseed failed "no camera frame available" (`9910381`).**
+  `_reseed_callback` used the consuming `_get_latest_data()`, which returns the
+  `False` dedup sentinel when the concurrent tracking loop has already claimed the
+  current `frame_seq` (race on the shared `last_processed_seq`). The reseed was
+  rejected despite a cached frame (the bbox/IoU path was fine — IoU ≈ 0.36 > 0.3).
+  Fix: `_get_latest_data(consume=False)` — non-consuming read for off-loop callers
+  (mirrors the idle telemetry tick). Test: `test_get_latest_data_consume.py`.
+
+Implemented via subagent-driven development (one implementer subagent per fix,
+disjoint files; controller did spec+quality review, git, build). Suite **186
+passed / 1 skip** (flake8 baseline 534 unchanged). Deployed to
+`/home/tinker/tk25_ws/install` via `tkbuild tk26_vision`. **Operator check still
+needed on-robot:** (1) lose operator > 2 s then walk back in → auto re-lock within
+~1 s, no wave; (2) lose operator, single wave → auto-reseed re-locks.
+
+---
+
+## 2026-06-08 (cont.) — camera-frame starvation freeze: "stops getting new frames" mid-track
+
+Reported: tracking works, then **at some point stops getting new camera frames**
+(web image frozen, no recovery, had to Ctrl-C). Systematic debug — checked every
+component boundary before any fix:
+
+- **Camera is NOT the cause.** Live `ros2 topic hz`: color **and** depth both
+  steady at 30 Hz; kernel log shows no xHCI death / USB disconnect (unlike the
+  earlier warm-reboot incident); `/dev/shm` 1%. The camera kept publishing — the
+  tracker stopped *consuming*. Subscriber-side root cause.
+- **Root cause (proven from code).** The loop's only frame source is the RGB+depth
+  `ApproximateTimeSynchronizer`; `frame_seq` advances only on a matched pair. When
+  the synchronizer stops emitting pairs, `_get_latest_data()` returns `False` and
+  the loop's False branch **busy-waited forever** — no `tracker.update`, no
+  `_handle_lost_frame` (so forever-hold/wave-to-resume never engaged), no debug
+  publish (frozen dashboard), no log. All prior loss/recovery work lives in the
+  `track_result is None` branch, which a frame-starvation stall never reaches.
+- **Trigger.** Synchronizer stops matching: QoS history `depth=1` + both image
+  subs on the node default mutually-exclusive group → one half of a pair is
+  dropped under executor jitter and pairs stop matching (doesn't self-heal).
+
+Fixes (operator chose both layers + reuse the loss FSM):
+- **Watchdog (`2e6fda6`).** Time-since-last-new-frame: ≥`frame_stall_warn_sec`
+  (0.5 s) warn + keep dashboard alive (`camera_stalled` banner + last frame);
+  ≥`frame_stall_lost_sec` (1.5 s) engage the existing loss/recovery FSM off the
+  last good frame. Pure classifier + handler unit-tested (`test_frame_stall_watchdog.py`).
+- **Synchronizer hardening (`7927066`).** QoS `depth=1→5`; dedicate a
+  `ReentrantCallbackGroup` to the two image streams (concurrent delivery).
+  BEST_EFFORT kept (RELIABLE reader wouldn't match the camera → zero data).
+
+**Build-tree gotcha (cost real time — record for next time).** The live env
+resolves `vision_track` to **`/home/tinker/tk25_ws/install`** (built by
+`tkbuild tk26_vision`, a plain copy with venv shebangs). `scripts/build.sh`
+installs to `src/tk26_vision/install`, which is **NOT on the live
+AMENT_PREFIX_PATH** — building there is a no-op for the running robot. Always
+`tkbuild <sub-ws>` and verify the `install/<pkg>/.../` copy actually changed.
+Confirmed machine truth via `/proc/<camera-pid>/environ`.
+
+Verification: full suite **179 passed / 1 skip** (flake8 baseline 534 unchanged);
+live smoke on the real camera — locked on a person, **177 frames at ~27 Hz, 0
+false stall warnings**, no errors; synthetic end-to-end stall — frames flow → 0
+warnings, frames stop → first warning at exactly **0.5 s**, keeps reporting (not
+silent). **Operator confirmation still needed on-robot:** reproduce the original
+mid-track stall on the bench and confirm the dashboard shows the `camera_stalled`
+banner + auto-recovers when frames resume.
+
+---
+
+## 2026-06-08 (cont.) — loss/recovery UX: frozen dashboard on loss + wave never resumed tracking
+
+Two follow-on fixes after single-person tracking was confirmed robust. Operator
+decisions: hold **truly forever** once help is requested; **auto-reseed on a
+single waver**.
+
+- **Wave never resumed tracking (`bc95702` + `f55e29a`).** Root cause: the
+  NEEDS_ACTIVE_HELP hold coasted only for `active_help_timeout_sec` (20s) then
+  aborted the goal (the lock FSM is already `hard_lost` by ~1.5s), so a
+  wave→ReseedTarget that landed after 20s hit a dead goal. Fix: `active_help_
+  timeout_sec` now defaults to **0 = hold indefinitely** (only a reseed or cancel
+  ends it); centralized in `_is_awaiting_help()`. And `track_web.wave()` now
+  **auto-reseeds when exactly one waver is detected** (multiple stay manual).
+  Tests: `test_active_help_hold.py`, `test_wave_auto_reseed.py`.
+- **Dashboard image froze on loss (`bc95702` + `09dd553`).** Two parts: (a) the
+  indefinite hold keeps the action loop publishing `debug_image` during the loss
+  (it no longer aborts → stops); (b) the `/stream.mjpg` generator now re-emits the
+  last frame on a ~0.5s **heartbeat** so a quiet multipart stream can't latch the
+  browser `<img>` on the last frame.
+
+Dashboard shows `∞ (waving)` for the unbounded hold. Suite 170 passed / 1 skipped;
+tkbuild green. **Operator confirmation still needed on-robot:** lose the person,
+wait >20s, wave → should resume; video should stay live throughout (incl. the
+BT-driven wave→reseed path, which is separate from the dashboard auto-reseed).
+
+## 2026-06-08 — "extremely laggy + loses target" — three stacked first-frame/recovery bugs (systematic debugging, validated via a synthetic camera, no human)
+
+Operator reported the tracker locked then instantly lost a lone person and felt
+"extremely laggy". Worked the four-phase scientific method; ruled out the obvious
+with measurements (camera **30 Hz**, GPU RTX 5070 Ti **idle/8%**, YOLO-seg
+**4 ms**, full `update()` offline **17 ms**). The lag/loss was three stacked
+one-time costs + a registry deadlock, not steady compute:
+
+1. **Registry self-poisoning** (reacquisition permanently blocked). A lone
+   operator returning under a fresh ByteTrack id was registered as its own
+   "other person" distractor, then rejected by `check_distinctiveness` against
+   that self-ghost (`best 0.861, max other 1.000, margin -0.139`) every frame —
+   permanently, since the confirmed-swap that clears the registry is gated behind
+   the very check the ghost breaks. Fix (commit `89907c0`): `register_other_persons`
+   skips a candidate scoring ≥0.72 to the target; `check_distinctiveness` ignores
+   an "other" matching the candidate ≥0.98 (a self-ghost). Guarded by
+   `test/test_registry_self_poison.py`.
+2. **Predictor nulled on lock** (~2 s freeze). `initialize_tracking()`/`reset()`
+   did `self.model.predictor = None` to clear ByteTrack state, which also discards
+   the cuDNN-autotuned graphs → full re-autotune on the next `track()`. Offline
+   `initialize_tracking` 2033 ms → **21 ms** after fix (commit `ca192e8`):
+   `_reset_bytetrack_state()` resets the tracker objects in place, keeping the
+   predictor. `_warmup_model` also now warms the real `track()` path + batched ReID.
+3. **First CUDA call on the action-executor thread** (~0.5 s lock freeze). The
+   `__init__` warmup runs on the main thread; the first YOLO+OSNet calls on the
+   action-server worker thread pay a one-time init that landed in
+   `initialize_tracking()` on the first tracked frame (`track=516 ms`, of which
+   yolo+pipe were only ~27 ms). Fix (commit `5184ca4`): `_run_tracking_loop` warms
+   `track()` + the ReID extractor on the action thread during init-search, before
+   any lock. First tracked frame **516 ms → 47 ms**.
+
+Under load (1)+(2)+(3) compounded: the freeze made the loop fall behind, ByteTrack
+dropped the just-locked id, and (1) then blocked recovery → "locks then instantly
+loses" + "laggy".
+
+### Autonomous validation (no human) — `/tmp/sim_camera.py` + `run_sim_test.sh`
+
+Built a synthetic camera that **republishes the real depth+camera_info** and swaps
+color between a saved person frame and a blank frame on a schedule, remapping the
+tracker to `/sim/*`. Reproducible lock→loss→reacquire with no operator. Result
+after all fixes: **first frame 47 ms, sustained ~27 ms (~30 Hz), 1 spike / 606
+frames, sustains the lock through blank gaps and reacquires.** Also added a
+`perf_logging` arg to `track_web_bench.launch.py` (commit `4507b46`) and a per-phase
+`yolo`/`pipe` split in the tracker `[perf]` line.
+
+### Still open / not changed
+
+- **Reacquisition of a lone operator after a *genuine* loss with appearance
+  drift.** Live, a same-person re-entry scored fused ~0.61 < the 0.72 single-person
+  bar and was rejected. Root contributor was the empty multi-view gallery (tracking
+  never sustained pre-fix, so no views built). With (2)+(3) fixed, tracking sustains
+  and the gallery builds during tracking, so reacquisition reid should be higher
+  naturally — **precision-sacred 0.72 bar left untouched.** A spatial-continuity-
+  gated lower bar (accept ≥~0.55 only when the candidate returns near the last-known
+  location) is the proposed extra-robustness knob if needed; deferred pending an
+  operator decision (precision tradeoff). Cannot be cleanly validated in the static
+  sim (identical frames → novelty gate keeps gallery_len=1; arbitrary loss-capture
+  frames hard-reject at 0.0, which is correct precision, not the 0.61 case).
+- **Bench auxiliary load.** The bench runs `waving_person_server` (MediaPipe +
+  spawns an `rqt_image_view` GUI) by default; lean tracking (without it) measured
+  smooth ~30 Hz. Making waving opt-in on the bench is a candidate de-lag.
+
+## 2026-06-07 — Orbbec publishes rgb8, not bgr8 — tracker ran channel-swapped on-robot; fixed at the decode point (+ idle/init dashboard preview)
+
+The `person_track_node` color path assumed the wire was already `bgr8` ("already
+bgr8 on the wire" comment, now removed). A live probe of the running camera
+disproved that.
+
+### Live probe evidence (2026-06-07)
+
+- The Orbbec color topic publishes `encoding: rgb8`, `step == width*3` (tightly
+  packed, no row padding).
+- Rate is ~30 Hz **only** with the `CAMERA_BRINGUP.md` FastDDS profile
+  (`FASTRTPS_DEFAULT_PROFILES_FILE=config/fastdds_shm.xml`); the bare vendored
+  launch measured ~2 Hz on this workstation.
+
+### Before / after consequence
+
+| Consumer | BEFORE (assumed bgr8, no swap) | AFTER (decode normalizes rgb8→BGR) |
+|---|---|---|
+| Tracker ReID feed | channel-swapped — on-robot ≠ the validated-offline runs | true RGB into the model |
+| Reseed path | swapped crop | correct |
+| Debug overlay / `feedback.rgb_img` | R/B-swapped | true BGR |
+| Gallery thumbs | R/B-swapped | correct |
+| `vision_logging.py` `cv2.imwrite` (lines ~215/289, expects BGR) | silently wrote R/B-swapped jpgs to disk | true BGR — **silent bonus fix** |
+
+The offline LaSOT / ReID benchmarks always fed **true RGB**, so on-robot
+behaviour diverged from what was validated offline. With the fix the on-robot
+tracker feed matches the validated-offline behaviour.
+
+### What landed
+
+- New `core/color_decode.py` `decode_color_msg(msg) -> (bgr|None, reason|None)`:
+  `bgr8` passthrough, `rgb8` channel-swap, padded-step / short-buffer / foreign
+  encodings rejected with a reason. 5 unit tests in `test/test_color_decode.py`.
+  Wired in as the node's single decode point (`_get_latest_data` normalized) so
+  every downstream consumer (tracker, reseed, overlay/feedback, gallery, vision
+  log) gets the right channel order from one place.
+- **Idle/init dashboard preview.** A 10 Hz idle timer publishes an `'idle'`
+  phase `debug_state` (candidates blanked) + the raw camera frame on
+  `~/debug_image` between goals; the goal init-search loop publishes an
+  `'initializing'` phase state + raw frames. The idle read of the frame cache is
+  non-consuming (never advances `last_processed_seq`). The dashboard renders both
+  phases as a neutral `IDLE`/`INITIALIZING` badge and shows the live preview
+  before any goal / during init; the annotated overlay replaces it on lock.
+
+### Flagged follow-up — same-assumption audit (NOT fixed here)
+
+Other nodes subscribing to the raw color topic likely carry the same `bgr8`
+assumption and need the same audit + normalizer:
+
+- `waving_person_server` — MediaPipe pose input + VLM crops
+- `object_detection_new`
+- `object_detection_generalist`
+- `kimi_api` feature crops
+- `follow_head`
+
+Only `vision_track` is fixed in this change.
+
+### To verify next bench session (operator)
+
+Live color correctness is unconfirmed on a real scene — hold a known-red object
+in view and confirm the dashboard / vision_log render it red (not blue).
+
+---
+
+## 2026-06-07 — track_web dashboard + active-reID test bench — shipped at unit+install level, live verification deferred
+
+Browser dashboard for `person_track_server`: live MJPEG of the tracker debug
+frame, WebSocket target/candidate state + scores, re-ID gallery thumbnails, and
+a click-to-reseed human-as-BT loop for validating the Spec B active re-ID path
+without a real behaviour tree.
+
+- Spec: `docs/superpowers/specs/2026-06-07-track-web-dashboard-design.md`
+- Plan: `docs/superpowers/plans/2026-06-07-track-web-dashboard.md`
+
+### What shipped (Tasks 1-7)
+
+- **Gallery thumbs + version** — `ReIDGallery` now carries `version` + `thumbs`
+  so the dashboard can diff and render per-identity crops.
+- **`build_debug_state`** — `core/debug_state.py` snapshots target/candidate
+  state + match scores into the JSON the WebSocket serves.
+- **Tracker score/thumb plumbing** — scores and crop thumbnails threaded through
+  the tracker into the debug state / gallery.
+- **Node publishers** — `~/debug_state`, `~/debug_gallery`, `~/debug_image`,
+  gated by params `debug_state_enabled` / `gallery_keep_crops` /
+  `debug_image_enabled`, **all default OFF** → zero impact on a normal run.
+- **`track_web_app.py`** — FastAPI core (HTTP routes, MJPEG stream, WebSocket
+  fan-out, reseed/waving proxy), pure-Python testable (8 TestClient tests).
+- **`track_web.py`** — ROS bridge node wrapping the app, `track_web` entry point,
+  `webui/` shipped via `data_files`.
+- **`webui/`** — `index.html` / `style.css` / `app.js` (live view, gallery,
+  bench Start/Stop, click-to-reseed, 👋 DetectWaving).
+
+### Verified here
+
+- **tkbuild** `tk26_vision --packages-select vision_track` clean (benign
+  `tests_require` / setuptools warnings only).
+- **Install tree** — `track_web` + `track_web_app` import; `ReIDGallery` exposes
+  `version`/`thumbs`; entry point `install/vision_track/lib/vision_track/track_web`
+  present with venv-python shebang; `webui/{index.html,app.js,style.css}` present
+  in the install share dir (tkbuild copies, not symlinks).
+- **Unit + TestClient** — full suite `151 passed, 4 skipped` (Tasks 1-7 added
+  ~16 tests over the 139 baseline).
+
+### Deferred to a camera/operator session (record results back here)
+
+Everything that needs a live tracker + camera + a person in frame is **not yet
+exercised**:
+
+- Real `~/debug_image` MJPEG + `~/debug_state` WebSocket rendering under a
+  running `person_track_server` (with the three telemetry params on).
+- Click-to-reseed end-to-end (browser click → `~/reseed_target` → tracker
+  re-lock), including the 👋 DetectWaving → click-a-wave-box human-as-BT loop.
+- Observer mode vs a real BT holding the `track_person` goal (dashboard drops to
+  read-only, doesn't fight the consumer for the action).
+
+---
+
+## 2026-06-07 — Active re-ID interface (Spec B) — vision-side capability shipped, active end-to-end deferred to on-robot
+
+Spec B of the active re-ID work on branch `feat/person-tracker-overhaul`. Tasks 1-6
+landed the interfaces + node wiring; this entry (Task 7, docs-only) records what
+shipped on the vision side and what is deferred.
+
+- Spec: `docs/superpowers/specs/2026-06-06-active-reid-interface-design.md`
+- Plan: `docs/superpowers/plans/2026-06-07-active-reid-interface.md`
+
+### Vision-side capability shipped
+
+- **Reacquisition-state feedback signal.** `TrackPerson` action feedback now
+  carries `uint8 reacquisition_state` (`REACQ_TRACKING=0`, `REACQ_PASSIVE=1`,
+  `REACQ_NEEDS_HELP=2`). It is pure hysteresis over `(tracked?, frames_lost)`
+  (`vision_track/core/reacq_state.py`) published from `_handle_tracked_frame`
+  (→ TRACKING) and `_handle_lost_frame` (→ PASSIVE / NEEDS_HELP). Escalation to
+  NEEDS_HELP debounces on `active_help_after_frames` (default **45**,
+  `config/default.yaml`) consecutive lost frames.
+- **Gallery-preserving `ReseedTarget` service.** Registered at `~/reseed_target`
+  (private name → resolves to `/person_track_node/reseed_target` under the
+  default node name; remap-aware). Request: `sensor_msgs/RegionOfInterest bbox`
+  + `string frame_id`. Response: `bool success`, `int32 target_track_id`
+  (`-1` on failure), `string message`. The re-lock (`yolo_tracker._apply_reseed`)
+  **preserves the Spec-A multi-view gallery** — same self-identified operator, so
+  the accumulated appearance is kept and the fresh confirmed view appended (not
+  reset), then ids re-lock, lost counter clears, lock FSM re-arms.
+- **`DetectWaving.waving_boxes` seam.** `DetectWaving.srv` response now has
+  `sensor_msgs/RegionOfInterest[] waving_boxes` 1:1 with the existing
+  `geometry_msgs/PointStamped[] waving_persons`, so the raise-hand detector's
+  image-space box can feed `ReseedTarget` directly.
+- **Precision-safety rationale.** Re-seed is safe because the operator
+  self-identifies (raise-hand), so it cannot lock onto the wrong person the way an
+  automatic re-acquire might — the only way to recover the "hard half" of loss
+  without lowering match thresholds. The BT trades a points penalty for a
+  guaranteed-correct re-lock.
+
+### Out of scope (tk25_decision)
+
+The **BT policy** — when to escalate, how to phrase the call-out, and accepting
+the RoboCup points penalty — lives in `tk25_decision` and is **not** implemented
+here. The consumer contract for that BT author is documented at
+`src/vision_track/docs/active_reid.md` (linked from the package readme).
+
+### Verified now (unit / import level)
+
+- Pure reacq-state hysteresis + gallery-preserving `_apply_reseed` re-lock state
+  logic + interface generation + node/server import-construction with the new
+  wiring: `pytest test/test_reacq_state.py test/test_reseed_target.py test/test_active_reid_interfaces.py`
+  → **10 passed** (`.venv-vision-main`). The interface test asserts the three
+  `REACQ_*` constant values, the `ReseedTarget` request/response shape, and that
+  `DetectWaving.Response` has `waving_boxes`; the reseed test asserts the gallery
+  is preserved (old view kept, fresh view appended; no growth when no fresh
+  feature) and a non-matching bbox fails with `-1`.
+
+### Lifecycle remediation (post-holistic-review, Task 8)
+
+A final whole-feature review caught an integration defect the per-task reviews
+structurally could not: with stock config the tracker **hard-aborted and
+`tracker.reset()` wiped the gallery ~1 frame after `NEEDS_HELP` first appeared**
+(`active_help_after_frames` 45 == `max_recovery_frames` 45; FSM hard-lost at 46 →
+`goal_handle.abort()` → `_cleanup_tracking()` → `target_appearance=None`), so the
+loop could never complete and "gallery-preserving" was defeated. Fixed in commit
+on `feat/person-tracker-overhaul`:
+
+- **Active-help hold.** While `reacquisition_state == NEEDS_HELP`,
+  `_handle_lost_frame` now coasts (publishes feedback every frame, **no
+  abort/reset**) for up to `active_help_timeout_sec` (new param, default
+  **20.0 s**, `config/default.yaml`) so the BT can call `ReseedTarget` with the
+  gallery intact. After the window the action aborts as before;
+  `active_help_timeout_sec: 0.0` disables the hold (legacy fast-abort).
+  **Caveat:** because the two frame knobs are equal, this changes give-up timing
+  for **all** `TrackPerson` callers (not just active-reID) — every loss now coasts
+  up to ~20 s before aborting (was ~1.5–3 s). Documented in `docs/active_reid.md`.
+- **Re-seed is gallery-additive only (user decision: "precision is sacred").**
+  `reseed_target` appends the fresh view to the deep gallery but **does not
+  overwrite the colour/identity anchors** — the re-seed match is IoU-only, so
+  anchor promotion could poison identity on a wrong-overlap box. Tradeoff: under
+  heavy appearance drift the colour reject-floors may re-drop the operator after a
+  re-seed; the deep gallery's max-over-views partially covers it, full drift
+  recovery is a non-goal (repeat call-out is the fallback).
+- **Signal honesty.** Tracked-path `reacquisition_state` now derives from
+  `feedback.target_lost` (not hardcoded TRACKING), so a provisional-recovery coast
+  no longer reports TRACKING while `target_lost=True`.
+- **Minors:** `_reseed_callback` warns (not rejects) on `bbox` `frame_id` mismatch
+  vs the camera frame; `_apply_reseed` clears `is_occluded` / `pre_occlusion_appearance`.
+
+**Known follow-up (deferred):** `PersonRegistry` has no staleness eviction, so a
+long coast in a crowd (now up to ~20 s) grows it and the per-frame recovery cost
+with it — bounded (not a leak), pre-existing, amplified by the longer coast. Add
+stale-temp-ID eviction if arena perf shows it; watch loop `[perf]` during a busy
+coast.
+
+### Deferred to a live operator session (record results back here)
+
+- **Active end-to-end validation** (call-out → operator raises hand →
+  `DetectWaving` → `ReseedTarget` re-lock → `reacquisition_state` returns to
+  TRACKING) needs an operator **plus** the tk25_decision BT **plus** the robot —
+  it is **not** exercisable in this sandbox and is deferred to on-robot
+  acceptance. Capture latency and correct-operator re-lock results here once run.
+
+---
+
+## 2026-06-04 — Person-tracker Phase 3 Task 4 — OPTIONAL TensorRT YOLO export (best-effort, manual)
+
+Phase 3 Task 4 of the person-tracker overhaul on branch `feat/person-tracker-overhaul`.
+The top-end YOLO speedup: a scripted FP16 TensorRT engine export plus a documented
+`.engine` load path. **OPTIONAL and best-effort** — TensorRT engines are
+resolution/batch-locked and hardware-specific, so there is **no hard unit test**;
+the build + throughput verification is a MANUAL operator-in-the-loop step.
+
+- Plan: `docs/superpowers/plans/2026-06-03-person-tracker-phase3-throughput.md` (§Task 4)
+
+### Executed in the dev sandbox (no cameras, no GPU build, `tensorrt` absent)
+
+- `scripts/export_yolo_trt.py` added (standalone CLI, no ROS). `--help` parses + exits 0.
+- Clear-error preflight: with `tensorrt` absent from `.venv-vision-main` (it lives in
+  `.venv-fs`), running the export without `--help` prints an explicit "tensorrt not
+  importable" message and exits 2 — it does **not** attempt an engine build. So in this
+  sandbox the export is a clean no-op-with-explanation, and the `.pt` path is unaffected.
+- `yolo_tracker._load_model` now logs a warning when `model_path` ends in `.engine`
+  (resolution/batch-locked reminder). Import smoke `from vision_track import yolo_tracker`
+  → `OK`. No `.engine` exists ⇒ default `.pt` load path is unchanged and the node/tracker
+  still constructs.
+- Regression: full ptbench **200 passed**; `vision_track` torch-gated + pure suites green
+  (batch/fp16/cache).
+
+### NOT executed here (operator-in-the-loop / hardware required)
+
+- **No TensorRT engine was built or verified.** The sandbox has no GPU, no `tensorrt`,
+  no `.pt` export run. The throughput claim below is the Phase-3 *target*, not a measured
+  number.
+
+### Manual hardware export + verify (run on the deployment box, record results back here)
+
+1. Provision `tensorrt` for the box's CUDA version (Ultralytics pulls a matching build,
+   or install manually). `.venv-vision-main` does NOT ship it.
+2. Export the FP16 imgsz-locked engine:
+   ```
+   cd src/vision_track
+   /home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/python \
+       scripts/export_yolo_trt.py --model yolo11s-seg.pt --imgsz 736
+   ```
+   (Takes minutes; produces `yolo11s-seg.engine` for THIS GPU/TensorRT version only.)
+3. Run the tracker against the engine with a **matching** imgsz:
+   ```
+   ros2 run vision_track person_track_server --ros-args \
+       -p model_path:=/abs/path/yolo11s-seg.engine -p inference_size:=736
+   ```
+   Confirm detections appear (a mismatched `inference_size` silently corrupts output —
+   `_load_model` emits the resolution-locked warning).
+4. Measure `throughput_hz` before (`.pt`) vs after (`.engine`) via the Phase-0
+   `perf_logging_enabled` per-stage timers in a 3–4-person scene. Phase-3 PASS target is
+   ≥12 Hz (WARN ≥8) — batching + cache + fp16 may already clear it without the engine, so
+   the engine is a best-effort extra, not required. **Record the before/after Hz here.**
+
+> Engine re-export is required per deployment box (different GPU / TensorRT version).
+> The `.pt` model is always the default/fallback; the engine is purely additive.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `src/vision_track/scripts/export_yolo_trt.py` | NEW — standalone FP16 TensorRT export CLI with clear-error preflight |
+| `src/vision_track/vision_track/yolo_tracker.py` | `_load_model` warns on `.engine` load (resolution/batch-locked) |
+| `CLAUDE.md` | new `vision_track/person_track_server` Configuration bullet (params + optional engine path) |
+
+---
+
+## 2026-06-04 — Person-tracker Phase 2 (recovery hysteresis + crosser reject + geometry) — build/structure verified, T3/T4 deferred
+
+Phase 2 of the person-tracker overhaul (asymmetric-hysteresis lock FSM, depth-gated
+crosser rejection, torso-band + EMA geometry smoothing) on branch
+`feat/person-tracker-overhaul`. Tasks 1-3 landed the pure modules + node wiring; this
+entry is Task 4 — the build + manual-integration verification step.
+
+- Plan: `docs/superpowers/plans/2026-06-03-person-tracker-phase2-recovery-geometry.md`
+- Spec: `docs/superpowers/specs/2026-06-03-person-tracker-overhaul-design.md` (§7, Phase 2)
+
+### Verified in the dev sandbox (no cameras / no servo / no live colcon)
+
+- `py_compile` clean on all 7 new/edited modules: `core/{lock_state_machine,depth_gate,centroid_smooth,tracking_pipeline,tracking_types}.py`, `yolo_tracker.py`, `person_track_node.py`.
+- Import hygiene: `from vision_track.core.{lock_state_machine,depth_gate,centroid_smooth}` + `LockDecision` import cleanly and **do not pull `rclpy` into `sys.modules`** (the package `__init__` still pulls torch/cv2/ultralytics, as the plan documents — that's expected and not a violation; the constraint is "no `rclpy`/no node import" for the pure suite).
+- Config-install sanity: `setup.py` `find_packages(exclude=['test'])` discovers `vision_track.core`; `glob('config/*.yaml')` installs `config/default.yaml` (Phase-2 params present) to `share/vision_track/config/` — the exact path the plan's T1 step references via `$(ros2 pkg prefix vision_track)/share/...`. Entry point `person_track_server` matches `ros2 run vision_track person_track_server`.
+- `default.yaml` carries the Phase-2 params: `max_recovery_frames: 45`, `provisional_high_bar: 0.72`, `provisional_distinct_margin: 0.10`, `crosser_depth_jump_m: 0.6`, `centroid_ema_alpha: 0.5`, `torso_band_{enabled,lo,hi}`.
+- Node init log strings the T1/T4 manual steps grep for are real: `Person Track Node initialized successfully` (L124), `Max recovery frames: {n}` (L222), abort reason `hard-lost (recovery cap)` (L978); **no** `allow_indefinite_recovery` line is emitted (replaced — see L140 comment).
+- Pure unit suites GREEN: `pytest test/test_lock_state_machine.py test/test_depth_gate.py test/test_centroid_smooth.py` → **30 passed**. Full vision_track functional tests: **89 passed, 1 skipped** (`pytest test/`).
+- ptbench offline harness still GREEN: `pytest benchmarks/person_tracker/tests/` → **200 passed**.
+
+### NOT executed here (operator-in-the-loop / hardware required)
+
+- **Live colcon build** (`./src/tk26_vision/scripts/build.sh --packages-select vision_track`): NOT run — this sandbox cannot run a full-workspace colcon build. py_compile + find_packages/glob sanity above is the feasible proxy; the live build + shebang-points-at-venv check (plan Step 1) is still required on the robot workstation.
+- **T1 startup with the installed params** (plan Step 2) and **T3/T4 staged scenes** (plan Steps 3-5): NOT run — no cameras, no operator. Captured as a repeatable interactive harness instead (below).
+
+### Manual harness authored (repeatable, self-documenting)
+
+New `t4_hardware.sh person_phase2` subcommand (`scripts/tests/t4_hardware.sh`), mirroring
+plan Task 4 Steps 2-5:
+- **T4.6.0** boots the node with the installed `default.yaml`, asserts `Max recovery frames: 45` + the init line + absence of any indefinite-recovery coast line.
+- **T4.6.1** occlusion re-entry: asserts the feedback stream shows a coast (`target_lost:true`) then a re-lock (`target_lost:false`); flags the re-lock-≤1 s and provisional-window behavior as visual.
+- **T4.6.2** crosser: asserts the committed `target_track_id` stayed stable across a bystander crossing nearer to the camera; the green-box-stays-on-operator check is visual + authoritative.
+- **T4.6.3** hard-lost: asserts the action aborts with `hard-lost (recovery cap)` after the recovery bound (no infinite coast).
+- **T4.6.4** lateral accuracy: captures a `/target_points` stream for the operator to compare x/y against a tape-measured offset and eyeball EMA jitter reduction.
+
+**Behavior nuance worth knowing (corrects a slight imprecision in the plan text):** the plan's
+Step 3 says `/target_points` "stays silent through the coast." It does **not** — the node
+publishes a **NaN-coordinate `PointStamped` sentinel** each lost frame
+(`person_track_node.py` ~L967) so consumers see "no target" rather than a stale last-good
+point. The real invariant (and what the harness checks) is **no FINITE point is published
+during the coast**, not topic silence. Operators echoing `/target_points` during occlusion
+will see a stream of `nan` points — that is correct, not a bug.
+
+### Deferred to a live operator session (record results back here)
+
+- Plan Step 1 live build + shebang check.
+- Plan Steps 2-5 via `t4_hardware.sh person_phase2` on the robot with Orbbec + RealSense up (see `CAMERA_BRINGUP.md`) and a moving operator.
+- Plan Step 5 lateral-accuracy numbers (measured offset vs observed `/target_points` x/y, jitter qualitative).
+- Arena-deferred acceptance gates (`reacquire_latency_s` ≤ 1.0, `false_target_rate` ≤ 0.05, `pos_error_lateral_m` ≤ 0.25, no new `wrong_lock_episodes`) require labeled Orbbec arena bags through `t4_hardware.sh follow_regression`; per `person-tracker-benchmark-strategy`, academic ReID/MOT sets are tuning knobs, never gates.
+
+### Lint baseline note (not a Phase-2 regression)
+
+`pytest test/` also runs the ament scaffolding checks `test_flake8` / `test_pep257`, which
+FAIL repo-wide (553 flake8 errors). These are **pre-existing**: the top contributors are
+`reid/reid.py` (157, untouched in Phase 2) and `yolo_tracker.py` (148, only +33 Phase-2
+lines). The **three new pure source modules** (`lock_state_machine.py`, `depth_gate.py`,
+`centroid_smooth.py`) are flake8-clean. The plan's acceptance scopes the "pure suite" to the
+three `test_<name>.py` files, all green; the style scaffolding is out of Phase-2 scope.
+
+---
+
+## 2026-05-27 — `object_match_all` node added
+
+A new service `/object_match_all` answers the dual question to `/object_match`:
+"given the items_map, where is each item in the camera frame?" Concurrent
+batched VLM calls with per-conflict VLM-judge resolution, response shape
+identical to `ObjectDetection.srv` plus the `detection_source` superset
+field.
+
+- Spec: `docs/superpowers/specs/2026-05-27-object-match-all-design.md`
+- Plan: `docs/superpowers/plans/2026-05-27-object-match-all.md`
+- Scripts: `src/tk_vision_specialized/scripts/produce_match_ground_truth.py`
+  + `benchmark_match_batch_size.py` (run before relying on the `batch_size`
+  default).
+
+Open items operator-side:
+- Capture a 10-scene benchmark set and regenerate GT + sweep to pin
+  `batch_size`.
+- T4 hardware pass against `shelf_scene` to compare detection quality with
+  `/object_detection_yolo` on the same scene.
+- Two carried-over follow-ups in match/judge clients (Important per code
+  review): (a) extract the retry loop into `_vlm_common.py` so
+  `max_retries=0` honors zero attempts rather than coercing to 1; (b) port
+  Task 6's lazy `from openai import OpenAI` pattern back into Task 5's
+  `vlm_match_client.py` to eliminate the `OpenAI = None` -> `TypeError`
+  footgun. Both are non-blocking for default-config production use
+  (default `vlm_max_retries=1`, openai installed in venv).
 
 ---
 

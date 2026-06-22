@@ -26,6 +26,18 @@ If a build errors on stale symlinks, `rm -rf build/<pkg> install/<pkg>` and rebu
 
 The wrapper sources `.venv-da3`, runs `colcon build --packages-select monocular_depth` (or the args you pass), then re-shebangs the entry-point script to `.venv-da3/bin/python3`. Don't pass `monocular_depth` to the main `build.sh` — it'll resolve `depth_anything_3` against the wrong venv and the entry-point script will start under `.venv-vision-main`'s python.
 
+**`foundation_stereo` builds under a third venv.** `torch==2.8.0+cu128` +
+`tensorrt==10.16.1.11` conflict with both the shared `.venv-vision-main`
+and `.venv-da3`. Use the dedicated wrapper:
+
+```bash
+./src/tk26_vision/scripts/build_foundation_stereo.sh [colcon args...]
+```
+
+The wrapper sources `.venv-fs/`, runs `colcon build --packages-select
+foundation_stereo` (or the args you pass), then re-shebangs the entry-point
+script. Provisioning the venv once: see `src/foundation_stereo/README.md`.
+
 ## Environment
 
 ### Python deps
@@ -38,6 +50,61 @@ pip install -r src/tk26_vision/src/kimi_api/requirements.txt
 pip install -r src/tk26_vision/src/pan_tilt/requirements.txt
 pip install -r src/tk26_vision/src/vision_track/requirements.txt
 ```
+
+### ReID backbone (torchreid OSNet) — `.venv-vision-main`
+
+`vision_track`'s person ReID deep term is now a genuinely-pretrained **OSNet**
+via `torchreid` (the old ResNet50 "deep" head was an *untrained* random
+projection — the #1 wrong-lock root cause, now deleted). `pip install -r
+src/tk26_vision/src/vision_track/requirements.txt` pulls it in.
+
+- **Additive install, zero version churn.** `torchreid==0.2.5` (PyPI wheel),
+  `gdown==6.1.0`, and `tensorboard==2.20.0` (+ chain) installed into the shared
+  `.venv-vision-main` with **no** numpy/torch downgrade — `numpy` stayed
+  `1.26.4`, `torch` stayed `2.11.0+cu128`. `tensorboard` is a *runtime import*
+  dep of torchreid's `__init__` (it loads the training engine), so it's required
+  even though we only do inference. No `--no-deps` deviation was needed.
+- **Wheel namespacing.** The 0.2.5 wheel puts the API under `torchreid.reid.*`:
+  `build_model` is at `torchreid.reid.models` (also re-exported as the attribute
+  `torchreid.models.build_model`, which is *not* an importable submodule);
+  `load_pretrained_weights` is at `torchreid.reid.utils`. `reid_backbone.py`'s
+  resolvers try both layouts.
+- **Weight strategy (important).** `build_model(pretrained=True)` loads only
+  **imagenet**-init weights — the 0.2.5 wheel embeds no ReID-trained
+  (Market/MSMT) download URLs. Imagenet-OSNet already removes the random-head
+  defect (the real win) but is not ReID-discriminatively trained. The current
+  default (`reid_backbone='osnet_ain_x1_0'`, `reid_weights_path=''`) is therefore
+  **imagenet-init**. **Recommended upgrade:** point the `reid_weights_path` ROS
+  param at a Market/MSMT-trained `osnet_ain_x1_0` checkpoint — it's loaded via
+  `torchreid.reid.utils.load_pretrained_weights` *after* building, overriding the
+  imagenet init (config change only, no code change) for maximal lookalike
+  discrimination.
+- **One-command MSMT17 upgrade (auto-used).** Run `scripts/fetch_reid_weights.sh`
+  to download the validated MSMT17-trained `osnet_ain_x1_0` checkpoint into
+  `~/.cache/torch/checkpoints/` (idempotent — skips if present). On the next
+  tracker start, `reid_backbone.discover_cached_reid_weights('osnet_ain_x1_0')`
+  finds it and loads it automatically over the imagenet init — **no
+  `reid_weights_path` needed**; the node logs which weights it picked
+  (msmt17-cached vs imagenet-init). An explicit non-empty `reid_weights_path`
+  still wins; a missing file falls back to imagenet (no error). Validated on
+  real Tinker crops: same/cross separation 0.47 → 0.57. Without the fetch the
+  tracker stays imagenet-init.
+- **Weight cache.** Pretrained OSNet weights are fetched once via torchreid's
+  gdown mirror and cached under `~/.cache/torch/checkpoints/` (e.g.
+  `osnet_ain_x1_0_imagenet.pth`). Pre-warm on a connected host before offline
+  runs — `drive.google.com` is unreachable from sandboxed CI, so only
+  already-cached variants build offline (`osnet_ain_x1_0` is cached here;
+  `osnet_x0_25` would need a download).
+- **Freeze-lock.** `.venv-vision-main/freeze.lock.txt` (git-ignored, same
+  convention as `.venv-da3/freeze.lock.txt`) is the diff-target for future
+  installs into this venv.
+- **Threshold retune is arena-deferred.** The fusion re-weight
+  (`WEIGHT_REID=0.75` dominates; color demoted to backup) and recalibrated
+  floors (`REID_THRESHOLD=0.55`, `MIN_REID_SIMILARITY_RAW=0.40`, color floors
+  `0.40`) are OSNet **starting points**. The offline Occluded-REID ROC that would
+  finalize them is an informing knob (never a CI gate) and was not reachable in
+  this environment; finalize against arena rosbags per
+  `person-tracker-benchmark-strategy`.
 
 ### Second venv: `.venv-da3` for `monocular_depth`
 
@@ -76,6 +143,7 @@ ros2 run object_detection_generalist generalist_node        # /object_detection_
 # Tracking / shelves
 ros2 run vision_track person_track_server            # action /track_person
 ros2 run tk_vision_specialized spot_on_shelf_server  # action /spot_on_shelf
+ros2 run tk_vision_specialized object_match_all_server   # /object_match_all (concurrent VLM scan over items_map)
 
 # Pan-tilt (servo on /dev/ttyUSB0; see src/pan_tilt/README.md)
 ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
@@ -95,6 +163,11 @@ ros2 run vision_util get_orbbec_pc                   # /get_orbbec_pc — CUDA-d
 
 # DA3-fused PC (separate venv .venv-da3 + dedicated package; see scripts/build_monocular_depth.sh)
 ros2 run monocular_depth monocular_depth_pc          # action /monocular_depth_pc — DA3 + RealSense/Orbbec fusion (numpy<2 isolated venv)
+
+# FoundationStereo (separate venv .venv-fs)
+ros2 launch foundation_stereo foundation_stereo.launch.py
+ros2 launch foundation_stereo foundation_stereo.launch.py \
+    stream_enabled:=true stream_align_to_color:=true
 ```
 
 ## Architecture
@@ -105,11 +178,12 @@ src/tk26_vision/src/
 ├── object_detection_new/          # YOLO-seg: specialist (yolo_seg_node, excludes 'person') + default (yolo_seg_default_node, pretrained COCO)
 ├── object_detection_generalist/   # Pretrained YOLO + YOLO-World (default fallback) or Gemini 2.5 Flash (enable_vlm) + MobileSAM mask, tk26 srv
 ├── vision_track/                  # ByteTrack + ResNet50 ReID (custom) or YOLO BoT-SORT (native)
-├── tk_vision_specialized/         # SpotOnShelf action + waving detector
+├── tk_vision_specialized/         # SpotOnShelf action + waving detector + object_match_server (single-target VLM grounding) + object_match_all_server.py (concurrent VLM matcher across all items_map entries — drop-in for /object_detection_yolo response shape)
 ├── pan_tilt/                      # controller + state_publisher + URDF TF + follow_head (closed-loop absolute targeting in a pan-tilt-rooted frame; feedback-gated settle; sticky ID + EMA)
 ├── kimi_api/                      # OpenRouter LLM services; _env.py centralizes key loading
 ├── vision_util/                   # door_detection (Orbbec 20x20 depth heuristic), get_point_cloud (cached relay), get_orbbec_pc (CUDA-deprojected Orbbec PC, sidesteps SDK colored-PC iGPU bottleneck); shared `_pc_utils.py` reused by monocular_depth
-└── monocular_depth/               # DA3-fused PC action server; lives in its own venv `.venv-da3` (numpy==1.23.4) because `depth_anything_3` requires numpy<2 — isolation prevents cascade-breaking the rest of the vision tree
+├── monocular_depth/               # DA3-fused PC action server; lives in its own venv `.venv-da3` (numpy==1.23.4) because `depth_anything_3` requires numpy<2 — isolation prevents cascade-breaking the rest of the vision tree
+└── foundation_stereo/             # FoundationStereo + Fast-FoundationStereo service/action + streaming depth publisher; lives in its own venv `.venv-fs` (torch 2.8 + cu128 + tensorrt 10.16) because those versions conflict with the shared `.venv-vision-main`. IR1→color alignment goes through `color_align_rs2.RealsenseAligner` (rs.align via software_device) — dense sub-pixel-splatted output. The naive forward-warp lives on as `color_align_legacy.reproject_ir_to_color` for non-RealSense sources; consumers of legacy output must hole-fill (medianBlur/dilate). See `debug_renders/2026-05-25-fs-vs-native-alignment/TRIAGE_FINDINGS.md` for the rationale.
 ```
 
 **Notes:**
@@ -129,11 +203,15 @@ YOLO `.pt` files pre-bundled under `object_detection_new/models/` / `vision_trac
 ## Configuration
 
 Key ROS2 parameters:
-- `object_detection_new`: `service_name`, `model_path`, camera topics, `sort_mode`
+- `object_detection_new`: `service_name`, `model_path`, camera topics, `sort_mode`. FFS depth: `prefer_ffs` (default `true` — try FoundationStereo `get_depth` before native aligned depth on realsense; flip to `false` to use native only), `ffs_service` (default `'/foundation_stereo/get_depth'` — absolute service path from caller's namespace), plus `ffs_wait_for_service_s` / `ffs_call_timeout_s` / `ffs_align_to_color` / `ffs_fallback_log_period_s` (timeouts and throttled-warning period). Config in `src/object_detection_new/config/default.yaml`; same six params mirrored in `src/object_detection_generalist/config/default.yaml`.
+- `vision_track/person_track_server`: `model_path` (default `yolo11m-seg.pt` — upgraded from `s` 2026-06-10 for better/more-frequent masks that feed the ReID bg-neutralization + the mask-fill gallery gate; `m`-seg is 5.5 ms @ imgsz 736 fp16 on the RTX 5070 Ti, ~182 fps, far under the 30 Hz budget — `s`=4.0/`l`=7.0/`x`=9.5 ms, see `scripts/bench_yolo_seg.py`; override to `yolo11s-seg.pt` on weaker/offline GPUs), `inference_size` (imgsz, default `736`), `reid_backbone` (default `osnet_ain_x1_0`) + `reid_weights_path`, `reid_fp16` (default `true` — fp16 ReID forward on CUDA, fp32 fallback on CPU). **Optional TensorRT top-end (best-effort, manual, per-box — NOT required, the `.pt` already clears the budget):** export a FP16 imgsz-locked engine with `python scripts/export_yolo_trt.py --model yolo11m-seg.pt --imgsz 736`, then point `model_path` at the produced `.engine` (`-p model_path:=/abs/yolo11m-seg.engine`) — Ultralytics loads `.engine` transparently, **no code change**. The engine is **resolution/batch-locked + hardware-specific**: `inference_size` MUST match the export `--imgsz`, and the engine must be re-exported on each deployment box (different GPU/TensorRT version). The `.pt` path is the default/fallback; `tensorrt` is NOT in `.venv-vision-main` (lives in `.venv-fs`), so the export script errors clearly and the node keeps using `.pt` when no engine exists. `_load_model` logs a warning when a `.engine` is loaded so an imgsz mismatch is diagnosable. No automated test — verify manually on hardware (see `DEV_NOTES.md`).
 - `pan_tilt/controller`: `device`, startup/feedback timing, limits, invert/trim, default speed/accel
 - `pan_tilt/state_publisher`: `state_topic`, `joint_state_topic`, joint names, stale timeout
 - `pan_tilt/follow_head`: full param surface in `src/pan_tilt/config/pan_tilt.yaml`. Highlights: `yolo_model`, `command_topic`/`state_topic`, `home_pan_deg`/`home_tilt_deg`, `pan_deadband_deg`/`tilt_deadband_deg`, `min_command_change_deg` (chatter suppression), `min_detection_interval_sec` (YOLO cap), `max_settle_timeout_sec` + `steady_{pan,tilt}_eps_deg` + `steady_velocity_eps_deg_per_sec` + `steady_sample_count` (feedback-gated settle), `ema_alpha` + `target_ttl_sec` + `reassoc_dist_m` (smoothing + identity lock), `command_speed_raw_{small,large}` + `small_error_deg` + `command_accel_raw` (motion profile). Defaults are biased for **responsiveness over smoothness** — turn `ema_alpha` down and `steady_*_eps_deg` tighter if you want calmer motion.
 - `kimi_api/*`: `llm_model`, `detection_service`, `log_prompts`
+- `kimi_api/seat_recommend_bbox`: `vlm_strategy` (default `'bbox_select'` — one structured Qwen3-VL call returns a cushion box + occupancy per seat + the chosen empty seat, the 2026-06-02 benchmark winner; set `'point'` for the legacy Gemini-pointing path via `_seat_vlm.request_seat`). `vlm_provider` (default `'qwen'`) + `vlm_fallback_provider` (default `'gemini'`, `''` to disable) define the bbox_select fallback chain; `bbox_model_qwen` (default `'qwen3-vl-plus'`) / `bbox_model_gemini` (default `'google/gemini-2.5-pro'`). `snap_enabled` now defaults to **`false`** — the chosen box already localizes the cushion, so its centre seeds the 5-tier robust-depth resolver directly (re-enable with `-p snap_enabled:=true` for the point path / noisy depth). Keys: bbox_select needs `DASHSCOPE_API_KEY` (or the typo'd `DASHCOPE_API_KEY`) for Qwen + `OPENROUTER_API_KEY` for the Gemini fallback; the point path needs only `OPENROUTER_API_KEY`. A legitimate "no empty seat" from the primary provider does **not** trigger fallback (only errors do). Benchmark + rationale: `src/kimi_api/seat_bench/report.md`.
+- `object_match_all_server`: full param surface in `docs/superpowers/specs/2026-05-27-object-match-all-design.md`. Key knobs: `vlm_provider` (qwen|gemini), `judge_provider` (empty=inherit), `batch_size` (default 3, set from `scripts/benchmark_match_batch_size.py`), `stage1_timeout_s`/`stage2_timeout_s` (15s/10s), `cluster_iou` (0.5), `judge_crop_margin_px` (20).
+- `waving_person_server` (`detect_waving_persons`): VLM fallback augments the MediaPipe waver list when `min_waving_persons` (new `DetectWaving.srv` request field, default `0` = off) exceeds the heuristic's count. `enable_vlm_fallback` (default `true`, global kill-switch), `vlm_provider` (`qwen`) → `vlm_fallback_provider` (`gemini`, `''` disables) errors-only chain; `vlm_model_qwen` (`qwen3-vl-plus`) / `vlm_model_gemini` (`google/gemini-2.5-pro`); `vlm_timeout_s` (20.0), `vlm_max_retries` (3), `vlm_dedup_iou` (0.3). Keys: `DASHSCOPE_API_KEY`/`DASHCOPE_API_KEY` (qwen) or `OPENROUTER_API_KEY` (gemini), resolved via `_waving_vlm.py` (no `kimi_api` import; same decoupled convention as `vlm_match_client.py`). A missing key disables the fallback (no crash). VLM-found wavers reuse an overlapping YOLO mask or box-center robust depth for their 3D centroid (`_waving_geometry.py`), are deduped against MediaPipe wavers, drawn in the debug overlay as `waving (vlm)`, and tagged `waving_person_vlm` in the vision log. Design: `docs/superpowers/specs/2026-06-02-waving-vlm-fallback-design.md`.
 - `monocular_depth/monocular_depth_pc`: `da3_model` (default `depth-anything/DA3-SMALL`, swap to `depth-anything/DA3-BASE` via `-p`), `fill_mode` (`holes_only`|`full_override`, default `holes_only`), `align_min_overlap_pixels` (2000), `align_trim_frac` (0.05), `output_frame_id` (override; default = depth msg frame), `debug_pc_topic` (default `~/debug_points`, SensorDataQoS). The action result is a single 32FC1 depth image at source RGB resolution (pixel-aligned to color); the goal's `stride` field subsamples **only** the debug PointCloud, which is published on `debug_pc_topic` only when `debug_publish=true`. DA3 weights via the `depth_anything_3` library's HuggingFace cache (`~/.cache/huggingface/hub`); `weights_cache.resolve_weights` is **not** used here. The node lives in its own ROS package + venv (`.venv-da3`) because `depth_anything_3` pins `numpy<2`. Build via `tkbuild tk26_vision --packages-select monocular_depth` (or `./scripts/build_monocular_depth.sh`), run via `ros2 run monocular_depth monocular_depth_pc`.
 - `vision_logging_enabled` (default `true` everywhere except `follow_head`, where both the code default and the yaml override default to `false` because the ~30-40 ms synchronous disk IO at 10 Hz detection stalls the action loop) + `vision_log_folder` (default `'vision_log'`) on the bbox/seg/centroid-producing nodes plus the kimi_api VLM services: `yolo_seg_{node,default_node}`, `generalist_node`, `person_track_node`, `waving_person_server`, `follow_head`, `feature_matching`, `feature_recognition` (covers both `feature_extraction_service` and `seat_recommend_service`), `seat_recommend_bbox`. **All vision nodes in one robot session share a single `vision_log/<YYYYmmdd_HHMMSS>/` subdir.** Resolution order on first write: (1) `$TINKER_VISION_SESSION_TS` env var (must match `YYYYmmdd_HHMMSS`) — exported defensively from every `master_*.sh` and `tmux_*.sh` under `src/tk25_basic/src/scripts/`; (2) newest existing `<base>/<YYYYmmdd_HHMMSS>/` subdir by mtime — lets late-spawned standalone nodes join the active session; (3) fresh `strftime` cold-start. Per-call filenames carry the producing node + branch: `<node_name>_<branch>_{orig,overlay,req}_<YYYYmmdd_HHMMSS_mmm>.{jpg,json}` (e.g. `yolo_seg_node_yolo_orig_…jpg`, `feature_recognition_node_feature_extraction_orig_…jpg`). Tracker logs only on lost/reclaim transitions; follow_head logs at its detection tick when re-enabled for debugging; `feature_matching` additionally dumps `…_feature_matching_ref<i>_<ts>.jpg` for each reference image; `feature_recognition.feature_extraction` additionally dumps `…_feature_extraction_crop_<ts>.jpg` of the chosen person; the legacy `visualization=True` debug PNGs (`yolo_seg_node`) now live in the same run_dir as `…_yolo_detection[_all]_<ts>.png`. Pass `-p vision_logging_enabled:=<bool>` to override.
 

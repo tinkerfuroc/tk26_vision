@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>track_web — Tinker person tracker</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>track_web</h1>
+  <span id="conn" class="badge off">connecting…</span>
+  <span id="mode" class="badge off">—</span>
+</header>
+<main>
+  <section id="video-pane">
+    <div id="video-wrap">
+      <img id="video" src="/stream.mjpg" alt="annotated tracker view">
+      <div id="overlays"></div>
+      <div id="stale-banner" class="hidden">NO DATA — tracker silent</div>
+    </div>
+    <div id="controls">
+      <button id="btn-start">▶ Start goal</button>
+      <button id="btn-stop">■ Stop</button>
+      <button id="btn-wave">👋 DetectWaving</button>
+      <button id="btn-record">⏺ Record bag</button>
+      <button id="btn-clear">✕ Clear overlays</button>
+    </div>
+  </section>
+  <aside id="rail">
+    <div class="panel" id="follow-card">
+      <h2>Follow demo</h2>
+      <label><input type="radio" name="follow-mode" value="follow_vision" checked> vision + audio</label>
+      <label><input type="radio" name="follow-mode" value="follow_nav"> with navigation</label>
+      <div class="row">
+        <button id="follow-start">▶ Start follow</button>
+        <button id="follow-stop">■ Stop follow</button>
+      </div>
+      <div id="follow-state" class="follow-state">Follow state: —</div>
+    </div>
+    <div class="panel">
+      <div id="reacq-badge" class="reacq">—</div>
+      <div id="searching" class="searching hidden">
+        <span class="spinner"></span>
+        <span id="searching-text">Searching for target…</span>
+      </div>
+      <table id="state-table">
+        <tr><td>FSM</td><td id="fsm">—</td></tr>
+        <tr><td>target_lost</td><td id="lost">—</td></tr>
+        <tr><td>track id</td><td id="ids">—</td></tr>
+        <tr><td>frames_lost</td><td id="frames">—</td></tr>
+        <tr><td>hold left</td><td id="hold">—</td></tr>
+        <tr><td>best / 2nd sim</td><td id="sims">—</td></tr>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Gallery <span id="gal-meta"></span></h2>
+      <div id="gallery"></div>
+    </div>
+    <div class="panel">
+      <h2>Events</h2>
+      <ul id="log"></ul>
+    </div>
+  </aside>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

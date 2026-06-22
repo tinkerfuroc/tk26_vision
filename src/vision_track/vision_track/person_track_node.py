@@ -15,25 +15,36 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.duration import Duration
 
 import numpy as np
 import cv2
+import math
 import threading
+from threading import Lock
 import time
+import json
+import base64
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
 
 # ROS2 messages
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped, Point
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String, UInt8
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_point
 
 # Action definition
 from tinker_vision_msgs_26.action import TrackPerson
+
+# Service definition (active re-ID / re-seed)
+from tinker_vision_msgs_26.srv import ReseedTarget
+
+# Pan-tilt head-follow messages (optional, default-off feature)
+from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 
 # Message filters for synchronization
 from message_filters import Subscriber, ApproximateTimeSynchronizer
@@ -47,6 +58,79 @@ from vision_track.track_yolo import YOLOTracker, TrackerState, TrackingResult
 # Shared logger
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
+
+from vision_track.core.centroid import reduce_centroid
+from vision_track.core.color_decode import decode_color_msg
+from vision_track.core.depth_roi import roi_window
+from vision_track.core.frame_diag import compute_frame_diag
+from vision_track.core.reacq_state import reacq_state
+from vision_track.core.debug_state import build_debug_state
+from vision_track.core.pan_follow import PanFollower, pan_follow_suppressed
+
+
+# Sentinel for the ~/reacq_state heartbeat when no TrackPerson goal is active.
+# It extends the reacq_state enum (0 TRACKING / 1 PASSIVE / 2 NEEDS_HELP) with a
+# value the live enum never takes, so a navigation-side consumer can tell
+# "tracker idle / shut down" apart from a real "wait, don't abort" period. 255 =
+# UInt8 max, an unambiguous out-of-band byte.
+REACQ_INACTIVE = 255
+
+
+def _target_box_color_kind(track_id, target_result, target_track_id, decision):
+    """Return the color kind for one detection box in the debug overlay.
+
+    Uses the LIVE ByteTrack id (target_track_id) and the FSM state so the
+    decision stays correct after a ReID reacquire, when target_result.track_id
+    (frozen original_track_id) may differ from the live id.
+
+    Returns:
+        'target'      — green, fully locked (live id match + FSM 'tracking')
+        'yolo_target' — yellow, live id matches but not fully committed
+        'other'       — blue, unrelated detection
+    """
+    fsm_tracking = (getattr(decision, 'state', None) == 'tracking')
+    is_target = (
+        target_result is not None
+        and target_track_id is not None
+        and track_id == target_track_id
+        and fsm_tracking
+    )
+    if is_target:
+        return 'target'
+    if track_id == target_track_id:
+        return 'yolo_target'
+    return 'other'
+
+
+def lost_should_abort(*, hard_lost, awaiting_help, time_since_seen,
+                      lost_timeout, active_help_enabled):
+    """True iff the lost goal should abort this frame.
+
+    Pure decision split out of ``_handle_lost_frame`` so the abort policy is
+    unit-testable (see test_needs_help_no_premature_abort.py).
+
+    Policy:
+    - ``time_since_seen > lost_timeout`` is the ABSOLUTE ceiling — always abort,
+      regardless of any active-help state.
+    - While the active-help hold is engaged (``awaiting_help``) the goal coasts:
+      never abort (the caller's _is_awaiting_help early-return normally handles
+      this, but it's folded in here too so the helper is correct standalone).
+    - The FSM recovery-cap (``hard_lost``) aborts ONLY when active help is
+      DISABLED (legacy ``active_help_after_sec <= 0``). With active help ENABLED
+      the recovery-cap must NOT abort — the goal coasts through the passive-
+      recovery window into the indefinite NEEDS_HELP hold (the pre-wall-clock
+      frame-coupled behavior). REGRESSION FIX (commit 1817a48 decoupled the FSM
+      recovery cap, ~1.5 s @ 30 fps, from the now-wall-clock 5 s escalation,
+      opening a [recovery-cap, active_help_after_sec] window where hard_lost
+      fired before the help-latch could shadow it).
+    """
+    if time_since_seen > lost_timeout:
+        return True
+    if awaiting_help:
+        return False
+    if hard_lost and not active_help_enabled:
+        return True
+    return False
 
 
 class PersonTrackNode(Node):
@@ -75,12 +159,137 @@ class PersonTrackNode(Node):
         # Track-state cache for lost/reclaim logging (last successful frame)
         self._last_tracked_rgb = None
         self._last_tracked_detection = None
+        # Last good RGB message, fed to the loss FSM when the camera stalls (no
+        # live frame to hand it). Its header re-stamps the stall feedback/sentinels.
+        self._last_tracked_msg = None
+        # Frame-stall watchdog: throttles stall telemetry to a few Hz so a hard
+        # freeze doesn't spam the log / feedback at loop rate.
+        self._last_stall_tick = 0.0
         self._was_lost = False
+        # Vision-log EVENT throttle (separate from _was_lost, which still drives
+        # latch/ema/help). Tracks the last STATE we wrote an artifact for and
+        # when, so writes fire only on a debounced acquire/lost transition or a
+        # steady-state heartbeat — never per-frame on churny tracked<->lost flips.
+        self._vlog_last_state = None  # 'tracked' | 'lost' | None
+        self._vlog_last_time = 0.0
+        # Active re-ID hold: throttle the "awaiting help" log to once per lost
+        # episode (reset on re-track and on cleanup).
+        self._active_help_logged = False
+        # Latched once we escalate to the help/hold regime; survives the
+        # frames_lost resets a pre-commit re-ID match causes, so the hold isn't
+        # aborted mid-reappearance. Cleared on re-lock + cleanup. See
+        # _is_awaiting_help.
+        self._help_latched = False
+        # Wall-clock anchor for the NEEDS_HELP escalation: the time of the last
+        # CONFIRMED lock (target_lost False). The escalation clock is
+        # time.time()-_last_confirmed_time. Refreshed ONLY on a true re-lock —
+        # NOT on a provisional/coast frame — so it measures real time since the
+        # last confirmed sighting (frame rate is unreliable in a tournament).
+        # Set at tracking start and per goal; placeholder until then.
+        self._last_confirmed_time = 0.0
+
+        # Phase 2: EMA smoother on the published 3D point; reset on loss so a
+        # re-acquired target doesn't lerp from a stale point.
+        from vision_track.core.centroid_smooth import PointEMA
+        self._point_ema = PointEMA(alpha=self.centroid_ema_alpha)
 
         self._vision_logger = VisionLogger(
             self, self.vision_logging_enabled, self.vision_log_folder,
         )
+        # Off-loop vision-log writer: the synchronous disk IO on a lost/reclaim
+        # transition (esp. the first write of a session, which resolves a large
+        # log tree) otherwise stalls the action loop and freezes the dashboard
+        # video the moment the target is lost. Single worker keeps writes ordered
+        # and avoids racing VisionLogger's lazy run_dir init.
+        self._log_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='vlog')
         self.target_point_pub = None
+
+        # track_web dashboard telemetry publishers (param-gated; see
+        # _publish_debug_outputs). Created unconditionally — they cost nothing
+        # until something publishes / subscribes, and the per-frame work is
+        # guarded by the (default-False) debug_* flags.
+        self.debug_state_pub = self.create_publisher(String, '~/debug_state', 10)
+        gallery_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.debug_gallery_pub = self.create_publisher(String, '~/debug_gallery', gallery_qos)
+        self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 1)
+        self._last_gallery_version = -1
+        # One-shot guard so the init-phase "searching" gallery (empty, v0) is
+        # published exactly once per goal — without it the gallery panel either
+        # shows a stale gallery from a previous goal or nothing until first lock.
+        # Reset per goal in _run_tracking_loop so a later goal re-emits it.
+        self._searching_gallery_published = False
+        # Wall-clock anchor (time.time()) for the init "searching" elapsed timer;
+        # set at goal/init start, None between goals. None ⇒ the webui animates
+        # rather than counting.
+        self._search_started_ts = None
+
+        # ~/reacq_state heartbeat: a permanently-on low-rate UInt8 mirror of the
+        # TrackPerson feedback reacquisition enum (0 TRACKING / 1 PASSIVE /
+        # 2 NEEDS_HELP), publishing REACQ_INACTIVE (255) whenever no goal is
+        # active. Plain std_msgs/UInt8 so the navigation follow executive can
+        # consume it without depending on tinker_vision_msgs_26. Unlike the
+        # debug_* publishers this is unconditional (no param gate) — the
+        # consumer needs a continuous liveness signal to tell a "wait, don't
+        # abort" period (PASSIVE/NEEDS_HELP) from tracker shutdown (INACTIVE).
+        self.reacq_state_pub = self.create_publisher(UInt8, '~/reacq_state', 10)
+        # Lock-free on purpose: single plain-int attribute, written from the
+        # action thread and read from the timer thread under
+        # MultiThreadedExecutor. Atomic under the GIL (single-bytecode
+        # load/store, no read-modify-write, no multi-field invariant), so a
+        # lock would add nothing.
+        self._last_reacq_state = REACQ_INACTIVE
+        self.create_timer(0.1, self._publish_reacq_state)
+
+        # --- Pan-tilt head follow (optional; gated by enable_pan_tilt_follow) ---
+        # These attributes are set UNCONDITIONALLY so the tracking loop + tick never
+        # AttributeError when the feature is disabled. Only the PanFollower, the
+        # pub/sub, and the enabled-log live inside the if-guard, so a disabled tracker
+        # creates no servo traffic and is byte-for-byte unchanged.
+        self.enable_pan_tilt_follow = bool(
+            self.get_parameter('enable_pan_tilt_follow').value)
+        self._current_pan_rad = None
+        self._pan_state_lock = Lock()
+        self._pan_tilt_initialized = False
+        self._last_target_u = None
+        self._pan_follower = None
+        self._pan_cmd_pub = None
+        self._fixed_tilt_rad = math.radians(
+            float(self.get_parameter('fixed_tilt_deg').value))
+        self._pan_cmd_speed = int(self.get_parameter('pan_command_speed_raw').value)
+        self._pan_cmd_accel = int(self.get_parameter('pan_command_accel_raw').value)
+        if self.enable_pan_tilt_follow:
+            self._pan_follower = PanFollower(
+                pan_sign=float(self.get_parameter('pan_sign').value),
+                deadband_rad=math.radians(
+                    float(self.get_parameter('pan_deadband_deg').value)),
+                min_change_rad=math.radians(
+                    float(self.get_parameter('pan_min_command_change_deg').value)),
+                min_interval_s=float(
+                    self.get_parameter('pan_min_command_interval_sec').value),
+                ema_alpha=float(self.get_parameter('pan_ema_alpha').value),
+                pan_min_rad=math.radians(float(self.get_parameter('pan_min_deg').value)),
+                pan_max_rad=math.radians(float(self.get_parameter('pan_max_deg').value)),
+            )
+            cmd_topic = self.get_parameter('pan_tilt_command_topic').value
+            state_topic = self.get_parameter('pan_tilt_state_topic').value
+            self._pan_cmd_pub = self.create_publisher(PanTiltCommand, cmd_topic, 1)
+            self.create_subscription(
+                PanTiltState, state_topic, self._pan_state_cb, 10)
+            self.get_logger().info(
+                f'Pan-tilt follow ENABLED: cmd={cmd_topic} state={state_topic} '
+                f'tilt={float(self.get_parameter("fixed_tilt_deg").value)} deg')
+
+        # Idle telemetry: between goals the tracking loop isn't running, so a
+        # light timer keeps the dashboard alive (camera preview + 'idle' state)
+        # when the debug params are on. The tick reads the frame cache WITHOUT
+        # consuming it (never touches last_processed_seq) so it cannot race
+        # the tracking loop.
+        self._idle_last_seq = -1
+        if self.debug_state_enabled or self.debug_image_enabled:
+            self.idle_debug_timer = self.create_timer(0.1, self._idle_debug_tick)
+
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
@@ -117,17 +326,132 @@ class PersonTrackNode(Node):
     def _declare_parameters(self):
         """Declare all ROS2 parameters."""
         # Prefer a stronger default model. If unavailable we will fall back at runtime.
-        self.declare_parameter('model_path', 'yolo11s-seg.pt')
+        # yolo11m-seg: better/more-frequent masks (helps ReID bg-neutralization +
+        # the mask-fill gallery gate) at 5.5 ms @ imgsz 736 fp16 on the RTX 5070 Ti
+        # (~182 fps, far under the 30 Hz budget — see scripts/bench_yolo_seg.py).
+        # Override to yolo11s-seg.pt on weaker GPUs / offline boxes without the
+        # m-seg weight cached, or to a .engine for a TensorRT top-end.
+        self.declare_parameter('model_path', 'yolo11m-seg.pt')
         self.declare_parameter('confidence_threshold', 0.5)
+        # LOW conf fed to model.track so ByteTrack's two-stage (high/low)
+        # association recovery actually runs — kept separate from
+        # confidence_threshold, which still gates detect() / downstream consumers.
+        self.declare_parameter('yolo_track_conf', 0.15)
         self.declare_parameter('enable_reid', True)
         self.declare_parameter('max_frames_lost', 600)  # ~20 seconds at 30fps
-        self.declare_parameter('inference_size', 1280)  # imgsz for YOLO; lower for speed
+        self.declare_parameter('inference_size', 736)  # imgsz for YOLO; lower for speed
         self.declare_parameter('reid_verification_interval', 5)  # periodic on-track ReID sanity check
-        self.declare_parameter('allow_indefinite_recovery', True)  # if True, never abort for long-term loss
-        
-        # ReID mode: 'custom' uses our ResNet50-based ReID, 'native' uses YOLO's BoT-SORT ReID
+        # Phase 2: bound recovery so the tracker eventually declares hard-lost.
+        # Replaces the effectively-infinite allow_indefinite_recovery coast.
+        self.declare_parameter('max_recovery_frames', 45)
+        # Issue 2: reseed confirmation gate. After a reseed (manual dashboard
+        # click OR waving auto-reseed — same ~/reseed_target service path), the
+        # IoU-selected id must be present + ReID-confirmed for this many
+        # consecutive frames before the lock commits (target_lost flips False).
+        # Adds an appearance check on top of the geometric reseed selection.
+        self.declare_parameter('reseed_confirmation_frames', 5)
+        # Issue 3 (Phase 3): pursue look-alikes during passive reacquisition
+        # WITHOUT lowering any commit bar.
+        #  - single_person_pursue_floor: lone-candidate similarity floor to PURSUE
+        #    (keep in play) rather than discard; default reid_threshold (0.55).
+        #  - single_person_commit_bar: lone-candidate similarity bar to COMMIT a
+        #    re-lock; held HIGH (0.72) so a lone look-alike that never clears it is
+        #    pursued (YELLOW) but never locked.
+        #  - provisional_commit_window: N-of-M window M; commit needs
+        #    reid_confirmation_frames (N) confirm hits within the last M frames, so
+        #    dips are tolerated without the strict-consecutive reset.
+        self.declare_parameter('single_person_pursue_floor', 0.55)
+        self.declare_parameter('single_person_commit_bar', 0.72)
+        self.declare_parameter('provisional_commit_window', 18)
+        # Issue 1: precision-bounded escape hatch out of a latched NEEDS_HELP. A
+        # lone returner scoring in the [0.55, 0.72) dead band is pursued every
+        # frame but never a strict hit → stuck in NEEDS_HELP forever. ONLY while
+        # latched in NEEDS_HELP AND exactly one person is visible, relax the lone
+        # commit bar to single_person_commit_bar_help (0.62) and require
+        # needs_help_confirm_frames (N) confirm hits within the last
+        # needs_help_commit_window (M) frames, then commit (clearing the latch).
+        # Outside that gate behavior is byte-for-byte unchanged.
+        self.declare_parameter('single_person_commit_bar_help', 0.62)
+        self.declare_parameter('needs_help_confirm_frames', 12)
+        self.declare_parameter('needs_help_commit_window', 16)
+        # Spec B: WALL-CLOCK seconds lost before the published reacquisition_state
+        # escalates to NEEDS_HELP, so a BT can debounce active (call-out) re-ID.
+        # Wall-clock (not frame-count) because tournament GPU contention makes the
+        # frame rate unreliable — a frame threshold would give an unpredictable
+        # real-time escalation window. Measured from the last CONFIRMED lock.
+        self.declare_parameter('active_help_after_sec', 5.0)
+        # While reacquisition_state==NEEDS_HELP, keep the tracker+gallery alive
+        # (coast, no abort/reset) so the operator can wave and be reseeded.
+        # <=0 (default) holds INDEFINITELY — only a successful reseed or a cancel
+        # ends the hold; a positive value bounds it to that many seconds. Disable
+        # active help entirely with active_help_after_sec<=0 (legacy abort on
+        # hard-lost).
+        self.declare_parameter('active_help_timeout_sec', 0.0)
+        # Frame-starvation watchdog. The loop's only frame source is the
+        # ApproximateTimeSynchronizer (RGB+depth); if it stops emitting matched
+        # pairs (e.g. RGB/depth desync) frame_seq freezes and the loop would
+        # otherwise busy-wait forever — frozen dashboard, no loss handling, no
+        # diagnostics. After warn_sec of no new frame: log + keep the dashboard
+        # alive. After lost_sec: engage the loss/recovery FSM (forever-hold +
+        # wave/reseed). Both must sit well above the camera inter-frame gap
+        # (~33 ms @ 30 Hz) to avoid false positives.
+        self.declare_parameter('frame_stall_warn_sec', 0.5)
+        self.declare_parameter('frame_stall_lost_sec', 1.5)
+        # track_web dashboard telemetry (all default OFF; byte-identical to
+        # legacy behavior with defaults).
+        self.declare_parameter('debug_state_enabled', False)
+        self.declare_parameter('gallery_keep_crops', False)
+        self.declare_parameter('debug_image_enabled', False)
+        # Reacquisition diagnostic (default OFF): while lost/recovering, log ~3 Hz the
+        # best ReID candidate similarity vs the pursue floor / help commit bar + the
+        # N-of-M window, so an operator can see on the live robot WHY a returning
+        # person does or doesn't re-lock (confirms whether the appearance bar is the
+        # wall). Routed through the ROS logger so it shows on the console.
+        self.declare_parameter('reacq_debug_logging', False)
+        self.declare_parameter('provisional_high_bar', 0.72)
+        self.declare_parameter('provisional_distinct_margin', 0.10)
+        # Phase 2: reject candidates whose median depth jumps this much (m)
+        # toward the camera vs the operator's last depth — a geometric crosser.
+        self.declare_parameter('crosser_depth_jump_m', 0.6)
+        # Phase 2: geometry robustness — torso-band sampling + EMA on the point.
+        self.declare_parameter('centroid_ema_alpha', 0.5)
+        self.declare_parameter('torso_band_enabled', True)
+        self.declare_parameter('torso_band_lo', 0.15)
+        self.declare_parameter('torso_band_hi', 0.55)
+
+        # ReID mode: 'custom' uses our OSNet-based ReID, 'native' uses YOLO's BoT-SORT ReID
         self.declare_parameter('reid_mode', 'custom')  # 'custom' or 'native'
-        
+
+        # ReID deep backbone (torchreid OSNet). Default is imagenet-init
+        # osnet_ain_x1_0; 'osnet_x0_25' is the lighter alt. To upgrade to a
+        # Market/MSMT ReID-trained checkpoint, point reid_weights_path at it
+        # (overrides imagenet init — config change only).
+        self.declare_parameter('reid_backbone', 'osnet_ain_x1_0')
+        self.declare_parameter('reid_weights_path', '')
+        # Half-precision ReID forward (CUDA only; silent no-op on CPU). Default
+        # True for throughput in multi-person re-ID scenes — output stays
+        # float32 + L2-normalized so identity gating is unaffected.
+        self.declare_parameter('reid_fp16', True)
+        # Multi-view reacquisition gallery (Phase 3). enabled is the kill-switch
+        # (False restores exact legacy single-anchor scoring); size = K diverse
+        # views kept; novelty_max = max cosine to existing views to admit a new
+        # one; score_mode = 'max' | 'top2_mean' (precision fallback).
+        self.declare_parameter('reid_gallery_enabled', True)
+        self.declare_parameter('reid_gallery_size', 6)
+        self.declare_parameter('reid_gallery_novelty_max', 0.85)
+        self.declare_parameter('reid_gallery_score_mode', 'max')
+        # Issue 3: gate gallery admission on MASK-FILL (mask_pixels / bbox_area),
+        # on BOTH bbox w/h ratio AND mask-fill. The operator is always standing,
+        # so admit only UPRIGHT, well-segmented views; crop_quality_ok ANDs the
+        # checks (reject if either fails).
+        #  - gallery_max_aspect_ratio: max bbox width/height to admit (default
+        #    0.5 — upright is taller-than-wide ~0.4; a square/wide box rejects).
+        #  - gallery_min_mask_fill: min mask-fill to admit (strict <=); None
+        #    coverage (no seg mask that frame) is not rejected on fill, but still
+        #    must pass the aspect gate.
+        self.declare_parameter('gallery_min_mask_fill', 0.35)
+        self.declare_parameter('gallery_max_aspect_ratio', 0.5)
+
         # Orbbec camera topics
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
@@ -142,6 +466,39 @@ class PersonTrackNode(Node):
         # transitions — no per-frame artifacts during steady-state tracking.
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
+        # Vision-log EVENT write throttle. The steady-state heartbeat period
+        # (writes one artifact every interval while tracking OR while lost) and
+        # the churn debounce (minimum gap between writes, so a rapid
+        # tracked<->lost flip-flop can't flood the log).
+        self.declare_parameter('vision_log_interval_s', 5.0)
+        self.declare_parameter('vision_log_min_gap_s', 1.0)
+
+        # Perf/quality instrumentation (default-off; zero overhead in production).
+        self.declare_parameter('perf_logging_enabled', False)
+
+        # --- Pan-tilt head follow (default ON; needs the pan_tilt controller up) ---
+        # When enabled the tracker keeps the locked person horizontally centered by
+        # commanding the head pan servo in ABSOLUTE mode (tilt held at fixed_tilt_deg).
+        # Runs in this ~30 Hz loop, NOT the BT (which ticks too slowly to center a head).
+        # Default ON: when no /pan_tilt_controller/state arrives it just warns
+        # (throttled) and issues no commands, so a setup without the servo is benign.
+        # Set False to disable entirely (e.g. when another node owns the head).
+        self.declare_parameter('enable_pan_tilt_follow', True)
+        self.declare_parameter('pan_tilt_command_topic', '/pan_tilt_controller/cmd')
+        self.declare_parameter('pan_tilt_state_topic', '/pan_tilt_controller/state')
+        self.declare_parameter('fixed_tilt_deg', 37.0)
+        # pan_sign: +1 derived from follow_head (world_pan = cur_pan + atan2(x_cam,z_cam),
+        # +x=right, URDF pan axis "0 0 -1" => positive pan turns right toward a right-side
+        # person). Param only so a different mount can flip it.
+        self.declare_parameter('pan_sign', 1.0)
+        self.declare_parameter('pan_deadband_deg', 3.0)
+        self.declare_parameter('pan_min_command_change_deg', 1.0)
+        self.declare_parameter('pan_min_command_interval_sec', 0.15)
+        self.declare_parameter('pan_ema_alpha', 0.5)
+        self.declare_parameter('pan_min_deg', -90.0)
+        self.declare_parameter('pan_max_deg', 90.0)
+        self.declare_parameter('pan_command_speed_raw', 0)   # 0 -> controller default
+        self.declare_parameter('pan_command_accel_raw', 0)
 
         self.get_logger().info('Parameters declared')
 
@@ -149,13 +506,57 @@ class PersonTrackNode(Node):
         """Load parameters."""
         self.model_path = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence_threshold').value
+        self.yolo_track_conf = self.get_parameter('yolo_track_conf').value
         self.enable_reid = self.get_parameter('enable_reid').value
         self.max_frames_lost = self.get_parameter('max_frames_lost').value
         self.inference_size = self.get_parameter('inference_size').value
         self.reid_verification_interval = self.get_parameter('reid_verification_interval').value
-        self.allow_indefinite_recovery = self.get_parameter('allow_indefinite_recovery').value
+        self.max_recovery_frames = self.get_parameter('max_recovery_frames').value
+        self.reseed_confirmation_frames = int(
+            self.get_parameter('reseed_confirmation_frames').value)
+        # Issue 3 (Phase 3): look-alike pursuit knobs.
+        self.single_person_pursue_floor = float(
+            self.get_parameter('single_person_pursue_floor').value)
+        self.single_person_commit_bar = float(
+            self.get_parameter('single_person_commit_bar').value)
+        self.provisional_commit_window = int(
+            self.get_parameter('provisional_commit_window').value)
+        # Issue 1: relaxed lone-candidate recovery while latched in NEEDS_HELP.
+        self.single_person_commit_bar_help = float(
+            self.get_parameter('single_person_commit_bar_help').value)
+        self.needs_help_confirm_frames = int(
+            self.get_parameter('needs_help_confirm_frames').value)
+        self.needs_help_commit_window = int(
+            self.get_parameter('needs_help_commit_window').value)
+        self.active_help_after_sec = float(self.get_parameter('active_help_after_sec').value)
+        self.active_help_timeout_sec = float(self.get_parameter('active_help_timeout_sec').value)
+        self.frame_stall_warn_sec = float(self.get_parameter('frame_stall_warn_sec').value)
+        self.frame_stall_lost_sec = float(self.get_parameter('frame_stall_lost_sec').value)
+        self.debug_state_enabled = bool(self.get_parameter('debug_state_enabled').value)
+        self.gallery_keep_crops = bool(self.get_parameter('gallery_keep_crops').value)
+        self.debug_image_enabled = bool(self.get_parameter('debug_image_enabled').value)
+        self.reacq_debug_logging = bool(self.get_parameter('reacq_debug_logging').value)
+        self._reacq_diag_last = 0.0
+        self.provisional_high_bar = self.get_parameter('provisional_high_bar').value
+        self.provisional_distinct_margin = self.get_parameter('provisional_distinct_margin').value
+        self.crosser_depth_jump_m = self.get_parameter('crosser_depth_jump_m').value
+        self.centroid_ema_alpha = self.get_parameter('centroid_ema_alpha').value
+        self.torso_band_enabled = self.get_parameter('torso_band_enabled').value
+        self.torso_band_lo = self.get_parameter('torso_band_lo').value
+        self.torso_band_hi = self.get_parameter('torso_band_hi').value
         self.reid_mode = self.get_parameter('reid_mode').value
-        
+        self.reid_backbone = self.get_parameter('reid_backbone').value
+        self.reid_weights_path = self.get_parameter('reid_weights_path').value
+        self.reid_fp16 = self.get_parameter('reid_fp16').value
+        self.reid_gallery_enabled = self.get_parameter('reid_gallery_enabled').value
+        self.reid_gallery_size = self.get_parameter('reid_gallery_size').value
+        self.reid_gallery_novelty_max = self.get_parameter('reid_gallery_novelty_max').value
+        self.reid_gallery_score_mode = self.get_parameter('reid_gallery_score_mode').value
+        # Issue 3: mask-fill gallery-admission gate.
+        self.gallery_min_mask_fill = float(self.get_parameter('gallery_min_mask_fill').value)
+        self.gallery_max_aspect_ratio = float(
+            self.get_parameter('gallery_max_aspect_ratio').value)
+
         self.image_topic = self.get_parameter('image_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
         self.camera_info_topic = self.get_parameter('camera_info_topic').value
@@ -166,13 +567,17 @@ class PersonTrackNode(Node):
 
         self.vision_logging_enabled = self.get_parameter('vision_logging_enabled').value
         self.vision_log_folder = self.get_parameter('vision_log_folder').value
+        self._vlog_interval_s = float(self.get_parameter('vision_log_interval_s').value)
+        self._vlog_min_gap_s = float(self.get_parameter('vision_log_min_gap_s').value)
+
+        self.perf_logging_enabled = self.get_parameter('perf_logging_enabled').value
         
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Enable ReID: {self.enable_reid}')
         self.get_logger().info(f'ReID mode: {self.reid_mode}')
         self.get_logger().info(f'Inference size (imgsz): {self.inference_size}')
         self.get_logger().info(f'ReID verification interval: {self.reid_verification_interval}')
-        self.get_logger().info(f'Allow indefinite recovery: {self.allow_indefinite_recovery}')
+        self.get_logger().info(f'Max recovery frames: {self.max_recovery_frames}')
         self.get_logger().info(f'Tracking rate: {self.tracking_rate} Hz')
 
     def _init_tracker(self):
@@ -182,42 +587,98 @@ class PersonTrackNode(Node):
         try:
             model_file = resolve_weights(self.model_path)
             # Allow loss duration to be governed by time, not fixed frames.
-            # Use whichever is larger: explicit max_frames_lost or rate * lost_timeout.
-            max_frames_allowed = (
-                int(self.tracking_rate * self.lost_timeout)
-                if not self.allow_indefinite_recovery
-                else int(1e12)  # effectively infinite
-            )
-            max_frames_allowed = max(max_frames_allowed, int(self.max_frames_lost))
+            # Coast/ByteTrack frame ceiling: the larger of the configured
+            # max_frames_lost and the FSM's max_recovery_frames. NOTE: this bounds
+            # the LEGACY (active-help-disabled) re-ID coast ONLY — while active
+            # help is enabled (active_help_after_sec > 0) passive re-ID runs
+            # indefinitely (the timer only escalates the advisory NEEDS_HELP
+            # state; see reidentify_target's active_help_enabled gate). The lock
+            # FSM owns hard-lost timing.
+            max_frames_allowed = max(int(self.max_frames_lost), int(self.max_recovery_frames))
             
             if self.reid_mode == 'native':
-                # Use native BoT-SORT ReID from YOLO
-                from vision_track.track_yolo_native import YOLOTrackerNative
-                self.tracker = YOLOTrackerNative(
-                    model_path=str(model_file),
-                    confidence_threshold=self.confidence_threshold,
-                    appearance_thresh=0.25,  # Lower = stricter ReID matching
-                    proximity_thresh=0.5,
-                    track_buffer=60,  # 2 seconds at 30fps
+                raise NotImplementedError(
+                    "reid_mode='native' is not implemented in tk26 — "
+                    "track_yolo_native.YOLOTrackerNative does not exist. "
+                    "Use reid_mode='custom' (the default)."
                 )
-                self.tracker.max_frames_lost = max_frames_allowed
-                self.get_logger().info(f'YOLO Tracker (NATIVE ReID) initialized with model: {model_file}')
             else:
-                # Use custom ResNet50-based ReID (default)
+                # Use custom OSNet-based ReID (default)
                 self.tracker = YOLOTracker(
                     model_path=str(model_file),
                     confidence_threshold=self.confidence_threshold,
                     enable_reid=self.enable_reid,
                     inference_size=self.inference_size,
-                    reid_verification_interval=int(self.reid_verification_interval)
+                    reid_verification_interval=int(self.reid_verification_interval),
+                    reid_backbone=self.reid_backbone,
+                    reid_weights_path=self.reid_weights_path,
+                    reid_fp16=self.reid_fp16,
+                    reid_gallery_enabled=self.reid_gallery_enabled,
+                    reid_gallery_size=int(self.reid_gallery_size),
+                    reid_gallery_novelty_max=float(self.reid_gallery_novelty_max),
+                    reid_gallery_score_mode=self.reid_gallery_score_mode,
+                    keep_gallery_thumbs=self.gallery_keep_crops,
+                    yolo_track_conf=self.yolo_track_conf,
                 )
                 self.tracker.max_frames_lost = max_frames_allowed
+                # Communicate the real loop cadence so loss/buffer timing is
+                # wall-clock-correct (ByteTrack frame_rate is wired through a
+                # project bytetrack.yaml in Phase 1; here we record it on the
+                # tracker for max_frames_lost derivation).
+                self.tracker.frame_rate = float(self.tracking_rate)
+                from vision_track.core.lock_state_machine import LockStateMachine
+                self.tracker.max_recovery_frames = int(self.max_recovery_frames)
+                # Issue 2: reseed probation length (frames the seeded id must be
+                # present + ReID-confirmed before the reseed lock commits).
+                self.tracker.reseed_confirmation_frames = int(self.reseed_confirmation_frames)
+                self.tracker.provisional_high_bar = float(self.provisional_high_bar)
+                self.tracker.provisional_distinct_margin = float(self.provisional_distinct_margin)
+                # Issue 3 (Phase 3): look-alike pursuit floor + held-high commit
+                # bar + N-of-M window. Set on the tracker AND threaded into the FSM
+                # (M) so both the pipeline's _confirm_reid_candidate window and the
+                # FSM provisional streak use the same dip-tolerant window.
+                self.tracker.single_person_pursue_floor = float(self.single_person_pursue_floor)
+                self.tracker.single_person_commit_bar = float(self.single_person_commit_bar)
+                self.tracker.provisional_commit_window = int(self.provisional_commit_window)
+                # Issue 1: relaxed lone-candidate recovery while latched in
+                # NEEDS_HELP. in_needs_help is set per tracking iteration (before
+                # tracker.update) from self._help_latched; these three knobs
+                # define the relaxed bar + N-of-M window used only then.
+                self.tracker.single_person_commit_bar_help = float(
+                    self.single_person_commit_bar_help)
+                self.tracker.needs_help_confirm_frames = int(self.needs_help_confirm_frames)
+                self.tracker.needs_help_commit_window = int(self.needs_help_commit_window)
+                # Passive re-ID liveness. When active help is enabled the
+                # NEEDS_HELP hold is the recovery regime, so re-ID must run
+                # indefinitely (never dead-end on frames_lost > max_frames_lost);
+                # the active-help timer only escalates the advisory state. Disabled
+                # (active_help_after_sec <= 0) restores the legacy frame-capped coast.
+                self.tracker.active_help_enabled = bool(self.active_help_after_sec > 0)
+                self.tracker.lock_state_machine = LockStateMachine(
+                    high_bar=self.tracker.provisional_high_bar,
+                    distinct_margin=self.tracker.provisional_distinct_margin,
+                    commit_frames=self.tracker.reid_confirmation_frames,
+                    max_recovery_frames=self.tracker.max_recovery_frames,
+                    provisional_commit_window=self.tracker.provisional_commit_window,
+                )
+                # Phase 2: crosser-rejection gate threshold (m). The tracker
+                # reads operator_last_depth_m + candidate_depths_m (both plumbed
+                # from the node) and this jump to reject toward-camera crossers.
+                self.tracker.crosser_depth_jump_m = float(self.crosser_depth_jump_m)
+                # Issue 3: mask-fill gallery-admission gate (relaxes the aspect
+                # reject so square-but-clean operator views enrich the gallery).
+                self.tracker.gallery_min_mask_fill = float(self.gallery_min_mask_fill)
+                self.tracker.gallery_max_aspect_ratio = float(self.gallery_max_aspect_ratio)
                 self.get_logger().info(f'YOLO Tracker (CUSTOM ReID) initialized with model: {model_file}')
             
             self.get_logger().info(
                 f"Max frames lost set to {self.tracker.max_frames_lost} "
-                f"(tracking_rate={self.tracking_rate} Hz, lost_timeout={self.lost_timeout}s, "
-                f"param_max_frames_lost={self.max_frames_lost})"
+                f"(param_max_frames_lost={self.max_frames_lost}, "
+                f"max_recovery_frames={self.max_recovery_frames}). "
+                f"active_help_enabled={self.tracker.active_help_enabled} "
+                f"(active_help_after_sec={self.active_help_after_sec}s) — when "
+                f"enabled, passive re-ID runs indefinitely (the cap bounds only "
+                f"the legacy active-help-disabled coast)."
             )
             
         except Exception as e:
@@ -226,17 +687,31 @@ class PersonTrackNode(Node):
 
     def _init_subscribers(self):
         """Initialize camera subscribers with synchronization."""
+        # depth=5 (was 1): a depth-1 history drops a frame whenever the executor
+        # is briefly busy as the next one arrives; if RGB and depth drop
+        # asymmetrically the ApproximateTimeSynchronizer can no longer match
+        # pairs and stalls (the trigger behind the frame-starvation freeze). A
+        # small buffer absorbs that jitter. BEST_EFFORT is kept deliberately —
+        # the camera publishes BEST_EFFORT, and a RELIABLE reader would fail to
+        # match it and receive nothing.
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=5
         )
 
         cb_group = MutuallyExclusiveCallbackGroup()
+        # Dedicated reentrant group for the two synchronized image streams so RGB
+        # and depth can be DELIVERED concurrently by the MultiThreadedExecutor.
+        # On the node default (mutually-exclusive) group they serialize, widening
+        # the window in which a history overwrite drops one half of a pair.
+        sync_group = ReentrantCallbackGroup()
 
         # Synchronized RGB and depth subscribers
-        image_sub = Subscriber(self, Image, self.image_topic, qos_profile=qos_profile)
-        depth_sub = Subscriber(self, Image, self.depth_topic, qos_profile=qos_profile)
+        image_sub = Subscriber(self, Image, self.image_topic,
+                               qos_profile=qos_profile, callback_group=sync_group)
+        depth_sub = Subscriber(self, Image, self.depth_topic,
+                               qos_profile=qos_profile, callback_group=sync_group)
         
         sync = ApproximateTimeSynchronizer(
             [image_sub, depth_sub],
@@ -272,6 +747,70 @@ class PersonTrackNode(Node):
         )
         self.get_logger().info('Action server created: track_person')
 
+        # Active re-ID: re-lock the tracker on an externally-confirmed bbox
+        # (e.g. raise-hand operator) without wiping the multi-view gallery.
+        self.reseed_srv = self.create_service(
+            ReseedTarget, '~/reseed_target', self._reseed_callback,
+            callback_group=ReentrantCallbackGroup())
+        self.get_logger().info('Service created: ~/reseed_target')
+
+    def _reseed_callback(self, request, response):
+        """Re-lock the tracker on request.bbox, preserving the gallery.
+
+        Runs under lock_tracker (serialized with the tracking loop's
+        tracker.update). Uses the latest cached color frame to match the bbox.
+        """
+        roi = request.bbox
+        bbox = (int(roi.x_offset), int(roi.y_offset),
+                int(roi.x_offset + roi.width), int(roi.y_offset + roi.height))
+        self.get_logger().info(
+            f'Reseed requested: bbox={bbox} frame_id={request.frame_id!r}')
+        # Non-consuming read (consume=False): the reseed runs off the tracking
+        # loop and must NOT race it on the frame-seq token. The loop consumes
+        # nearly every frame via the shared last_processed_seq, so a consuming
+        # read here would almost always hit the dedup and return False even though
+        # a frame is cached — wrongly rejecting the reseed. With consume=False,
+        # _get_latest_data returns the latest cached frame regardless of seq and
+        # never returns False; it still returns None (no msg / no intrinsic /
+        # decode fail). A success is a 4-tuple (always truthy), so `not data`
+        # covers only the None sentinel now.
+        data = self._get_latest_data(consume=False)
+        if not data:
+            self.get_logger().warn('Reseed failed: no camera frame available')
+            response.success = False
+            response.target_track_id = -1
+            response.message = 'no camera frame available'
+            return response
+        rgb_img = data[0]
+        rgb_msg = data[1]
+        if request.frame_id and request.frame_id != rgb_msg.header.frame_id:
+            self.get_logger().warn(
+                f'Reseed bbox frame_id {request.frame_id!r} != camera frame '
+                f'{rgb_msg.header.frame_id!r}; matching against the camera frame anyway')
+        # Mirror the live tracking loop: it feeds the tracker a BGR->RGB frame
+        # (see _run_tracking_loop). reseed_target must get the SAME convention
+        # or detection/ReID degrades. Do NOT pass the raw bgr8 buffer here.
+        rgb_frame = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+        # A raising service callback propagates out of the MultiThreadedExecutor
+        # and crashes the node; the YOLO/ReID work inside reseed_target can throw
+        # on a bad frame / CUDA OOM, so guard it (mirrors _execute_callback).
+        try:
+            with self.lock_tracker:
+                tid = self.tracker.reseed_target(rgb_frame, bbox, target_class='person')
+        except Exception as exc:  # service must never crash the node
+            self.get_logger().error(f'Reseed errored: {exc}')
+            response.success = False
+            response.target_track_id = -1
+            response.message = f'reseed error: {exc}'
+            return response
+        response.success = tid >= 0
+        response.target_track_id = int(tid)
+        response.message = 'reseeded' if tid >= 0 else 'no detection matched bbox'
+        self.get_logger().info(
+            f'Reseed result: success={response.success} '
+            f'track_id={response.target_track_id} ({response.message})')
+        return response
+
     def _camera_info_callback(self, msg: CameraInfo):
         """Store camera intrinsic parameters."""
         with self.lock_info:
@@ -287,7 +826,7 @@ class PersonTrackNode(Node):
             self.recent_msg_time = self.get_clock().now()
             self.frame_seq += 1
 
-    def _depth_image_to_points(self, depth_msg: Image, intrinsic: CameraInfo) -> tuple:
+    def _depth_image_to_points(self, depth_msg: Image, intrinsic: CameraInfo, bbox: tuple = None) -> tuple:
         """
         Unproject a registered depth image (encoding 16UC1, mm) to per-pixel XYZ.
 
@@ -307,6 +846,14 @@ class PersonTrackNode(Node):
 
         valid_mask = (depth > self.min_depth) & (depth < self.max_depth)
 
+        # Only the target bbox is ever sampled by _calculate_centroid, so
+        # restrict the unproject to a padded window around it. Pixels outside
+        # the window stay zeroed and invalid.
+        x0, y0, x1, y1 = roi_window(bbox, w=w, h=h, pad=16)
+        valid_roi = np.zeros_like(valid_mask)
+        valid_roi[y0:y1, x0:x1] = valid_mask[y0:y1, x0:x1]
+        valid_mask = valid_roi
+
         # Cache meshgrid across calls at this resolution.
         cache = getattr(self, '_uv_cache', None)
         if cache is None or cache[0] != (h, w):
@@ -314,10 +861,13 @@ class PersonTrackNode(Node):
             self._uv_cache = ((h, w), u, v)
         _, u, v = self._uv_cache
 
-        z = depth
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-        points = np.stack([x, y, z], axis=-1)
+        points = np.zeros((h, w, 3), dtype=np.float32)
+        z_roi = depth[y0:y1, x0:x1]
+        u_roi = u[y0:y1, x0:x1]
+        v_roi = v[y0:y1, x0:x1]
+        points[y0:y1, x0:x1, 0] = (u_roi - cx) * z_roi / fx
+        points[y0:y1, x0:x1, 1] = (v_roi - cy) * z_roi / fy
+        points[y0:y1, x0:x1, 2] = z_roi
 
         return points, valid_mask
 
@@ -349,7 +899,18 @@ class PersonTrackNode(Node):
         
         if x2 <= x1 or y2 <= y1:
             return None
-        
+
+        # Phase 2: restrict to the chest band BEFORE the Phase-0 robust reduction
+        # so swinging arms/legs/head don't pull the centroid. Layers on top of the
+        # robust median-x/y + z-outlier reduction below — does not replace it.
+        from vision_track.core.centroid_smooth import torso_band_mask
+        if self.torso_band_enabled:
+            yb1, yb2 = torso_band_mask((x1, y1, x2, y2),
+                                       lo=self.torso_band_lo, hi=self.torso_band_hi)
+            y1, y2 = yb1, yb2
+            if y2 <= y1:
+                return None
+
         # Extract region of interest
         roi_points = points[y1:y2, x1:x2]
         roi_valid = valid_mask[y1:y2, x1:x2]
@@ -375,69 +936,70 @@ class PersonTrackNode(Node):
         if len(obj_pts.shape) != 2 or obj_pts.shape[0] == 0:
             return None
         
-        # Calculate centroid (mean for x/y, median for depth)
-        centroid_3d = np.mean(obj_pts, axis=0)
-        centroid_3d[2] = np.median(obj_pts[:, 2])  # Use median for depth (more robust)
-        
+        # Robust reduction shared with ptbench geometry: median lateral x/y +
+        # z-outlier-rejected median z (vision_track.core.centroid.reduce_centroid).
+        cx_m, cy_m, cz_m = reduce_centroid(obj_pts)
+
         # Create Point message (Orbbec frame convention)
         point = Point()
-        point.x = float(centroid_3d[0])
-        point.y = float(centroid_3d[1])
-        point.z = float(centroid_3d[2])
-        
+        point.x = cx_m
+        point.y = cy_m
+        point.z = cz_m
+
         return point
 
     def _draw_debug_info(
-        self, 
-        rgb_img: np.ndarray, 
+        self,
+        rgb_img: np.ndarray,
         all_results: list,
         target_result: 'TrackingResult',
         target_track_id: int
     ) -> np.ndarray:
         """
         Draw debug visualization on the RGB image.
-        
+
         Args:
             rgb_img: BGR image to draw on
             all_results: All tracking results from YOLO
             target_result: The target tracking result (or None)
             target_track_id: The current target YOLO track ID
-            
+
         Returns:
             Annotated BGR image
         """
         debug_img = rgb_img.copy()
-        
+        decision = getattr(self.tracker, 'last_lock_decision', None)
+
         # Draw all detected persons
         for result in all_results:
             if result.class_id != 0:  # Skip non-person
                 continue
-                
+
             x1, y1, x2, y2 = result.bbox
             track_id = result.track_id
-            
-            # Determine color based on whether this is the target
-            is_target = (target_result is not None and track_id == target_result.track_id)
-            is_yolo_target = (track_id == target_track_id)
-            
-            if is_target:
-                color = (0, 255, 0)  # Green for tracked target
+
+            # Determine color using live id + FSM state (fixes stuck-yellow after reacquire)
+            color_kind = _target_box_color_kind(
+                track_id, target_result, target_track_id, decision)
+
+            if color_kind == 'target':
+                color = (0, 255, 0)    # Green for locked target
                 thickness = 3
-            elif is_yolo_target:
-                color = (0, 255, 255)  # Yellow for YOLO target ID (but not matched)
+            elif color_kind == 'yolo_target':
+                color = (0, 255, 255)  # Yellow for YOLO id match, not fully committed
                 thickness = 2
             else:
-                color = (255, 0, 0)  # Blue for other detections
+                color = (255, 0, 0)    # Blue for other detections
                 thickness = 1
-            
+
             # Draw bounding box
             cv2.rectangle(debug_img, (x1, y1), (x2, y2), color, thickness)
-            
+
             # Draw track ID label
             label = f"ID:{track_id}"
-            if is_target:
+            if color_kind == 'target':
                 label += " (TARGET)"
-            elif is_yolo_target:
+            elif color_kind == 'yolo_target':
                 label += " (YOLO_TARGET)"
             
             # Add confidence
@@ -535,12 +1097,49 @@ class PersonTrackNode(Node):
     def _run_tracking_loop(self, goal_handle, feedback, result, params):
         last_seen_time = time.time()
         init_start_time = time.time()
+        # Wall-time of the last *new* synchronized frame; drives the
+        # frame-starvation watchdog (the `data is False` branch below).
+        last_frame_time = time.time()
         initialized = False
-        rate_period = 1.0 / self.tracking_rate
+
+        # Per-goal init/search liveness anchors (Fix A/B/C): re-arm the one-shot
+        # "searching" gallery, anchor the elapsed-search timer to goal start.
+        self._search_started_ts = init_start_time
+        self._searching_gallery_published = False
+
+        # Close the warmup blackout: goal-accept stops the idle telemetry timer
+        # (tracking_active=True), and the CUDA warmup below holds lock_tracker for
+        # a short window before the first loop iteration — so without this the
+        # dashboard sees neither 'idle' nor 'initializing' state and shows the
+        # NO-DATA stale banner. Publish the 'initializing' phase (and the empty
+        # "searching" gallery) ONCE up front so the panels reflect goal-accept
+        # within ~1 s. _publish_phase_debug_state reads only getattr-guarded
+        # snapshot fields, so it's safe to call without holding lock_tracker.
+        self._publish_phase_debug_state('initializing')
+        self._publish_searching_gallery()
+
+        # Warm CUDA on THIS executor thread before the lock loop. The __init__
+        # warmup ran on the main thread; the first cuDNN call on an action-worker
+        # thread pays a ~0.5s one-time init that would otherwise land on the first
+        # tracked frame — a freeze right at lock that, under load, drops the
+        # just-acquired target into a false loss. Paid here (during init search,
+        # before any lock) it is invisible. ByteTrack state is reset after.
+        try:
+            with self.lock_tracker:
+                tk = self.tracker
+                dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
+                tk.track(dummy, persist=True)            # warm YOLO on this thread
+                tk._reset_bytetrack_state()
+                ext = getattr(tk, 'appearance_extractor', None)
+                if ext is not None:                      # warm OSNet ReID too
+                    ext.extract_features(dummy, (0, 0, 100, 100), None)
+                    batch = getattr(ext, 'extract_features_batch', None)
+                    if batch is not None:
+                        batch(dummy, [(0, 0, 100, 100)], [None], [0])
+        except Exception as warm_exc:  # never block tracking on a warmup hiccup
+            self.get_logger().debug(f'action-thread warmup skipped: {warm_exc}')
 
         while rclpy.ok():
-            loop_start = time.time()
-
             if self._handle_cancel(goal_handle, result):
                 return result
 
@@ -549,21 +1148,65 @@ class PersonTrackNode(Node):
                 time.sleep(0.01)
                 continue
             if data is False:
+                # No new synchronized pair. Normally this is just the sub-frame
+                # gap at camera rate; but if it persists, the synchronizer has
+                # stalled — run the watchdog (rate-limited) instead of silently
+                # busy-waiting forever with a frozen dashboard and no recovery.
+                now = time.time()
+                if (now - last_frame_time >= self.frame_stall_warn_sec
+                        and now - self._last_stall_tick >= 0.2):
+                    self._last_stall_tick = now
+                    if self._handle_frame_stall(
+                            now - last_frame_time, last_seen_time,
+                            feedback, goal_handle, params, result):
+                        return result
                 time.sleep(0.005)
                 continue
 
             rgb_img, rgb_msg, depth_msg, intrinsic = data
+            last_frame_time = time.time()
             rgb_frame = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
 
+            loop_start = time.time()
+            t_track0 = time.perf_counter()
             with self.lock_tracker:
                 if not initialized:
                     initialized = self._try_initialize(rgb_frame, init_start_time, goal_handle, result)
                     if not initialized:
+                        # Dashboard UX: without this the track_web stale banner
+                        # ("NO DATA") shows for the whole init search right
+                        # after the operator presses Start.
+                        self._publish_phase_debug_state('initializing')
+                        # One-shot empty "searching" gallery (no-op after the
+                        # pre-warmup emit) so the gallery panel shows "0 views"
+                        # during the whole search even if a subscriber connects
+                        # only after the up-front publish.
+                        self._publish_searching_gallery()
+                        self._publish_raw_debug_image(rgb_img)
                         time.sleep(0.1)
                         continue
                     last_seen_time = time.time()
+                    # Tracking just started (init succeeded): anchor the
+                    # wall-clock escalation here. Refreshed only on a true
+                    # re-lock thereafter (never on a provisional coast).
+                    self._last_confirmed_time = time.time()
+                # Phase 2: median depth per visible person bbox (from the last
+                # frame's results against the current depth) so the pipeline's
+                # crosser gate can reject toward-camera candidates this frame.
+                if self.tracker.last_results and depth_msg is not None:
+                    self._refresh_candidate_depths(depth_msg)
+                # Issue 1: expose the (stable) NEEDS_HELP latch to the tracker
+                # BEFORE update() so _confirm_reid_candidate can take the relaxed
+                # lone-candidate recovery path this frame. The latch is set/cleared
+                # in the lost/reclaim handlers, so it's well-defined here.
+                self.tracker.in_needs_help = bool(self._help_latched)
+                # Reset the pan-follow bbox each iteration so a lost frame leaves it
+                # None (HOLD/RECENTER); _handle_tracked_frame repopulates it on a lock.
+                self._last_target_u = None
                 track_result = self.tracker.update(rgb_frame)
+            t_track = time.perf_counter() - t_track0
 
+            t_post0 = time.perf_counter()
             if track_result is not None:
                 last_seen_time = time.time()
                 self._handle_tracked_frame(
@@ -572,10 +1215,30 @@ class PersonTrackNode(Node):
             else:
                 if self._handle_lost_frame(last_seen_time, rgb_img, rgb_msg, feedback, goal_handle, params, result):
                     return result
+            self._publish_debug_outputs(rgb_img, track_result, feedback, last_seen_time)
+            # Pan-tilt head follow (no-op unless enable_pan_tilt_follow). Reads the
+            # bbox center-x set above (CENTER); no bbox -> HOLD (incl. NEEDS_HELP).
+            self._pan_follow_tick()
+            # Reacquisition diagnostic (no-op unless reacq_debug_logging). Logs why a
+            # returning person does/doesn't re-lock while lost/recovering.
+            if self.reacq_debug_logging and (
+                    track_result is None or int(self._last_reacq_state) != 0):
+                self._log_reacq_diag(track_result)
+            t_post = time.perf_counter() - t_post0
 
-            elapsed = time.time() - loop_start
-            if elapsed < rate_period:
-                time.sleep(rate_period - elapsed)
+            if self.perf_logging_enabled:
+                tk = self.tracker
+                self.get_logger().info(
+                    f"[perf] track={t_track*1000:.1f}ms "
+                    f"(yolo={getattr(tk, '_t_yolo_ms', 0.0):.1f} "
+                    f"pipe={getattr(tk, '_t_pipeline_ms', 0.0):.1f}) "
+                    f"post={t_post*1000:.1f}ms "
+                    f"loop={(time.time()-loop_start)*1000:.1f}ms"
+                )
+
+            # No artificial Hz cap: frame-seq dedup in _get_latest_data gates the
+            # loop to the camera rate. A 1 ms yield keeps the GIL fair.
+            time.sleep(0.001)
 
         if goal_handle.is_active and not goal_handle.is_cancel_requested:
             result.status = 0
@@ -592,35 +1255,82 @@ class PersonTrackNode(Node):
         result.message = 'Tracking canceled by request'
         return True
 
-    def _get_latest_data(self):
+    def _get_latest_data(self, consume: bool = True):
+        """Fetch the latest decoded color frame + depth/intrinsic bundle.
+
+        Returns (rgb_img, rgb_msg, depth_msg, intrinsic) on success, or a falsy
+        sentinel: None (no msg yet / no intrinsic / color decode failure) or, when
+        ``consume`` is True, False (frame-seq dedup — nothing new since the last
+        consume).
+
+        With ``consume=True`` (the tracking loop) the call performs the frame-seq
+        dedup check and advances ``last_processed_seq``, gating the loop to the
+        camera rate.
+
+        With ``consume=False`` it returns the latest cached frame WITHOUT the
+        frame-seq dedup and WITHOUT advancing ``last_processed_seq`` — so off-loop
+        callers (the reseed service) never race the tracking loop's seq token, and
+        it NEVER returns False. This mirrors the idle telemetry tick's
+        non-consuming read.
+        """
         with self.lock_msg:
             if self.recent_sync_msg is None:
                 return None
             current_seq = self.frame_seq
-            if current_seq == self.last_processed_seq:
-                return False
+            if consume:
+                if current_seq == self.last_processed_seq:
+                    return False
+                self.last_processed_seq = current_seq
             rgb_msg, depth_msg = self.recent_sync_msg
-            self.last_processed_seq = current_seq
 
         with self.lock_info:
             intrinsic = self.camera_intrinsic
         if intrinsic is None:
             return None
 
-        try:
-            # Avoid CvBridge's extra copy; image is already bgr8 on the wire.
-            rgb_img = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
-                rgb_msg.height, rgb_msg.width, 3
-            )
-        except Exception as e:
-            self.get_logger().warn(f'Failed to convert RGB image: {e}')
+        # Normalize the wire format (Orbbec = rgb8, others = bgr8) to BGR once,
+        # here — every downstream consumer (tracker feed via BGR2RGB, debug
+        # draw/publish, vision logger) assumes BGR. Zero-copy for bgr8 (the
+        # returned view is read-only; all writers copy first).
+        rgb_img, err = decode_color_msg(rgb_msg)
+        if rgb_img is None:
+            self.get_logger().warn(f'color frame dropped: {err}',
+                                   throttle_duration_sec=5.0)
             return None
 
         return rgb_img, rgb_msg, depth_msg, intrinsic
 
+    def _refresh_candidate_depths(self, depth_msg):
+        """Median-depth per visible person bbox, for the crosser gate.
+
+        Reads the previous frame's person results and writes the
+        track_id -> median-depth (m) map onto the tracker so the pure depth gate
+        in the pipeline can reject toward-camera crossers. The node is the sole
+        owner of the depth image; the tracker never touches ROS.
+        """
+        from vision_track.core.depth_gate import roi_median_depth
+        h, w = depth_msg.height, depth_msg.width
+        depth = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(h, w)
+        depths = {}
+        for r in self.tracker.last_results:
+            if r.class_id != 0 or r.track_id < 0:
+                continue
+            m = roi_median_depth(depth, r.bbox, self.min_depth, self.max_depth)
+            if m is not None:
+                depths[r.track_id] = m
+        self.tracker.candidate_depths_m = depths
+
     def _try_initialize(self, rgb_frame, init_start_time, goal_handle, result) -> bool:
         success = self.tracker.initialize_tracking(rgb_frame, target_class='person')
         if success:
+            # Phase 2: arm the lock FSM on the freshly committed id. Without
+            # this the FSM stays in 'lost' and step() short-circuits, so no
+            # recovery decision (provisional/commit/hard-lost) is ever made.
+            if (
+                getattr(self.tracker, 'lock_state_machine', None) is not None
+                and self.tracker.original_track_id is not None
+            ):
+                self.tracker.lock_state_machine.start(self.tracker.original_track_id)
             self.get_logger().info(f'Tracking initialized on person (ID: {self.tracker.original_track_id})')
             return True
 
@@ -642,8 +1352,13 @@ class PersonTrackNode(Node):
         goal_handle,
         params,
     ):
+        # Pan-tilt head follow: record the bbox center-x (u) so _pan_follow_tick can
+        # CENTER the head on the locked person this iteration (bbox is x1,y1,x2,y2).
+        if track_result.bbox is not None:
+            self._last_target_u = 0.5 * (float(track_result.bbox[0]) + float(track_result.bbox[2]))
+
         try:
-            points, valid_mask = self._depth_image_to_points(depth_msg, intrinsic)
+            points, valid_mask = self._depth_image_to_points(depth_msg, intrinsic, bbox=track_result.bbox)
         except Exception as e:
             self.get_logger().warn(f'Failed to process pointcloud: {e}')
             points, valid_mask = None, None
@@ -652,7 +1367,57 @@ class PersonTrackNode(Node):
         if points is not None:
             position = self._calculate_centroid(points, track_result.mask, valid_mask, track_result.bbox)
 
-        feedback.target_lost = False
+        # Phase 2: EMA-smooth the published 3D point. First sample (or first after
+        # a loss reset) passes through; later frames blend. Applied before the
+        # depth plumb / feedback so consumers and the crosser gate see the
+        # smoothed point.
+        if position is not None:
+            sx, sy, sz = self._point_ema.update((position.x, position.y, position.z))
+            position.x, position.y, position.z = float(sx), float(sy), float(sz)
+
+        # Phase 2: plumb the operator's last known depth (m) into the tracker so
+        # the crosser depth gate can reject toward-camera candidates next frame.
+        # z is the optical-frame forward axis (depth). Only the node owns depth;
+        # use the smoothed z so the gate sees the same point consumers do.
+        if position is not None:
+            self.tracker.operator_last_depth_m = float(position.z)
+
+        if self.perf_logging_enabled and points is not None:
+            diag = compute_frame_diag(points, track_result.mask, valid_mask, track_result.bbox)
+            self.get_logger().info(
+                f"[diag] mask_px={diag['mask_pixel_count']} "
+                f"valid_px={diag['valid_pixel_count']} used_mask={diag['used_mask']} "
+                f"z_iqr={diag['depth_z_iqr']:.3f} "
+                f"mask_c={diag['mask_centroid']} bbox_c={diag['bbox_centroid']} "
+                f"no_centroid={diag['no_centroid']}"
+            )
+
+        # The FSM is the publish/target_lost authority. A tracked frame here
+        # means the committed id was matched (Stage 1) or a recovery candidate
+        # was surfaced (Stage 2). The recovery path (reidentify_target) already
+        # stepped the FSM authoritatively and set last_frame_recovery=True; in
+        # that case the node MUST defer to last_lock_decision and not re-step
+        # present=True — doing so on a partial-confirm recovery frame would flip
+        # target_lost=False below the high bar and defeat the asymmetric
+        # hysteresis. Only a genuine Stage-1 present-by-id hold (not a recovery
+        # frame) re-steps present=True here. The pipeline remains the
+        # identity-swap authority — this only drives the publish/target_lost gate.
+        fsm = getattr(self.tracker, 'lock_state_machine', None)
+        decision = getattr(self.tracker, 'last_lock_decision', None)
+        recovery_frame = bool(getattr(self.tracker, 'last_frame_recovery', False))
+        target_present = (
+            not recovery_frame
+            and self.tracker.target_track_id is not None
+            and track_result.track_id == self.tracker.original_track_id
+            and getattr(self.tracker, 'frames_lost', 0) == 0
+        )
+        if fsm is not None and target_present:
+            decision = fsm.step(
+                sim_score=1.0, present=True, frames_since_loss=0,
+                num_candidates=1, distinct_margin=float('inf'), depth_consistent=True,
+            )
+            self.tracker.last_lock_decision = decision
+        feedback.target_lost = bool(decision.target_lost) if decision is not None else False
         feedback.target_track_id = track_result.track_id
         feedback.target_position = PointStamped()
         feedback.is_transformation_successful = False
@@ -709,11 +1474,26 @@ class PersonTrackNode(Node):
             feedback.segment_img = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
             feedback.segment_img.header = rgb_msg.header
 
+        # Derive from the real status: during a provisional-recovery coast
+        # track_result is not None but feedback.target_lost is True, so a hardcoded
+        # REACQ_TRACKING would contradict target_lost. Report PASSIVE/NEEDS_HELP
+        # honestly in that window and REACQ_TRACKING only when fully held.
+        # NOTE: this call is BEFORE the re-lock anchor refresh below — on a held
+        # frame tracked=True forces TRACKING regardless of the clock; on a
+        # provisional coast tracked=False and the elapsed time is correct.
+        feedback.reacquisition_state = reacq_state(
+            tracked=not feedback.target_lost,
+            time_since_lost=time.time() - self._last_confirmed_time,
+            help_after_sec=self.active_help_after_sec)
+        # Mirror into the ~/reacq_state heartbeat so the nav consumer tracks the
+        # same enum the action feedback carries.
+        self._last_reacq_state = feedback.reacquisition_state
         goal_handle.publish_feedback(feedback)
 
         # Cache the latest good frame for the lost-transition dump, and emit
         # a 'reclaimed' artifact if we're just coming back from a lost state.
         self._last_tracked_rgb = rgb_img.copy()
+        self._last_tracked_msg = rgb_msg
         self._last_tracked_detection = {
             'bbox': list(track_result.bbox) if track_result.bbox is not None else None,
             'mask': track_result.mask,
@@ -724,14 +1504,94 @@ class PersonTrackNode(Node):
             ] if position is not None else None,
             'track_id': int(track_result.track_id),
         }
-        if self._was_lost and self._vision_logger.enabled:
-            self._vision_logger.write(
+        now = time.time()
+        if self._vision_logger.enabled and self._vision_log_due('tracked', now):
+            event = ('reclaimed' if self._vlog_last_state == 'lost'
+                     else 'acquired' if self._vlog_last_state is None
+                     else 'tracking')
+            self._log_async(
                 rgb_img, [self._last_tracked_detection],
                 request_ctx={'target_frame': params.get('target_frame')},
                 branch='person_track',
-                extras={'event': 'reclaimed'},
+                extras={'event': event},
             )
+            self._mark_vision_logged('tracked', now)
         self._was_lost = False
+        # Re-tracking ends the lost episode: re-arm the active-help log throttle
+        # so the next loss logs the hold entry again.
+        self._active_help_logged = False
+        # Release the hold latch ONLY on a TRUE re-lock (target_lost False) — a
+        # new loss→reclaim cycle then gets a fresh hold (enables repeated
+        # reclaims). Do NOT clear it on a provisional/partial recovery frame:
+        # those surface here with target_lost STILL True while the FSM is 'lost',
+        # and clearing the latch then would let a subsequent frames_lost reset
+        # (a pre-commit re-ID) drop _is_awaiting_help to False and fire the
+        # hard-lost abort mid-reacquire — exactly the bag-test abort. See
+        # _is_awaiting_help.
+        if not feedback.target_lost:
+            self._help_latched = False
+            # True re-lock: refresh the wall-clock escalation anchor. This is the
+            # ONLY refresh site (never a provisional/coast frame, where
+            # target_lost is still True) — that is what keeps the escalation clock
+            # measuring real time since the last CONFIRMED lock.
+            self._last_confirmed_time = time.time()
+
+    def _vision_log_due(self, state: str, now: float) -> bool:
+        """True if a vision-log write should fire for `state` ('tracked'/'lost') now.
+
+        Fires on a debounced state transition (changed AND >= min_gap since last
+        write) or on the steady-state heartbeat (>= interval since last write).
+        """
+        changed = state != self._vlog_last_state
+        gap = now - self._vlog_last_time
+        if changed and gap >= self._vlog_min_gap_s:
+            return True
+        return gap >= self._vlog_interval_s
+
+    def _mark_vision_logged(self, state, now):
+        """Record the state + time of the most recent vision-log write."""
+        self._vlog_last_state = state
+        self._vlog_last_time = now
+
+    def _log_async(self, *args, **kwargs):
+        """Submit a vision-log write to the off-loop writer (never blocks the
+        tracking loop / never raises into it)."""
+        try:
+            self._log_executor.submit(self._vision_logger.write, *args, **kwargs)
+        except Exception as exc:  # e.g. executor shutting down
+            self.get_logger().warn(f'vision-log submit failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _is_awaiting_help(self, time_since_lost, time_since_seen):
+        """True while coasting (holding) for re-ID recovery — auto-reclaim or wave.
+
+        Escalates after ``active_help_after_sec`` WALL-CLOCK seconds lost
+        (measured from the last CONFIRMED lock) and then LATCHES
+        (``_help_latched``). The latch is essential: when the operator reappears,
+        the passive re-ID path resets ``frames_lost`` to 0 on every pre-commit
+        confirmation frame (see _confirm_reid_candidate) — and a provisional coast
+        does NOT refresh the confirmed-lock anchor, so the elapsed clock can read
+        low right after escalation. Without the latch a sub-threshold reading
+        would flip this predicate False and let the hard-lost abort fire
+        mid-reappearance — killing the goal before the auto-reclaim can complete.
+        The latch clears only on a successful re-lock (_handle_tracked_frame) or
+        goal cleanup, so each loss→reclaim cycle gets a fresh hold.
+
+        Once latched, holds INDEFINITELY when ``active_help_timeout_sec <= 0``
+        (default — only a reseed, re-lock, or cancel ends it), or up to that many
+        seconds measured from the last CONFIRMED sighting (a pre-commit match does
+        not refresh ``time_since_seen``). ``active_help_after_sec <= 0`` disables
+        active help (legacy abort on hard-lost).
+        """
+        if self.active_help_after_sec <= 0:
+            return False
+        if time_since_lost >= self.active_help_after_sec:
+            self._help_latched = True
+        if not getattr(self, '_help_latched', False):
+            return False
+        if self.active_help_timeout_sec <= 0.0:
+            return True
+        return time_since_seen <= self.active_help_timeout_sec
 
     def _handle_lost_frame(
         self,
@@ -748,20 +1608,35 @@ class PersonTrackNode(Node):
         # First tick after a TRACKING → LOST transition: dump the last-good
         # frame and the current (failed) frame. Subsequent lost ticks don't
         # log, so a long occlusion produces exactly two artifacts.
-        if (not self._was_lost) and self._vision_logger.enabled:
-            if self._last_tracked_rgb is not None and self._last_tracked_detection is not None:
-                self._vision_logger.write(
-                    self._last_tracked_rgb, [self._last_tracked_detection],
+        now = time.time()
+        if self._vision_logger.enabled and self._vision_log_due('lost', now):
+            if self._vlog_last_state != 'lost':  # real transition into lost
+                if self._last_tracked_rgb is not None and self._last_tracked_detection is not None:
+                    self._log_async(
+                        self._last_tracked_rgb, [self._last_tracked_detection],
+                        request_ctx={'target_frame': params.get('target_frame')},
+                        branch='person_track',
+                        extras={'event': 'lost', 'time_since_seen_s': float(time_since_seen)},
+                    )
+                self._log_async(
+                    rgb_img, None,
                     request_ctx={'target_frame': params.get('target_frame')},
                     branch='person_track',
-                    extras={'event': 'lost', 'time_since_seen_s': float(time_since_seen)},
+                    extras={'event': 'lost_current', 'time_since_seen_s': float(time_since_seen)},
                 )
-            self._vision_logger.write(
-                rgb_img, None,
-                request_ctx={'target_frame': params.get('target_frame')},
-                branch='person_track',
-                extras={'event': 'lost_current', 'time_since_seen_s': float(time_since_seen)},
-            )
+            else:  # steady-lost heartbeat — one current-frame artifact
+                self._log_async(
+                    rgb_img, None,
+                    request_ctx={'target_frame': params.get('target_frame')},
+                    branch='person_track',
+                    extras={'event': 'lost_heartbeat',
+                            'time_since_seen_s': float(time_since_seen)},
+                )
+            self._mark_vision_logged('lost', now)
+        # Phase 2: reset the point smoother on the TRACKING → LOST transition so a
+        # re-acquired target doesn't lerp from a stale pre-loss point.
+        if not self._was_lost:
+            self._point_ema.reset()
         self._was_lost = True
 
         feedback.target_lost = True
@@ -783,15 +1658,382 @@ class PersonTrackNode(Node):
             else:
                 feedback.rgb_img = rgb_msg
 
+        feedback.reacquisition_state = reacq_state(
+            tracked=False,
+            time_since_lost=time.time() - self._last_confirmed_time,
+            help_after_sec=self.active_help_after_sec)
+        # Mirror into the ~/reacq_state heartbeat so the nav consumer tracks the
+        # same enum the action feedback carries.
+        self._last_reacq_state = feedback.reacquisition_state
         goal_handle.publish_feedback(feedback)
 
-        if time_since_seen > self.lost_timeout:
-            self.get_logger().warn(f'Target lost for {time_since_seen:.1f}s, aborting')
+        # Republish a lost-sentinel so /target_points consumers see the loss
+        # instead of a stale last-good point. NaN coords flag "no target".
+        if self.target_point_pub is not None:
+            sentinel = PointStamped()
+            sentinel.header = rgb_msg.header
+            sentinel.point.x = float('nan')
+            sentinel.point.y = float('nan')
+            sentinel.point.z = float('nan')
+            self.target_point_pub.publish(sentinel)
+
+        decision = getattr(self.tracker, 'last_lock_decision', None)
+        hard_lost = decision is not None and decision.state == 'lost'
+        # Active re-ID hold: once escalated to NEEDS_ACTIVE_HELP, keep the tracker
+        # + multi-view gallery alive (coast, no abort/reset) so the BT can call
+        # ~/reseed_target and re-lock the self-identified operator preserving
+        # identity. Bounded by active_help_timeout_sec; lost_timeout stays the
+        # absolute ceiling. Set active_help_timeout_sec<=0 to disable (legacy abort).
+        time_since_lost = time.time() - self._last_confirmed_time
+        if self._is_awaiting_help(time_since_lost, time_since_seen):
+            if not self._active_help_logged:
+                bound = ('indefinitely' if self.active_help_timeout_sec <= 0.0
+                         else f'up to {self.active_help_timeout_sec:.0f}s')
+                self.get_logger().warn(
+                    f'Target lost {time_since_lost:.1f}s; awaiting active re-ID help '
+                    f'(holding {bound} for ~/reseed_target — wave to resume)')
+                self._active_help_logged = True
+            return False
+        # The _is_awaiting_help early-return above already held the goal when the
+        # active-help hold is engaged, so pass awaiting_help=False here. With
+        # active help ENABLED the FSM recovery-cap (hard_lost) must NOT abort —
+        # the goal coasts through the passive-recovery window into the indefinite
+        # NEEDS_HELP hold (matching the pre-1817a48 frame-coupled behavior, where
+        # the latch always shadowed hard_lost). hard_lost aborts ONLY in the
+        # legacy active-help-disabled mode; lost_timeout stays the absolute ceiling.
+        if lost_should_abort(
+                hard_lost=hard_lost, awaiting_help=False,
+                time_since_seen=time_since_seen, lost_timeout=self.lost_timeout,
+                active_help_enabled=self.active_help_after_sec > 0):
+            over_ceiling = time_since_seen > self.lost_timeout
+            reason = (f'lost for {time_since_seen:.1f}s' if over_ceiling
+                      else 'hard-lost (recovery cap)')
+            self.get_logger().warn(f'Target {reason}, aborting')
             goal_handle.abort()
             result.status = 1
-            result.message = f'Target lost for {time_since_seen:.1f} seconds'
+            result.message = f'Target {reason}'
             return True
         return False
+
+    def _classify_frame_stall(self, stall_sec: float) -> str:
+        """Severity of a camera-frame gap: 'ok' | 'warn' | 'lost'.
+
+        ``stall_sec`` is wall-time since the last *new* synchronized RGB+depth
+        pair. The thresholds (frame_stall_warn_sec / frame_stall_lost_sec) sit
+        well above the camera inter-frame gap (~33 ms @ 30 Hz), so normal
+        operation never trips it — only a genuine synchronizer stall does.
+        """
+        if stall_sec >= self.frame_stall_lost_sec:
+            return 'lost'
+        if stall_sec >= self.frame_stall_warn_sec:
+            return 'warn'
+        return 'ok'
+
+    def _handle_frame_stall(self, stall_sec, last_seen_time, feedback,
+                            goal_handle, params, result) -> bool:
+        """React to a camera-frame stall (synchronizer stopped emitting pairs).
+
+        The diagnosed root cause of "stopped getting new camera frames": when
+        frame_seq freezes the loop would otherwise busy-wait forever with a
+        frozen dashboard, no loss handling, and no diagnostics.
+
+        - 'warn': log (throttled) + keep the dashboard alive (distinct
+          ``camera_stalled`` phase + re-emit the last good frame) instead of a
+          silent frozen video.
+        - 'lost': additionally drive the existing loss/recovery FSM so
+          forever-hold + wave/reseed applies and the operator sees NEEDS_HELP;
+          the live frame is gone, so feed it the last good frame/msg.
+
+        Returns True only if the loss FSM aborts the goal. Caller rate-limits
+        invocation (``_last_stall_tick``), so the per-call work is cheap.
+        """
+        level = self._classify_frame_stall(stall_sec)
+        if level == 'ok':
+            return False
+        self.get_logger().warn(
+            f'No new synchronized camera frame for {stall_sec:.1f}s — RGB/depth '
+            f'sync stalled (camera may still be publishing)',
+            throttle_duration_sec=2.0)
+        # Keep the dashboard advancing instead of hard-freezing on the last frame.
+        self._publish_phase_debug_state('camera_stalled')
+        if self._last_tracked_rgb is not None:
+            self._publish_raw_debug_image(self._last_tracked_rgb)
+        if (level == 'lost' and self._last_tracked_rgb is not None
+                and self._last_tracked_msg is not None):
+            # Distinct warning already logged above; reuse the loss FSM for the
+            # actual hold/abort policy so a camera stall and a person-lost share
+            # one recovery path (forever-hold + wave/reseed).
+            return self._handle_lost_frame(
+                last_seen_time, self._last_tracked_rgb, self._last_tracked_msg,
+                feedback, goal_handle, params, result)
+        return False
+
+    def _publish_reacq_state(self):
+        """10 Hz heartbeat mirroring the last published reacquisition state.
+
+        Emits ``_last_reacq_state`` — set at each feedback publish to the live
+        TrackPerson enum, and reset to REACQ_INACTIVE (255) on goal teardown —
+        as a plain UInt8 so a navigation consumer always sees a current liveness
+        byte without subscribing to the action feedback. Permanently on.
+        """
+        msg = UInt8()
+        msg.data = int(self._last_reacq_state)
+        self.reacq_state_pub.publish(msg)
+
+    def _publish_phase_debug_state(self, phase: str):
+        """Out-of-tracking telemetry tick: 'initializing' during goal init,
+        'idle' between goals.
+
+        Published while the tracking loop isn't producing live telemetry so the
+        dashboard shows the current phase instead of the NO-DATA stale banner.
+        Param-gated; must never raise into the loop.
+        """
+        if not self.debug_state_enabled:
+            return
+        try:
+            state = build_debug_state(
+                self.tracker, ts=time.time(),
+                target_lost=True,
+                reacquisition_state=1,  # REACQ_PASSIVE: searching, not locked
+                time_since_seen=0.0, awaiting_help=False,
+                active_help_after_sec=self.active_help_after_sec,
+                active_help_timeout_sec=self.active_help_timeout_sec)
+            state["fsm_state"] = phase
+            state["candidates"] = []      # may be stale from a previous goal;
+            state["best_sim"] = None      # no live click targets outside the
+            state["second_sim"] = None    # tracking loop
+            # Init search liveness: a wall-clock anchor so the dashboard can show
+            # an elapsed "Searching for target…" timer instead of a dead row of
+            # "—". Set once at goal/init start (see _run_tracking_loop); cleared
+            # to None between goals so the 'idle' phase doesn't show a timer.
+            state["search_started_ts"] = (
+                self._search_started_ts if phase == 'initializing' else None)
+            self.debug_state_pub.publish(String(data=json.dumps(state)))
+        except Exception as exc:
+            self.get_logger().warn(f'{phase} debug state failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _publish_raw_debug_image(self, rgb_img):
+        """Un-annotated BGR camera frame for the dashboard outside TRACKING."""
+        if not (self.debug_image_enabled
+                and self.debug_image_pub.get_subscription_count() > 0):
+            return
+        try:
+            self.debug_image_pub.publish(
+                self.bridge.cv2_to_imgmsg(rgb_img, encoding='bgr8'))
+        except Exception as exc:
+            self.get_logger().warn(f'raw debug image failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _idle_debug_tick(self):
+        """Dashboard telemetry while NO goal is active (loop not running)."""
+        if self.tracking_active:
+            return  # the tracking loop owns telemetry during a goal
+        self._publish_phase_debug_state('idle')
+        if not (self.debug_image_enabled
+                and self.debug_image_pub.get_subscription_count() > 0):
+            return
+        with self.lock_msg:
+            pair = self.recent_sync_msg
+            seq = self.frame_seq
+        if pair is None or seq == self._idle_last_seq:
+            return
+        rgb_img, err = decode_color_msg(pair[0])
+        if rgb_img is None:
+            self.get_logger().warn(f'idle frame dropped: {err}',
+                                   throttle_duration_sec=5.0)
+            return
+        self._idle_last_seq = seq
+        self._publish_raw_debug_image(rgb_img)
+
+    def _publish_debug_outputs(self, rgb_img, track_result, feedback, last_seen_time):
+        """Param-gated dashboard telemetry; must never raise into the loop."""
+        try:
+            if self.debug_state_enabled:
+                tss = time.time() - last_seen_time
+                time_since_lost = time.time() - self._last_confirmed_time
+                awaiting = (bool(feedback.target_lost)
+                            and self._is_awaiting_help(time_since_lost, tss))
+                state = build_debug_state(
+                    self.tracker, ts=time.time(),
+                    target_lost=bool(feedback.target_lost),
+                    reacquisition_state=int(feedback.reacquisition_state),
+                    time_since_seen=tss, awaiting_help=awaiting,
+                    active_help_after_sec=self.active_help_after_sec,
+                    active_help_timeout_sec=self.active_help_timeout_sec)
+                self.debug_state_pub.publish(String(data=json.dumps(state)))
+                if self.gallery_keep_crops:
+                    self._maybe_publish_gallery(state["gallery_version"])
+            if self.debug_image_enabled and self.debug_image_pub.get_subscription_count() > 0:
+                annotated = self._draw_debug_info(
+                    rgb_img, self.tracker.last_results, track_result,
+                    self.tracker.target_track_id)
+                self.debug_image_pub.publish(
+                    self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8'))
+        except Exception as exc:  # telemetry must never kill tracking
+            self.get_logger().warn(f'debug output failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _publish_searching_gallery(self):
+        """Emit an empty (v0) gallery ONCE at init so the dashboard panel shows
+        "0 views" immediately instead of a stale gallery or nothing until lock.
+
+        One-shot per goal via ``_searching_gallery_published`` (reset at the top
+        of ``_run_tracking_loop``). Gated the same way as the live gallery
+        (``gallery_keep_crops``); must never raise into the loop.
+        """
+        if self._searching_gallery_published or not self.gallery_keep_crops:
+            return
+        self._searching_gallery_published = True
+        try:
+            self.debug_gallery_pub.publish(String(data=json.dumps(
+                {'version': 0, 'thumbs': []})))
+            # Keep _last_gallery_version coherent so the first real lock (which
+            # bumps the gallery version off 0) still publishes via
+            # _maybe_publish_gallery.
+            self._last_gallery_version = 0
+        except Exception as exc:
+            self.get_logger().warn(f'searching gallery failed: {exc}',
+                                   throttle_duration_sec=5.0)
+
+    def _maybe_publish_gallery(self, version: int):
+        if version == self._last_gallery_version:
+            return
+        app = getattr(self.tracker, 'target_appearance', None)
+        thumbs = list(getattr(getattr(app, 'gallery', None), 'thumbs', []) or []) if app else []
+        encoded = []
+        for t in thumbs:
+            # Per-thumb fault tolerance: one bad crop degrades to a None slot
+            # instead of raising — which would leave _last_gallery_version
+            # stale and retry (and re-warn) every frame until the gallery
+            # changes again.
+            enc = None
+            if t is not None:
+                try:
+                    # Thumbs are BGRA (alpha = person mask); PNG preserves the
+                    # transparent background, JPEG would discard it. No colour
+                    # conversion: _make_thumb already stores BGR(A).
+                    ok, buf = cv2.imencode('.png', t)
+                    if ok:
+                        enc = base64.b64encode(buf).decode('ascii')
+                except Exception:
+                    enc = None
+            encoded.append(enc)
+        self.debug_gallery_pub.publish(String(data=json.dumps(
+            {'version': version, 'thumbs': encoded})))
+        self._write_gallery_thumbs_to_log(version, thumbs)
+        self._last_gallery_version = version
+
+    def _write_gallery_thumbs_to_log(self, version: int, thumbs: list):
+        """Best-effort: persist each transparent BGRA gallery thumb as a PNG in
+        the active vision_log run dir (Change 3b).
+
+        Only runs when vision logging is enabled. Gated by ``version`` via the
+        caller (``_maybe_publish_gallery`` returns early when the version is
+        unchanged), so this writes once per gallery change — no per-frame spam.
+        Wrapped so a logging failure never propagates into the tracking loop.
+        """
+        logger = getattr(self, '_vision_logger', None)
+        if logger is None or not getattr(logger, 'enabled', False):
+            return
+        try:
+            run_dir = logger._ensure_run_dir()
+        except Exception as exc:  # noqa: BLE001 — never break tracking on logging
+            self.get_logger().warn(f'vision_logging: gallery run_dir failed: {exc}')
+            return
+        for i, t in enumerate(thumbs):
+            if t is None:
+                continue
+            try:
+                path = os.path.join(run_dir, f'gallery_view_{version}_{i}.png')
+                cv2.imwrite(path, t)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f'vision_logging: gallery thumb {i} write failed: {exc}'
+                )
+
+    def _log_reacq_diag(self, track_result):
+        """Throttled (~3 Hz) NEEDS_HELP reacquisition diagnostic.
+
+        Surfaces, while the operator is lost/recovering, the best ReID candidate
+        similarity vs the pursue floor / help commit bar and the N-of-M confirm
+        window — so an operator can read on the live console WHY a returning person
+        does or doesn't re-lock. A person standing in clear view with
+        ``best_sim`` below ``pursue_floor`` (0.55) confirms the appearance bar is
+        the wall; ``persons=0`` while they're plainly visible would instead point at
+        detection. Gated by ``reacq_debug_logging`` (default off) — no normal-run cost.
+        """
+        now = time.time()
+        if (now - self._reacq_diag_last) < 0.3:
+            return
+        self._reacq_diag_last = now
+        tk = self.tracker
+        scores = getattr(tk, 'last_debug_scores', {}) or {}
+        best = max(scores.values()) if scores else 0.0
+        persons = len([r for r in (tk.last_results or [])
+                       if r.class_id == 0 and r.track_id >= 0])
+        needs_help = bool(getattr(tk, 'in_needs_help', False))
+        in_help = needs_help and persons == 1
+        win = getattr(tk, 'reid_confirm_window', []) or []
+        scores_str = ', '.join(f'{int(k)}:{float(v):.2f}' for k, v in scores.items())
+        self.get_logger().warn(
+            f"[reacq-diag] reacq_state={int(self._last_reacq_state)} "
+            f"needs_help={needs_help} in_help={in_help} persons={persons} "
+            f"frames_lost={getattr(tk, 'frames_lost', -1)} best_sim={best:.3f} "
+            f"scores={{{scores_str}}} pursue_floor={self.single_person_pursue_floor:.2f} "
+            f"help_commit_bar={self.single_person_commit_bar_help:.2f} "
+            f"window={sum(win)}/{len(win)} locked={track_result is not None}")
+
+    def _pan_state_cb(self, msg: PanTiltState):
+        with self._pan_state_lock:
+            self._current_pan_rad = float(msg.pan_rad)
+
+    def _publish_pan_tilt(self, pan_rad: float):
+        cmd = PanTiltCommand()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.mode = PanTiltCommand.ABSOLUTE          # ABSOLUTE only — no accumulation
+        cmd.pan_rad = float(pan_rad)
+        cmd.tilt_rad = float(self._fixed_tilt_rad)  # tilt held at fixed_tilt_deg
+        cmd.speed_raw = int(self._pan_cmd_speed)
+        cmd.accel_raw = int(self._pan_cmd_accel)
+        self._pan_cmd_pub.publish(cmd)
+
+    def _pan_follow_tick(self):
+        """Center the head on the tracked person; called once per loop iteration."""
+        if pan_follow_suppressed(self.enable_pan_tilt_follow,
+                                 self._pan_cmd_pub is not None,
+                                 getattr(self, '_help_latched', False)):
+            return
+        with self._pan_state_lock:
+            current_pan = self._current_pan_rad
+        if current_pan is None:
+            # No PanTiltState yet -> can't do ABSOLUTE centering; wait (state_publisher
+            # publishes continuously once the controller is up).
+            self.get_logger().warn('pan-tilt follow: awaiting PanTiltState',
+                                   throttle_duration_sec=5.0)
+            return
+        now = time.monotonic()
+        # One-time: pitch the head to the fixed tilt (and hold current pan) so the
+        # head reaches 40 deg even before the first centering command.
+        if not self._pan_tilt_initialized:
+            self._publish_pan_tilt(current_pan)
+            self._pan_tilt_initialized = True
+            return
+        target = None
+        if self._last_target_u is not None and self.camera_intrinsic is not None:
+            fx = float(self.camera_intrinsic.k[0])
+            cx = float(self.camera_intrinsic.k[2])
+            target = self._pan_follower.center(
+                self._last_target_u, cx, fx, current_pan, now)   # CENTER
+        # No bbox -> HOLD: issue no command, so the servo keeps pointing where the
+        # person was last seen. This applies during BOTH the PASSIVE coast AND the
+        # NEEDS_HELP hold: do NOT recenter the head during NEEDS_HELP — turning the
+        # camera away from the operator's last direction is exactly what made
+        # re-acquisition fail (they walk back into where they left, but the head
+        # had swung to face forward, so they were never re-detected). Holding keeps
+        # the camera on that direction so they re-enter the view and re-lock.
+        if target is not None:
+            self._publish_pan_tilt(target)
 
     def _cleanup_tracking(self):
         """Clean up tracking state."""
@@ -801,7 +2043,27 @@ class PersonTrackNode(Node):
 
         self._last_tracked_rgb = None
         self._last_tracked_detection = None
+        self._last_tracked_msg = None
+        self._last_stall_tick = 0.0
         self._was_lost = False
+        self._active_help_logged = False
+        self._help_latched = False
+        # Goal over (success/abort/cancel/exception — this runs in the execute
+        # callback's finally): the ~/reacq_state heartbeat reverts to INACTIVE so
+        # the nav consumer sees "no goal" rather than a stale last-frame enum.
+        self._last_reacq_state = REACQ_INACTIVE
+        # Drop pan-follow EMA/throttle + re-arm the one-time tilt init so the next
+        # goal re-pitches the head and doesn't carry stale centering state.
+        if self._pan_follower is not None:
+            self._pan_follower.reset()
+        self._pan_tilt_initialized = False
+        # Drop the init-search liveness anchor so the 'idle' phase between goals
+        # doesn't surface a stale "searching" elapsed timer in the dashboard.
+        self._search_started_ts = None
+        # Re-anchor the escalation clock per goal (runs on goal completion, so
+        # the next goal begins with a fresh anchor); tracking start overwrites it.
+        self._last_confirmed_time = time.time()
+        self._point_ema.reset()
 
         if self.target_point_pub is not None:
             self.destroy_publisher(self.target_point_pub)
@@ -828,6 +2090,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info('Shutting down...')
     finally:
+        node._log_executor.shutdown(wait=False)
         node.destroy_node()
         rclpy.shutdown()
 

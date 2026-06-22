@@ -48,6 +48,28 @@ import numpy as np
 _SESSION_TS_RE = re.compile(r'^\d{8}_\d{6}$')
 
 
+def _apply_mask_overlay(overlay, mask, color=(0, 160, 255), alpha=0.5):
+    """Blend ``color`` at ``alpha`` onto ``overlay`` pixels where ``mask`` is set.
+
+    ``mask`` may be bool OR a uint8/int 0/1 array. It MUST be coerced to boolean
+    before indexing: with an integer mask, ``overlay[mask]`` is fancy-indexing
+    along axis 0 (shape (H, W, W, 3), ~14 GB float32 at 720p), not boolean
+    masking. Returns ``overlay`` (mutated in place). No-op on shape mismatch or
+    empty mask.
+    """
+    if mask is None or getattr(mask, 'shape', None) is None:
+        return overlay
+    m = mask if getattr(mask, 'dtype', None) == bool else (np.asarray(mask) != 0)
+    if m.shape[:2] != overlay.shape[:2]:
+        return overlay
+    sel = overlay[m]
+    if sel.size == 0:
+        return overlay
+    overlay[m] = (sel.astype(np.float32) * (1.0 - alpha)
+                  + np.array(color, dtype=np.float32) * alpha).astype(np.uint8)
+    return overlay
+
+
 def _sanitize_tag(raw: str | None) -> str:
     """Make a node name safe for use as a filename prefix."""
     if not raw:
@@ -239,10 +261,12 @@ class VisionLogger:
                     try:
                         # Direct 50% blend on masked pixels — avoids the
                         # double-blend that produces only ~15% orange contribution.
-                        overlay[mask] = (
-                            overlay[mask].astype(np.float32) * 0.5
-                            + np.array([0, 160, 255], dtype=np.float32) * 0.5
-                        ).astype(np.uint8)
+                        # The helper coerces mask to boolean first: an integer
+                        # (uint8 0/1) mask would fancy-index along axis 0
+                        # ((H, W, W, 3), ~14 GB float32 at 720p) instead of
+                        # boolean-masking.
+                        _apply_mask_overlay(overlay, mask, color=(0, 160, 255),
+                                            alpha=0.5)
                     except Exception as _mask_exc:  # noqa: BLE001
                         if self._node is not None:
                             self._node.get_logger().warn(

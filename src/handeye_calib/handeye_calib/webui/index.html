@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>handeye_web · calibrate</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="bg-panel">
+    <span class="title">handeye_calib · calibrate_web</span>
+    <span id="conn-indicator" class="conn-indicator">WS: connecting…</span>
+  </header>
+  <main>
+    <!-- Live frame panel: floats top-left, controls wrap around it. -->
+    <div class="cam-panel" id="cam-panel">
+      <img id="cam-img" class="cam-img" alt="">
+      <div class="cam-resize" id="cam-resize" title="drag to resize"></div>
+      <div class="frame-toolbar">
+        <label><input type="radio" name="frame-mode" value="annotated" checked> annotated</label>
+        <label><input type="radio" name="frame-mode" value="raw"> raw</label>
+      </div>
+      <div class="detection-badge" id="detection-badge">corners=0  NO DETECTION</div>
+      <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/xarm_camera/color/image_raw</span></div>
+    </div>
+
+    <nav class="side-tabs">
+      <button class="side-tab active" data-tab="info">Info</button>
+      <button class="side-tab" data-tab="move">Move</button>
+      <button class="side-tab" data-tab="capture">Capture</button>
+      <button class="side-tab" data-tab="solve">Solve</button>
+      <button class="side-tab" data-tab="promote">Promote</button>
+    </nav>
+    <section class="side-panel-content active" data-panel="info">
+      <!-- T1 status lines stay at the top of the Info tab so the camera /
+           TF health stays glanceable, and so the existing T1/T2 assertions
+           (which look up these ids) keep passing. -->
+      <div class="status-line" id="info-camera">camera: …</div>
+      <div class="status-line" id="info-tf">tf: …</div>
+
+      <h2>Camera</h2>
+      <table class="kv-table" id="info-kv-camera">
+        <tr><td>subscribed to</td><td data-k="image_topic">–</td></tr>
+        <tr><td>ROS_DOMAIN_ID</td><td data-k="ros_domain_id">–</td></tr>
+        <tr><td>status</td><td data-k="status">–</td></tr>
+        <tr><td>frames received</td><td data-k="frame_count">0</td></tr>
+        <tr><td>last frame age</td><td data-k="frame_age">–</td></tr>
+        <tr><td>frame rate (rolling)</td><td data-k="frame_hz">–</td></tr>
+      </table>
+
+      <h2>Robot state</h2>
+      <table class="kv-table" id="info-kv-robot">
+        <tr><td>xArm joints</td><td data-k="xarm_joints">–</td></tr>
+        <tr><td>xArm TF (base→ee)</td><td data-k="tf_status">–</td></tr>
+      </table>
+
+      <h2>T<sub>base→eef</sub></h2>
+      <pre class="matrix-block" id="info-matrix-tbe">–</pre>
+
+      <h2>ChArUco board</h2>
+      <table class="kv-table" id="info-board">
+        <tr><td>grid</td><td data-k="grid">–</td></tr>
+        <tr><td>square_len</td><td data-k="square_len">–</td></tr>
+        <tr><td>marker_len</td><td data-k="marker_len">–</td></tr>
+        <tr><td>aruco_dict</td><td data-k="aruco_dict">–</td></tr>
+      </table>
+
+      <h2>Safety envelope</h2>
+      <pre class="matrix-block" id="info-safety">–</pre>
+    </section>
+    <section class="side-panel-content" data-panel="move">
+      <!-- Joint editor. Mirrors src/pan_tilt/webui/index.html (xArm Waypoints
+           tab) verbatim — same unit-toggle radio group + joint-grid pattern,
+           same confirm() copy on Move (joints), same Load current / Zero all
+           buttons. Reusing the visual language so the two tools feel like
+           the same family. -->
+      <div class="move-panel">
+        <p class="muted">
+          Send a <code>tinker_arm_msgs/JointMove</code> goal to <code>/xarm/joint_move</code>.
+          The server-side <code>SafetyEnvelope</code> verdict on the current EE
+          pose is shown below — but the planner / arm driver remain the real
+          safety boundary.
+        </p>
+
+        <div class="unit-toggle" id="move-unit-toggle">
+          <label><input type="radio" name="move-unit" value="rad" checked> rad</label>
+          <label><input type="radio" name="move-unit" value="deg"> deg</label>
+        </div>
+
+        <div class="joint-grid" id="move-joint-inputs"></div>
+
+        <div class="row">
+          <button id="move-load-current" type="button">Load current</button>
+          <button id="move-zero" type="button">Zero all</button>
+          <button class="primary" id="move-send" type="button">Move (joints)</button>
+        </div>
+
+        <div class="status-line" id="move-status"></div>
+        <div class="status-line" id="move-safety-status">–</div>
+
+        <h3>Presets</h3>
+        <div class="preset-bar" id="move-presets">
+          <button data-preset="home" type="button">Home [0,0,0,0,0,0,0]</button>
+          <button data-preset="look-forward" type="button">Look forward at board</button>
+        </div>
+        <p class="muted">
+          <code>Home</code> sends all seven joints to zero (a verified safe
+          rest pose on the xArm). The <code>Look forward at board</code>
+          preset is a placeholder until a verified safe joint set from a
+          calibration session is recorded — see the TODO in <code>app.js</code>.
+        </p>
+      </div>
+    </section>
+    <section class="side-panel-content" data-panel="capture"></section>
+    <section class="side-panel-content" data-panel="solve"></section>
+    <section class="side-panel-content" data-panel="promote"></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

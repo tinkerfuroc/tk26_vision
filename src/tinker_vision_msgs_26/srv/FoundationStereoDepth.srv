@@ -1,0 +1,22 @@
+# Request — per-call overrides (empty string / 0 means use node default)
+string model_kind
+string trt_variant
+float32 scale
+int32 iters
+float32 z_far
+bool want_pointcloud
+bool want_debug_jpeg
+bool align_to_color
+---
+# Response
+int32 status
+string error_msg
+sensor_msgs/Image depth_image
+sensor_msgs/CameraInfo camera_info
+sensor_msgs/PointCloud2 pointcloud
+sensor_msgs/CompressedImage debug_jpeg
+float32 forward_ms
+float32 load_s
+float32 end_to_end_s
+string model_used
+string trt_variant_used

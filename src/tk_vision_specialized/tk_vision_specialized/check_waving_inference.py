@@ -79,7 +79,11 @@ class WavingInferenceCheckNode(Node):
             'visibility': float(lm.visibility),
         }
 
+    ELBOW_TOL_NORM = 0.1
+
     def _is_waving(self, landmarks):
+        nose = landmarks[self.mp_pose.PoseLandmark.NOSE]
+
         right_hand = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST]
         right_elbow = landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW]
         right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
@@ -88,16 +92,16 @@ class WavingInferenceCheckNode(Node):
         left_elbow = landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW]
         left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
 
-        right_hand_above_shoulder = right_hand.y <= right_shoulder.y
-        left_hand_above_shoulder = left_hand.y <= left_shoulder.y
+        right_hand_above_head = right_hand.y < nose.y
+        left_hand_above_head = left_hand.y < nose.y
         right_hand_above_elbow = right_hand.y < right_elbow.y
         left_hand_above_elbow = left_hand.y < left_elbow.y
-        right_elbow_above_shoulder = right_elbow.y <= right_shoulder.y
-        left_elbow_above_shoulder = left_elbow.y <= left_shoulder.y
+        right_elbow_above_shoulder = right_elbow.y <= right_shoulder.y + self.ELBOW_TOL_NORM
+        left_elbow_above_shoulder = left_elbow.y <= left_shoulder.y + self.ELBOW_TOL_NORM
 
         waving = (
-            right_hand_above_shoulder
-            or left_hand_above_shoulder
+            right_hand_above_head
+            or left_hand_above_head
             or (right_hand_above_elbow and right_elbow_above_shoulder)
             or (left_hand_above_elbow and left_elbow_above_shoulder)
         )

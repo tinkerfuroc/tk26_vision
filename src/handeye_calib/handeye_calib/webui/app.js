@@ -1,0 +1,445 @@
+// handeye_calib calibrate_web — v2 skeleton (T1).
+// Vanilla JS, no build step. T2-T6 fill in the empty panel bodies; this file
+// owns the WS connection, tab switching, connection pill, and the
+// info-tab status lines that every later task reads from `state`.
+
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+
+// ---- global state shared with later tasks ----------------------------------
+// `state` is the last WS message body. Tabs added in T2-T6 read from it.
+let state = null;
+
+// ---- status line helper ----------------------------------------------------
+// Mirrors pan_tilt's status-line convention: `kind` is one of
+// "", "ok", "warn", "err" — the class drives the colour via style.css.
+function setStatus(id, text, kind = "") {
+  const el = typeof id === "string" ? document.getElementById(id) : id;
+  if (!el) return;
+  el.textContent = text;
+  el.className = "status-line" + (kind ? " " + kind : "");
+}
+
+// ---- tab switching ---------------------------------------------------------
+function activateTab(name) {
+  $$(".side-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  $$(".side-panel-content").forEach(p => p.classList.toggle("active", p.dataset.panel === name));
+}
+$$(".side-tab").forEach(b => {
+  b.addEventListener("click", () => activateTab(b.dataset.tab));
+});
+
+// ---- T2: resizable live camera panel --------------------------------------
+// Camera floats top-left; controls wrap around it. A handle in the panel's
+// bottom-right corner lets the operator drag to resize. Width clamped 240-800
+// and persisted to localStorage under `handeye-cam-w` (the brief-named key).
+const CAM_PANEL = $("#cam-panel");
+const CAM_HANDLE = $("#cam-resize");
+const CAM_IMG = $("#cam-img");
+const CAM_KEY = "handeye-cam-w";
+const CAM_MIN = 240, CAM_MAX = 800;
+
+function clampCamWidth(px) {
+  // Also bound by viewport so the panel can never swallow the whole window.
+  const maxAllowed = Math.min(CAM_MAX, window.innerWidth - 80);
+  return Math.max(CAM_MIN, Math.min(maxAllowed, px));
+}
+function setCamWidth(px) {
+  const w = clampCamWidth(px);
+  document.documentElement.style.setProperty("--cam-w", w + "px");
+  return w;
+}
+(function initCamWidth() {
+  const stored = parseInt(localStorage.getItem(CAM_KEY) || "", 10);
+  setCamWidth(Number.isFinite(stored) ? stored : 480);
+})();
+if (CAM_HANDLE) {
+  let dragging = false, startX = 0, startW = 0;
+  CAM_HANDLE.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startW = parseInt(getComputedStyle(document.documentElement)
+      .getPropertyValue("--cam-w"), 10) || 480;
+    CAM_HANDLE.classList.add("dragging");
+    try { CAM_HANDLE.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  CAM_HANDLE.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    setCamWidth(startW + (e.clientX - startX));
+  });
+  const endDrag = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    CAM_HANDLE.classList.remove("dragging");
+    try { CAM_HANDLE.releasePointerCapture(e.pointerId); } catch (_) {}
+    const cur = parseInt(getComputedStyle(document.documentElement)
+      .getPropertyValue("--cam-w"), 10);
+    if (Number.isFinite(cur)) localStorage.setItem(CAM_KEY, String(cur));
+  };
+  CAM_HANDLE.addEventListener("pointerup", endDrag);
+  CAM_HANDLE.addEventListener("pointercancel", endDrag);
+}
+window.addEventListener("resize", () => {
+  const cur = parseInt(getComputedStyle(document.documentElement)
+    .getPropertyValue("--cam-w"), 10);
+  if (Number.isFinite(cur)) setCamWidth(cur);
+});
+
+// ---- T2: live frame polling (3 Hz, cache-busted) --------------------------
+// /api/frame.jpg returns the annotated overlay by default; `?raw=1` skips it.
+// The `frame-mode` radio toggles between annotated and raw at the URL level
+// so the server-side overlay budget controls bandwidth either way.
+let frameMode = "annotated";
+
+function currentFrameUrl() {
+  const base = "/api/frame.jpg";
+  const params = new URLSearchParams({ t: String(Date.now()) });
+  if (frameMode === "raw") params.set("raw", "1");
+  return `${base}?${params.toString()}`;
+}
+function refreshFrame() {
+  if (CAM_IMG) CAM_IMG.src = currentFrameUrl();
+}
+// 3 Hz (~333 ms): matches the brief; smooth enough for board-positioning
+// without saturating the wifi link to a remote operator station.
+setInterval(refreshFrame, 333);
+refreshFrame();  // kick off immediately so the panel isn't blank for a tick
+
+// Placeholder visibility — driven by the <img>'s load/error events. The
+// `cam-panel.no-frame` class swap is the CSS-only "show placeholder"
+// mechanism mirrored from pan_tilt.
+function markFrameMissing(missing) {
+  if (CAM_PANEL) CAM_PANEL.classList.toggle("no-frame", missing);
+}
+if (CAM_IMG) {
+  CAM_IMG.addEventListener("load", () => markFrameMissing(false));
+  CAM_IMG.addEventListener("error", () => markFrameMissing(true));
+}
+
+// Mode radio handler — flip the URL on change so the next tick uses raw/ann.
+$$('input[name="frame-mode"]').forEach((r) => {
+  r.addEventListener("change", () => {
+    const checked = document.querySelector('input[name="frame-mode"]:checked');
+    frameMode = checked ? checked.value : "annotated";
+    refreshFrame();  // pick up the new URL without waiting for the next tick
+  });
+});
+
+// ---- WebSocket connection pill --------------------------------------------
+const INDICATOR = $("#conn-indicator");
+
+function setIndicator(text, kind) {
+  if (!INDICATOR) return;
+  INDICATOR.textContent = text;
+  INDICATOR.classList.remove("connected", "dropped");
+  if (kind) INDICATOR.classList.add(kind);
+}
+
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(proto + "//" + location.host + "/ws");
+  ws.onopen = () => setIndicator("WS: live", "connected");
+  ws.onmessage = (ev) => {
+    try { state = JSON.parse(ev.data); } catch (_) { return; }
+    render();
+  };
+  const reconnect = () => {
+    setIndicator("WS: dropped — retrying", "dropped");
+    setTimeout(connectWS, 1500);
+  };
+  ws.onclose = reconnect;
+  ws.onerror = () => { /* onclose fires after */ };
+  return ws;
+}
+connectWS();
+
+// ---- T3: Move tab — joint editor + presets --------------------------------
+// Mirrors src/pan_tilt/webui/app.js's joint editor verbatim: 7 J0..J6 inputs,
+// rad/deg radio toggle with `prevUnit` tracking to convert in place, Load
+// current / Zero all helpers, and a confirm() dialog before any POST /api/move.
+// Presets: Home = [0,0,0,0,0,0,0]; look-forward is wired as a button but
+// emits a console.warn() until a verified safe joint set from a calibration
+// session is recorded. The brief is literal: do NOT invent unsafe joint
+// values — a button that warns is correct, a button that sends unsafe joints
+// is not.
+const N_JOINTS = 7;
+const MOVE_INPUTS_EL = $("#move-joint-inputs");
+const moveJointInputs = [];
+if (MOVE_INPUTS_EL) {
+  for (let i = 0; i < N_JOINTS; i++) {
+    const row = document.createElement("div");
+    row.className = "joint-row";
+    row.innerHTML = `<label>J${i}</label><input type="number" step="0.01" value="0">`;
+    MOVE_INPUTS_EL.appendChild(row);
+    moveJointInputs.push(row.querySelector("input"));
+  }
+}
+
+function moveUnit() {
+  const checked = document.querySelector('input[name="move-unit"]:checked');
+  return checked ? checked.value : "rad";
+}
+function readMoveJointsRad() {
+  const unit = moveUnit();
+  return moveJointInputs.map((inp) => {
+    const v = parseFloat(inp.value) || 0;
+    return unit === "deg" ? (v * Math.PI) / 180 : v;
+  });
+}
+function writeMoveJoints(valuesRad) {
+  const unit = moveUnit();
+  moveJointInputs.forEach((inp, i) => {
+    const v = valuesRad[i] !== undefined ? valuesRad[i] : 0;
+    inp.value = (unit === "deg" ? (v * 180) / Math.PI : v).toFixed(4);
+  });
+}
+
+// Unit-switch with prevUnit tracking so values stay numerically consistent
+// across toggles (rad → deg → rad round-trips without drift). Copied from
+// pan_tilt/webui/app.js to keep the two tools' UX identical.
+let prevMoveUnit = "rad";
+document.querySelectorAll('input[name="move-unit"]').forEach((r) => {
+  r.addEventListener("change", () => {
+    const nu = moveUnit();
+    if (nu === prevMoveUnit) return;
+    moveJointInputs.forEach((inp) => {
+      const v = parseFloat(inp.value) || 0;
+      const asRad = prevMoveUnit === "deg" ? (v * Math.PI) / 180 : v;
+      inp.value = (nu === "deg" ? (asRad * 180) / Math.PI : asRad).toFixed(4);
+    });
+    prevMoveUnit = nu;
+  });
+});
+
+const BTN_LOAD_CURRENT = $("#move-load-current");
+if (BTN_LOAD_CURRENT) {
+  BTN_LOAD_CURRENT.addEventListener("click", () => {
+    if (!state || !state.xarm_joint_positions || state.xarm_joint_positions.length === 0) {
+      alert("xArm joint_states not yet received");
+      return;
+    }
+    writeMoveJoints(state.xarm_joint_positions.slice(0, N_JOINTS));
+  });
+}
+const BTN_ZERO = $("#move-zero");
+if (BTN_ZERO) {
+  BTN_ZERO.addEventListener("click", () => writeMoveJoints(Array(N_JOINTS).fill(0)));
+}
+
+// applyMoveConfirm(angles_rad) — confirm + POST /api/move + status wiring.
+// Exposed as a named function (per the brief's "Produces" list) so future
+// tasks / smoke scripts can re-use the exact same client path. Status flow:
+// warn ("moving…") → ok (server reason) or err (server reason / HTTP error).
+async function applyMoveConfirm(anglesRad) {
+  if (!Array.isArray(anglesRad) || anglesRad.length !== N_JOINTS) {
+    setStatus("move-status", `expected ${N_JOINTS} joints, got ${anglesRad && anglesRad.length}`, "err");
+    return;
+  }
+  if (!confirm("Send xArm to these joints now?\n" + anglesRad.map((a) => a.toFixed(4)).join(", "))) {
+    return;
+  }
+  setStatus("move-status", "moving…", "warn");
+  try {
+    const r = await fetch("/api/move", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ joints: anglesRad }),
+    });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      setStatus("move-status", "move sent: " + (body.reason || "ok"), "ok");
+    } else {
+      setStatus("move-status", "FAIL: " + (body.reason || body.detail || ("HTTP " + r.status)), "err");
+    }
+  } catch (e) {
+    setStatus("move-status", "ERROR: " + e, "err");
+  }
+}
+
+const BTN_SEND = $("#move-send");
+if (BTN_SEND) {
+  BTN_SEND.addEventListener("click", () => applyMoveConfirm(readMoveJointsRad()));
+}
+
+// Presets: Home zeroes all seven joints (a verified safe rest pose on the
+// xArm). look-forward intentionally warns until a calibration-session pose
+// is recorded — see the TODO note in index.html.
+const PRESET_BAR = $("#move-presets");
+if (PRESET_BAR) {
+  PRESET_BAR.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-preset]");
+    if (!btn) return;
+    const preset = btn.dataset.preset;
+    if (preset === "home") {
+      writeMoveJoints(Array(N_JOINTS).fill(0));
+      setStatus("move-status", "preset loaded: home (zeros)", "");
+    } else if (preset === "look-forward") {
+      // TODO: look-forward preset pose not yet defined — pick a verified
+      // safe joint set from a calibration session and wire here. Deliberately
+      // NOT inventing joint values: the brief is literal about not shipping
+      // an unsafe preset, so this button warns and does nothing else.
+      console.warn(
+        "TODO: look-forward preset pose not yet defined — pick a verified safe joint set from a calibration session and wire here"
+      );
+      setStatus(
+        "move-status",
+        "look-forward preset not wired yet (see TODO in app.js)",
+        "warn"
+      );
+    }
+  });
+}
+
+// ---- T3: Info tab — kv-tables + matrix + safety ---------------------------
+
+// formatMatrix(rows, dp=4): joins a 2-D numeric array into the same monospace
+// "+0.1234 -0.5678 …" rows the pan_tilt T_base_ee pre block uses, so the two
+// tools' Info tabs render T_base_ee identically. Defaults to 4 dp per the
+// brief.
+function formatMatrix(rows, dp = 4) {
+  if (!Array.isArray(rows) || rows.length === 0) return "–";
+  return rows
+    .map((row) =>
+      row
+        .map((v) => {
+          const n = Number(v);
+          if (!Number.isFinite(n)) return "  ?    ";
+          return (n >= 0 ? " " : "") + n.toFixed(dp);
+        })
+        .join("  ")
+    )
+    .join("\n");
+}
+
+function kvSet(rootSel, key, value, kind = "") {
+  const cell = document.querySelector(`${rootSel} td[data-k="${key}"]`);
+  if (!cell) return;
+  cell.textContent = value;
+  cell.className = kind || "";
+}
+
+function renderInfoTab(s) {
+  // ---- Camera ------------------------------------------------------------
+  kvSet("#info-kv-camera", "image_topic", s.image_topic || "—");
+  kvSet("#info-kv-camera", "ros_domain_id",
+        s.ros_domain_id !== undefined && s.ros_domain_id !== null ? String(s.ros_domain_id) : "—");
+  kvSet("#info-kv-camera", "status", s.camera_connected ? "streaming" : "—");
+  kvSet("#info-kv-camera", "frame_count",
+        s.frame_count !== undefined && s.frame_count !== null ? String(s.frame_count) : "0");
+  if (s.frame_age_sec === null || s.frame_age_sec === undefined) {
+    kvSet("#info-kv-camera", "frame_age", "—");
+  } else {
+    const age = Number(s.frame_age_sec);
+    kvSet("#info-kv-camera", "frame_age", age < 10 ? age.toFixed(2) + " s" : ">10 s (stale)");
+  }
+  kvSet("#info-kv-camera", "frame_hz",
+        Number.isFinite(s.frame_hz) && s.frame_hz > 0 ? s.frame_hz.toFixed(1) + " Hz" : "—");
+
+  // ---- Robot state -------------------------------------------------------
+  if (Array.isArray(s.xarm_joint_positions) && s.xarm_joint_positions.length > 0) {
+    const joints = s.xarm_joint_positions.map((j) => Number(j).toFixed(4)).join(", ");
+    kvSet("#info-kv-robot", "xarm_joints",
+          `${s.xarm_joint_positions.length} joints: [${joints}]`);
+  } else {
+    kvSet("#info-kv-robot", "xarm_joints", "—");
+  }
+  kvSet("#info-kv-robot", "tf_status", s.t_base_ee ? "ok" : "waiting");
+
+  // ---- T_base_eef matrix -------------------------------------------------
+  const matEl = $("#info-matrix-tbe");
+  if (matEl) {
+    matEl.textContent = s.t_base_ee ? formatMatrix(s.t_base_ee, 4) : "–";
+  }
+
+  // ---- ChArUco board -----------------------------------------------------
+  const b = s.board || {};
+  const grid = (b.squares_x && b.squares_y) ? `${b.squares_x} × ${b.squares_y}` : "—";
+  kvSet("#info-board", "grid", grid);
+  kvSet("#info-board", "square_len",
+        Number.isFinite(b.square_len_m) ? (b.square_len_m * 1000).toFixed(1) + " mm" : "—");
+  kvSet("#info-board", "marker_len",
+        Number.isFinite(b.marker_len_m) ? (b.marker_len_m * 1000).toFixed(1) + " mm" : "—");
+  kvSet("#info-board", "aruco_dict", b.aruco_dict || "—");
+
+  // ---- Safety envelope ---------------------------------------------------
+  const safEl = $("#info-safety");
+  if (safEl) {
+    safEl.textContent = s.safety_envelope
+      ? JSON.stringify(s.safety_envelope, null, 2)
+      : "–";
+  }
+}
+
+// renderMoveSafety: drive #move-safety-status off state.safety_preview, the
+// server-side SafetyEnvelope verdict (added in T3 so the math doesn't have
+// to be duplicated in JS). Shape: {safe: bool|null, detail: str}. Green
+// when safe, red when violation, muted when the server can't decide (no TF
+// / no envelope).
+function renderMoveSafety(s) {
+  const sp = s.safety_preview;
+  if (!sp || sp.safe === null || sp.safe === undefined) {
+    setStatus("move-safety-status",
+              (sp && sp.detail) ? sp.detail : "safety: waiting for TF…",
+              "");
+    return;
+  }
+  setStatus("move-safety-status",
+            sp.detail || (sp.safe ? "safe" : "VIOLATION"),
+            sp.safe ? "ok" : "err");
+}
+
+// ---- render the info tab from state ---------------------------------------
+function render() {
+  if (!state) return;
+
+  if (state.camera_connected) {
+    const hz = (state.frame_hz || 0).toFixed(1);
+    const age = state.frame_age_sec === null || state.frame_age_sec === undefined
+      ? "—"
+      : (state.frame_age_sec < 10
+          ? state.frame_age_sec.toFixed(2) + " s"
+          : ">10 s (stale)");
+    setStatus("info-camera", `camera: streaming ${hz} Hz · last frame ${age} ago`, "ok");
+  } else {
+    setStatus("info-camera",
+      `camera: waiting on ${state.image_topic || "(no topic)"}`,
+      "warn");
+  }
+
+  if (state.t_base_ee) {
+    setStatus("info-tf", "tf: base→ee resolved", "ok");
+  } else {
+    setStatus("info-tf", "tf: waiting for base→ee", "warn");
+  }
+
+  // T2: detection badge in the lower-left of the camera panel. Reads
+  // state.last_detection = {corners: int, reproj_px: float|null} (T1 schema)
+  // and shows "corners=N rms=X.XXpx OK" (green) when the board is visible,
+  // or "corners=0 NO DETECTION" (red) otherwise.
+  const badge = document.getElementById("detection-badge");
+  if (badge) {
+    const ld = state.last_detection;
+    if (ld && Number.isFinite(ld.corners) && ld.corners > 0) {
+      const rms = Number.isFinite(ld.reproj_px) ? ld.reproj_px.toFixed(2) + "px" : "—";
+      badge.textContent = `corners=${ld.corners}  rms=${rms}  OK`;
+      badge.classList.remove("err");
+      badge.classList.add("ok");
+    } else {
+      badge.textContent = "corners=0  NO DETECTION";
+      badge.classList.remove("ok");
+      badge.classList.add("err");
+    }
+  }
+
+  // T2: keep the placeholder topic in sync with whatever image_topic the
+  // server is currently subscribed to. Cheap idempotent assignment.
+  const placeholderTopic = document.getElementById("placeholder-topic");
+  if (placeholderTopic && state.image_topic) {
+    placeholderTopic.textContent = state.image_topic;
+  }
+
+  // T3: Info-tab kv-tables / matrix / board / safety + Move-tab safety line.
+  renderInfoTab(state);
+  renderMoveSafety(state);
+}

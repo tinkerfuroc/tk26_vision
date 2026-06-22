@@ -35,6 +35,7 @@ setup(
             'check_waving_inference = tk_vision_specialized.check_waving_inference:main',
             'placing_location_server = tk_vision_specialized.placing_location_server:main',
             'object_match_server = tk_vision_specialized.object_match_server:main',
+            'object_match_all_server = tk_vision_specialized.object_match_all_server:main',
         ],
     },
 )

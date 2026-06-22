@@ -258,6 +258,38 @@ $("follow-stop").addEventListener("click", async () => {
   setFollowControlsRunning(false);
 });
 
+/* Follow cruise settings: load current B/A/min-gap on startup, save on click.
+   Persisted server-side to ~/.tk25/follow_cruise.yaml and injected as -p
+   overrides on the next follow_server launch (no live update). */
+async function loadCruise() {
+  try {
+    const c = await (await fetch("/api/follow/cruise")).json();
+    $("cruise-goalgate").checked = !!c.enable_cruise_goalgate;
+    $("cruise-carrot").checked = !!c.enable_cruise_carrot;
+    $("cruise-min-gap").value = Number(c.cruise_min_gap).toFixed(2);
+    $("cruise-status").textContent =
+      `B=${c.enable_cruise_goalgate} A=${c.enable_cruise_carrot} gap=${c.cruise_min_gap} m`;
+  } catch (e) { $("cruise-status").textContent = `load failed: ${e}`; }
+}
+$("cruise-save").addEventListener("click", async () => {
+  const gap = parseFloat($("cruise-min-gap").value);
+  if (isNaN(gap) || gap < 0.2 || gap > 1.5) {
+    $("cruise-status").textContent = "Invalid min-gap (must be 0.2-1.5 m)";
+    return;
+  }
+  const body = {
+    enable_cruise_goalgate: $("cruise-goalgate").checked,
+    enable_cruise_carrot: $("cruise-carrot").checked,
+    cruise_min_gap: gap,
+  };
+  const r = await post("/api/follow/cruise", body);
+  $("cruise-status").textContent = r.cruise_min_gap !== undefined
+    ? `saved — B=${r.enable_cruise_goalgate} A=${r.enable_cruise_carrot} gap=${r.cruise_min_gap} m (restart follow to apply)`
+    : `save failed: ${r.message || JSON.stringify(r)}`;
+  log(`cruise save → ${JSON.stringify(r)}`);
+});
+loadCruise();
+
 /* Stale banner + observer/bench mode chip + record state. */
 setInterval(async () => {
   $("stale-banner").classList.toggle("hidden", Date.now() - lastStateAt < 1000);

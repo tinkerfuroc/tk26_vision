@@ -24,6 +24,8 @@ object (the ROS node in production, a fake in tests). The bridge contract:
     reseed(bbox:[x1,y1,x2,y2]) -> dict      # ReseedTarget response fields
     wave() -> dict                          # DetectWaving boxes/points or error
     record_start() / record_stop() -> dict  # ros2 bag record control (offline replay)
+    get_follow_cruise() -> dict                 # current cruise settings
+    set_follow_cruise(dict) -> dict             # persist; applies on next follow start
 
 All bridge methods must be thread-safe; handlers poll (no cross-thread asyncio).
 """
@@ -50,6 +52,19 @@ class ReseedRequest(BaseModel):
     def _valid_box(cls, v):
         if len(v) != 4 or v[2] <= v[0] or v[3] <= v[1]:
             raise ValueError("bbox must be [x1,y1,x2,y2] with x2>x1, y2>y1")
+        return v
+
+
+class CruiseRequest(BaseModel):
+    enable_cruise_goalgate: bool
+    enable_cruise_carrot: bool
+    cruise_min_gap: float
+
+    @field_validator("cruise_min_gap")
+    @classmethod
+    def _valid_gap(cls, v):
+        if not (0.2 <= v <= 1.5):
+            raise ValueError("cruise_min_gap must be in [0.2, 1.5] m")
         return v
 
 
@@ -140,6 +155,14 @@ def create_app(bridge, webui_dir: Optional[Path] = None) -> FastAPI:
     @app.get("/api/follow/status")
     def follow_status():
         return bridge.follow_status()
+
+    @app.get("/api/follow/cruise")
+    def follow_cruise_get():
+        return bridge.get_follow_cruise()
+
+    @app.post("/api/follow/cruise")
+    def follow_cruise_set(req: CruiseRequest):
+        return bridge.set_follow_cruise(req.model_dump())
 
     @app.post("/api/proc/{name}/start")
     def proc_start(name: str):

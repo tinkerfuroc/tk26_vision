@@ -123,6 +123,12 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-06-15 — Tracking web UI: Follow cruise panel** (B/A toggles + min gap) →
+  persisted to `~/.tk25/follow_cruise.yaml`, injected as `-p` overrides on each
+  `follow_server` launch. `process_manager` gains `follow_server_argv` /
+  `DEFAULT_CRUISE` + sidecar load/persist (`get_follow_cruise`/`set_follow_cruise`);
+  `track_web` exposes a `cruise_sidecar` param + bridge methods; `track_web_app`
+  adds `GET`/`POST /api/follow/cruise` (`CruiseRequest`, gap clamped to [0.2, 1.5]).
 - **2026-06-15 — Pan-follow tilt 40° → 37°.** `fixed_tilt_deg` default lowered to
   37° (code default + `config/default.yaml`) to match the behavior tree's recovery
   head-scan tilt (`BtNode_RecoveryScan.tilt_deg=37`), so the head holds one

@@ -1,0 +1,89 @@
+"""TDD for the FFS-depth residual in the bundle adjust.
+
+The calibration's per-view T_cam_board is monocular planar PnP, whose
+optical-axis (depth/scale) translation is the weakest-constrained DOF and is
+biased by any focal-length / board-scale error. FoundationStereo gives metric
+depth at the corners; feeding it as a 3D point residual in the bundle adjust
+pins that DOF. These tests prove the residual (a) is harmless when depth is
+perfect, (b) corrects a focal-scale-biased monocular solve, (c) degrades
+gracefully to monocular when depth is absent, (d) honors the validity mask.
+"""
+import numpy as np
+from handeye_calib import synthetic as syn, transforms as tf, handeye_solve as hs
+
+
+def test_depth_residual_harmless_when_consistent():
+    # Noiseless, correct K, perfect metric depth -> BA still recovers X exactly.
+    sc = syn.make_scenario(n_poses=15, pixel_noise=0.0, seed=8, with_depth=True)
+    Xs, Tbbs, _ = hs.seed_handeye(sc.samples, sc.K, None, sc.board_pts)
+    Xb, _, info = hs.bundle_adjust(sc.samples, sc.K, None, sc.board_pts, Xs, Tbbs,
+                                   depth_weight=1.0, depth_sigma_m=0.003)
+    assert np.linalg.norm(Xb[:3, 3] - sc.X_true[:3, 3]) * 1000 < 0.1
+    assert info["final_reproj_px"] < 1e-2
+
+
+def test_depth_corrects_focal_scale_bias():
+    # Pixels were generated with the TRUE K. Hand the solver a 5%-too-large
+    # focal length: monocular reprojection-only BA then drifts to a scale-wrong
+    # X (the classic planar-PnP failure). The metric depth residual pulls the
+    # translation scale back toward truth.
+    sc = syn.make_scenario(n_poses=18, pixel_noise=0.0, seed=7, with_depth=True)
+    K_wrong = sc.K.copy()
+    K_wrong[0, 0] *= 1.05
+    K_wrong[1, 1] *= 1.05
+
+    Xoff, _, _ = hs.bundle_adjust(sc.samples, K_wrong, None, sc.board_pts,
+                                  sc.X_true, sc.Tbb_true, depth_weight=0.0)
+    Xon, _, _ = hs.bundle_adjust(sc.samples, K_wrong, None, sc.board_pts,
+                                 sc.X_true, sc.Tbb_true,
+                                 depth_weight=1.0, depth_sigma_m=0.003)
+    err_off = np.linalg.norm(Xoff[:3, 3] - sc.X_true[:3, 3])
+    err_on = np.linalg.norm(Xon[:3, 3] - sc.X_true[:3, 3])
+    assert err_off > 0.003, f"monocular not biased enough to be a fair test: {err_off*1000:.2f}mm"
+    assert err_on < 0.5 * err_off, f"depth didn't help: on={err_on*1000:.2f} off={err_off*1000:.2f}mm"
+    assert err_on < 0.003, f"depth-on still off by {err_on*1000:.2f}mm"
+
+
+def test_depth_weight_noop_when_no_depth_present():
+    # Samples without obs_xyz_cam + depth_weight>0 must behave EXACTLY like
+    # monocular (graceful fallback when FFS is unavailable at capture).
+    sc = syn.make_scenario(n_poses=15, pixel_noise=0.3, seed=8)  # with_depth=False
+    Xs, Tbbs, _ = hs.seed_handeye(sc.samples, sc.K, None, sc.board_pts)
+    Xa, _, _ = hs.bundle_adjust(sc.samples, sc.K, None, sc.board_pts, Xs, Tbbs,
+                                depth_weight=0.0)
+    Xb, _, _ = hs.bundle_adjust(sc.samples, sc.K, None, sc.board_pts, Xs, Tbbs,
+                                depth_weight=5.0, depth_sigma_m=0.003)
+    np.testing.assert_allclose(Xa, Xb, atol=1e-12)
+
+
+def test_depth_validity_mask_excludes_bad_corners():
+    # Corrupt a few corners' depth but mark them invalid -> result must match
+    # the all-good case (invalid entries never enter the residual).
+    sc = syn.make_scenario(n_poses=15, pixel_noise=0.0, seed=8, with_depth=True)
+    Xs, Tbbs, _ = hs.seed_handeye(sc.samples, sc.K, None, sc.board_pts)
+    Xgood, _, _ = hs.bundle_adjust(sc.samples, sc.K, None, sc.board_pts, Xs, Tbbs,
+                                   depth_weight=1.0, depth_sigma_m=0.003)
+    for s in sc.samples:
+        s.obs_xyz_cam = s.obs_xyz_cam.copy()
+        s.obs_xyz_valid = s.obs_xyz_valid.copy()
+        s.obs_xyz_cam[0] = [9.9, 9.9, 9.9]   # garbage
+        s.obs_xyz_valid[0] = False           # but flagged invalid
+    Xmask, _, _ = hs.bundle_adjust(sc.samples, sc.K, None, sc.board_pts, Xs, Tbbs,
+                                   depth_weight=1.0, depth_sigma_m=0.003)
+    np.testing.assert_allclose(Xgood, Xmask, atol=1e-9)
+
+
+def test_solve_reports_depth_metrics_when_present():
+    sc = syn.make_scenario(n_poses=16, pixel_noise=0.3, seed=11, with_depth=True)
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts,
+                   depth_weight=1.0, depth_sigma_m=0.003)
+    # depth-grounded honest metric surfaces in the held-out block
+    assert "depth_point_rmse_mm" in res.heldout_metrics
+    assert res.heldout_metrics["depth_point_rmse_mm"] is not None
+    assert res.heldout_metrics["n_depth_corners"] > 0
+
+
+def test_solve_omits_depth_metrics_when_absent():
+    sc = syn.make_scenario(n_poses=16, pixel_noise=0.3, seed=11)  # no depth
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts)
+    assert res.heldout_metrics.get("depth_point_rmse_mm") is None

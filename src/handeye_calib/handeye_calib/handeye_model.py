@@ -49,3 +49,10 @@ class Sample:
     T_cam_board: np.ndarray       # 4x4, B_i (from PnP) — seed input
     obs_px: np.ndarray            # (M,2) observed corner pixels
     corner_idx: np.ndarray        # (M,) indices into board_corners() for obs_px
+    # FFS metric depth (optional, default None for back-compat / monocular-only
+    # capture). When present these are the FoundationStereo-deprojected corner
+    # points in the camera optical frame and a per-corner validity mask — they
+    # feed the depth residual in the bundle adjust so the optical-axis (depth)
+    # translation of T_cam_board is *measured*, not inferred by planar PnP.
+    obs_xyz_cam: np.ndarray = None    # (M,3) camera-frame metric points or None
+    obs_xyz_valid: np.ndarray = None  # (M,) bool mask or None

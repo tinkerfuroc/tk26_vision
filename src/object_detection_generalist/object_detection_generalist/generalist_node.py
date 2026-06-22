@@ -172,9 +172,23 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         #   - use_vlm_sam_fallback=True → race YOLO-World vs VLM concurrently.
         self.declare_parameter('enable_vlm', False)
         self.declare_parameter('vlm_model', 'google/gemini-2.5-flash')
+        # Fallback chain. A 'dashscope/' prefix routes the model to Alibaba
+        # DashScope's OpenAI-compatible endpoint (separate DASHSCOPE_API_KEY +
+        # base URL) instead of OpenRouter — see vlm_bbox._split_provider. qwen
+        # is served via DashScope so it stays reachable on networks where
+        # openrouter.ai is blocked.
         self.declare_parameter(
-            'vlm_fallback_models', ['qwen/qwen3-vl-8b-instruct']
+            'vlm_fallback_models', ['dashscope/qwen3-vl-plus']
         )
+        # Convenience switch: make the DashScope qwen model the PRIMARY VLM and
+        # drop OpenRouter from the chain entirely. Use this on networks where
+        # openrouter.ai is unreachable — it avoids the ~20 s of gemini
+        # connection failures the node would otherwise burn before falling back.
+        # When True, `vlm_model` becomes `dashscope_qwen_model` and
+        # `vlm_fallback_models` is emptied (overriding the two params above).
+        #   ros2 run ... --ros-args -p prefer_dashscope_qwen:=true
+        self.declare_parameter('prefer_dashscope_qwen', False)
+        self.declare_parameter('dashscope_qwen_model', 'dashscope/qwen3-vl-plus')
         self.declare_parameter('vlm_fallback_on_empty', False)
         # vlm_timeout_s is the OVERALL wall-clock budget across all retries
         # and fallback models for one /object_detection_generalist call.
@@ -225,6 +239,16 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         self.vlm_fallback_models = self._load_string_list_parameter(
             'vlm_fallback_models'
         )
+        # prefer_dashscope_qwen wins over vlm_model / vlm_fallback_models:
+        # qwen-via-DashScope becomes the sole VLM model, so the node never
+        # touches the (possibly blocked) OpenRouter host.
+        if bool(self.get_parameter('prefer_dashscope_qwen').value):
+            self.vlm_model = self.get_parameter('dashscope_qwen_model').value
+            self.vlm_fallback_models = []
+            self.get_logger().info(
+                f'prefer_dashscope_qwen=True: VLM primary set to '
+                f'"{self.vlm_model}" (DashScope), OpenRouter fallbacks dropped'
+            )
         self.vlm_fallback_on_empty = bool(
             self.get_parameter('vlm_fallback_on_empty').value
         )
@@ -801,16 +825,21 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         event alone will short-circuit the worker at the next checkpoint.
         """
         abandon_event.set()
-        client = client_holder.get('client')
-        if client is None:
-            return
-        try:
-            client.close()
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().debug(
-                f'Closing VLM client during cancel raised {type(exc).__name__}: '
-                f'{exc} (safe to ignore)'
-            )
+        # request_bboxes may build more than one client (e.g. OpenRouter for
+        # the gemini leg + DashScope for the qwen leg). Close all of them;
+        # fall back to the single-client key for older holders.
+        clients = client_holder.get('clients')
+        if not clients:
+            single = client_holder.get('client')
+            clients = [single] if single is not None else []
+        for client in clients:
+            try:
+                client.close()
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().debug(
+                    f'Closing VLM client during cancel raised '
+                    f'{type(exc).__name__}: {exc} (safe to ignore)'
+                )
 
     def _log_debug(self, _t0, request, prompt, rgb_img, result):
         """Write per-call debug artifacts. Fires unconditionally — empty

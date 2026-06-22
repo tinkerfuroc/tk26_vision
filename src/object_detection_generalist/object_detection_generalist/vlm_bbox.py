@@ -19,12 +19,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import threading
 import time
 from typing import Callable, List, Tuple
 
 import numpy as np
 
-from kimi_api._env import base_url, load_env, require_api_key
+from kimi_api._env import (
+    base_url,
+    dashscope_base_url,
+    load_env,
+    require_api_key,
+    require_dashscope_api_key,
+)
 from kimi_api._image_utils import encode_to_data_url
 
 
@@ -57,6 +64,25 @@ _QWEN_SYSTEM_PROMPT = (
     "size, where (0,0) is the top-left corner. Never return masks, points, "
     "3D coordinates, depth, rotation, markdown, or explanatory text. Limit to "
     "25 objects. If no instances match, return an empty detections list."
+)
+
+
+# Qwen3-VL (qwen3-vl-plus/max on DashScope, qwen3-vl-* on OpenRouter) emits
+# box coordinates NORMALIZED to 0-1000 natively — it ignores a "pixel
+# coordinates" instruction and returns 0-1000 regardless (verified against a
+# known-position target: a box at pixel (520,240,760,480) on 1280x720 comes
+# back as [407,333,595,667], i.e. value/1000*dim). So the prompt asks for the
+# format the model actually produces, and `_decode_qwen3_bbox` scales 0-1000 ->
+# pixels. Axis order is [x1,y1,x2,y2] (vs Gemini's [ymin,xmin,ymax,xmax]).
+_QWEN3_SYSTEM_PROMPT = (
+    "You are a precise visual grounding model. Return only JSON matching the "
+    "requested schema. Detect every visible instance of the target classes. "
+    "For each detection, output label and box_2d. The box_2d MUST be exactly "
+    "four integers [x1, y1, x2, y2] NORMALIZED to the range 0-1000, where "
+    "(0,0) is the top-left corner and (1000,1000) is the bottom-right corner "
+    "of the image. Never return masks, points, 3D coordinates, depth, "
+    "rotation, markdown, or explanatory text. Limit to 25 objects. If no "
+    "instances match, return an empty detections list."
 )
 
 
@@ -109,11 +135,27 @@ _QWEN_PROFILE = _ProviderProfile(
     system_prompt=_QWEN_SYSTEM_PROMPT,
     bbox_format='pixel_xyxy',
 )
+_QWEN3_PROFILE = _ProviderProfile(
+    name='qwen3',
+    system_prompt=_QWEN3_SYSTEM_PROMPT,
+    bbox_format='normalized_xyxy',
+)
 
 
 def _provider_profile_for_model(model: str) -> _ProviderProfile:
-    """Pick the prompt/decoder profile for an OpenRouter model tag."""
+    """Pick the prompt/decoder profile for a model tag.
+
+    Keyed on substring, so it works on both the OpenRouter id
+    (``qwen/qwen3-vl-8b-instruct``) and the prefix-stripped DashScope id
+    (``qwen3-vl-plus``).
+
+    Qwen3-VL returns 0-1000 NORMALIZED xyxy boxes, while the older Qwen2.5-VL
+    family returns absolute pixel xyxy — so ``qwen3`` gets its own profile and
+    decoder. Order matters: test ``qwen3`` before the generic ``qwen``.
+    """
     model_l = (model or '').lower()
+    if 'qwen3' in model_l:
+        return _QWEN3_PROFILE
     if 'qwen' in model_l:
         return _QWEN_PROFILE
     return _GEMINI_PROFILE
@@ -160,6 +202,28 @@ def _decode_qwen_bbox(box_2d, w: int, h: int) -> Bbox | None:
     )
 
 
+def _decode_qwen3_bbox(box_2d, w: int, h: int) -> Bbox | None:
+    """Decode Qwen3-VL [x1, y1, x2, y2] 0-1000 normalized bbox to pixels."""
+    if not isinstance(box_2d, (list, tuple)) or len(box_2d) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(box_2d[i]) for i in range(4))
+    except (TypeError, ValueError):
+        return None
+
+    # Guard against the occasional flipped corner order.
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+
+    px1 = int(round(x0 * w / 1000.0))
+    py1 = int(round(y0 * h / 1000.0))
+    px2 = int(round(x1 * w / 1000.0))
+    py2 = int(round(y1 * h / 1000.0))
+    return _clip_pixel_bbox(px1, py1, px2, py2, w, h)
+
+
 def _clip_pixel_bbox(px1: int, py1: int, px2: int, py2: int,
                      w: int, h: int) -> Bbox | None:
     px1 = max(0, min(px1, w - 1))
@@ -179,6 +243,8 @@ def _decode_bbox(box_2d, w: int, h: int) -> Bbox | None:
 
 def _decode_bbox_for_profile(box_2d, w: int, h: int,
                              profile: _ProviderProfile) -> Bbox | None:
+    if profile.bbox_format == 'normalized_xyxy':
+        return _decode_qwen3_bbox(box_2d, w, h)
     if profile.bbox_format == 'pixel_xyxy':
         return _decode_qwen_bbox(box_2d, w, h)
     return _decode_gemini_bbox(box_2d, w, h)
@@ -217,6 +283,25 @@ def _build_model_chain(model: str, fallback_models) -> list[str]:
         seen.add(model_name)
         models.append(model_name)
     return models
+
+
+_DASHSCOPE_PREFIX = 'dashscope/'
+
+
+def _split_provider(model_name: str) -> Tuple[str, str]:
+    """Split a model-chain entry into ``(provider, api_model_id)``.
+
+    A ``dashscope/`` prefix routes the request to Alibaba DashScope's
+    OpenAI-compatible endpoint (separate API key + base URL); the prefix is
+    stripped before the id is sent to the API, so ``'dashscope/qwen3-vl-plus'``
+    calls model ``'qwen3-vl-plus'`` against the DashScope host. Everything else
+    goes to the default OpenRouter gateway unchanged. Routing is data-driven via
+    the existing ``vlm_fallback_models`` param — no new routing parameter — so
+    the qwen fallback reaches DashScope even when ``openrouter.ai`` is blocked.
+    """
+    if model_name.startswith(_DASHSCOPE_PREFIX):
+        return 'dashscope', model_name[len(_DASHSCOPE_PREFIX):]
+    return 'openrouter', model_name
 
 
 def request_bboxes(
@@ -273,22 +358,49 @@ def request_bboxes(
     """
 
     load_env()
-    try:
-        api_key = require_api_key()
-    except RuntimeError as exc:
-        raise VlmBboxError(str(exc)) from exc
 
     # Imported lazily so the node can start without openai installed on the
     # default path (openai is in kimi_api's requirements, and the generalist
     # package depends on kimi_api at runtime, so this should succeed).
     from openai import OpenAI
 
-    # Keep retry ownership here, not inside the SDK. The OpenAI client retries
-    # timeouts twice by default; we also enforce timeout_s as one hard
-    # wall-clock budget across our retry/fallback loop below.
-    client = OpenAI(api_key=api_key, base_url=base_url(), max_retries=0)
-    if client_holder is not None:
-        client_holder['client'] = client
+    # Per-provider clients, built lazily and cached for the duration of this
+    # call. A chain like ['google/gemini-2.5-flash', 'dashscope/qwen3-vl-plus']
+    # needs two clients with different keys + base URLs: OpenRouter for the
+    # gemini leg, DashScope for the qwen leg. Routing OpenRouter and DashScope
+    # to distinct hosts is the whole point — when OpenRouter is unreachable the
+    # DashScope leg still succeeds.
+    _clients: dict = {}
+    _clients_lock = threading.Lock()
+
+    def _client_for(provider: str):
+        """Lazily build + cache the OpenAI-compatible client for a provider.
+
+        Raises VlmBboxError if the provider's key is missing; the caller turns
+        that into a failed-model attempt so the chain falls through to the next
+        model instead of aborting the whole request. Keep retry ownership here,
+        not in the SDK (max_retries=0); timeout_s is the hard wall-clock budget
+        across our own retry/fallback loop.
+        """
+        with _clients_lock:
+            existing = _clients.get(provider)
+            if existing is not None:
+                return existing
+            try:
+                if provider == 'dashscope':
+                    key, base = require_dashscope_api_key(), dashscope_base_url()
+                else:
+                    key, base = require_api_key(), base_url()
+            except RuntimeError as exc:
+                raise VlmBboxError(str(exc)) from exc
+            cli = OpenAI(api_key=key, base_url=base, max_retries=0)
+            _clients[provider] = cli
+            if client_holder is not None:
+                # Back-compat: `_cancel_vlm` closes client_holder['client'];
+                # 'clients' carries the full set so cancel can close them all.
+                client_holder.setdefault('client', cli)
+                client_holder.setdefault('clients', []).append(cli)
+            return cli
 
     _t0 = time.perf_counter()
     hard_deadline = _t0 + float(timeout_s)
@@ -298,12 +410,28 @@ def request_bboxes(
         model_chain = _build_model_chain(model, fallback_models)
 
         def single_model_fn(model_name: str):
+            provider, api_model = _split_provider(model_name)
+            try:
+                client = _client_for(provider)
+            except VlmBboxError as exc:
+                if logger is not None:
+                    logger.warn(
+                        f'VLM client unavailable for {model_name} '
+                        f'({provider}): {exc}'
+                    )
+                return [], [], [{
+                    'model': model_name,
+                    'attempt': 0,
+                    'elapsed_s': 0.0,
+                    'status': 'error',
+                    'error': f'VlmBboxError: {exc}',
+                }]
             return _request_bboxes_single_model(
                 client=client,
                 data_url=data_url,
                 image_shape=(h, w),
                 prompt=prompt,
-                model=model_name,
+                model=api_model,
                 max_retries=max_retries,
                 timeout_s=timeout_s,
                 per_attempt_timeout_s=per_attempt_timeout_s,
@@ -325,12 +453,15 @@ def request_bboxes(
         )
         return boxes, labels, time.perf_counter() - _t0, metadata
     finally:
-        # Always close the client we own. Idempotent: caller may have already
-        # closed it as part of the abandon path.
-        try:
-            client.close()
-        except Exception:  # noqa: BLE001
-            pass
+        # Always close every client we built. Idempotent: the caller may have
+        # already closed one as part of the abandon path.
+        with _clients_lock:
+            to_close = list(_clients.values())
+        for cli in to_close:
+            try:
+                cli.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _run_model_chain(
@@ -717,6 +848,23 @@ def _request_raw_completion(
     return completion.choices[0].message.content or ''
 
 
+def _is_structurally_valid_box(box_2d) -> bool:
+    """True iff box_2d is a list/tuple of >=4 numerics.
+
+    Distinguishes a *malformed* payload (wrong length / non-numeric — a model
+    glitch worth a retry) from a *degenerate* one (four real numbers that
+    happen to clip to zero area — a clean no-detection, not worth a retry).
+    """
+    if not isinstance(box_2d, (list, tuple)) or len(box_2d) < 4:
+        return False
+    try:
+        for i in range(4):
+            float(box_2d[i])
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _parse_detections(raw: str, w: int, h: int,
                       profile: _ProviderProfile) -> tuple[List[Bbox], List[str], int]:
     parsed = json.loads(raw)
@@ -726,26 +874,32 @@ def _parse_detections(raw: str, w: int, h: int,
 
     boxes: List[Bbox] = []
     labels: List[str] = []
-    invalid_boxes = 0
+    malformed_boxes = 0    # structurally bad → error + retry
+    degenerate_boxes = 0   # well-formed but zero-area after clip → skip, empty
     for det in detections:
         if not isinstance(det, dict):
-            invalid_boxes += 1
+            malformed_boxes += 1
             continue
-        decoded = _decode_bbox_for_profile(det.get('box_2d'), w, h, profile)
+        box_2d = det.get('box_2d')
+        decoded = _decode_bbox_for_profile(box_2d, w, h, profile)
         if decoded is None:
-            invalid_boxes += 1
+            if _is_structurally_valid_box(box_2d):
+                # Four real numbers that collapse to zero area (e.g. the model
+                # echoed a point or an off-image box). Treat as no-detection,
+                # not a parse failure: retrying yields the same answer.
+                degenerate_boxes += 1
+            else:
+                malformed_boxes += 1
             continue
         boxes.append(decoded)
         raw_label = det.get('label')
         labels.append(raw_label if isinstance(raw_label, str) else '')
 
-    if detections and not boxes:
+    # Only structurally malformed payloads are worth a retry. A response whose
+    # every box is well-formed-but-degenerate is an authoritative empty result.
+    if malformed_boxes and not boxes:
         raise ValueError(
-            f'all {len(detections)} detection(s) had invalid box_2d values'
-        )
-    if invalid_boxes and not boxes:
-        raise ValueError(
-            f'{invalid_boxes} detection(s) had invalid box_2d values'
+            f'{malformed_boxes} detection(s) had invalid box_2d values'
         )
     return boxes, labels, len(detections)
 

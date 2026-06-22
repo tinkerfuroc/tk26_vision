@@ -61,3 +61,35 @@ def test_se3_average_antipodal_sign_alignment():
 def test_se3_average_empty_raises():
     with pytest.raises(ValueError):
         tf.se3_average([])
+
+
+def test_rigid_3d_3d_recovers_known_transform():
+    # rigid_3d_3d(src, dst) returns T s.t. dst ≈ R @ src + t (no scale).
+    # Used for the FFS-depth metric cross-check: src = board-frame corner
+    # model points, dst = FFS-deprojected camera-frame points => T_cam_board.
+    from scipy.spatial.transform import Rotation as R
+    rng = np.random.default_rng(0)
+    Rm = R.from_euler('xyz', [25, -40, 12], degrees=True).as_matrix()
+    t = np.array([0.3, -0.15, 0.55])
+    src = rng.uniform(-0.1, 0.1, size=(20, 3))
+    dst = (Rm @ src.T).T + t
+    T = tf.rigid_3d_3d(src, dst)
+    np.testing.assert_allclose(T[:3, :3], Rm, atol=1e-9)
+    np.testing.assert_allclose(T[:3, 3], t, atol=1e-9)
+    # Applying T to src reproduces dst.
+    src_h = np.c_[src, np.ones(len(src))]
+    np.testing.assert_allclose((T @ src_h.T).T[:, :3], dst, atol=1e-9)
+
+
+def test_rigid_3d_3d_no_reflection_under_noise():
+    # Coplanar/near-degenerate points + noise must still yield a proper
+    # rotation (det = +1), never a reflection (the classic Kabsch SVD trap).
+    from scipy.spatial.transform import Rotation as R
+    rng = np.random.default_rng(3)
+    Rm = R.from_euler('xyz', [5, 8, -3], degrees=True).as_matrix()
+    t = np.array([0.1, 0.2, 0.5])
+    src = np.c_[rng.uniform(-0.08, 0.08, size=(16, 2)), np.zeros(16)]  # planar board
+    dst = (Rm @ src.T).T + t + rng.normal(0, 1e-3, size=(16, 3))
+    T = tf.rigid_3d_3d(src, dst)
+    assert np.linalg.det(T[:3, :3]) > 0.99           # proper rotation, not a flip
+    assert tf.rotation_angle_deg(T[:3, :3], Rm) < 1.0

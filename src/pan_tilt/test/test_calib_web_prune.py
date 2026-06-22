@@ -126,7 +126,7 @@ def fake_robot(tmp_path: Path):
             "phase1_waypoints_custom": [],
             "phase2_waypoints": [[0.0, 0.0, 0.0, 1.2, 0.0, -1.0, 0.0]],
             "pan_grid_deg": [-30.0, 0.0, 30.0],
-            "tilt_grid_deg": [15.0, 30.0, 45.0],
+            "tilt_grid_deg": [10.0, 20.0, 30.0],
         },
     }
     cfg_path.write_text(yaml.safe_dump(sample_cfg, sort_keys=False))
@@ -324,7 +324,7 @@ def test_phase2_grid_apply_emits_grid_pairs(fake_robot):
     # Each kept pair lies on the original grid.
     for pan, tilt in sd["collector"]["phase2_grid_pairs"]:
         assert pan in (-30.0, 0.0, 30.0)
-        assert tilt in (15.0, 30.0, 45.0)
+        assert tilt in (10.0, 20.0, 30.0)
 
 
 def test_unknown_predictor_choice_rejected(fake_robot):
@@ -441,8 +441,8 @@ def test_overwrite_syncs_in_memory_grid(fake_robot):
     src_data = yaml.safe_load(fake_robot["config_path"].read_text())
     src_data["collector"]["tilt_grid_deg"] = [10.0, 20.0, 40.0]
     fake_robot["config_path"].write_text(yaml.safe_dump(src_data, sort_keys=False))
-    assert node._loaded_cfg["tilt_grid_deg"] == [15.0, 30.0, 45.0]
-    assert node.state.grid["tilt_deg"] == [15.0, 30.0, 45.0]
+    assert node._loaded_cfg["tilt_grid_deg"] == [10.0, 20.0, 30.0]
+    assert node.state.grid["tilt_deg"] == [10.0, 20.0, 30.0]
 
     body = {
         "phase": "phase2_grid",

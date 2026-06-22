@@ -98,21 +98,21 @@ class CollectConfig:
     board: BoardSpec = field(default_factory=BoardSpec)
     safety: SafetyEnvelope = field(default_factory=SafetyEnvelope)
 
-    phase1_waypoints: list = field(default_factory=list)   # list of joint-angle lists (rad), used at firmware (pan=0, tilt=+45) (level)
+    phase1_waypoints: list = field(default_factory=list)   # list of joint-angle lists (rad), used at firmware (pan=0, tilt=+30) (level)
     phase1_waypoints_custom: list = field(default_factory=list)  # used at the operator-chosen custom park
     # Custom Phase-1 park pose (firmware degrees). Defaults to (0, 0) so old
-    # behavior (camera looking 45° down) holds for unconfigured installs.
+    # behavior (camera looking 30° down) holds for unconfigured installs.
     phase1_custom_park_pan_deg: float = 0.0
     phase1_custom_park_tilt_deg: float = 0.0
     phase2_waypoints: list = field(default_factory=list)
     pan_grid_deg: list = field(default_factory=lambda: [-30.0, -15.0, 0.0, 15.0, 30.0])
-    # Firmware degrees. Grid spans from physical level (firmware +45) DOWN
+    # Firmware degrees. Grid spans from physical level (firmware +30) DOWN
     # by 30 deg -- it does NOT go above level because the board sits on the
     # xArm EE below the camera, and anything tilted above level points the
     # camera at the ceiling. Per pan_tilt_model.py, "+firmware = tilt up",
     # so smaller firmware values = looking further down. Servo-zero
-    # (firmware 0) = 45 deg below level.
-    tilt_grid_deg: list = field(default_factory=lambda: [15.0, 22.0, 30.0, 37.0, 45.0])
+    # (firmware 0) = 30 deg below level.
+    tilt_grid_deg: list = field(default_factory=lambda: [6.0, 12.0, 18.0, 24.0, 30.0])
     # Optional pruned override of the (pan, tilt) cross-product. When set,
     # `run_phase2` iterates these (pan_deg, tilt_deg) pairs instead of the
     # rectangular `pan_grid_deg × tilt_grid_deg`. Produced by the calib_web
@@ -136,15 +136,16 @@ class CollectConfig:
     # parks at whatever (pan, tilt) is demanded. Set > 0 to re-enable a
     # per-axis overshoot-then-return pass; the soft envelope below clamps
     # the intermediate so it never asks for an unreachable angle. Defaults
-    # match the operator-declared envelope: pan ±30, tilt ≤+45 (the
+    # match the operator-declared envelope: pan ±30, tilt ≤+30 (the
     # "physical level" ceiling -- anything above points the camera at the
-    # ceiling).
+    # ceiling). The controller's hard clamp at tilt_max_deg=30 will reject
+    # any over-bound intermediate as well.
     servo_backlash_overshoot_deg: float = 0.0
     servo_backlash_pause_sec: float = 0.2
     pan_overshoot_max_deg: float = 30.0
     pan_overshoot_min_deg: float = -30.0
-    tilt_overshoot_max_deg: float = 45.0
-    tilt_overshoot_min_deg: float = 10.0
+    tilt_overshoot_max_deg: float = 30.0
+    tilt_overshoot_min_deg: float = 0.0
     # xArm joint feedback says "done" before the EE finishes oscillating.
     # 1.5 s leaves the board mechanically steady so 1080p frames aren't blurred.
     # Used as a fallback wait when joint_state-based convergence isn't available
@@ -742,7 +743,6 @@ class CalibrateCollectNode(Node):
             )
             return False
 
-        from sensor_msgs.msg import PointCloud2, PointField
         goal = self._joint_move_type.Goal()
         a = list(angles_rad) + [0.0] * max(0, 7 - len(angles_rad))
         goal.joint0 = float(a[0])
@@ -752,24 +752,11 @@ class CalibrateCollectNode(Node):
         goal.joint4 = float(a[4])
         goal.joint5 = float(a[5])
         goal.joint6 = float(a[6])
-        # pick_and_place runs pcl::fromROSMsg + tf2 lookupTransform on
-        # env_points, so a default-constructed PointCloud2 would trip on
-        # missing x/y/z fields and empty frame_id. Build a zero-point cloud
-        # in base_link so the server short-circuits the transform step.
-        env = PointCloud2()
-        env.header.frame_id = "base_link"
-        env.height = 1
-        env.width = 0
-        env.is_bigendian = False
-        env.is_dense = True
-        env.point_step = 12
-        env.row_step = 0
-        env.fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-        ]
-        goal.env_points = env
+        # JointMove's env_points field was replaced by add_octomap (bool).
+        # Stay False: during calibration the planner should not pull a fresh
+        # octomap from sensors -- the EE / marker board / fixture would all
+        # become obstacles and reject otherwise-feasible waypoints.
+        goal.add_octomap = False
 
         timeout = float(self._cfg.arm_action_timeout_sec)
         send_fut = self._joint_move_client.send_goal_async(goal)
@@ -1057,14 +1044,14 @@ class CalibrateCollectNode(Node):
         return n_fail
 
     def run_phase1(self, *, park_pan_deg: float = 0.0,
-                    park_tilt_deg: float = 45.0,
+                    park_tilt_deg: float = 30.0,
                     waypoints: Optional[list] = None,
                     label_prefix: str = "phase1") -> list:
         """Park pan-tilt at the chosen (pan, tilt), then iterate xArm waypoints
         and capture one averaged sample per waypoint.
 
         Two operating modes today:
-          - level (default):  pan=0, tilt=+45 (camera horizontal). Canonical
+          - level (default):  pan=0, tilt=+30 (camera horizontal). Canonical
             hand-eye reference; not operator-mutable.
           - custom:           operator-chosen pan/tilt for a robot whose
             geometry needs a different head pose to keep the marker in view.
@@ -1072,8 +1059,8 @@ class CalibrateCollectNode(Node):
             running both gives an inter-park self-consistency check on the
             recovered T_ee_marker (it must agree across parks).
 
-        Per pan_tilt_model.py "+firmware = tilt up", so firmware +45 = level
-        and firmware 0 = servo zero = looking 45° down.
+        Per pan_tilt_model.py "+firmware = tilt up", so firmware +30 = level
+        and firmware 0 = servo zero = looking 30° down.
         """
         if waypoints is None:
             waypoints = self._cfg.phase1_waypoints
@@ -1206,8 +1193,8 @@ class CalibrateCollectNode(Node):
         self.get_logger().info("=== Sanity pose ===")
         if not self._send_xarm_joint(self._cfg.sanity_xarm_angles_rad):
             return None
-        # Park at physical level (firmware tilt=+45); same reason as Phase 1.
-        if not self._send_pt_with_backlash(0.0, 45.0):
+        # Park at physical level (firmware tilt=+30); same reason as Phase 1.
+        if not self._send_pt_with_backlash(0.0, 30.0):
             return None
         return self._capture_cell("sanity")
 
@@ -1365,7 +1352,7 @@ class CalibrateCollectNode(Node):
             return 0
 
         sanity_start = self.run_sanity()
-        phase1 = (self.run_phase1(park_pan_deg=0.0, park_tilt_deg=45.0,
+        phase1 = (self.run_phase1(park_pan_deg=0.0, park_tilt_deg=30.0,
                                    waypoints=self._cfg.phase1_waypoints,
                                    label_prefix="phase1")
                   if self._phase_select in ("both", "phase1") else [])

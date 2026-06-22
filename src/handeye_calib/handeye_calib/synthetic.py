@@ -29,7 +29,8 @@ def _pnp(board_pts, px, K):
 
 
 def make_scenario(n_poses=15, pixel_noise=0.3, seed=0,
-                  squares_x=5, squares_y=5, square_len=0.04):
+                  squares_x=5, squares_y=5, square_len=0.04,
+                  with_depth=False, depth_noise=0.0):
     rng = np.random.default_rng(seed)
     K = np.array([[615., 0, 320.], [0, 615., 240.], [0, 0, 1.]])
     board_pts = hm.board_corners(squares_x, squares_y, square_len)
@@ -69,8 +70,24 @@ def make_scenario(n_poses=15, pixel_noise=0.3, seed=0,
             continue  # board must be fully in frame
         obs = px + rng.normal(0, pixel_noise, px.shape) if pixel_noise else px
         idx = np.arange(len(board_pts))
+        # Optional FFS-style metric depth: the TRUE camera-frame corner points
+        # (board model points carried through the ground-truth T_cam_board),
+        # optionally with per-coordinate gaussian noise to mimic stereo depth
+        # error. Crucially these are metrically correct regardless of pixel/
+        # focal error, which is exactly why the depth residual fixes the
+        # monocular scale ambiguity.
+        if with_depth:
+            P_meas = (T_cam_board[:3, :3] @ board_pts.T).T + T_cam_board[:3, 3]
+            if depth_noise:
+                P_meas = P_meas + rng.normal(0, depth_noise, P_meas.shape)
+            obs_xyz_cam = P_meas
+            obs_xyz_valid = np.ones(len(board_pts), bool)
+        else:
+            obs_xyz_cam = None
+            obs_xyz_valid = None
         samples.append(hm.Sample(T_base_eef=A, T_cam_board=_pnp(board_pts, obs, K),
-                                 obs_px=obs, corner_idx=idx))
+                                 obs_px=obs, corner_idx=idx,
+                                 obs_xyz_cam=obs_xyz_cam, obs_xyz_valid=obs_xyz_valid))
     if len(samples) < n_poses:
         raise RuntimeError(f"only generated {len(samples)}/{n_poses} poses")
     return Scenario(samples, X_true, Tbb_true, K, board_pts)

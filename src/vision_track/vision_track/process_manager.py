@@ -41,6 +41,35 @@ import subprocess
 import threading
 import time
 
+import yaml
+
+DEFAULT_CRUISE = {
+    "enable_cruise_goalgate": True,   # B (default on)
+    "enable_cruise_carrot": False,    # A (default off)
+    "cruise_min_gap": 0.6,
+}
+
+
+def follow_server_argv(base_argv, cruise):
+    """Append cruise `-p key:=val` overrides to the follow_server launch argv.
+
+    base_argv already ends with `--ros-args -p working_frame:=map`, so extra
+    `-p` pairs simply extend it. Bools render as ROS-style lowercase literals.
+    """
+    def _b(v):
+        return "true" if bool(v) else "false"
+    # Clamp at the launch boundary: _load_cruise() reads the sidecar yaml
+    # without bounds, so a hand-corrupted sidecar could otherwise inject an
+    # extreme value into the follow_server `-p` arg. The API path is already
+    # Pydantic-validated to [0.2, 1.5]; this bounds garbage from the file too.
+    gap = min(1.5, max(0.2, float(cruise['cruise_min_gap'])))
+    return list(base_argv) + [
+        "-p", f"enable_cruise_goalgate:={_b(cruise['enable_cruise_goalgate'])}",
+        "-p", f"enable_cruise_carrot:={_b(cruise['enable_cruise_carrot'])}",
+        "-p", f"cruise_min_gap:={gap}",
+    ]
+
+
 # Fixed allowlist. Keys are the only values the API will accept; the argv lists
 # are never built from caller input.
 REGISTRY = {
@@ -62,7 +91,8 @@ GROUPS = {
 class ProcessManager:
     """Supervise a fixed set of named subprocesses (start/stop/status)."""
 
-    def __init__(self, registry=REGISTRY, groups=GROUPS, stagger_sec=1.5):
+    def __init__(self, registry=REGISTRY, groups=GROUPS, stagger_sec=1.5,
+                 cruise_sidecar="~/.tk25/follow_cruise.yaml"):
         """Store the allowlist and init per-name process / returncode caches.
 
         Args:
@@ -83,6 +113,11 @@ class ProcessManager:
         self._last_rc: dict[str, int | None] = {}
         self._lock = threading.Lock()
         self.term_timeout_s = 5.0
+        self._cruise_sidecar = os.path.expanduser(cruise_sidecar)
+        self._cruise = dict(DEFAULT_CRUISE)
+        # Runs single-threaded at construction (before the web/uvicorn thread
+        # starts), so it intentionally reads the sidecar without the lock.
+        self._load_cruise()
 
     # -- public API --------------------------------------------------------
 
@@ -106,8 +141,11 @@ class ProcessManager:
                 # so killpg(getpgid(pid)) reaches the whole ros2 launch tree.
                 # stdout/stderr inherit the parent's (None) to avoid a pipe
                 # that nobody drains (which would deadlock the child).
+                argv = self._registry[name]
+                if name == "follow_server":
+                    argv = follow_server_argv(argv, self._cruise)
                 proc = subprocess.Popen(
-                    self._registry[name],
+                    argv,
                     start_new_session=True,
                     env=os.environ.copy(),
                     stdout=None,
@@ -191,6 +229,40 @@ class ProcessManager:
         if group not in self._groups:
             return {"group": group, "error": f"unknown group '{group}'"}
         return [self.stop(name) for name in reversed(self._groups[group])]
+
+    # -- follow cruise settings (persisted sidecar) ------------------------
+
+    def _load_cruise(self):
+        try:
+            with open(self._cruise_sidecar) as f:
+                data = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError):
+            return
+        self._cruise.update({k: data[k] for k in DEFAULT_CRUISE if k in data})
+
+    def get_follow_cruise(self) -> dict:
+        with self._lock:
+            return dict(self._cruise)
+
+    def set_follow_cruise(self, settings: dict) -> dict:
+        """Update + persist the cruise settings (only known keys; coerced).
+
+        Takes effect on the NEXT follow_server launch (no live update)."""
+        with self._lock:
+            if "enable_cruise_goalgate" in settings:
+                self._cruise["enable_cruise_goalgate"] = bool(settings["enable_cruise_goalgate"])
+            if "enable_cruise_carrot" in settings:
+                self._cruise["enable_cruise_carrot"] = bool(settings["enable_cruise_carrot"])
+            if "cruise_min_gap" in settings:
+                self._cruise["cruise_min_gap"] = float(settings["cruise_min_gap"])
+            snapshot = dict(self._cruise)
+        try:
+            os.makedirs(os.path.dirname(self._cruise_sidecar), exist_ok=True)
+            with open(self._cruise_sidecar, "w") as f:
+                yaml.safe_dump(snapshot, f)
+        except OSError:
+            pass
+        return snapshot
 
     # -- internals (all called with self._lock held) -----------------------
 

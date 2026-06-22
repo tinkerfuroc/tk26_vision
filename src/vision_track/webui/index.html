@@ -37,6 +37,16 @@
       </div>
       <div id="follow-state" class="follow-state">Follow state: —</div>
     </div>
+    <div class="panel" id="cruise-card">
+      <h2>Follow cruise <small>(applies on next follow start)</small></h2>
+      <label><input type="checkbox" id="cruise-goalgate"> B: cruise controller (no goal braking)</label>
+      <label><input type="checkbox" id="cruise-carrot"> A: closer cruise standoff</label>
+      <label>min gap (m): <input type="number" id="cruise-min-gap" step="0.05" min="0.2" max="1.5" value="0.60"></label>
+      <div class="row">
+        <button id="cruise-save">Save cruise settings</button>
+      </div>
+      <div id="cruise-status" class="follow-state">—</div>
+    </div>
     <div class="panel">
       <div id="reacq-badge" class="reacq">—</div>
       <div id="searching" class="searching hidden">

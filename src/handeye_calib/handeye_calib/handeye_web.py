@@ -1375,6 +1375,199 @@ def _make_node_class():
                 return {"ok": True}
             return runner.cancel()
 
+        # ---- calibration cross-check: board pose consistency across poses ----
+
+        def do_board_pose_check(self, pose_indices=None, n_poses: int = 5,
+                                settle_timeout_s: float = None):
+            """Verify calibration by checking if the board's pose in ``link_base``
+            looks the same from multiple arm positions.
+
+            For each requested waypoint i, captures ``T_cam_board_i`` and looks
+            up ``T_base_eef_i``, then computes:
+                T_base_board_i = T_base_eef_i · X · T_cam_board_i⁻¹
+            where ``X = last_solve.X`` (current in-memory calibration).
+            The board is physically stationary, so ``T_base_board_i`` MUST be
+            constant across all i if X is correct. The spread of T_base_board
+            translations and rotations is the calibration's real-world
+            accuracy — much more diagnostic than train/heldout residuals.
+
+            ``pose_indices`` (optional): explicit list of waypoint indices to
+            visit. Defaults to ``n_poses`` indices evenly spaced through the
+            waypoint store (so a 25-waypoint list with n_poses=5 visits
+            indices [0, 5, 10, 15, 20]).
+
+            Returns ``{ok, n_poses, t_std_mm, t_max_offset_mm, r_std_deg,
+            r_max_deg, per_pose: [...]}``.
+            """
+            with self.lock:
+                waypoints = list(self.waypoint_store.list())
+            if not waypoints:
+                return {"ok": False, "reason": "no waypoints recorded"}
+            # Prefer last_solve.X (in-memory, freshest); fall back to the
+            # deployed per-robot ``hand_eye.yaml`` so the check still runs
+            # against the calibration on disk after a server restart.
+            if self.last_solve is not None:
+                X = np.asarray(self.last_solve.X)
+                X_source = "last_solve"
+            else:
+                robot = self._resolve_robot_name()
+                if not robot:
+                    return {"ok": False, "reason":
+                            "no last_solve and ROBOT_NAME unset — can't load deployed X"}
+                basic_root = self._tk25_basic_repo_root()
+                if basic_root is None:
+                    return {"ok": False, "reason":
+                            "tk25_basic repo root not resolvable"}
+                yaml_path = self._hand_eye_path(robot)
+                if not yaml_path.exists():
+                    return {"ok": False, "reason":
+                            f"no last_solve and no hand_eye.yaml at {yaml_path}"}
+                try:
+                    import yaml as _yaml
+                    with open(yaml_path) as f:
+                        doc = _yaml.safe_load(f) or {}
+                    he = (doc or {}).get("hand_eye") or {}
+                    xyz_s = he.get("color_optical_xyz", "").split()
+                    rpy_s = he.get("color_optical_rpy", "").split()
+                    if len(xyz_s) != 3 or len(rpy_s) != 3:
+                        raise ValueError(
+                            "hand_eye.yaml missing color_optical_xyz/rpy")
+                    xyz = [float(v) for v in xyz_s]
+                    rpy = [float(v) for v in rpy_s]
+                    X = np.eye(4)
+                    X[:3, :3] = _R.from_euler('xyz', rpy).as_matrix()
+                    X[:3, 3] = xyz
+                    X_source = f"yaml@{yaml_path}"
+                except Exception as exc:
+                    return {"ok": False, "reason":
+                            f"failed to load X from {yaml_path}: {exc}"}
+
+            if pose_indices is None:
+                n = max(2, min(int(n_poses), len(waypoints)))
+                pose_indices = [int(round(i * (len(waypoints) - 1) / (n - 1)))
+                                for i in range(n)]
+            pose_indices = [int(p) for p in pose_indices]
+            for p in pose_indices:
+                if p < 0 or p >= len(waypoints):
+                    return {"ok": False, "reason":
+                            f"pose_idx {p} out of range (store has {len(waypoints)})"}
+
+            timeout = (float(settle_timeout_s) if settle_timeout_s is not None
+                       else float(self._settle_timeout_s))
+            runner = CaptureSequenceRunner(self)
+
+            per_pose = []
+            skipped = []  # list of {pose_idx, reason}
+            from rclpy.time import Time as _RclpyTime
+            for pose_idx in pose_indices:
+                joints = list(waypoints[pose_idx])
+                mv = runner._do_move_wait(joints)
+                if not mv["ok"]:
+                    skipped.append({"pose_idx": int(pose_idx),
+                                    "reason": f"move failed: {mv['reason']}"})
+                    self.get_logger().warn(
+                        f"board_pose_check: skip pose {pose_idx} — move failed: {mv['reason']}")
+                    continue
+                if not runner._wait_for_settle(timeout):
+                    skipped.append({"pose_idx": int(pose_idx),
+                                    "reason": f"settle timed out after {timeout:.1f}s"})
+                    self.get_logger().warn(
+                        f"board_pose_check: skip pose {pose_idx} — settle timed out")
+                    continue
+                with self.lock:
+                    cap = self._cap
+                    frame_stamp = self._frame_stamp
+                if cap is None:
+                    skipped.append({"pose_idx": int(pose_idx),
+                                    "reason": "no board detection"})
+                    self.get_logger().warn(
+                        f"board_pose_check: skip pose {pose_idx} — no board detection")
+                    continue
+                tf_time = (_RclpyTime.from_msg(frame_stamp) if frame_stamp is not None
+                           else self._rclpy_time())
+                try:
+                    tfm = self.tf_buffer.lookup_transform(
+                        self._base_frame, self._eef_frame, tf_time)
+                except Exception:
+                    try:
+                        tfm = self.tf_buffer.lookup_transform(
+                            self._base_frame, self._eef_frame, self._rclpy_time())
+                    except Exception as exc:
+                        skipped.append({"pose_idx": int(pose_idx),
+                                        "reason": f"TF lookup failed: {exc}"})
+                        self.get_logger().warn(
+                            f"board_pose_check: skip pose {pose_idx} — TF lookup failed: {exc}")
+                        continue
+                T_base_eef = ws.tf_to_matrix(
+                    [tfm.transform.translation.x, tfm.transform.translation.y,
+                     tfm.transform.translation.z],
+                    [tfm.transform.rotation.x, tfm.transform.rotation.y,
+                     tfm.transform.rotation.z, tfm.transform.rotation.w])
+                T_cam_board = np.asarray(cap["T_cam_board"])
+                # T_base_board = T_base_eef · X · T_cam_board.
+                # OpenCV PnP returns T_cam_board such that board-frame points
+                # transform to camera-frame coords via T_cam_board (i.e. it's
+                # the pose of the board IN the camera frame), so chaining
+                # T_base_eef · X (= T_base_cam) · T_cam_board yields T_base_board
+                # with NO inverse. Mirrors the solver's `_reproj_rms` constraint
+                # T_cam_board = inv(T_base_eef·X) · T_base_board, solved for Tbb.
+                T_base_board = T_base_eef @ X @ T_cam_board
+                per_pose.append({
+                    "pose_idx": int(pose_idx),
+                    "T_base_board": T_base_board,
+                    "reproj_px": float(cap["reproj_px"]),
+                })
+
+            # Need at least 2 successful poses to compute a meaningful spread.
+            if len(per_pose) < 2:
+                return {"ok": False,
+                        "reason": (f"only {len(per_pose)} of {len(pose_indices)} "
+                                   f"poses succeeded — need ≥2 for spread"),
+                        "skipped": skipped}
+
+            # Spread: each pose's T_base_board vs the mean translation + first rotation
+            trans = np.asarray([p["T_base_board"][:3, 3] for p in per_pose])
+            t_mean = trans.mean(axis=0)
+            t_offsets = np.linalg.norm(trans - t_mean, axis=1)
+            R0 = per_pose[0]["T_base_board"][:3, :3]
+            def _rot_angle(Ra, Rb):
+                return float(np.degrees(np.linalg.norm(
+                    _R.from_matrix(Ra.T @ Rb).as_rotvec())))
+            rot_devs = [_rot_angle(R0, np.asarray(p["T_base_board"])[:3, :3])
+                        for p in per_pose]
+
+            self.get_logger().info(
+                f"board_pose_check: X_source={X_source} "
+                f"used={len(per_pose)}/{len(pose_indices)} (skipped {len(skipped)}) | "
+                f"t_std={t_offsets.std()*1000:.2f}mm "
+                f"t_max_offset={t_offsets.max()*1000:.2f}mm | "
+                f"r_std={float(np.std(rot_devs)):.3f}deg "
+                f"r_max={float(np.max(rot_devs)):.3f}deg")
+            return {
+                "ok": True,
+                "X_source": X_source,
+                "n_poses": len(per_pose),
+                "n_skipped": len(skipped),
+                "skipped": skipped,
+                "pose_indices": pose_indices,
+                "t_std_mm": float(t_offsets.std() * 1000.0),
+                "t_max_offset_mm": float(t_offsets.max() * 1000.0),
+                "r_std_deg": float(np.std(rot_devs)),
+                "r_max_deg": float(np.max(rot_devs)),
+                "per_pose": [{
+                    "pose_idx": int(p["pose_idx"]),
+                    "T_base_board_xyz_mm": [
+                        float(p["T_base_board"][0, 3] * 1000),
+                        float(p["T_base_board"][1, 3] * 1000),
+                        float(p["T_base_board"][2, 3] * 1000),
+                    ],
+                    "offset_from_mean_mm": float(np.linalg.norm(
+                        p["T_base_board"][:3, 3] - t_mean) * 1000.0),
+                    "rot_from_first_deg": float(d),
+                    "reproj_px": p["reproj_px"],
+                } for p, d in zip(per_pose, rot_devs)],
+            }
+
         # ---- mount rigidity test ---------------------------------------------
 
         def do_mount_test(self, pose_idx: int = 0, n_visits: int = 5,
@@ -2083,6 +2276,42 @@ def make_app(node):
     def sequence_cancel():
         """POST /api/sequence/cancel → do_cancel_sequence() (idempotent no-op)."""
         return JSONResponse(node.do_cancel_sequence())
+
+    @app.post("/api/board_pose_check")
+    async def board_pose_check(request: Request):
+        """Calibration cross-check: visit multiple waypoints, compute the
+        board's pose in link_base from each view, report the spread.
+
+        Body (all optional):
+          {pose_indices: list[int] = evenly spaced through waypoints,
+           n_poses: int = 5,
+           settle_timeout_s: float = None}
+
+        Returns ``{t_std_mm, t_max_offset_mm, r_std_deg, r_max_deg, per_pose}``.
+        ``t_std_mm`` is the headline number: if X is correct, this is the
+        calibration's real-world accuracy (a single number you can ship to
+        a downstream task as the error budget).
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        kwargs = {}
+        if body.get("pose_indices") is not None:
+            kwargs["pose_indices"] = body["pose_indices"]
+        if body.get("n_poses") is not None:
+            kwargs["n_poses"] = int(body["n_poses"])
+        if body.get("settle_timeout_s") is not None:
+            try:
+                kwargs["settle_timeout_s"] = float(body["settle_timeout_s"])
+            except (TypeError, ValueError):
+                pass
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None,
+            lambda: node.do_board_pose_check(**kwargs))
+        return JSONResponse(result)
 
     @app.post("/api/mount_test")
     async def mount_test(request: Request):

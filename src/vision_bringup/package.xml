@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vision_bringup</name>
+  <version>0.1.0</version>
+  <description>
+    Composed bringup launch files for the tk26 vision stack: a driver/hardware
+    layer (pan-tilt + Orbbec + RealSense + FoundationStereo streaming) and a
+    perception layer (detection, tracking, specialized servers, LLM services,
+    utilities). See src/tk26_vision/CAMERA_BRINGUP.md for the FastDDS SHM
+    rationale both launches encode.
+  </description>
+  <maintainer email="cindy.w0135@gmail.com">Ccindy0171</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Driver layer -->
+  <exec_depend>pan_tilt</exec_depend>
+  <exec_depend>orbbec_camera</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>foundation_stereo</exec_depend>
+
+  <!-- Perception layer -->
+  <exec_depend>object_detection_new</exec_depend>
+  <exec_depend>object_detection_generalist</exec_depend>
+  <exec_depend>vision_track</exec_depend>
+  <exec_depend>tk_vision_specialized</exec_depend>
+  <exec_depend>kimi_api</exec_depend>
+  <exec_depend>vision_util</exec_depend>
+  <exec_depend>monocular_depth</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

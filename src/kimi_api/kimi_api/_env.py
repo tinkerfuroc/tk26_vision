@@ -38,6 +38,7 @@ def base_url() -> str:
 def default_model() -> str:
     return os.environ.get('LLM_MODEL', 'google/gemini-2.5-pro')
 
+
 def default_flash_model() -> str:
     return os.environ.get('FLASH_MODEL', 'google/gemini-2.5-flash')
 
@@ -48,5 +49,37 @@ def gemini_api_key() -> str:
         raise RuntimeError(
             'GEMINI_API_KEY is not set. Add it to .env at the workspace root '
             'or export it in your shell before running the direct-Gemini path.'
+        )
+    return key
+
+
+def dashscope_base_url() -> str:
+    """DashScope OpenAI-compatible endpoint.
+
+    Defaults to the China-mainland (bailian) host. Override with
+    `DASHSCOPE_BASE_URL` for the international account, e.g.
+    `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`.
+    """
+    return os.environ.get(
+        'DASHSCOPE_BASE_URL',
+        'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    )
+
+
+def require_dashscope_api_key() -> str:
+    """Return the DashScope API key, failing fast if unset.
+
+    Accepts the correct spelling `DASHSCOPE_API_KEY` first, then the
+    legacy/typo'd `DASHCOPE_API_KEY` that older `.env` files carried, so
+    existing setups keep working without an edit.
+    """
+    key = (
+        os.environ.get('DASHSCOPE_API_KEY')
+        or os.environ.get('DASHCOPE_API_KEY')
+    )
+    if not key:
+        raise RuntimeError(
+            'DASHSCOPE_API_KEY is not set. Add it to .env at the workspace '
+            'root (or export it) before using a dashscope/ VLM model.'
         )
     return key

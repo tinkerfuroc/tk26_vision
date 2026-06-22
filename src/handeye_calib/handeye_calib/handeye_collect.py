@@ -24,15 +24,29 @@ class CaptureSession:
         self.samples = []
 
     def try_add(self, T_base_eef, T_cam_board, obs_px, corner_idx,
-                n_corners, reproj_px, area_frac):
+                n_corners, reproj_px, area_frac,
+                obs_xyz_cam=None, obs_xyz_valid=None):
+        """Gate then accumulate a sample.
+
+        ``obs_xyz_cam`` / ``obs_xyz_valid`` (optional) are the FFS-deprojected
+        per-corner camera-frame metric points + validity mask. When omitted the
+        sample is monocular-only (current behaviour); when present they are
+        stored on the :class:`Sample` for the solver's depth residual. They do
+        NOT participate in the accept/reject gates — depth is a refinement
+        signal, not an admission criterion, so an FFS hiccup never blocks an
+        otherwise-good pose.
+        """
         ok, reason = gates.quality_ok(n_corners, reproj_px, area_frac, **self.q)
         if not ok:
             return False, reason
         accepted_eef = [s.T_base_eef for s in self.samples]
         if not gates.is_diverse(T_base_eef, accepted_eef, self.min_diversity_deg):
             return False, "not diverse (<%g deg)" % self.min_diversity_deg
-        self.samples.append(hm.Sample(np.asarray(T_base_eef), np.asarray(T_cam_board),
-                                      np.asarray(obs_px), np.asarray(corner_idx)))
+        self.samples.append(hm.Sample(
+            np.asarray(T_base_eef), np.asarray(T_cam_board),
+            np.asarray(obs_px), np.asarray(corner_idx),
+            obs_xyz_cam=(None if obs_xyz_cam is None else np.asarray(obs_xyz_cam, float)),
+            obs_xyz_valid=(None if obs_xyz_valid is None else np.asarray(obs_xyz_valid, bool))))
         return True, "accepted"
 
     def to_json(self):
@@ -41,6 +55,10 @@ class CaptureSession:
             "T_cam_board": s.T_cam_board.tolist(),
             "obs_px": s.obs_px.tolist(),
             "corner_idx": s.corner_idx.tolist(),
+            "obs_xyz_cam": (None if s.obs_xyz_cam is None
+                            else np.asarray(s.obs_xyz_cam).tolist()),
+            "obs_xyz_valid": (None if s.obs_xyz_valid is None
+                              else np.asarray(s.obs_xyz_valid).tolist()),
         } for s in self.samples])
 
 

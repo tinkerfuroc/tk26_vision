@@ -65,6 +65,7 @@ class TrackWebNode(Node):
         self.declare_parameter("port", 8766)
         self.declare_parameter("tracker_node_name", "person_track_node")
         self.declare_parameter("waving_service", "detect_waving_persons")
+        self.declare_parameter("cruise_sidecar", "~/.tk25/follow_cruise.yaml")
         self.bind_host = str(self.get_parameter("bind").value)
         self.bind_port = int(self.get_parameter("port").value)
         tracker = str(self.get_parameter("tracker_node_name").value)
@@ -94,7 +95,8 @@ class TrackWebNode(Node):
         # Fixed-allowlist supervisor for the bringup demo components
         # (audio / follow_server / follow-person BT). Children die in main()'s
         # teardown. (dummy_nav was dropped in the 2026-06-13 follow integration.)
-        self.proc_manager = ProcessManager()
+        self.proc_manager = ProcessManager(
+            cruise_sidecar=str(self.get_parameter("cruise_sidecar").value))
 
         # Latest follow-server status (parsed /follow_server/status JSON) so the
         # dashboard can render live follow state; staleness is derived per-read.
@@ -362,6 +364,13 @@ class TrackWebNode(Node):
                    if self._follow_status else 1e9)
         data["stale"] = age > 2.0   # no fresh status in 2 s -> panel shows "—"
         return data
+
+    # ---- follow cruise settings (delegates to ProcessManager) ---------------
+    def get_follow_cruise(self):
+        return self.proc_manager.get_follow_cruise()
+
+    def set_follow_cruise(self, settings):
+        return self.proc_manager.set_follow_cruise(settings)
 
 
 def main():

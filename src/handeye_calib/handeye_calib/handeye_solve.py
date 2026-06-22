@@ -74,22 +74,54 @@ def seed_handeye(samples, K, dist, board_pts, *, methods=None):
     return best["X"], best["Tbb"], per_method
 
 
-def _residuals(params, samples, K, dist, board_pts):
+def _residuals(params, samples, K, dist, board_pts,
+               depth_weight=0.0, depth_sigma_m=0.005):
+    """Stacked residual: per-corner pixel reprojection, plus (when enabled) a
+    metric 3D point residual against FFS-measured camera-frame corner points.
+
+    The depth block ``(P_pred - P_meas) * depth_weight / depth_sigma_m`` is in
+    units of "sigmas of depth error", so with ``depth_weight=1`` a corner whose
+    predicted position is one ``depth_sigma_m`` off contributes like a 1 px
+    reprojection error. The pixel block is left unscaled so ``depth_weight=0``
+    reproduces the original monocular residual byte-for-byte (and is skipped
+    entirely for samples without ``obs_xyz_cam``, i.e. graceful fallback when
+    FFS was unavailable at capture). Reprojection pins rotation + lateral
+    translation; the depth block pins the optical-axis DOF planar PnP can't see.
+    """
     X = tf.T_from_vec(params[:6])
     Tbb = tf.T_from_vec(params[6:])
     res = []
     for s in samples:
         T_cam_board = tf.invert(s.T_base_eef @ X) @ Tbb
-        pred = hm.project_corners(board_pts[s.corner_idx], T_cam_board, K, dist)
+        bp = board_pts[s.corner_idx]
+        pred = hm.project_corners(bp, T_cam_board, K, dist)
         res.append((pred - s.obs_px).ravel())
+        if depth_weight > 0.0 and getattr(s, "obs_xyz_cam", None) is not None:
+            meas = np.asarray(s.obs_xyz_cam, float)
+            valid = (np.asarray(s.obs_xyz_valid, bool)
+                     if getattr(s, "obs_xyz_valid", None) is not None
+                     else np.ones(len(meas), bool))
+            if valid.any():
+                P_pred = (T_cam_board[:3, :3] @ bp.T).T + T_cam_board[:3, 3]
+                d = (P_pred[valid] - meas[valid]) * (depth_weight / depth_sigma_m)
+                res.append(d.ravel())
     return np.concatenate(res)
 
 
-def bundle_adjust(samples, K, dist, board_pts, X0, Tbb0):
-    """Jointly refine X (T_eef_cam) and Tbb (T_base_board) minimizing corner reprojection."""
+def bundle_adjust(samples, K, dist, board_pts, X0, Tbb0,
+                  depth_weight=0.0, depth_sigma_m=0.005):
+    """Jointly refine X (T_eef_cam) and Tbb (T_base_board) minimizing corner
+    reprojection, plus the optional FFS-depth 3D residual (``depth_weight>0``).
+
+    ``depth_weight`` defaults to ``0.0`` so existing direct callers (and the
+    pixel-only synthetic tests) get the unchanged monocular solve; the higher-
+    level :func:`solve` passes a non-zero default which no-ops anyway on samples
+    that carry no depth.
+    """
     p0 = np.concatenate([tf.vec_from_T(X0), tf.vec_from_T(Tbb0)])
     sol = least_squares(_residuals, p0, loss="soft_l1", method="trf",
-                        args=(samples, K, dist, board_pts))
+                        args=(samples, K, dist, board_pts,
+                              depth_weight, depth_sigma_m))
     X = tf.T_from_vec(sol.x[:6])
     Tbb = tf.T_from_vec(sol.x[6:])
     info = {"final_reproj_px": _reproj_rms(X, Tbb, samples, K, dist, board_pts),
@@ -122,6 +154,33 @@ def split_train_test(samples, heldout_frac, rng_seed=0):
     return [samples[i] for i in tr], [samples[i] for i in te]
 
 
+def _depth_point_metrics(X, Tbb, samples, board_pts):
+    """Honest, depth-grounded accuracy: RMS distance (mm) between the solved
+    chain's predicted camera-frame corner points and the FFS-measured points,
+    over all valid corners. Unlike ``trans_rmse_m`` (which compares against the
+    monocular PnP pose — itself a potentially-biased estimate), this compares
+    against an independent *metric* measurement, so it's the number to ship as
+    the real-world error budget. Returns ``(rmse_mm_or_None, n_corners)``."""
+    sq = []
+    for s in samples:
+        if getattr(s, "obs_xyz_cam", None) is None:
+            continue
+        meas = np.asarray(s.obs_xyz_cam, float)
+        valid = (np.asarray(s.obs_xyz_valid, bool)
+                 if getattr(s, "obs_xyz_valid", None) is not None
+                 else np.ones(len(meas), bool))
+        if not valid.any():
+            continue
+        T_cam_board = tf.invert(s.T_base_eef @ X) @ Tbb
+        bp = board_pts[s.corner_idx]
+        P_pred = (T_cam_board[:3, :3] @ bp.T).T + T_cam_board[:3, 3]
+        sq.append(np.sum((P_pred[valid] - meas[valid]) ** 2, axis=1))
+    if not sq:
+        return None, 0
+    allsq = np.concatenate(sq)
+    return float(np.sqrt(np.mean(allsq)) * 1000.0), int(allsq.size)
+
+
 def evaluate(X, Tbb, samples, K, dist, board_pts):
     trans_e, rot_e = [], []
     for s in samples:
@@ -129,9 +188,14 @@ def evaluate(X, Tbb, samples, K, dist, board_pts):
         T_obs = s.T_cam_board                           # observed (PnP)
         trans_e.append(np.linalg.norm(T_pred[:3, 3] - T_obs[:3, 3]))
         rot_e.append(np.radians(tf.rotation_angle_deg(T_pred[:3, :3], T_obs[:3, :3])))
-    return {"trans_rmse_m": float(np.sqrt(np.mean(np.square(trans_e)))),
-            "rot_rmse_rad": float(np.sqrt(np.mean(np.square(rot_e)))),
-            "reproj_px": _reproj_rms(X, Tbb, samples, K, dist, board_pts)}
+    out = {"trans_rmse_m": float(np.sqrt(np.mean(np.square(trans_e)))),
+           "rot_rmse_rad": float(np.sqrt(np.mean(np.square(rot_e)))),
+           "reproj_px": _reproj_rms(X, Tbb, samples, K, dist, board_pts)}
+    depth_rmse_mm, n_depth = _depth_point_metrics(X, Tbb, samples, board_pts)
+    if depth_rmse_mm is not None:
+        out["depth_point_rmse_mm"] = depth_rmse_mm
+        out["n_depth_corners"] = n_depth
+    return out
 
 
 def gate(metrics):
@@ -145,7 +209,8 @@ def gate(metrics):
 
 
 def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
-          methods=None, reject_sigma=None, max_reject_frac=0.5):
+          methods=None, reject_sigma=None, max_reject_frac=0.5,
+          depth_weight=1.0, depth_sigma_m=0.005):
     """Full solve pipeline. ``methods`` is forwarded to :func:`seed_handeye`
     so a single-method run (e.g. ``methods={"TSAI": cv2.CALIB_HAND_EYE_TSAI}``)
     skips the multi-method best-of step; ``None`` keeps the default 5-method
@@ -164,7 +229,8 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
     """
     train, test = split_train_test(samples, heldout_frac, rng_seed)
     X0, Tbb0, per_method = seed_handeye(train, K, dist, board_pts, methods=methods)
-    X, Tbb, _ = bundle_adjust(train, K, dist, board_pts, X0, Tbb0)
+    X, Tbb, _ = bundle_adjust(train, K, dist, board_pts, X0, Tbb0,
+                              depth_weight=depth_weight, depth_sigma_m=depth_sigma_m)
 
     rejected = []
     if reject_sigma is not None and len(train) >= 6:
@@ -202,7 +268,9 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
             active = new_active
             sub = [train[i] for i in active]
             X0r, Tbb0r, _ = seed_handeye(sub, K, dist, board_pts, methods=methods)
-            X, Tbb, _ = bundle_adjust(sub, K, dist, board_pts, X0r, Tbb0r)
+            X, Tbb, _ = bundle_adjust(sub, K, dist, board_pts, X0r, Tbb0r,
+                                      depth_weight=depth_weight,
+                                      depth_sigma_m=depth_sigma_m)
         train = [train[i] for i in active]
 
     train_m = evaluate(X, Tbb, train, K, dist, board_pts)

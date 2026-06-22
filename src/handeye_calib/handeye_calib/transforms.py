@@ -54,3 +54,36 @@ def se3_average(Ts):
 def rotation_angle_deg(R1, R2):
     Rrel = np.asarray(R1).T @ np.asarray(R2)
     return float(np.degrees(R.from_matrix(Rrel).magnitude()))
+
+
+def rigid_3d_3d(src, dst):
+    """Least-squares rigid transform ``T`` (4x4) mapping ``src`` onto ``dst``.
+
+    Solves the no-scale Kabsch/Umeyama problem: returns ``T`` minimizing
+    ``sum_i || (R @ src_i + t) - dst_i ||²`` over proper rotations ``R`` (det
+    +1) and translations ``t``. ``src`` and ``dst`` are ``(N, 3)`` arrays of
+    corresponding points.
+
+    Used by the FFS-depth path: ``src`` = board-frame ChArUco corner model
+    points, ``dst`` = the FFS-deprojected metric camera-frame points, so the
+    returned ``T`` is a depth-grounded ``T_cam_board`` whose optical-axis
+    translation is *measured* rather than inferred by monocular PnP.
+
+    The ``np.diag([1, 1, sign(det(V Uᵀ))])`` correction forbids a reflection
+    when the point set is planar (the ChArUco board is exactly z=0 in board
+    frame) plus noise — the classic Kabsch SVD trap that would otherwise flip
+    handedness and corrupt the pose.
+    """
+    src = np.asarray(src, float).reshape(-1, 3)
+    dst = np.asarray(dst, float).reshape(-1, 3)
+    if src.shape != dst.shape or len(src) < 3:
+        raise ValueError(
+            f"rigid_3d_3d needs >=3 matched points, got src{src.shape} dst{dst.shape}")
+    mu_s = src.mean(axis=0)
+    mu_d = dst.mean(axis=0)
+    H = (src - mu_s).T @ (dst - mu_d)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    Rm = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    t = mu_d - Rm @ mu_s
+    return T_from_Rt(Rm, t)

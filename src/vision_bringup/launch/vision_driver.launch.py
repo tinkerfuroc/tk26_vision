@@ -1,24 +1,36 @@
-"""Vision driver bringup — the hardware / driver layer of the tk26 vision stack.
+"""Vision driver bringup — the sensor / hardware layer of the tk26 vision stack.
 
 Brings up, in one command:
   - the pan-tilt head (controller + state_publisher + URDF RSP),
-  - the Orbbec Femto Bolt (the tk26-tuned overrides),
-  - the RealSense (aligned depth + the tk26 QoS overrides), and
+  - the Orbbec Femto Bolt (the tk26-tuned overrides), and
   - FoundationStereo with its streaming depth publisher ENABLED.
 
-RealSense is included because FoundationStereo's streaming consumes the
-RealSense IR pair — without it, ``stream_enabled`` produces nothing.
+RealSense is deliberately NOT here — the manipulation launch (grasp_bringup /
+arm_bringup_cumotion) owns the ``xarm_camera`` RealSense and is the only place
+that enables its IR pair (``enable_infra1/2``). Launching it here too would
+double-bind the same serial/node. FoundationStereo consumes that
+manipulation-owned IR pair, so its streamed depth is non-empty only when the
+manipulation stack is already up (see the cross-launch contract in
+``docs/vision-bringup-design.md``).
 
-Sets ``FASTRTPS_DEFAULT_PROFILES_FILE`` to the FastDDS SHM profile for the whole
-launch so the cameras (and any subscriber that inherits the env) negotiate
-shared-memory transport and hit ~30 Hz instead of the ~3 Hz the vendored
-launches drop to over UDP. See src/tk26_vision/CAMERA_BRINGUP.md for the
-full root-cause writeup.
+FastDDS transport — the whole launch (pan-tilt + Orbbec + FFS) runs under
+``FASTRTPS_DEFAULT_PROFILES_FILE`` = the SHM profile (``fastdds_shm.xml``):
+  * the Orbbec *publisher* must offer SHM so the perception subscribers in
+    vision_bringup negotiate shared memory and sustain ~30 Hz instead of the
+    ~3 Hz the vendored launch drops to over UDP (src/tk26_vision/CAMERA_BRINGUP.md);
+  * FoundationStereo ALSO needs it — the RealSense IR pair it subscribes to
+    (~0.82 MB combined) exceeds the *default* ~512 KB FastDDS SHM segment, so a
+    frame drops and FFS time-sync collapses; the profile's larger (20 MB)
+    segment fixes that. (An earlier "SHM corrupts cuMotion collision voxels"
+    concern was experimentally refuted — the 20 MB segment is data-safe; the
+    real IR-pair reliability fix lives on the camera *owner*, the manipulation
+    launch, which must publish under the same profile. See
+    ``docs/vision-bringup-design.md``.)
 
 Usage::
 
     ros2 launch vision_bringup vision_driver.launch.py
-    ros2 launch vision_bringup vision_driver.launch.py enable_realsense:=false
+    ros2 launch vision_bringup vision_driver.launch.py enable_ffs:=false
     # alongside grasp_bringup (which already owns /robot_description):
     ros2 launch vision_bringup vision_driver.launch.py launch_robot_state_publisher:=false
 
@@ -40,13 +52,18 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     pkg_share = FindPackageShare('vision_bringup')
     fastdds_profile = PathJoinSubstitution([pkg_share, 'config', 'fastdds_shm.xml'])
-    realsense_qos = PathJoinSubstitution([pkg_share, 'config', 'realsense_qos.yaml'])
 
     args = [
         DeclareLaunchArgument('enable_pan_tilt', default_value='true'),
         DeclareLaunchArgument('enable_orbbec', default_value='true'),
-        DeclareLaunchArgument('enable_realsense', default_value='true'),
-        DeclareLaunchArgument('enable_ffs', default_value='true'),
+        DeclareLaunchArgument(
+            'enable_ffs', default_value='true',
+            description=(
+                'FoundationStereo streaming depth. Needs the manipulation-owned '
+                'RealSense IR pair to produce output; set false for vision-only '
+                'bench runs without the arm stack.'
+            ),
+        ),
         DeclareLaunchArgument(
             'device', default_value='/dev/ttyUSB0',
             description='pan-tilt servo serial device',
@@ -62,10 +79,23 @@ def generate_launch_description():
             'camera_profile', default_value='d435',
             description='FoundationStereo camera profile.',
         ),
+        DeclareLaunchArgument(
+            'ffs_stream_enabled', default_value='true',
+            description='Publish the FFS streaming depth topic.',
+        ),
+        DeclareLaunchArgument(
+            'ffs_stream_align_to_color', default_value='false',
+            description=(
+                'false = non-aligned /foundation_stereo/depth/* (the form the '
+                'cuMotion nvblox collision path consumes). Do not enable unless '
+                'a consumer specifically needs aligned-to-color depth.'
+            ),
+        ),
     ]
 
-    # Whole-launch env: every child process (cameras + FFS) inherits the SHM
-    # profile. Downstream subscribers must set the same env to negotiate SHM.
+    # SHM profile for the whole launch: the Orbbec publisher offers SHM to the
+    # perception subscribers, and FFS gets the larger SHM segment its RealSense
+    # IR pair needs. Perception subscribers in vision_bringup set the same env.
     set_dds = SetEnvironmentVariable(
         'FASTRTPS_DEFAULT_PROFILES_FILE', fastdds_profile,
     )
@@ -95,29 +125,18 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('enable_orbbec')),
     )
 
-    realsense = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            FindPackageShare('realsense2_camera'), '/launch/rs_launch.py',
-        ]),
-        launch_arguments={
-            'camera_name': 'xarm_camera',
-            'align_depth.enable': 'true',
-            'config_file': realsense_qos,
-        }.items(),
-        condition=IfCondition(LaunchConfiguration('enable_realsense')),
-    )
-
     ffs = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             FindPackageShare('foundation_stereo'),
             '/launch/foundation_stereo.launch.py',
         ]),
         launch_arguments={
-            'stream_enabled': 'true',
-            'stream_align_to_color': 'true',
+            'stream_enabled': LaunchConfiguration('ffs_stream_enabled'),
+            'stream_align_to_color':
+                LaunchConfiguration('ffs_stream_align_to_color'),
             'camera_profile': LaunchConfiguration('camera_profile'),
         }.items(),
         condition=IfCondition(LaunchConfiguration('enable_ffs')),
     )
 
-    return LaunchDescription(args + [set_dds, pan_tilt, orbbec, realsense, ffs])
+    return LaunchDescription(args + [set_dds, pan_tilt, orbbec, ffs])

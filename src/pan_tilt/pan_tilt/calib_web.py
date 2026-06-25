@@ -287,6 +287,7 @@ class CalibrateRunner:
         params = _apply_to_urdf_mod._load_params(results_path)
         import numpy as _np
         t_a = _np.asarray(params["t_a"], dtype=float)
+        t_a_rotvec = _np.asarray(params.get("t_a_rotvec", [0, 0, 0]), dtype=float)
         t_b_trans = _np.asarray(params["t_b_trans"], dtype=float)
         t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
         pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
@@ -298,7 +299,7 @@ class CalibrateRunner:
         original_xacro = xacro.read_text()
         try:
             patched_xacro = _apply_to_urdf_mod._patched_xacro(
-                original_xacro, t_a, t_b_trans, t_b_rotvec,
+                original_xacro, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
                 allow_flipped_camera=True,  # diff mode — show what would land
             )
         except _apply_to_urdf_mod.CalibrationApplyError as exc:
@@ -330,10 +331,36 @@ class CalibrateRunner:
                     tofile=str(yaml_path) + " (calibrated)",
                 ))
 
+        # Per-robot urdf_overrides.yaml — the file that actually wins at launch.
+        # Folded into the yaml-diff pane so it surfaces without a UI change.
+        overrides_path = None
+        try:
+            ovr = _apply_to_urdf_mod._resolve_overrides_yaml(None, no_overrides=False)
+        except _apply_to_urdf_mod.CalibrationApplyError:
+            ovr = None
+        if ovr is not None:
+            overrides_path = str(ovr)
+            original_ovr = ovr.read_text()
+            try:
+                patched_ovr, _ = _apply_to_urdf_mod._patch_urdf_overrides(
+                    original_ovr, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
+                    allow_flipped_camera=True,
+                )
+            except _apply_to_urdf_mod.CalibrationApplyError as exc:
+                yaml_diff_text += f"\n# urdf_overrides.yaml patch error: {exc}\n"
+            else:
+                yaml_diff_text += "".join(difflib.unified_diff(
+                    original_ovr.splitlines(keepends=True),
+                    patched_ovr.splitlines(keepends=True),
+                    fromfile=str(ovr),
+                    tofile=str(ovr) + " (calibrated)",
+                ))
+
         return {
             "diff": urdf_diff_text,
             "yaml_diff": yaml_diff_text,
             "yaml_path": str(yaml_targets[0].path) if yaml_targets else None,
+            "overrides_path": overrides_path,
         }
 
     # ---- apply_to_urdf write (atomic in-place patch with backup) -----------
@@ -375,6 +402,7 @@ class CalibrateRunner:
         params = _apply_to_urdf_mod._load_params(results_path)
         import numpy as _np
         t_a = _np.asarray(params["t_a"], dtype=float)
+        t_a_rotvec = _np.asarray(params.get("t_a_rotvec", [0, 0, 0]), dtype=float)
         t_b_trans = _np.asarray(params["t_b_trans"], dtype=float)
         t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
         pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
@@ -384,7 +412,7 @@ class CalibrateRunner:
         original_xacro = xacro.read_text()
         try:
             patched_xacro = _apply_to_urdf_mod._patched_xacro(
-                original_xacro, t_a, t_b_trans, t_b_rotvec,
+                original_xacro, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
                 allow_flipped_camera=True,
             )
         except _apply_to_urdf_mod.CalibrationApplyError as exc:
@@ -400,6 +428,35 @@ class CalibrateRunner:
             )
         except _apply_to_urdf_mod.CalibrationApplyError as exc:
             raise RuntimeError(str(exc)) from exc
+
+        # Per-robot urdf_overrides.yaml — the file that actually wins at launch.
+        # Patched as a separate atomic write after the URDF+YAML pair (same
+        # rationale as the CLI: a failure here leaves the pair applied, and an
+        # idempotent re-run recovers). Auto-discovered via $ROBOT_NAME.
+        overrides_applied = False
+        overrides_path_str = None
+        overrides_backup = None
+        overrides_keys: list[str] = []
+        try:
+            overrides_path = _apply_to_urdf_mod._resolve_overrides_yaml(
+                None, no_overrides=False,
+            )
+        except _apply_to_urdf_mod.CalibrationApplyError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if overrides_path is not None:
+            overrides_path_str = str(overrides_path)
+            try:
+                patched_ovr, overrides_keys = _apply_to_urdf_mod._patch_urdf_overrides(
+                    overrides_path.read_text(), t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
+                    allow_flipped_camera=True,
+                )
+                ovr_res = _apply_to_urdf_mod._atomic_write_single(
+                    overrides_path, patched_ovr,
+                )
+            except _apply_to_urdf_mod.CalibrationApplyError as exc:
+                raise RuntimeError(str(exc)) from exc
+            overrides_applied = ovr_res["applied"]
+            overrides_backup = ovr_res["backup_path"]
 
         # Diff previews for the UI's success card. Compare current file
         # contents (post-replace) against the .old-<ts> backups.
@@ -421,12 +478,14 @@ class CalibrateRunner:
                 tofile=str(yaml_path) + " (calibrated)",
             ))[:12])
 
-        applied_anything = atomic["xacro_applied"] or atomic["yaml_applied"]
+        applied_anything = (
+            atomic["xacro_applied"] or atomic["yaml_applied"] or overrides_applied
+        )
         return {
             "applied": applied_anything,
             "reason": (
                 None if applied_anything else
-                "no change — URDF and YAML already match calibration"
+                "no change — URDF, YAML, and overrides already match calibration"
             ),
             "build_package": target.build_package,
             "build_command": target.build_command,
@@ -441,6 +500,11 @@ class CalibrateRunner:
             "yaml_diff_preview": yaml_diff_preview,
             "pan_offset_rad": pan_offset_rad,
             "tilt_offset_rad": tilt_offset_rad,
+            # Per-robot urdf_overrides.yaml surface (the file that wins at launch).
+            "overrides_path": overrides_path_str,
+            "overrides_applied": overrides_applied,
+            "overrides_backup_path": overrides_backup,
+            "overrides_keys": overrides_keys,
         }
 
 
@@ -903,6 +967,10 @@ class CalibWebNode(Node):
     def snapshot_state(self) -> dict:
         with self.lock:
             d = asdict(self.state)
+        # Surface the per-robot canonical "level" park tilt (firmware deg) so the
+        # UI's Level jog button + grid-display math track the active config
+        # (tinker1=45, tinker2=30) instead of a hardcoded value.
+        d["level_tilt_deg"] = float(self._loaded_cfg.get("level_tilt_deg", 30.0))
         # JSON can't encode inf/nan; sanitize recursively before returning.
         return _sanitize_for_json(d)
 
@@ -2200,7 +2268,7 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             # Allowlist of client flags passed through to run_calibration.
             analysis_flags = {
                 "--fit-pan-offset", "--lock-tb-rotation", "--unlock-tb-rotation",
-                "--verbose",
+                "--fit-pan-axis-tilt", "--verbose",
             }
             for f in extra_flags:
                 if f not in analysis_flags:

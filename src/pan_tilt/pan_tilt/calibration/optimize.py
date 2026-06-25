@@ -163,11 +163,13 @@ def _predict_chain_gt(samples, t_ee_marker: np.ndarray):
     return out
 
 
-def _chain_residuals(x, samples, template, fit_pan_offset, fit_tb_rotation, t_base_cam_gt):
+def _chain_residuals(x, samples, template, fit_pan_offset, fit_tb_rotation,
+                     fit_pan_axis_tilt, t_base_cam_gt):
     params = unpack_chain(
         x, template,
         fit_pan_offset=fit_pan_offset,
         fit_tb_rotation=fit_tb_rotation,
+        fit_pan_axis_tilt=fit_pan_axis_tilt,
     )
     res = []
     for s, T_gt in zip(samples, t_base_cam_gt):
@@ -184,6 +186,7 @@ def fit_chain(
     initial: Optional[PanTiltParams] = None,
     fit_pan_offset: bool = False,
     fit_tb_rotation: bool = False,
+    fit_pan_axis_tilt: bool = False,
     loss: str = "soft_l1",
     verbose: int = 0,
     allow_flipped_camera: bool = False,
@@ -211,6 +214,13 @@ def fit_chain(
         the warm-start value avoids that degeneracy. Unlock only during the
         polish phase, where Phase-1 data jointly anchors T_ee_marker and
         breaks the degeneracy.
+    fit_pan_axis_tilt
+        Default **False**. When True, fit the X/Y components of `t_a_rotvec`
+        (the base->pan-axis rotation), letting the pan axis be non-vertical.
+        These 2 params are appended to the END of the packed vector, so the
+        index of t_b_rotvec[Z] (and hence its yaw bound) is unchanged. The Z
+        component of t_a_rotvec is never fit — it is degenerate with
+        theta_p_offset. Off by default so legacy behavior is bit-identical.
     loss
         scipy.optimize.least_squares `loss` kwarg; soft_l1 is robust to outliers.
     allow_flipped_camera
@@ -224,6 +234,7 @@ def fit_chain(
         template,
         fit_pan_offset=fit_pan_offset,
         fit_tb_rotation=fit_tb_rotation,
+        fit_pan_axis_tilt=fit_pan_axis_tilt,
     )
 
     yaw_idx = (
@@ -239,7 +250,8 @@ def fit_chain(
     result = least_squares(
         _chain_residuals,
         x0,
-        args=(samples, template, fit_pan_offset, fit_tb_rotation, t_base_cam_gt),
+        args=(samples, template, fit_pan_offset, fit_tb_rotation,
+              fit_pan_axis_tilt, t_base_cam_gt),
         method="trf",
         loss=loss,
         verbose=verbose,
@@ -250,6 +262,7 @@ def fit_chain(
         result.x, template,
         fit_pan_offset=fit_pan_offset,
         fit_tb_rotation=fit_tb_rotation,
+        fit_pan_axis_tilt=fit_pan_axis_tilt,
     )
     report = _build_report(result, samples, params, t_base_cam_gt=t_base_cam_gt)
     return params, report
@@ -325,12 +338,14 @@ def warm_start_t_b_rotation(
 
 # ---- joint (polish) fit -----------------------------------------------------
 
-def _joint_residuals(x, samples, template, fit_tb_rotation, fit_pan_offset):
+def _joint_residuals(x, samples, template, fit_tb_rotation, fit_pan_offset,
+                     fit_pan_axis_tilt):
     params = unpack_joint(
         x,
         template,
         fit_tb_rotation=fit_tb_rotation,
         fit_pan_offset=fit_pan_offset,
+        fit_pan_axis_tilt=fit_pan_axis_tilt,
     )
     T_ee_m = params.t_ee_marker()
     res = []
@@ -352,6 +367,7 @@ def fit_joint(
     initial: PanTiltParams,
     fit_tb_rotation: bool = False,
     fit_pan_offset: bool = False,
+    fit_pan_axis_tilt: bool = False,
     loss: str = "soft_l1",
     verbose: int = 0,
     allow_flipped_camera: bool = False,
@@ -359,10 +375,13 @@ def fit_joint(
     """Phase-3 polish: joint fit over all parameters including T_ee_marker.
 
     `allow_flipped_camera` widens the body-frame yaw bound on T_B from ±π/2
-    to ±π — see module-level forward-camera invariant.
+    to ±π — see module-level forward-camera invariant. `fit_pan_axis_tilt`
+    (default False) appends the 2-DOF base->pan-axis tilt to the parameter
+    vector, same semantics as in `fit_chain`.
     """
     x0 = pack_joint(
-        initial, fit_tb_rotation=fit_tb_rotation, fit_pan_offset=fit_pan_offset
+        initial, fit_tb_rotation=fit_tb_rotation, fit_pan_offset=fit_pan_offset,
+        fit_pan_axis_tilt=fit_pan_axis_tilt,
     )
 
     yaw_idx = (
@@ -376,7 +395,7 @@ def fit_joint(
     result = least_squares(
         _joint_residuals,
         x0,
-        args=(samples, initial, fit_tb_rotation, fit_pan_offset),
+        args=(samples, initial, fit_tb_rotation, fit_pan_offset, fit_pan_axis_tilt),
         method="trf",
         loss=loss,
         verbose=verbose,
@@ -388,6 +407,7 @@ def fit_joint(
         initial,
         fit_tb_rotation=fit_tb_rotation,
         fit_pan_offset=fit_pan_offset,
+        fit_pan_axis_tilt=fit_pan_axis_tilt,
     )
     report = _build_joint_report(result, samples, params)
     return params, report

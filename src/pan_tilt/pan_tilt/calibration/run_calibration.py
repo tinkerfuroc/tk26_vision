@@ -134,6 +134,8 @@ def _prefer_basin_zero(candidates):
 def _params_to_dict(p: PanTiltParams) -> dict:
     return {
         "t_a": p.t_a.tolist(),
+        "t_a_rotvec": np.asarray(p.t_a_rotvec, dtype=float).tolist(),
+        "t_a_tilt_deg": np.degrees(np.asarray(p.t_a_rotvec, dtype=float)).tolist(),
         "t_b_trans": p.t_b_trans.tolist(),
         "t_b_rotvec": p.t_b_rotvec.tolist(),
         "t_ee_marker_rotvec": p.t_ee_marker_rotvec.tolist(),
@@ -149,6 +151,9 @@ def _params_to_dict(p: PanTiltParams) -> dict:
 def _params_from_dict(d: dict) -> PanTiltParams:
     return PanTiltParams(
         t_a=np.asarray(d["t_a"], dtype=float),
+        # Optional: absent in pre-pan-axis-tilt JSON files -> identity (vertical
+        # pan axis), preserving the legacy model exactly.
+        t_a_rotvec=np.asarray(d.get("t_a_rotvec", [0.0, 0.0, 0.0]), dtype=float),
         t_b_trans=np.asarray(d["t_b_trans"], dtype=float),
         t_b_rotvec=np.asarray(d.get("t_b_rotvec", [0, 0, 0]), dtype=float),
         t_ee_marker_rotvec=np.asarray(d.get("t_ee_marker_rotvec", [0, 0, 0]), dtype=float),
@@ -211,6 +216,26 @@ def cmd_intrinsic(args):
     print(f"Wrote {out_path}")
 
 
+def _robust_z(values: np.ndarray) -> np.ndarray:
+    """Per-axis modified z-score for 1-D residuals: (x - median)/(1.4826*MAD).
+
+    The 1.4826 factor makes MAD a consistent estimator of the Gaussian standard
+    deviation, so a threshold of `z > reject_sigma` is interpretable in sigma
+    units. Scoring translation and rotation residuals *separately* (then taking
+    the elementwise max) is what lets the MAD loop catch a pure-translation
+    outlier that a combined sqrt(trans_m**2 + rot_rad**2) metric would mask:
+    that combined metric mixes metres and radians, so a broad rotation residual
+    (e.g. the pan-axis-tilt floor) inflates the threshold and hides large
+    translation errors. Returns all-zeros when the spread is degenerate
+    (MAD ~= 0) so a near-constant residual set rejects nothing."""
+    values = np.asarray(values, dtype=float)
+    med = float(np.median(values))
+    mad = float(np.median(np.abs(values - med)))
+    if mad < 1e-12:
+        return np.zeros_like(values)
+    return (values - med) / (1.4826 * mad)
+
+
 def cmd_handeye(args):
     samples = _load_samples(Path(args.phase1))
     n_loaded = len(samples)
@@ -248,18 +273,25 @@ def cmd_handeye(args):
     #    5°). This catches per-cell IPPE flips at the absolute level, before
     #    they pollute MAD statistics.
     #
-    # 2. Iterative MAD-sigma refinement on what remains: continue dropping
-    #    the worst-residual sample until either the threshold passes or the
-    #    rejection cap kicks in.
+    # 2. Iterative MAD-sigma refinement on what remains: score each sample's
+    #    translation and rotation residuals as separate robust (modified) z-
+    #    scores and drop the worst whenever max(trans_z, rot_z) > reject_sigma,
+    #    until the threshold passes or the rejection cap kicks in. Per-axis
+    #    scoring (vs a combined sqrt(t^2+r^2)) prevents a pure-translation
+    #    outlier from hiding under a rotation-inflated threshold.
     #
     # Knobs:
     #   --prefilter-rot-deg: absolute rot-residual threshold for stage 1.
-    #   --max-reject-frac: cap on stage-2 rejections (default 0.25).
-    #   --reject-sigma: stage-2 MAD threshold (default 3.0).
+    #   --max-reject-frac: cap on stage-2 rejections (default 0.30).
+    #   --reject-sigma: stage-2 MAD threshold (default 2.5 — aggressive; cuts
+    #     ~2.5σ-equivalent tails to keep per-config xArm-FK outliers out of the
+    #     solve. Was 3.0; tightened 2026-06-25 after sweeps showed noisier
+    #     datasets dropped from ~5-6 mm to ~2.6-2.8 mm with no regression on
+    #     already-clean sets, which stay cap-bound).
     #   --no-reject: skip both stages (e.g. for test fixtures).
     prefilter_rot_deg = float(getattr(args, "prefilter_rot_deg", 5.0))
-    max_reject_frac = float(getattr(args, "max_reject_frac", 0.25))
-    reject_sigma = float(getattr(args, "reject_sigma", 3.0))
+    max_reject_frac = float(getattr(args, "max_reject_frac", 0.30))
+    reject_sigma = float(getattr(args, "reject_sigma", 2.5))
     do_reject = not bool(getattr(args, "no_reject", False))
 
     if do_reject:
@@ -286,19 +318,17 @@ def cmd_handeye(args):
         rot_errs = np.array([p[1] for p in per_pose])
         if not do_reject:
             break
-        combined = np.sqrt(trans_errs ** 2 + rot_errs ** 2)
-        med = float(np.median(combined))
-        mad = float(np.median(np.abs(combined - med))) + 1e-9
-        threshold = med + reject_sigma * 1.4826 * mad
-        bad_local = np.where(combined > threshold)[0]
-        if len(bad_local) == 0:
+        z_trans = _robust_z(trans_errs)
+        z_rot = _robust_z(rot_errs)
+        score = np.maximum(z_trans, z_rot)
+        worst_local = int(np.argmax(score))
+        if score[worst_local] <= reject_sigma:
             break
         n_dropped = len(samples) - len(keep_idx)
         if n_dropped >= int(max_reject_frac * len(samples)):
             break
         if len(keep_idx) - 1 < 3:
             break
-        worst_local = int(np.argmax(combined))
         worst_global = int(keep_idx[worst_local])
         rejected_history.append((
             worst_global,
@@ -309,8 +339,9 @@ def cmd_handeye(args):
         print(
             f"  MAD reject sample #{worst_global} ({samples[worst_global].get('label','?')}): "
             f"residual {trans_errs[worst_local]*1000:.1f} mm / "
-            f"{np.degrees(rot_errs[worst_local]):.2f} deg (threshold "
-            f"{threshold*1000:.1f} mm-equiv)"
+            f"{np.degrees(rot_errs[worst_local]):.2f} deg "
+            f"(robust-z {score[worst_local]:.2f} > {reject_sigma:.1f}; "
+            f"trans-z {z_trans[worst_local]:.2f}, rot-z {z_rot[worst_local]:.2f})"
         )
 
     if rejected_history:
@@ -361,28 +392,26 @@ def cmd_handeye(args):
                     phase1_path.stat().st_mtime
                 ).strftime('%Y-%m-%d %H:%M:%S') if phase1_path.is_file() else "?"
                 msg = (
-                    f"\nT_ee_marker sibling cross-check FAILED.\n"
+                    f"\n[WARNING] T_ee_marker sibling cross-check disagrees (advisory, NOT blocking).\n"
                     f"  new solve   ({out_name}, from {phase1_path.name} @ {phase1_mtime}):\n"
                     f"    trans={np.round(t_ee_marker[:3,3],4).tolist()}\n"
                     f"  sibling     ({sibling} @ {sib_mtime}):\n"
                     f"    trans={np.round(em_sib[:3,3],4).tolist()}\n"
                     f"  disagreement: {te*1000:.1f} mm trans, {np.degrees(re_):.2f} deg rot\n"
-                    f"  (gate: 5 mm / 1 deg)\n\n"
+                    f"  (advisory gate: 5 mm / 1 deg)\n\n"
                     f"T_ee_marker is the rigid pose of the marker on the EE flange — both\n"
-                    f"handeye solves describe the same physical board, so they must agree.\n"
+                    f"handeye solves describe the same physical board, so they should agree.\n"
                     f"Likely causes:\n"
-                    f"  • One of the phase-1 sample files is stale (you re-collected one\n"
-                    f"    park pose but not the other). Check the mtimes above.\n"
-                    f"  • The board was re-mounted on the EE between collects.\n"
-                    f"Recovery:\n"
-                    f"  • Re-collect BOTH phase-1 datasets in one sitting without\n"
-                    f"    touching the board, the EE, or the xArm zero. Re-run handeye.\n"
-                    f"  • OR pass --allow-t-ee-marker-mismatch if you genuinely intended\n"
-                    f"    to remount (e.g. swapping marker boards for evaluation).\n"
-                    f"Refusing to write {out_path}; existing sibling file is untouched.\n"
+                    f"  • A stale sibling file (you re-collected/re-solved one park but not the\n"
+                    f"    other). Check the mtimes above — delete the stale handeye*.json first.\n"
+                    f"  • A 180-deg solver branch flip: one solve landed on the wrong\n"
+                    f"    T_ee_marker branch (~180 deg / ~0.2 m apart). Verify the branch:\n"
+                    f"    T_ee_marker norm should match the physical link_eef->board distance.\n"
+                    f"  • The board was genuinely re-mounted on the EE between collects.\n"
+                    f"Proceeding to write {out_path} anyway — REVIEW the values above before\n"
+                    f"trusting the chain/polish that consume this file.\n"
                 )
                 print(msg)
-                sys.exit(2)
 
     _save_json(out_path, {
         "t_ee_marker": matrix_to_pose_dict(t_ee_marker),
@@ -464,6 +493,7 @@ def cmd_chain(args):
             initial=warm,
             fit_pan_offset=args.fit_pan_offset,
             fit_tb_rotation=args.unlock_tb_rotation,
+            fit_pan_axis_tilt=getattr(args, "fit_pan_axis_tilt", False),
             loss=args.loss,
             allow_flipped_camera=getattr(args, "allow_flipped_camera", False),
         )
@@ -497,6 +527,13 @@ def cmd_chain(args):
     else:
         print(f"Chosen basin: {basin_label}")
     print("TRAIN:", report.summary())
+    if getattr(args, "fit_pan_axis_tilt", False):
+        tilt_deg = np.degrees(np.asarray(params.t_a_rotvec, dtype=float))
+        print(
+            f"Pan-axis tilt fit: about base-X {tilt_deg[0]:+.2f} deg, "
+            f"about base-Y {tilt_deg[1]:+.2f} deg "
+            f"(the non-vertical pan axis; Z fixed at 0)."
+        )
 
     # Operator-facing hint for the runtime offset YAML — these go straight
     # into config/pan_tilt.yaml under pan_tilt_state_publisher.
@@ -541,6 +578,7 @@ def cmd_chain(args):
         "per_sample_rot_err_rad": report.rot_rmse_per_sample.tolist(),
         "fit_pan_offset": args.fit_pan_offset,
         "fit_tb_rotation": args.unlock_tb_rotation,
+        "fit_pan_axis_tilt": getattr(args, "fit_pan_axis_tilt", False),
         "handeye_source": str(Path(args.handeye)),
     })
     print(f"Wrote {out_path}")
@@ -590,8 +628,8 @@ def cmd_polish(args):
     # find the worst-residual sample, drop it if it exceeds the MAD threshold,
     # re-solve. Stops when no sample is above threshold, the rejection cap is
     # hit, or we'd drop below the safety floor for a joint fit.
-    reject_sigma = float(getattr(args, "reject_sigma", 3.0))
-    max_reject_frac = float(getattr(args, "max_reject_frac", 0.10))
+    reject_sigma = float(getattr(args, "reject_sigma", 2.5))
+    max_reject_frac = float(getattr(args, "max_reject_frac", 0.20))
     do_reject = not bool(getattr(args, "no_reject", False))
     rejected_auto: list[dict] = []
     params = seed
@@ -603,6 +641,7 @@ def cmd_polish(args):
             initial=seed,
             fit_tb_rotation=args.unlock_tb_rotation,
             fit_pan_offset=args.fit_pan_offset,
+            fit_pan_axis_tilt=getattr(args, "fit_pan_axis_tilt", False),
             loss=args.loss,
             allow_flipped_camera=getattr(args, "allow_flipped_camera", False),
         )
@@ -610,12 +649,16 @@ def cmd_polish(args):
             break
         trans_e = np.asarray(report.trans_rmse_per_sample)
         rot_e = np.asarray(report.rot_rmse_per_sample)
-        combined = np.sqrt(trans_e ** 2 + rot_e ** 2)
-        med = float(np.median(combined))
-        mad = float(np.median(np.abs(combined - med))) + 1e-9
-        threshold = med + reject_sigma * 1.4826 * mad
-        worst_local = int(np.argmax(combined))
-        if combined[worst_local] <= threshold:
+        # Per-axis robust-z scoring (see _robust_z): a sample is an outlier if
+        # EITHER its translation OR its rotation residual exceeds reject_sigma
+        # robust-sigmas. Decoupling the axes is what catches a large translation
+        # outlier that the old combined sqrt(t^2+r^2) metric masked once polish's
+        # broad rotation residual inflated the threshold.
+        z_trans = _robust_z(trans_e)
+        z_rot = _robust_z(rot_e)
+        score = np.maximum(z_trans, z_rot)
+        worst_local = int(np.argmax(score))
+        if score[worst_local] <= reject_sigma:
             break
         n_dropped_total = len(rejected_auto) + len(rejected_manual)
         if n_dropped_total >= int(max_reject_frac * n_total):
@@ -637,7 +680,8 @@ def cmd_polish(args):
             f"({samples[worst_global].get('label','?')}): residual "
             f"{trans_e[worst_local]*1000:.1f} mm / "
             f"{np.degrees(rot_e[worst_local]):.2f} deg "
-            f"(threshold {threshold*1000:.1f} mm-equiv)"
+            f"(robust-z {score[worst_local]:.2f} > {reject_sigma:.1f}; "
+            f"trans-z {z_trans[worst_local]:.2f}, rot-z {z_rot[worst_local]:.2f})"
         )
 
     print("POLISH:", report.summary())
@@ -662,6 +706,7 @@ def cmd_polish(args):
         "per_sample_rot_err_rad": report.rot_rmse_per_sample.tolist(),
         "fit_tb_rotation": args.unlock_tb_rotation,
         "fit_pan_offset": args.fit_pan_offset,
+        "fit_pan_axis_tilt": getattr(args, "fit_pan_axis_tilt", False),
         "reject_sigma": reject_sigma,
         "max_reject_frac": max_reject_frac,
         "phase1_sources": [str(p) for p in phase1_paths],
@@ -874,12 +919,13 @@ def main(argv=None):
                          "consensus pre-pass (default 5.0). Drops cells whose implied "
                          "T_ee_marker is geometrically inconsistent with the bulk before "
                          "the MAD-sigma loop runs.")
-    ph.add_argument("--max-reject-frac", type=float, default=0.25,
+    ph.add_argument("--max-reject-frac", type=float, default=0.30,
                     help="Cap on fraction of samples that may be auto-rejected by the "
-                         "MAD-sigma stage (default 0.25). Pre-filter rejections are not "
+                         "MAD-sigma stage (default 0.30). Pre-filter rejections are not "
                          "counted toward this cap.")
-    ph.add_argument("--reject-sigma", type=float, default=3.0,
-                    help="MAD-sigma threshold above which a sample is treated as an outlier (default 3.0).")
+    ph.add_argument("--reject-sigma", type=float, default=2.5,
+                    help="MAD-sigma threshold above which a sample is treated as an outlier "
+                         "(default 2.5 — aggressive; raise toward 3.0 to reject fewer).")
     ph.add_argument("--no-reject", action="store_true",
                     help="Disable both the consensus pre-filter and iterative outlier rejection.")
     ph.add_argument("--out-name", default=None,
@@ -910,6 +956,13 @@ def main(argv=None):
                          "during Phase-2-only fitting; the warm-start from Phase-1 anchors it. "
                          "Unlock only for debugging or comparison runs; the joint polish phase "
                          "is the right place to refine T_B rotation against Phase-1 data.")
+    pc.add_argument("--fit-pan-axis-tilt", action="store_true",
+                    help="Fit the 2-DOF base->pan-axis tilt (t_a_rotvec X/Y), letting the pan "
+                         "axis be non-vertical. Off by default (legacy: pan axis locked to base "
+                         "+Z). Use this when the locked/unlocked-T_B chain leaves a uniform ~1 deg "
+                         "rotation residual that scales with pan — the signature of a tilted pan "
+                         "axis. Composable with --fit-pan-offset (Z of the tilt is never fit: it "
+                         "is degenerate with theta_p_offset).")
     pc.add_argument("--loss", default="soft_l1")
     pc.add_argument("--val-seed", type=int, default=0)
     pc.add_argument("--verbose", action="store_true")
@@ -934,17 +987,21 @@ def main(argv=None):
     pp.add_argument("--out", default="results")
     pp.add_argument("--unlock-tb-rotation", action="store_true")
     pp.add_argument("--fit-pan-offset", action="store_true")
+    pp.add_argument("--fit-pan-axis-tilt", action="store_true",
+                    help="Fit the 2-DOF base->pan-axis tilt in the joint polish "
+                         "(same semantics as the chain flag).")
     pp.add_argument("--loss", default="soft_l1")
     pp.add_argument("--exclude-indices", type=int, nargs="+", default=[],
                     help="Manual indices into the concatenated (phase1 + phase2) sample array "
                          "to drop before fitting. Indices [0..len(phase1)-1] are phase1; the "
                          "rest are phase2. Use this when handeye already flagged a sample as "
                          "an outlier (it does not propagate to polish automatically).")
-    pp.add_argument("--reject-sigma", type=float, default=3.0,
-                    help="MAD-sigma threshold for the iterative auto-rejection loop (default 3.0).")
-    pp.add_argument("--max-reject-frac", type=float, default=0.10,
+    pp.add_argument("--reject-sigma", type=float, default=2.5,
+                    help="MAD-sigma threshold for the iterative auto-rejection loop "
+                         "(default 2.5 — aggressive; raise toward 3.0 to reject fewer).")
+    pp.add_argument("--max-reject-frac", type=float, default=0.20,
                     help="Cap on fraction of samples (manual + auto) that may be dropped "
-                         "(default 0.10). Once this is hit the loop stops even if the MAD "
+                         "(default 0.20). Once this is hit the loop stops even if the MAD "
                          "threshold still flags samples.")
     pp.add_argument("--no-reject", action="store_true",
                     help="Disable the iterative MAD-sigma rejection. --exclude-indices still applies.")

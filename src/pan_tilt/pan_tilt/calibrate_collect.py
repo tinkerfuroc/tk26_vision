@@ -98,12 +98,18 @@ class CollectConfig:
     board: BoardSpec = field(default_factory=BoardSpec)
     safety: SafetyEnvelope = field(default_factory=SafetyEnvelope)
 
-    phase1_waypoints: list = field(default_factory=list)   # list of joint-angle lists (rad), used at firmware (pan=0, tilt=+30) (level)
+    phase1_waypoints: list = field(default_factory=list)   # list of joint-angle lists (rad), used at firmware (pan=0, tilt=level_tilt_deg) — the canonical "level" park
     phase1_waypoints_custom: list = field(default_factory=list)  # used at the operator-chosen custom park
     # Custom Phase-1 park pose (firmware degrees). Defaults to (0, 0) so old
     # behavior (camera looking 30° down) holds for unconfigured installs.
     phase1_custom_park_pan_deg: float = 0.0
     phase1_custom_park_tilt_deg: float = 0.0
+    # Canonical "level" park tilt (firmware deg) for the Phase-1 hand-eye — the
+    # head pose where the camera optical axis is horizontal. HARDWARE-SPECIFIC:
+    # tinker2's 2026 head remount makes level = +30; tinker1's older mount makes
+    # level = +45. Override per-robot via the collector: section of
+    # calibration.yaml. Default 30 preserves tinker2 behavior when unset.
+    level_tilt_deg: float = 30.0
     phase2_waypoints: list = field(default_factory=list)
     pan_grid_deg: list = field(default_factory=lambda: [-30.0, -15.0, 0.0, 15.0, 30.0])
     # Firmware degrees. Grid spans from physical level (firmware +30) DOWN
@@ -1352,7 +1358,8 @@ class CalibrateCollectNode(Node):
             return 0
 
         sanity_start = self.run_sanity()
-        phase1 = (self.run_phase1(park_pan_deg=0.0, park_tilt_deg=30.0,
+        phase1 = (self.run_phase1(park_pan_deg=0.0,
+                                   park_tilt_deg=self._cfg.level_tilt_deg,
                                    waypoints=self._cfg.phase1_waypoints,
                                    label_prefix="phase1")
                   if self._phase_select in ("both", "phase1") else [])

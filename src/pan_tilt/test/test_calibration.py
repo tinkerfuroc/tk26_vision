@@ -170,6 +170,50 @@ def test_noisy_chain_recovers_within_tolerance():
     assert abs(params.theta_t_offset - truth.theta_t_offset) < np.deg2rad(0.3)
 
 
+def test_pan_axis_tilt_recovers_nonvertical_axis():
+    """A physically non-vertical pan axis (the documented ~3 deg-about-Y tilt of
+    this head) cannot be absorbed by T_B or the joint offsets, so the default
+    chain leaves a rotation residual that scales with pan. Enabling
+    `fit_pan_axis_tilt` must (a) recover the X/Y tilt, (b) drive the noise-free
+    rotation residual to ~0, and (c) leave the Z component at exactly 0 (it is
+    degenerate with theta_p_offset). With the flag OFF the residual stays large,
+    proving the term is doing real work — and that off-by-default is safe."""
+    truth, t_ee_marker = _make_truth()
+    # Tilt the pan axis: +0.4 deg about base-X, -3.0 deg about base-Y.
+    truth.t_a_rotvec = np.array([np.deg2rad(0.4), np.deg2rad(-3.0), 0.0])
+    samples = _phase2_samples(truth, t_ee_marker, noise_rng=None)
+
+    init = PanTiltParams()  # URDF defaults: vertical pan axis
+
+    # Baseline: no pan-axis-tilt DOF -> the -3 deg tilt is unmodelable.
+    _, base_report = fit_chain(
+        samples, t_ee_marker=t_ee_marker, initial=init,
+        fit_pan_offset=True, loss="linear",
+    )
+    assert np.degrees(base_report.rot_rmse_rad) > 0.5, (
+        "a non-vertical pan axis should NOT be absorbable without the new DOF; "
+        f"baseline rot_rmse={np.degrees(base_report.rot_rmse_rad):.3f} deg"
+    )
+
+    # With the DOF: should recover the tilt and collapse the residual.
+    params, report = fit_chain(
+        samples, t_ee_marker=t_ee_marker, initial=init,
+        fit_pan_offset=True, fit_pan_axis_tilt=True, loss="linear",
+    )
+    assert report.success
+    assert report.rot_rmse_rad < 1e-4, report.summary()
+    assert report.trans_rmse_m < 1e-4, report.summary()
+    # X/Y tilt recovered; Z held at exactly 0 (degenerate with theta_p_offset).
+    assert np.allclose(params.t_a_rotvec[:2], truth.t_a_rotvec[:2], atol=np.deg2rad(0.05)), (
+        f"recovered tilt {np.degrees(params.t_a_rotvec)} vs truth "
+        f"{np.degrees(truth.t_a_rotvec)}"
+    )
+    assert params.t_a_rotvec[2] == 0.0
+    # Other params still recovered.
+    assert np.allclose(params.t_a, truth.t_a, atol=1e-4)
+    assert abs(params.theta_p_offset - truth.theta_p_offset) < np.deg2rad(0.1)
+
+
 def test_handeye_recovers_t_ee_marker():
     truth, t_ee_marker = _make_truth()
     noise_rng = np.random.default_rng(RNG_SEED + 200)
@@ -328,6 +372,75 @@ def test_apply_to_urdf_patches_both_xacro_forms():
         assert 'rpy="0.1 0 3.0"' not in p, "old rpy should be gone"
         assert 'xyz="-0.08 -0.01 0.08"' in p
 
+    # Non-zero t_a_rotvec (pan-axis tilt) must overwrite the pan_joint origin
+    # rpy (standalone) / attach_rpy default (macro); a zero one preserves it
+    # (the default-arg path tested above). Use the emitter to get the exact rpy
+    # string so the assertion is convention-agnostic.
+    from pan_tilt.calibration.apply_to_urdf import _pan_axis_rpy_str
+    t_a_rotvec = np.array([np.deg2rad(0.4), np.deg2rad(-2.9), 0.0])
+    expect_pan_rpy = _pan_axis_rpy_str(t_a_rotvec)
+    assert expect_pan_rpy is not None
+
+    p_std = _patched_xacro(standalone, t_a, t_b_trans, t_b_rotvec=np.zeros(3),
+                           t_a_rotvec=t_a_rotvec)
+    assert 'rpy="0.01 0 0"' not in p_std, "pan_joint rpy should be overwritten"
+    assert f'rpy="{expect_pan_rpy}"' in p_std
+    assert 'xyz="-0.3 -0.02 1.52"' in p_std  # translation still applied
+
+    p_mac = _patched_xacro(macro, t_a, t_b_trans, t_b_rotvec=np.zeros(3),
+                           t_a_rotvec=t_a_rotvec)
+    assert "attach_rpy:='0.01 0 0'" not in p_mac, "attach_rpy should be overwritten"
+    assert f"attach_rpy:='{expect_pan_rpy}'" in p_mac
+    assert "attach_xyz:='-0.3 -0.02 1.52'" in p_mac
+
+
+def test_patch_urdf_overrides():
+    """apply_to_urdf must keep the per-robot urdf_overrides.yaml in sync — that
+    file's attach_*/camera_mount_* keys OVERRIDE the xacro at launch. xyz keys
+    always update; rpy keys update only for a non-zero rotvec (zero preserves the
+    existing value, same rule as the xacro); comments/quoting/order are kept."""
+    from pan_tilt.calibration.apply_to_urdf import (
+        _patch_urdf_overrides, _pan_axis_rpy_str, _rotvec_to_rpy_str,
+    )
+
+    ovr = (
+        "# header comment, must survive\n"
+        "pan_tilt:\n"
+        "  urdf_overrides:\n"
+        '    attach_xyz: "-0.310913 0.00283274 1.35846"\n'
+        '    attach_rpy: "0.019631607 0.033441848 0.052035773"  # inline kept\n'
+        '    camera_mount_xyz: "0.04 0.028 0.051"\n'
+        '    camera_mount_rpy: "0.04 -0.79 3.08"\n'
+    )
+    t_a = np.array([-0.30, -0.02, 1.52])
+    t_b_trans = np.array([-0.08, -0.01, 0.08])
+
+    # (1) Non-zero pan-axis tilt + non-zero T_B rotvec: all four keys change.
+    t_a_rotvec = np.array([np.deg2rad(0.4), np.deg2rad(-2.9), 0.0])
+    t_b_rotvec = np.array([1.4, 0.0, 0.2])  # forward-facing (|yaw| < π/2)
+    patched, changed = _patch_urdf_overrides(
+        ovr, t_a, t_b_trans, t_b_rotvec, t_a_rotvec, allow_flipped_camera=False)
+    assert set(changed) == set(
+        ["attach_xyz", "attach_rpy", "camera_mount_xyz", "camera_mount_rpy"])
+    assert '"-0.3 -0.02 1.52"' in patched
+    assert f'"{_pan_axis_rpy_str(t_a_rotvec)}"' in patched
+    assert f'"{_rotvec_to_rpy_str(t_b_rotvec, False)}"' in patched
+    assert "# header comment, must survive" in patched  # comments preserved
+    assert "# inline kept" in patched
+
+    # (2) Zero rotvecs: xyz update, both rpy preserved (no silent zeroing).
+    patched0, changed0 = _patch_urdf_overrides(
+        ovr, t_a, t_b_trans, np.zeros(3), np.zeros(3))
+    assert set(changed0) == set(["attach_xyz", "camera_mount_xyz"])
+    assert '"0.019631607 0.033441848 0.052035773"' in patched0  # attach_rpy kept
+    assert '"0.04 -0.79 3.08"' in patched0                      # camera_mount_rpy kept
+    assert '"-0.3 -0.02 1.52"' in patched0
+
+    # (3) Missing keys are skipped silently (file may omit some).
+    partial = "pan_tilt:\n  urdf_overrides:\n    attach_xyz: \"0 0 0\"\n"
+    p3, c3 = _patch_urdf_overrides(partial, t_a, t_b_trans, np.zeros(3), np.zeros(3))
+    assert c3 == ["attach_xyz"]
+
 
 def test_polish_rejects_corrupted_sample(tmp_path):
     """Polish must drop outliers like handeye does. We synthesize a clean
@@ -431,16 +544,19 @@ def test_polish_rejects_corrupted_sample(tmp_path):
     )
 
 
-def test_handeye_t_ee_marker_cross_check(tmp_path):
+def test_handeye_t_ee_marker_cross_check(tmp_path, capsys):
     """If `handeye_custom.json` would be written with a T_ee_marker that disagrees
     with the existing canonical `handeye.json` by more than 5 mm / 1°, the
-    handeye solver must refuse — that's the operator's loud signal that one of
-    the phase-1 files is stale or the board was re-mounted between collects.
-    Override flag bypasses the check.
+    handeye solver must emit a loud advisory WARNING — the operator's signal that
+    one of the phase-1 files is stale or the board was re-mounted between
+    collects. The cross-check is *advisory, not blocking*: it still writes the
+    file (the operator decides whether to trust it). The override flag suppresses
+    the gate entirely.
 
     This is the regression guard for the 0426_newset incident where a stale
     canonical `phase1_handeye.json` quietly poisoned the entire downstream
-    pipeline (chain ~13 mm / 21°, polish ~248 mm / 32°)."""
+    pipeline (chain ~13 mm / 21°, polish ~248 mm / 32°). The guard now surfaces
+    that as a warning rather than a hard stop."""
     from pan_tilt.calibration import run_calibration as rc
     import json, argparse, pytest
 
@@ -483,14 +599,18 @@ def test_handeye_t_ee_marker_cross_check(tmp_path):
     assert canonical.is_file()
     canonical_bytes_before = canonical.read_bytes()
 
-    # Step 2: try to write handeye_custom from the second batch — must abort.
+    # Step 2: writing handeye_custom from the mismatched second batch emits a
+    # loud advisory WARNING but still writes the file (the cross-check was
+    # downgraded from a hard SystemExit to a non-blocking warning).
     custom = tmp_path / "handeye_custom.json"
     assert not custom.is_file()
-    with pytest.raises(SystemExit) as excinfo:
-        rc.cmd_handeye(_handeye_args(pb, out_name="handeye_custom.json"))
-    assert excinfo.value.code != 0
-    assert not custom.is_file(), "cross-check should refuse to write the file"
-    # Canonical file must be untouched.
+    rc.cmd_handeye(_handeye_args(pb, out_name="handeye_custom.json"))
+    warn_out = capsys.readouterr().out
+    assert "WARNING" in warn_out and "cross-check disagrees" in warn_out, (
+        "a genuine T_ee_marker mismatch must surface a loud advisory warning"
+    )
+    assert custom.is_file(), "cross-check is advisory now — the file is still written"
+    # The canonical file must be untouched by the custom solve.
     assert canonical.read_bytes() == canonical_bytes_before
 
     # Step 3: with the override flag, the file is written.

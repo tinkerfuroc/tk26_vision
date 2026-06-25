@@ -211,7 +211,7 @@
 
       <h3>Quick actions</h3>
       <div class="jog-buttons">
-        <button data-pan="0" data-tilt="30" title="physical level (horizontal)">Level (0, +30)</button>
+        <button id="btn-level" data-pan="0" data-tilt="30" title="physical level (horizontal)">Level (0, +30)</button>
         <button data-pan="0" data-tilt="0" title="servo zero; camera points 30° down">Home (0, 0)</button>
       </div>
       <h3>Grid corners</h3>
@@ -311,7 +311,7 @@
       </p>
       <div class="joint-controls" id="calib-run-buttons-collect">
         <button data-calib-cmd="collect_dry_run"       type="button" title="Send each xArm waypoint with no image capture and no pan-tilt motion. Reports which fail so you can fix the yaml before a real collect.">Validate waypoints (dry run)</button>
-        <button data-calib-cmd="collect_phase1"        type="button">Collect Phase 1 — level (pan=0, tilt=+30)</button>
+        <button data-calib-cmd="collect_phase1"        type="button">Collect Phase 1 — level (pan=0, head horizontal)</button>
         <button data-calib-cmd="collect_phase1_custom" type="button" id="calib-collect-phase1-custom">Collect Phase 1 — custom</button>
         <button data-calib-cmd="collect_phase2"        type="button">Collect Phase 2 (sweep)</button>
         <button data-calib-cmd="collect_sanity"      type="button">Collect sanity pose</button>
@@ -323,6 +323,15 @@
       <div class="joint-controls" id="calib-run-buttons">
         <button data-calib-cmd="handeye" type="button">handeye</button>
         <button data-calib-cmd="handeye_custom" type="button">handeye (custom)</button>
+
+        <span class="calib-cmd-group">
+          <label title="Fit the 2-DOF base→pan-axis tilt (a physically non-vertical pan axis) during chain + polish. ON by default — it collapses the ~1° chain rotation floor on this head. Uncheck to fall back to the legacy vertical-axis model.">
+            <input type="checkbox" id="chk-pan-axis-tilt" checked> fit pan-axis tilt
+          </label>
+          <label title="Unlock T_B (camera-mount) rotation during chain + polish. ON by default. T_B-Y is degenerate with the tilt offset in a phase-2-only chain fit (the warm-start anchors it); if a chain run reports a ~20° rotation RMSE, uncheck this to lock T_B at the warm-start value.">
+            <input type="checkbox" id="chk-unlock-tb" checked> unlock T_B rotation
+          </label>
+        </span>
 
         <span class="calib-cmd-group">
           <label>handeye:
@@ -341,7 +350,7 @@
               <label><input type="checkbox" value="phase1_handeye_custom.json"> custom</label>
             </span>
           </label>
-          <button data-calib-cmd="polish" data-calib-flags="--unlock-tb-rotation" type="button">polish</button>
+          <button data-calib-cmd="polish" type="button">polish</button>
         </span>
 
         <span class="calib-cmd-group">

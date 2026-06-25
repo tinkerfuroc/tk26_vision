@@ -82,8 +82,16 @@ def translation(xyz):
 class PanTiltParams:
     """Calibration parameter block."""
 
-    # base_link -> pan_axis (translation only; rotation assumed identity).
+    # base_link -> pan_axis translation.
     t_a: np.ndarray = field(default_factory=lambda: np.array([-0.2754, -0.0134, 1.5459]))
+    # base_link -> pan_axis rotation (rotvec). Default identity: historically the
+    # pan axis was assumed to be exactly base +Z. A physically non-vertical pan
+    # axis (this head sits ~3 deg off +Z about base-Y) cannot be absorbed by
+    # T_B (post-tilt) or theta_t_offset, so it shows up as a ~1.3 deg chain
+    # rotation floor. Fitting the X/Y components of this rotvec (the
+    # `fit_pan_axis_tilt` path) collapses that floor. The Z component is left at
+    # zero on purpose: a yaw of T_A is degenerate with theta_p_offset.
+    t_a_rotvec: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     # tilt_end -> head_camera_link (body frame).
     t_b_trans: np.ndarray = field(default_factory=lambda: np.array([-0.0724, -0.009, 0.075]))
@@ -116,7 +124,10 @@ def forward_kinematics(
     params: PanTiltParams,
 ) -> np.ndarray:
     """T_base_link_to_head_camera_link for firmware-reported (theta_p, theta_t) in **radians**."""
-    T_a = translation(params.t_a)
+    # T_a carries the base->pan-axis translation AND an optional small rotation
+    # (params.t_a_rotvec). When t_a_rotvec is zero this is identical to a pure
+    # translation, so legacy behavior is unchanged.
+    T_a = transform_matrix(params.t_a_rotvec, params.t_a)
     R_pan = rotation_about_z(theta_pan + params.theta_p_offset)
     T_lp = translation([0.0, 0.0, params.l_pan])
     R_tilt = rotation_about_y(theta_tilt + params.theta_t_offset)
@@ -134,6 +145,7 @@ def pack_chain(
     params: PanTiltParams,
     fit_pan_offset: bool = False,
     fit_tb_rotation: bool = True,
+    fit_pan_axis_tilt: bool = False,
 ) -> np.ndarray:
     flat = [
         params.t_a,
@@ -144,6 +156,13 @@ def pack_chain(
         flat.append(np.array([params.theta_p_offset]))
     if fit_tb_rotation:
         flat.append(params.t_b_rotvec)
+    # Pan-axis tilt is appended LAST (after t_b_rotvec) so the index of every
+    # pre-existing parameter — crucially t_b_rotvec[Z], whose position the
+    # bounds code computes via _t_b_rotvec_z_index_chain — is unchanged when
+    # this flag is off. Only the X/Y rotvec components are fit; Z stays 0
+    # (degenerate with theta_p_offset).
+    if fit_pan_axis_tilt:
+        flat.append(np.asarray(params.t_a_rotvec, dtype=float)[:2])
     return np.concatenate(flat)
 
 
@@ -152,6 +171,7 @@ def unpack_chain(
     template: PanTiltParams,
     fit_pan_offset: bool = False,
     fit_tb_rotation: bool = True,
+    fit_pan_axis_tilt: bool = False,
 ) -> PanTiltParams:
     offset = 0
 
@@ -166,9 +186,15 @@ def unpack_chain(
     theta_t = float(take(1)[0])
     theta_p = float(take(1)[0]) if fit_pan_offset else template.theta_p_offset
     t_b_rotvec = take(3) if fit_tb_rotation else template.t_b_rotvec.copy()
+    if fit_pan_axis_tilt:
+        rx, ry = take(2)
+        t_a_rotvec = np.array([rx, ry, 0.0])
+    else:
+        t_a_rotvec = np.asarray(template.t_a_rotvec, dtype=float).copy()
 
     return PanTiltParams(
         t_a=t_a,
+        t_a_rotvec=t_a_rotvec,
         t_b_trans=t_b_trans,
         t_b_rotvec=t_b_rotvec,
         t_ee_marker_rotvec=template.t_ee_marker_rotvec.copy(),
@@ -183,6 +209,7 @@ def pack_joint(
     params: PanTiltParams,
     fit_tb_rotation: bool = False,
     fit_pan_offset: bool = False,
+    fit_pan_axis_tilt: bool = False,
 ) -> np.ndarray:
     flat = [
         params.t_a,
@@ -195,6 +222,10 @@ def pack_joint(
         flat.append(np.array([params.theta_p_offset]))
     if fit_tb_rotation:
         flat.append(params.t_b_rotvec)
+    # Appended LAST, same rationale as pack_chain: keeps t_b_rotvec[Z]'s index
+    # (used by _t_b_rotvec_z_index_joint) stable when this flag is off.
+    if fit_pan_axis_tilt:
+        flat.append(np.asarray(params.t_a_rotvec, dtype=float)[:2])
     return np.concatenate(flat)
 
 
@@ -203,6 +234,7 @@ def unpack_joint(
     template: PanTiltParams,
     fit_tb_rotation: bool = False,
     fit_pan_offset: bool = False,
+    fit_pan_axis_tilt: bool = False,
 ) -> PanTiltParams:
     offset = 0
 
@@ -219,9 +251,15 @@ def unpack_joint(
     theta_t = float(take(1)[0])
     theta_p = float(take(1)[0]) if fit_pan_offset else template.theta_p_offset
     t_b_rotvec = take(3) if fit_tb_rotation else template.t_b_rotvec.copy()
+    if fit_pan_axis_tilt:
+        rx, ry = take(2)
+        t_a_rotvec = np.array([rx, ry, 0.0])
+    else:
+        t_a_rotvec = np.asarray(template.t_a_rotvec, dtype=float).copy()
 
     return PanTiltParams(
         t_a=t_a,
+        t_a_rotvec=t_a_rotvec,
         t_b_trans=t_b_trans,
         t_b_rotvec=t_b_rotvec,
         t_ee_marker_rotvec=t_ee_rot,

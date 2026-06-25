@@ -24,9 +24,11 @@ The patcher writes:
   non-trivial (>1e-6 norm). A zero rotvec preserves the existing rpy, which
   matters because the chain-phase fit locks T_B rotation and we don't want
   to silently zero-out a rotation that a previous polish run had written.
-
-T_A rotation is never written — our plan locks it at identity and only the
-optional polish phase would touch it, which we haven't wired through.
+- ``t_a_rotvec`` ⇒ pan_joint origin rpy (standalone) / ``attach_rpy`` default
+  (macro), **only if** non-trivial. This is the base→pan-axis tilt fit by the
+  optional ``--fit-pan-axis-tilt`` calibration path (a physically non-vertical
+  pan axis). A zero/absent rotvec preserves the existing rpy, so calibration
+  results from before that fit existed patch exactly as they always did.
 """
 
 from __future__ import annotations
@@ -159,21 +161,38 @@ def _rotvec_to_rpy_str(t_b_rotvec, allow_flipped_camera: bool) -> str | None:
     return _fmt_triplet(euler)
 
 
+def _pan_axis_rpy_str(t_a_rotvec) -> str | None:
+    """Convert the base→pan-axis rotvec (`t_a_rotvec`) to a URDF rpy triplet for
+    the pan_joint origin. Returns ``None`` when sub-threshold (>1e-6 norm), so a
+    zero/absent tilt preserves the existing rpy. No forward-camera yaw guard —
+    this is the pan axis, not the camera (and the fit holds its Z/yaw at 0). The
+    rotvec→xyz-euler→URDF-rpy path is the same one validated for the camera
+    mount, so the emitted rpy reproduces transform_matrix(t_a_rotvec, ·)."""
+    rotvec = np.asarray(t_a_rotvec, dtype=float)
+    if np.linalg.norm(rotvec) <= 1e-6:
+        return None
+    return _fmt_triplet(rotvec_to_xyz_euler(rotvec))
+
+
 def _patched_standalone(
-    xacro_text: str, t_a, t_b_trans, t_b_rotvec, *,
+    xacro_text: str, t_a, t_b_trans, t_b_rotvec, t_a_rotvec=None, *,
     allow_flipped_camera: bool = False,
 ) -> str:
     """Patch the tk26_vision standalone form: literal pan_joint + camera_mount_joint."""
     rpy_str = _rotvec_to_rpy_str(t_b_rotvec, allow_flipped_camera)
     have_rot = rpy_str is not None
+    pan_rpy_str = _pan_axis_rpy_str(t_a_rotvec if t_a_rotvec is not None else np.zeros(3))
+    have_pan_rot = pan_rpy_str is not None
 
     def repl(match):
         name = _bare_name(match.group("name"))
         body = match.group("body")
         if name == "pan_joint":
-            # T_A rotation locked identity in our model — don't overwrite rpy.
+            # T_A rotation: write the fitted pan-axis tilt when present,
+            # otherwise preserve the existing rpy (legacy behavior).
             new_body = _replace_origin(
-                body, _fmt_triplet(t_a), preserve_rpy=True, new_rpy=None,
+                body, _fmt_triplet(t_a),
+                preserve_rpy=not have_pan_rot, new_rpy=pan_rpy_str,
             )
         elif name == "camera_mount_joint":
             new_body = _replace_origin(
@@ -188,18 +207,25 @@ def _patched_standalone(
 
 
 def _patched_macro(
-    xacro_text: str, t_a, t_b_trans, t_b_rotvec, *,
+    xacro_text: str, t_a, t_b_trans, t_b_rotvec, t_a_rotvec=None, *,
     allow_flipped_camera: bool = False,
 ) -> str:
     """Patch the tk25_basic macro form: `attach_xyz` default + camera_mount_joint."""
     rpy_str = _rotvec_to_rpy_str(t_b_rotvec, allow_flipped_camera)
     have_rot = rpy_str is not None
+    pan_rpy_str = _pan_axis_rpy_str(t_a_rotvec if t_a_rotvec is not None else np.zeros(3))
 
     out = ATTACH_XYZ_DEFAULT_RE.sub(
         lambda m: f"{m.group('key')}{_fmt_triplet(t_a)}{m.group('close')}",
         xacro_text, count=1,
     )
-    # attach_rpy is T_A rotation; we don't fit it, so preserve whatever was there.
+    # attach_rpy is the T_A (base->pan-axis) rotation. Write the fitted pan-axis
+    # tilt when present; otherwise leave whatever was there (legacy behavior).
+    if pan_rpy_str is not None:
+        out = ATTACH_RPY_DEFAULT_RE.sub(
+            lambda m: f"{m.group('key')}{pan_rpy_str}{m.group('close')}",
+            out, count=1,
+        )
 
     def repl(match):
         name = _bare_name(match.group("name"))
@@ -216,17 +242,18 @@ def _patched_macro(
 
 
 def _patched_xacro(
-    xacro_text: str, t_a, t_b_trans, t_b_rotvec=None, *,
+    xacro_text: str, t_a, t_b_trans, t_b_rotvec=None, t_a_rotvec=None, *,
     allow_flipped_camera: bool = False,
 ) -> str:
     t_b_rotvec = np.zeros(3) if t_b_rotvec is None else np.asarray(t_b_rotvec, dtype=float)
+    t_a_rotvec = np.zeros(3) if t_a_rotvec is None else np.asarray(t_a_rotvec, dtype=float)
     if MACRO_DECL_RE.search(xacro_text):
         return _patched_macro(
-            xacro_text, t_a, t_b_trans, t_b_rotvec,
+            xacro_text, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
             allow_flipped_camera=allow_flipped_camera,
         )
     return _patched_standalone(
-        xacro_text, t_a, t_b_trans, t_b_rotvec,
+        xacro_text, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
         allow_flipped_camera=allow_flipped_camera,
     )
 
@@ -307,6 +334,123 @@ def _resolve_yaml_path(cli_yaml: Optional[Path], no_yaml: bool) -> Optional[Path
             "skip the YAML patch."
         )
     return Path(targets[0].path)
+
+
+# ---- per-robot urdf_overrides.yaml patcher --------------------------------
+#
+# The pan-tilt geometry actually consumed at launch lives in
+# tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml. Its
+# attach_xyz / attach_rpy / camera_mount_xyz / camera_mount_rpy OVERRIDE the
+# xacro defaults (pan_tilt.launch.py / robot_description.launch.py flatten them
+# in), so patching only the xacro has no runtime effect on robots that use
+# overrides. We keep this file in sync too. Surgical regex per key preserves
+# comments, quoting, indentation, and key order.
+
+_OVERRIDE_KEYS = ("attach_xyz", "attach_rpy", "camera_mount_xyz", "camera_mount_rpy")
+
+
+def _override_key_re(key: str) -> re.Pattern:
+    # Matches `   key: "v0 v1 v2"   # comment`, preserving indent/quotes/comment.
+    return re.compile(rf'^(?P<lead>\s*{key}:\s*")[^"]*(?P<close>".*)$', re.MULTILINE)
+
+
+def _patch_urdf_overrides(
+    yaml_text: str, t_a, t_b_trans, t_b_rotvec, t_a_rotvec=None, *,
+    allow_flipped_camera: bool = False,
+) -> tuple[str, list[str]]:
+    """Surgically patch the pan-tilt urdf_overrides.yaml.
+
+    attach_xyz <- t_a and camera_mount_xyz <- t_b_trans are written whenever the
+    key is present. attach_rpy <- t_a_rotvec and camera_mount_rpy <- t_b_rotvec
+    are written only when the rotvec is non-trivial — a zero rotvec preserves the
+    existing rpy (same rule as the xacro patcher), so a calibration that didn't
+    fit a rotation never zeroes one a prior run wrote. camera_mount_rpy goes
+    through the forward-camera yaw guard. Missing keys are skipped silently (the
+    file may legitimately omit some). Returns (patched_text, changed_keys)."""
+    t_a_rotvec = np.zeros(3) if t_a_rotvec is None else np.asarray(t_a_rotvec, dtype=float)
+    new_vals = {
+        "attach_xyz": _fmt_triplet(t_a),
+        "attach_rpy": _pan_axis_rpy_str(t_a_rotvec),                     # None -> preserve
+        "camera_mount_xyz": _fmt_triplet(t_b_trans),
+        "camera_mount_rpy": _rotvec_to_rpy_str(t_b_rotvec, allow_flipped_camera),  # None -> preserve
+    }
+    out = yaml_text
+    changed: list[str] = []
+    for key in _OVERRIDE_KEYS:
+        val = new_vals[key]
+        if val is None:
+            continue
+        new_out, n = _override_key_re(key).subn(
+            lambda m: f"{m.group('lead')}{val}{m.group('close')}", out, count=1,
+        )
+        if n:
+            out = new_out
+            changed.append(key)
+    return out, changed
+
+
+def _resolve_overrides_yaml(
+    cli_path: Optional[Path], no_overrides: bool,
+) -> Optional[Path]:
+    """Resolve which per-robot urdf_overrides.yaml to patch.
+
+    Precedence: --no-overrides -> None; --overrides-yaml <path> -> that path
+    (must exist); else auto-discover the installed
+    `tinker_robot_config/robots/$ROBOT_NAME/pan_tilt/urdf_overrides.yaml`.
+    Auto-discovery returns None (not an error) when $ROBOT_NAME is unset,
+    tinker_robot_config isn't installed, or the file is absent — overrides are
+    an optional target, so a missing one is skipped with a note rather than
+    aborting the whole apply."""
+    if no_overrides:
+        return None
+    if cli_path is not None:
+        if not cli_path.is_file():
+            raise CalibrationApplyError(
+                f"--overrides-yaml path {cli_path} does not exist."
+            )
+        return cli_path
+    robot = os.environ.get("ROBOT_NAME", "").strip()
+    if not robot:
+        return None
+    try:
+        from ament_index_python.packages import (
+            get_package_share_directory, PackageNotFoundError,
+        )
+    except ImportError:
+        return None
+    try:
+        share = Path(get_package_share_directory("tinker_robot_config"))
+    except (PackageNotFoundError, Exception):
+        return None
+    cand = share / "robots" / robot / "pan_tilt" / "urdf_overrides.yaml"
+    return cand if cand.is_file() else None
+
+
+def _atomic_write_single(
+    path: Path, new_text: str, *, timestamp: Optional[str] = None,
+) -> dict:
+    """Atomically replace `path` with `new_text`, saving a `.old-<ts>` backup.
+
+    Idempotent: when the new content matches, no write/backup happens and
+    `applied` is False. Mirrors the per-file half of `_atomic_write_pair` for
+    standalone targets (the override yaml) that aren't part of the URDF+offset
+    lockstep pair."""
+    ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = uuid.uuid4().hex[:8]
+    original = path.read_bytes()
+    new_bytes = new_text.encode("utf-8")
+    if new_bytes == original:
+        return {"path": str(path), "applied": False, "backup_path": None}
+    tmp = path.with_name(path.name + f".tmp-{run_id}")
+    tmp.write_bytes(new_bytes)
+    bak = path.with_name(path.name + f".old-{ts}")
+    try:
+        bak.write_bytes(original)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return {"path": str(path), "applied": True, "backup_path": str(bak)}
 
 
 def _atomic_write_pair(
@@ -422,6 +566,18 @@ def main(argv=None):
                              "elsewhere — without the YAML, the URDF chain "
                              "mis-represents the camera pose at any non-zero "
                              "firmware tilt.")
+    parser.add_argument("--overrides-yaml", type=Path, default=None,
+                        help="Path to the per-robot pan-tilt urdf_overrides.yaml "
+                             "(default: auto-discover the installed "
+                             "tinker_robot_config/robots/$ROBOT_NAME/pan_tilt/"
+                             "urdf_overrides.yaml). This file's attach_xyz/"
+                             "attach_rpy/camera_mount_xyz/camera_mount_rpy keys "
+                             "OVERRIDE the xacro defaults at launch, so it must "
+                             "be patched too or the calibration has no runtime "
+                             "effect on robots that use overrides.")
+    parser.add_argument("--no-overrides", action="store_true",
+                        help="Skip the urdf_overrides.yaml patch. Use for dry "
+                             "runs or robots that don't use the override system.")
     parser.add_argument("--allow-flipped-camera", action="store_true",
                         help="Override the forward-camera invariant (|yaw| < π/2). "
                              "Use ONLY when the head camera is genuinely mounted "
@@ -434,6 +590,8 @@ def main(argv=None):
 
     params = _load_params(args.results)
     t_a = np.asarray(params["t_a"], dtype=float)
+    # Optional: absent in pre-pan-axis-tilt results -> zero -> existing rpy preserved.
+    t_a_rotvec = np.asarray(params.get("t_a_rotvec", [0, 0, 0]), dtype=float)
     t_b_trans = np.asarray(params["t_b_trans"], dtype=float)
     t_b_rotvec = np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
     pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
@@ -442,7 +600,7 @@ def main(argv=None):
     original = args.xacro.read_text()
     try:
         patched = _patched_xacro(
-            original, t_a, t_b_trans, t_b_rotvec,
+            original, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
             allow_flipped_camera=args.allow_flipped_camera,
         )
     except CalibrationApplyError as exc:
@@ -464,9 +622,32 @@ def main(argv=None):
             f"pan_tilt_state_publisher.ros__parameters):\n"
             f"    pan_offset_rad:  {pan_offset_rad:.10f}\n"
             f"    tilt_offset_rad: {tilt_offset_rad:.10f}\n"
-            f"\n(Re-run without --out to apply both URDF + YAML "
-            f"atomically in place.)"
+            f"\n(Re-run without --out to apply URDF + YAML + per-robot "
+            f"urdf_overrides.yaml atomically in place.)"
         )
+        # Show what the per-robot override patch would write (the file that
+        # actually wins at launch), without touching it.
+        try:
+            ovr_path = _resolve_overrides_yaml(args.overrides_yaml, args.no_overrides)
+        except CalibrationApplyError as exc:
+            print(f"\n(overrides: {exc})")
+            ovr_path = None
+        if ovr_path is not None:
+            _, changed = _patch_urdf_overrides(
+                ovr_path.read_text(), t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
+                allow_flipped_camera=args.allow_flipped_camera,
+            )
+            print(
+                f"\n→ Would also patch per-robot overrides "
+                f"({', '.join(changed) or 'no matching keys'}):\n"
+                f"    {ovr_path}"
+            )
+        elif not args.no_overrides:
+            print(
+                "\n(no urdf_overrides.yaml patched: $ROBOT_NAME unset, "
+                "tinker_robot_config not installed, or file absent — pass "
+                "--overrides-yaml to point at one.)"
+            )
         return
 
     # In-place lockstep apply: URDF + YAML, atomic with backups.
@@ -485,8 +666,31 @@ def main(argv=None):
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    if not result["xacro_applied"] and not result["yaml_applied"]:
-        print("No change — URDF and YAML already match the calibration.")
+    # Per-robot override patch (the file that actually wins at launch). Done as
+    # a separate atomic write after the URDF+YAML pair: if it fails the pair
+    # stays applied (idempotent re-run recovers) rather than rolling back a
+    # good URDF/YAML write over an optional, secondary target.
+    try:
+        overrides_path = _resolve_overrides_yaml(args.overrides_yaml, args.no_overrides)
+    except CalibrationApplyError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+    override_result = None
+    override_changed: list[str] = []
+    if overrides_path is not None:
+        try:
+            patched_ovr, override_changed = _patch_urdf_overrides(
+                overrides_path.read_text(), t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
+                allow_flipped_camera=args.allow_flipped_camera,
+            )
+            override_result = _atomic_write_single(overrides_path, patched_ovr)
+        except CalibrationApplyError as exc:
+            print(f"ERROR (urdf_overrides.yaml): {exc}", file=sys.stderr)
+            sys.exit(2)
+
+    if (not result["xacro_applied"] and not result["yaml_applied"]
+            and (override_result is None or not override_result["applied"])):
+        print("No change — URDF, YAML, and overrides already match the calibration.")
         return
 
     print(f"Patched URDF: {result['xacro_path']}")
@@ -513,10 +717,26 @@ def main(argv=None):
             f"tilt_offset_rad in pan_tilt.yaml manually."
         )
 
+    if override_result is not None:
+        if override_result["applied"]:
+            print(f"Patched overrides: {override_result['path']}")
+            print(f"  keys:      {', '.join(override_changed) or '(none matched)'}")
+            print(f"  backup:    {override_result['backup_path']}")
+        else:
+            print(f"Overrides: {overrides_path} (no change — already matches)")
+    elif not args.no_overrides:
+        print(
+            "urdf_overrides.yaml NOT patched ($ROBOT_NAME unset, "
+            "tinker_robot_config not installed, or file absent). If this robot "
+            "uses the override system, the xacro patch alone will NOT take "
+            "effect — pass --overrides-yaml <path>."
+        )
+
     print(
-        "\nRebuild the affected URDF package, then restart the pan_tilt "
-        "launch. Both URDF and YAML are now sourced from the same "
-        f"calibration ({args.results.name})."
+        "\nRebuild the affected package(s) (pan_tilt / tinker_urdf / "
+        "tinker_robot_config), then restart robot_state_publisher + "
+        "pan_tilt state_publisher. URDF, YAML, and per-robot overrides are now "
+        f"sourced from the same calibration ({args.results.name})."
     )
 
 

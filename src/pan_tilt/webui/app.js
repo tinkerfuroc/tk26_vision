@@ -3,6 +3,19 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
+// Canonical "level" park tilt (firmware deg), per-robot via calibration.yaml
+// (tinker1=45, tinker2=30). Updated from /api/state; drives the Level jog
+// button + the "physical tilt from level" grid display.
+let LEVEL_TILT = 30;
+function syncLevelButton() {
+  const b = document.getElementById('btn-level');
+  if (b) {
+    b.dataset.tilt = String(LEVEL_TILT);
+    b.textContent = `Level (0, +${LEVEL_TILT})`;
+    b.title = `physical level (horizontal) — firmware tilt +${LEVEL_TILT}`;
+  }
+}
+
 // FastAPI returns plain-text "Internal Server Error" on unhandled 500s, which
 // crashes raw `r.json()` with "Unexpected token 'I'... is not valid JSON".
 // Read once as text, JSON-parse if possible, otherwise wrap the text under
@@ -195,6 +208,10 @@ function fmt(v, n = 4) {
 }
 
 function renderState(s) {
+  if (typeof s.level_tilt_deg === 'number' && s.level_tilt_deg !== LEVEL_TILT) {
+    LEVEL_TILT = s.level_tilt_deg;
+    syncLevelButton();
+  }
   $('#s-camera').textContent = s.have_camera ? 'streaming' : '—';
   $('#s-image-topic').textContent = s.image_topic || '—';
   $('#s-domain').textContent = s.ros_domain_id || '—';
@@ -284,7 +301,7 @@ function renderGridFromState(grid) {
   if (panKv) panKv.textContent = pan.length ? `[${fmt(pan)}]°  (span ±${Math.max(...pan.map(Math.abs)).toFixed(0)}°)` : '—';
   if (tiltKv) tiltKv.textContent = tilt.length ? `[${fmt(tilt)}]°` : '—';
   if (tiltPhysKv) tiltPhysKv.textContent = tilt.length
-    ? `[${fmt(tilt.map(t => t - 45))}]°  (±${(Math.max(...tilt) - Math.min(...tilt)) / 2}° around level, + = up)`
+    ? `[${fmt(tilt.map(t => t - LEVEL_TILT))}]°  (±${(Math.max(...tilt) - Math.min(...tilt)) / 2}° around level, + = up)`
     : '—';
   if (nKv) nKv.textContent = (pan.length * tilt.length) + ` (${pan.length} pan × ${tilt.length} tilt)`;
   renderGridCornerButtons(pan, tilt);
@@ -307,7 +324,7 @@ function renderGridCornerButtons(pan, tilt) {
   for (const [p, t, gly] of corners) {
     const b = document.createElement('button');
     b.textContent = `${gly} (${p}, ${t})`;
-    b.title = `Physical tilt ${t - 45}° from level (+ = up)`;
+    b.title = `Physical tilt ${t - LEVEL_TILT}° from level (+ = up)`;
     b.dataset.pan = String(p);
     b.dataset.tilt = String(t);
     b.addEventListener('click', () => {
@@ -526,7 +543,7 @@ $('#btn-cart-move').addEventListener('click', async () => {
 const PHASES = [
   {
     key: 'phase1_waypoints',
-    label: 'Phase 1 — hand-eye (LEVEL, tilt=+30)',
+    label: 'Phase 1 — hand-eye (LEVEL, head horizontal)',
     hint: 'Head parks at (pan=0, tilt=+30 firmware) = physically level. Record 12–15 distinct xArm EE poses; aim for ≥60° orientation change between consecutive poses. Compact configs (wrist near base) minimise gravity sag. Gate: trans RMSE < 3 mm, rot RMSE < 0.5°.',
   },
   {
@@ -1332,7 +1349,7 @@ async function calibRun(cmd, flags) {
   // so a stray click doesn't kick off a 20-minute sweep.
   if (cmd.startsWith('collect_')) {
     const human = {
-      collect_phase1:        'Phase 1 LEVEL (pan=0, tilt=+30 — head horizontal, uses phase1_waypoints)',
+      collect_phase1:        'Phase 1 LEVEL (pan=0, head horizontal, uses phase1_waypoints)',
       collect_phase1_custom: `Phase 1 CUSTOM (pan=${_phase1CustomPark.pan_deg}°, tilt=${_phase1CustomPark.tilt_deg}°, uses phase1_waypoints_custom)`,
       collect_dry_run:       'Dry-run waypoint validation (NO image capture, NO pan-tilt motion). Sends each xArm waypoint via JointMove and reports which ones fail. Cheap; safe to run before a full collect.',
       collect_phase2:        'Phase 2 (pan-tilt grid sweep at each xArm anchor)',
@@ -1394,6 +1411,18 @@ $$('#calib-run-buttons button[data-calib-cmd], #calib-run-buttons-collect button
   b.addEventListener('click', () => {
     const cmd = b.dataset.calibCmd;
     const flags = (b.dataset.calibFlags || '').split(/\s+/).filter(Boolean);
+    // Solver-option toggles are default-on for the web UI and apply to the two
+    // solves that fit kinematics — chain and polish. They're appended here (not
+    // baked into data-calib-flags) so the checkboxes control them live.
+    if (cmd === 'chain' || cmd === 'polish') {
+      // Pan-axis tilt (non-vertical pan axis). Off → legacy vertical-axis model.
+      const panAxisTilt = document.getElementById('chk-pan-axis-tilt');
+      if (panAxisTilt && panAxisTilt.checked) flags.push('--fit-pan-axis-tilt');
+      // Unlock T_B rotation. Off → lock T_B at the warm-start (chain's legacy
+      // default; the degeneracy-safe fallback if a fit reports ~20° rot RMSE).
+      const unlockTb = document.getElementById('chk-unlock-tb');
+      if (unlockTb && unlockTb.checked) flags.push('--unlock-tb-rotation');
+    }
     calibRun(cmd, flags);
   });
 });

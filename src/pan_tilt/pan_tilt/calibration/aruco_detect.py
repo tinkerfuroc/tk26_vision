@@ -44,12 +44,12 @@ from .optimize import _average_se3
 
 # ---- default board config (plan spec) ---------------------------------------
 #
-# Dictionary: DICT_5X5_100 — ample ID budget for 5x7 board (only 24 markers used).
-# Square size 40 mm, marker size 30 mm. Callers can override to match a physical
-# board that differs.
+# Dictionary: DICT_5X5_100 — ample ID budget for a 5x5 board (only 12 markers used).
+# Square size 40 mm, marker size 30 mm — matches the Tinker physical board. Callers
+# can override (yaml `board:` section / `--board` JSON) to match a board that differs.
 
 DEFAULT_SQUARES_X = 5
-DEFAULT_SQUARES_Y = 7
+DEFAULT_SQUARES_Y = 5
 DEFAULT_SQUARE_LEN_M = 0.040
 DEFAULT_MARKER_LEN_M = 0.030
 DEFAULT_DICT_ID = cv2.aruco.DICT_5X5_100

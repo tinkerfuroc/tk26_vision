@@ -29,3 +29,36 @@ def test_average_board_anchors_reports_scatter():
     assert 0.0 < scatter["rot_deg"] < 2.0
     # mean is close to truth (noise averages partly down)
     assert np.linalg.norm(mean[:3, 3] - sc.Tbb_true[:3, 3]) * 1000.0 < 10.0
+
+
+def test_anchor_rescues_degenerate_solve():
+    # Low rotation diversity => calibrateHandEye seed is poorly conditioned.
+    # Pin BOTH solves to TSAI only: on this degenerate set TSAI lands in a
+    # wrong basin its bundle-adjust can't escape (~1.5 m off), so the closed-
+    # form-only solve fails deterministically and the multi-start board-anchor
+    # branch is what rescues it. (The default 5-method best-of would let a
+    # stronger method recover, masking the rescue path under test.)
+    methods = {"TSAI": hs._METHODS["TSAI"]}
+    sc = syn.make_scenario(n_poses=12, pixel_noise=0.3, seed=7, rot_range=0.05)
+    plain = hs.solve(sc.samples, sc.K, None, sc.board_pts, heldout_frac=0.25,
+                     reject_sigma=None, methods=methods)
+    # Simulate a realistic (slightly noisy) head anchor: ~5 mm / 0.3 deg off.
+    rng = np.random.default_rng(2)
+    anchor = sc.Tbb_true @ tf.T_from_vec(np.concatenate([
+        rng.normal(0, np.radians(0.3), 3), rng.normal(0, 0.005, 3)]))
+    assisted = hs.solve(sc.samples, sc.K, None, sc.board_pts, heldout_frac=0.25,
+                        reject_sigma=None, anchor_Tbb=anchor, methods=methods)
+    err_plain = np.linalg.norm(plain.X[:3, 3] - sc.X_true[:3, 3])
+    err_assisted = np.linalg.norm(assisted.X[:3, 3] - sc.X_true[:3, 3])
+    # The anchor-assisted X is dramatically better on a degenerate set, and
+    # within the head's ~1 cm floor (NOT necessarily the 3 mm gate).
+    assert err_assisted < err_plain
+    assert err_assisted < 0.012
+
+
+def test_solve_default_no_anchor_is_unchanged():
+    # anchor_Tbb=None must reproduce the historical clean-data PASS.
+    sc = syn.make_scenario(n_poses=20, pixel_noise=0.3, seed=11)
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts, heldout_frac=0.25,
+                   rng_seed=0, reject_sigma=None)
+    assert res.status == "PASS"

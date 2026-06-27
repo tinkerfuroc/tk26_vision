@@ -185,6 +185,32 @@ def bundle_adjust(samples, K, dist, board_pts, X0, Tbb0,
     return X, Tbb, info
 
 
+def _solve_once(samples, K, dist, board_pts, *, methods=None,
+                depth_weight=0.0, depth_sigma_m=0.005, anchor_Tbb=None):
+    """Multi-start seed -> bundle-adjust; return (X, Tbb, per_method, seed_used).
+
+    Candidate seeds: the best-of-5 closed-form ``calibrateHandEye`` seed, plus
+    (when ``anchor_Tbb`` is given) the basin-immune board-anchor seed. Each is
+    bundle-adjusted; the converged result with the lowest reprojection RMS wins.
+    On degenerate (low-rotation) sets where calibrateHandEye returns a poor or
+    flipped seed, the anchor branch rescues the solve.
+    """
+    X0, Tbb0, per_method = seed_handeye(samples, K, dist, board_pts, methods=methods)
+    candidates = [("closed_form", X0, Tbb0)]
+    if anchor_Tbb is not None:
+        Xa, Tba = seed_from_board_anchor(samples, anchor_Tbb)
+        candidates.append(("board_anchor", Xa, Tba))
+    best = None
+    for name, Xs, Tbs in candidates:
+        X, Tbb, info = bundle_adjust(samples, K, dist, board_pts, Xs, Tbs,
+                                     depth_weight=depth_weight,
+                                     depth_sigma_m=depth_sigma_m)
+        reproj = info["final_reproj_px"]
+        if best is None or reproj < best[3]:
+            best = (X, Tbb, name, reproj)
+    return best[0], best[1], per_method, best[2]
+
+
 @dataclass
 class SolveResult:
     X: np.ndarray
@@ -273,7 +299,7 @@ def gate(metrics):
 
 def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
           methods=None, reject_sigma=None, max_reject_frac=0.5,
-          depth_weight=1.0, depth_sigma_m=0.005):
+          depth_weight=1.0, depth_sigma_m=0.005, anchor_Tbb=None):
     """Full solve pipeline. ``methods`` is forwarded to :func:`seed_handeye`
     so a single-method run (e.g. ``methods={"TSAI": cv2.CALIB_HAND_EYE_TSAI}``)
     skips the multi-method best-of step; ``None`` keeps the default 5-method
@@ -291,9 +317,10 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
     to the returned ``SolveResult.per_method[-1]`` for operator visibility.
     """
     train, test = split_train_test(samples, heldout_frac, rng_seed)
-    X0, Tbb0, per_method = seed_handeye(train, K, dist, board_pts, methods=methods)
-    X, Tbb, _ = bundle_adjust(train, K, dist, board_pts, X0, Tbb0,
-                              depth_weight=depth_weight, depth_sigma_m=depth_sigma_m)
+    X, Tbb, per_method, _seed_used = _solve_once(
+        train, K, dist, board_pts, methods=methods,
+        depth_weight=depth_weight, depth_sigma_m=depth_sigma_m,
+        anchor_Tbb=anchor_Tbb)
 
     rejected = []
     if reject_sigma is not None and len(train) >= 6:

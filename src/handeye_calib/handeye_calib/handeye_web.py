@@ -421,6 +421,24 @@ def _make_node_class():
             self._ir_emitter_enabled = None
             self._emitter_wait_s = 1.0
 
+            # ---- pan-tilt HEAD Orbbec warm-start anchor ---------------------
+            # The head is already calibrated (~3 mm/0.5deg in base_link). It
+            # observes the SAME fixed board and supplies T_base_board, used ONLY
+            # as a basin-immune SEED for the wrist solve (handeye_solve.solve
+            # anchor_Tbb=...). Tbb stays FREE in the bundle adjust, so the head's
+            # absolute bias never enters the final X. Disabled until the first
+            # successful anchor; head camera defaults are the Orbbec /camera ns.
+            self._head_image_topic = str(self._param("head_image_topic", "/camera/color/image_raw"))
+            self._head_info_topic = str(self._param("head_info_topic", "/camera/color/camera_info"))
+            self._head_optical_frame = str(self._param("head_optical_frame", "camera_color_optical_frame"))
+            self._head_frame = None
+            self._head_frame_stamp = None
+            self._head_K = None
+            self._head_D = None
+            self._tbb_head = None          # 4x4 averaged T_base_board, or None
+            self._anchor_obs = []          # list of 4x4 per-snap T_base_board
+            self._anchor_scatter = None    # {"trans_mm","rot_deg","n"} or None
+
             self.bridge = CvBridge()
             self._frame = None
             self._frame_stamp = None   # ROS stamp of the most recent image
@@ -646,6 +664,11 @@ def _make_node_class():
                 CameraInfo, self._ir_info_topic, self._on_ir_info, qos_profile_sensor_data)
             self.create_subscription(
                 Image, self._ffs_ir_depth_topic, self._on_ir_depth, qos_profile_sensor_data)
+            self.create_subscription(
+                Image, self._head_image_topic, self._on_head_image,
+                qos_profile_sensor_data)
+            self.create_subscription(
+                CameraInfo, self._head_info_topic, self._on_head_info, 10)
             self._jm = ActionClient(self, JointMove, self._param("jointmove_action", "joint_move_action"))
 
             self._np = np
@@ -783,6 +806,87 @@ def _make_node_class():
                 if self._calib_frame == "ir":
                     self._K = K
                     self._D = D
+
+        def _on_head_image(self, msg):
+            """Cache the latest HEAD Orbbec color frame (warm-start anchor only;
+            does NOT drive the wrist detection/stability path)."""
+            try:
+                bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"head cv_bridge failed ({exc})",
+                                       throttle_duration_sec=10.0)
+                return
+            with self.lock:
+                self._head_frame = bgr
+                self._head_frame_stamp = self.get_clock().now().to_msg()
+
+        def _on_head_info(self, msg):
+            np = self._np
+            K = np.array(msg.k, float).reshape(3, 3)
+            D = np.array(msg.d, float).flatten() if len(msg.d) else np.zeros(5)
+            with self.lock:
+                self._head_K = K
+                self._head_D = D
+
+        def do_anchor_board(self):
+            """Observe the fixed board with the HEAD Orbbec and record one
+            T_base_board sample for the warm-start. Call multiple times (ideally
+            from a few different pan/tilt head poses) to average down the head's
+            pose-dependent bias; the running mean + scatter is stored on
+            ``self._tbb_head`` / ``self._anchor_scatter``. Degrades to ok:False
+            (never 500) when the head frame / intrinsics / TF / detection are
+            missing."""
+            from pan_tilt.calibration.aruco_detect import detect_pose
+            with self.lock:
+                bgr = None if self._head_frame is None else self._head_frame.copy()
+                K = None if self._head_K is None else self._head_K.copy()
+                D = None if self._head_D is None else self._head_D.copy()
+                stamp = self._head_frame_stamp
+                n_obs = len(self._anchor_obs)
+            if bgr is None or K is None:
+                return {"ok": False, "reason": "no head camera frame/intrinsics yet",
+                        "n_anchor_obs": n_obs}
+            det = detect_pose(bgr, K, D, board=self._board, detector=self._detector)
+            if not det.success:
+                return {"ok": False, "reason": "head saw no usable board",
+                        "n_anchor_obs": n_obs}
+            # detect_pose returns the board pose in the head OPTICAL frame.
+            from rclpy.time import Time as _RclpyTime
+            tf_time = (_RclpyTime.from_msg(stamp) if stamp is not None
+                       else self._rclpy_time())
+            try:
+                tfm = self.tf_buffer.lookup_transform(
+                    self._base_frame, self._head_optical_frame, tf_time)
+            except Exception:
+                try:
+                    tfm = self.tf_buffer.lookup_transform(
+                        self._base_frame, self._head_optical_frame, self._rclpy_time())
+                except Exception as exc2:
+                    return {"ok": False,
+                            "reason": (f"TF {self._base_frame}->"
+                                       f"{self._head_optical_frame} unavailable: {exc2}"),
+                            "n_anchor_obs": n_obs}
+            T_base_headopt = ws.tf_to_matrix(
+                [tfm.transform.translation.x, tfm.transform.translation.y,
+                 tfm.transform.translation.z],
+                [tfm.transform.rotation.x, tfm.transform.rotation.y,
+                 tfm.transform.rotation.z, tfm.transform.rotation.w])
+            Tbb_obs = T_base_headopt @ det.pose_optical
+            with self.lock:
+                self._anchor_obs.append(Tbb_obs)
+                mean, scatter = hs.average_board_anchors(self._anchor_obs)
+                self._tbb_head = mean
+                self._anchor_scatter = scatter
+                n_obs = len(self._anchor_obs)
+            return {"ok": True, "n_anchor_obs": n_obs, "scatter": scatter,
+                    "reproj_px": float(det.reprojection_rms_px)}
+
+        def do_clear_anchor(self):
+            with self.lock:
+                self._anchor_obs = []
+                self._tbb_head = None
+                self._anchor_scatter = None
+            return {"ok": True, "n_anchor_obs": 0}
 
         def _on_ir_depth(self, msg):
             """Cache the latest native-IR FFS depth (float32 metres). The stream
@@ -1301,6 +1405,12 @@ def _make_node_class():
             # Runtime config (calib_frame + depth knobs + emitter) for the
             # Settings controls on the Info tab.
             payload["config"] = self.config_dict()
+            with self.lock:
+                payload["anchor"] = {
+                    "have": self._tbb_head is not None,
+                    "n_obs": len(self._anchor_obs),
+                    "scatter": self._anchor_scatter,
+                }
             return payload
 
         def safety_preview(self):
@@ -1704,6 +1814,7 @@ def _make_node_class():
             """
             with self.lock:
                 samples, K, D = list(self.session.samples), self._K, self._D
+                anchor = None if self._tbb_head is None else self._tbb_head.copy()
             if len(samples) < 6:
                 return {"ok": False, "reason": f"need >=6 samples, have {len(samples)}"}
             if K is None:
@@ -1723,7 +1834,8 @@ def _make_node_class():
                                reject_sigma=(float(reject_sigma)
                                              if reject_sigma is not None else None),
                                depth_weight=self._depth_weight,
-                               depth_sigma_m=self._depth_sigma_m)
+                               depth_sigma_m=self._depth_sigma_m,
+                               anchor_Tbb=anchor)
             except Exception as exc:
                 # seed_handeye raises when every OpenCV method fails (e.g. all
                 # samples colinear); bundle_adjust may also blow up on a
@@ -2764,6 +2876,14 @@ def make_app(node):
         return JSONResponse(node.do_solve(
             method=body_d.get("method", "auto"),
             reject_sigma=rs))
+
+    @app.post("/api/anchor")
+    async def anchor(request: Request):
+        return JSONResponse(ws.json_safe(node.do_anchor_board()))
+
+    @app.post("/api/anchor/clear")
+    async def anchor_clear(request: Request):
+        return JSONResponse(ws.json_safe(node.do_clear_anchor()))
 
     @app.post("/api/promote")
     def promote():

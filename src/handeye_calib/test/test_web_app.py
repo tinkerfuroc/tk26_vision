@@ -741,3 +741,27 @@ def test_json_response_scrubs_nan_inf():
         assert body["per_sample_reproj_px"][1] is None
     finally:
         node.destroy_node()
+
+
+def test_anchor_endpoint_graceful_without_head_camera():
+    node, c = _client()
+    try:
+        r = c.post("/api/anchor")
+        assert r.status_code == 200
+        body = r.json()
+        # No head frames have arrived -> ok:False with a clear reason, never 500.
+        assert body["ok"] is False
+        assert "head" in body["reason"].lower()
+        assert body["n_anchor_obs"] == 0
+    finally:
+        node.destroy_node()
+
+
+def test_anchor_clear_is_idempotent():
+    node, c = _client()
+    try:
+        r = c.post("/api/anchor/clear")
+        assert r.status_code == 200 and r.json()["ok"] is True
+        assert r.json()["n_anchor_obs"] == 0
+    finally:
+        node.destroy_node()

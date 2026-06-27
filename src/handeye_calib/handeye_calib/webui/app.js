@@ -1153,6 +1153,10 @@ function renderSolvePayload(p) {
   const samples = (state && Array.isArray(state.samples)) ? state.samples : [];
   const K = (state && state.K) || (state && state.intrinsics && state.intrinsics.K) || null;
   drawCoverage("coverage", samples, K);
+  if (p.observability && p.observability.ok === false) {
+    setStatus(SOLVE_STATUS,
+      'WARN: ' + p.observability.detail);
+  }
 }
 
 async function runSolve() {

@@ -306,3 +306,13 @@ def test_sample_metadata_angular_delta_vs_prev():
     assert md["angular_delta_deg"] is not None
     assert abs(md["angular_delta_deg"] - 45.0) < 1e-6
     assert md["joint_positions"] == [0.0] * 7
+
+
+def test_solve_payload_v2_carries_observability():
+    import numpy as np
+    from handeye_calib import synthetic as syn, handeye_solve as hs, web_support as ws
+    sc = syn.make_scenario(n_poses=12, pixel_noise=0.3, seed=11)
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts, reject_sigma=None)
+    payload = ws.solve_payload_v2(res, sc.samples, sc.K, None, sc.board_pts)
+    assert "observability" in payload
+    assert "ok" in payload["observability"]

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 import cv2
 from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation as _R
 
 from handeye_calib import transforms as tf
 from handeye_calib import handeye_model as hm
@@ -371,6 +372,40 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
                                           "X": X, "Tbb": Tbb,
                                           "reproj_px": float("nan")}]
     return SolveResult(X, Tbb, train_m, held_m, gate(held_m), per_method)
+
+
+def rotation_observability(samples, *, min_singular=0.3):
+    """Diagnose AX=XB rotation observability of the accepted pose set.
+
+    Eye-in-hand identifiability needs >= 2 non-parallel relative-rotation axes;
+    a set whose flange rotations all share one axis (or are pure translation)
+    leaves X's rotation unobservable and lets a rotation error in X hide in the
+    board pose Tbb. We collect the unit axis of every pairwise relative rotation
+    R_ij = R_j R_i^T (skipping pairs that rotate < 2 deg, which have no
+    well-defined axis), stack them into a 3xK matrix, and SVD. The 2nd singular
+    value measures how much the axes span a second dimension; below
+    ``min_singular`` the set is effectively single-axis. Returns a JSON-safe
+    dict; ``ok`` is the gate the UI shows as a WARN badge.
+    """
+    Rs = [np.asarray(s.T_base_eef, float)[:3, :3] for s in samples]
+    axes = []
+    for i in range(len(Rs)):
+        for j in range(i + 1, len(Rs)):
+            rv = _R.from_matrix(Rs[j] @ Rs[i].T).as_rotvec()
+            ang = float(np.linalg.norm(rv))
+            if np.degrees(ang) >= 2.0:
+                axes.append(rv / ang)
+    if len(axes) < 2:
+        return {"ok": False, "n_axes": len(axes), "second_singular": 0.0,
+                "detail": "fewer than 2 usable rotation axes — X rotation "
+                          "unobservable; add poses that rotate the flange"}
+    sv = np.linalg.svd(np.asarray(axes, float).T, compute_uv=False)
+    second = float(sv[1]) if len(sv) >= 2 else 0.0
+    ok = bool(second >= min_singular)
+    return {"ok": ok, "n_axes": len(axes), "second_singular": second,
+            "detail": ("rotation axes span >= 2 dimensions" if ok else
+                       "rotation axes nearly collinear — add poses that rotate "
+                       "the flange about a DIFFERENT axis")}
 
 
 def consensus_corners(frames, *, min_frac=0.6):

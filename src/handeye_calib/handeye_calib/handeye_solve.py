@@ -74,6 +74,57 @@ def seed_handeye(samples, K, dist, board_pts, *, methods=None):
     return best["X"], best["Tbb"], per_method
 
 
+def seed_from_board_anchor(samples, anchor_Tbb):
+    """Closed-form warm-start ``X = T_eef_cam`` from a KNOWN board pose in base.
+
+    The board pose in the arm-base frame (``anchor_Tbb`` = T_base_board) is
+    measured by an EXTERNAL, already-calibrated sensor (the pan-tilt head
+    Orbbec, composed through TF into the arm base frame). Each sample then
+    closes the kinematic loop directly::
+
+        A_i @ X @ B_i = Tbb   =>   X_i = inv(A_i) @ Tbb @ inv(B_i)
+
+    with A_i = T_base_eef (FK) and B_i = T_cam_board (wrist PnP). Unlike AX=XB
+    this needs NO rotation diversity — a single pose determines X — so it is a
+    basin-immune seed for the bundle adjust. Returns ``Tbb_seed = anchor_Tbb``;
+    the bundle adjust keeps Tbb FREE, so the head's absolute bias is used only
+    to choose the convergence basin and is NOT injected into the final X.
+    """
+    Xs = []
+    for s in samples:
+        A = np.asarray(s.T_base_eef, float)
+        B = np.asarray(s.T_cam_board, float)
+        Xs.append(tf.invert(A) @ np.asarray(anchor_Tbb, float) @ tf.invert(B))
+    return tf.se3_average(Xs), np.asarray(anchor_Tbb, float)
+
+
+def average_board_anchors(anchors):
+    """SE(3)-average a list of board-in-base measurements and report scatter.
+
+    ``anchors`` is a list of 4x4 ``T_base_board`` observations (e.g. the head
+    at several pan/tilt poses). Returns ``(Tbb_mean, scatter)`` where scatter is
+    ``{"trans_mm", "rot_deg", "n"}`` — the RMS deviation of the observations
+    from their mean, a data-driven confidence readout (large scatter => the
+    anchor is unreliable; widen the prior / re-check the head TF).
+    """
+    Ts = [np.asarray(T, float) for T in anchors]
+    if not Ts:
+        raise ValueError("average_board_anchors needs >=1 anchor")
+    mean = tf.se3_average(Ts)
+    inv_mean = tf.invert(mean)
+    t_dev, r_dev = [], []
+    for T in Ts:
+        D = inv_mean @ T
+        t_dev.append(float(np.linalg.norm(D[:3, 3])))
+        r_dev.append(np.radians(tf.rotation_angle_deg(np.eye(3), D[:3, :3])))
+    scatter = {
+        "trans_mm": float(np.sqrt(np.mean(np.square(t_dev))) * 1000.0),
+        "rot_deg": float(np.degrees(np.sqrt(np.mean(np.square(r_dev))))),
+        "n": len(Ts),
+    }
+    return mean, scatter
+
+
 def _residuals(params, samples, K, dist, board_pts,
                depth_weight=0.0, depth_sigma_m=0.005):
     """Stacked residual: per-corner pixel reprojection, plus (when enabled) a

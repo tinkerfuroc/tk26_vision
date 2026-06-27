@@ -371,3 +371,36 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
                                           "X": X, "Tbb": Tbb,
                                           "reproj_px": float("nan")}]
     return SolveResult(X, Tbb, train_m, held_m, gate(held_m), per_method)
+
+
+def consensus_corners(frames, *, min_frac=0.6):
+    """Per-corner sub-pixel consensus across N steady frames.
+
+    ``frames`` is a list of ``(ids, px)`` for one frame each: ``ids`` is an
+    ``(M,)`` int array of ChArUco corner indices, ``px`` an ``(M,2)`` array of
+    sub-pixel corner pixels. A corner id is kept only if it was detected in at
+    least ``ceil(min_frac * N)`` frames; its consensus pixel is the per-corner
+    MEDIAN over the frames that saw it (robust to the occasional mis-localized
+    corner). Returns ``(ids, px)`` sorted by id, or ``(None, None)`` only when
+    no corner reaches quorum (caller falls back to the single-frame pose; the
+    downstream PnP path enforces its own >=6-corner floor).
+    """
+    n = len(frames)
+    if n == 0:
+        return None, None
+    quorum = max(1, int(np.ceil(min_frac * n)))
+    acc = {}
+    for ids, px in frames:
+        ids = np.asarray(ids).reshape(-1).astype(int)
+        px = np.asarray(px, float).reshape(-1, 2)
+        for cid, p in zip(ids, px):
+            acc.setdefault(int(cid), []).append(p)
+    kept_ids, kept_px = [], []
+    for cid in sorted(acc):
+        pts = np.asarray(acc[cid], float)
+        if len(pts) >= quorum:
+            kept_ids.append(cid)
+            kept_px.append(np.median(pts, axis=0))
+    if not kept_ids:
+        return None, None
+    return np.asarray(kept_ids, int), np.asarray(kept_px, float)

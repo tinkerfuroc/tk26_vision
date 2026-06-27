@@ -101,6 +101,11 @@ def _residuals(params, samples, K, dist, board_pts,
             valid = (np.asarray(s.obs_xyz_valid, bool)
                      if getattr(s, "obs_xyz_valid", None) is not None
                      else np.ones(len(meas), bool))
+            # deproject_corners writes NaN rows for holes ("never a fake 0"); AND
+            # the mask with finiteness so a NaN can never reach least_squares
+            # (which rejects a non-finite initial residual) even if the mask was
+            # dropped in a round-trip — keeps the NaN contract self-consistent.
+            valid = valid & np.isfinite(meas).all(axis=1)
             if valid.any():
                 P_pred = (T_cam_board[:3, :3] @ bp.T).T + T_cam_board[:3, 3]
                 d = (P_pred[valid] - meas[valid]) * (depth_weight / depth_sigma_m)
@@ -155,12 +160,18 @@ def split_train_test(samples, heldout_frac, rng_seed=0):
 
 
 def _depth_point_metrics(X, Tbb, samples, board_pts):
-    """Honest, depth-grounded accuracy: RMS distance (mm) between the solved
-    chain's predicted camera-frame corner points and the FFS-measured points,
-    over all valid corners. Unlike ``trans_rmse_m`` (which compares against the
-    monocular PnP pose — itself a potentially-biased estimate), this compares
-    against an independent *metric* measurement, so it's the number to ship as
-    the real-world error budget. Returns ``(rmse_mm_or_None, n_corners)``."""
+    """Depth-grounded accuracy: RMS distance (mm) between the solved chain's
+    predicted camera-frame corner points and the FFS-measured points, over all
+    valid corners. Unlike ``trans_rmse_m`` (which compares against the monocular
+    PnP pose — itself biased when intrinsics/board-scale are off), this compares
+    against an independent *metric* measurement.
+
+    Honest only on the HELD-OUT split: those poses never entered the bundle
+    adjust, so the metric genuinely cross-validates the depth-grounded solve.
+    The TRAIN value is in-sample (X/Tbb were fit to these same points with
+    ``depth_weight>0``), so it can read deceptively low if the depth term
+    over-fits a systematic FFS bias — read the held-out value as the real-world
+    error budget. Returns ``(rmse_mm_or_None, n_corners)``."""
     sq = []
     for s in samples:
         if getattr(s, "obs_xyz_cam", None) is None:
@@ -169,6 +180,7 @@ def _depth_point_metrics(X, Tbb, samples, board_pts):
         valid = (np.asarray(s.obs_xyz_valid, bool)
                  if getattr(s, "obs_xyz_valid", None) is not None
                  else np.ones(len(meas), bool))
+        valid = valid & np.isfinite(meas).all(axis=1)  # NaN holes never count
         if not valid.any():
             continue
         T_cam_board = tf.invert(s.T_base_eef @ X) @ Tbb

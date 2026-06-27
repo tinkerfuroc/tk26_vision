@@ -164,6 +164,42 @@ def test_solve_payload_v2_units_and_keys():
     assert p["per_sample_reproj_px"] == []
 
 
+def test_solve_payload_v2_surfaces_depth_metrics():
+    """FFS-depth path: when the solve carries a depth-grounded metric
+    (``depth_point_rmse_mm`` / ``n_depth_corners``), solve_payload_v2 must
+    surface it in the mm/deg blocks so the UI can show the honest, metric
+    real-world accuracy alongside the reprojection number."""
+    from handeye_calib.handeye_solve import SolveResult
+    res = SolveResult(
+        X=np.eye(4), Tbb=np.eye(4),
+        train_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.00174,
+                       "reproj_px": 0.3, "depth_point_rmse_mm": 3.2,
+                       "n_depth_corners": 240},
+        heldout_metrics={"trans_rmse_m": 0.002, "rot_rmse_rad": 0.00349,
+                         "reproj_px": 0.5, "depth_point_rmse_mm": 4.1,
+                         "n_depth_corners": 64},
+        status="PASS", per_method=[])
+    p = ws.solve_payload_v2(res, samples=[], K=np.eye(3), dist=None,
+                            board_pts=np.zeros((0, 3)))
+    assert p["heldout_metrics_mm_deg"]["depth_point_rmse_mm"] == 4.1
+    assert p["heldout_metrics_mm_deg"]["n_depth_corners"] == 64
+    assert p["train_metrics_mm_deg"]["depth_point_rmse_mm"] == 3.2
+
+
+def test_solve_payload_v2_omits_depth_metrics_when_absent():
+    """Monocular-only solve (no FFS): depth keys are simply absent, never a
+    fake 0 that would read as a perfect depth fit."""
+    from handeye_calib.handeye_solve import SolveResult
+    res = SolveResult(
+        X=np.eye(4), Tbb=np.eye(4),
+        train_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.00174, "reproj_px": 0.3},
+        heldout_metrics={"trans_rmse_m": 0.002, "rot_rmse_rad": 0.00349, "reproj_px": 0.5},
+        status="PASS", per_method=[])
+    p = ws.solve_payload_v2(res, samples=[], K=np.eye(3), dist=None,
+                            board_pts=np.zeros((0, 3)))
+    assert "depth_point_rmse_mm" not in p["heldout_metrics_mm_deg"]
+
+
 def test_solve_payload_v2_per_sample_residuals_match_samples():
     """T5: ``per_sample_reproj_px`` is a 1:1 list with the input samples."""
     from handeye_calib import synthetic as syn, handeye_solve as hs

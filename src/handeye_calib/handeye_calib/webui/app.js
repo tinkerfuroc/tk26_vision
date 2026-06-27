@@ -661,6 +661,7 @@ function render() {
 
   // T3: Info-tab kv-tables / matrix / board / safety + Move-tab safety line.
   renderInfoTab(state);
+  renderSettings(state);
   renderMoveSafety(state);
   // T4: Capture-tab stability badge + gallery + diversity meter.
   renderCaptureTab(state);
@@ -669,6 +670,87 @@ function render() {
   // T4: Auto-capture sequence UI (below waypoints, above manual capture).
   renderSequenceUI();
 }
+
+// ---- Calibration settings (Info tab): calib_frame + depth knobs + emitter ----
+// Mirrors state.config from the WS push into the form, and POSTs /api/config on
+// Apply. While the operator is mid-edit (configDirty), the 10 Hz render loop must
+// NOT clobber their inputs — so we only sync from state when not dirty.
+let configDirty = false;
+let emitterDirty = false;  // separate: the emitter command is ONLY sent when the
+                           // operator actually touched the checkbox, so a routine
+                           // depth/frame Apply in color mode never kills the projector.
+const CFG_INPUTS = [
+  "use-ffs-depth-input", "depth-weight-input",
+  "depth-sigma-input", "depth-win-input", "depth-min-corners-input",
+];
+function markConfigDirty() { configDirty = true; }
+CFG_INPUTS.forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("change", markConfigDirty);
+});
+$$('input[name="calib-frame"]').forEach((r) => r.addEventListener("change", markConfigDirty));
+const EMITTER_INPUT = document.getElementById("ir-emitter-input");
+if (EMITTER_INPUT) EMITTER_INPUT.addEventListener("change", () => { configDirty = true; emitterDirty = true; });
+
+function renderSettings(s) {
+  const cfg = s.config;
+  if (!cfg || configDirty) return;  // don't clobber in-progress edits
+  const r = document.querySelector(`input[name="calib-frame"][value="${cfg.calib_frame}"]`);
+  if (r) r.checked = true;
+  const set = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
+  const chk = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.checked = !!v; };
+  chk("use-ffs-depth-input", cfg.use_ffs_depth);
+  if (cfg.ir_emitter_enabled !== null && cfg.ir_emitter_enabled !== undefined) {
+    chk("ir-emitter-input", cfg.ir_emitter_enabled);
+  }
+  set("depth-weight-input", cfg.depth_weight);
+  set("depth-sigma-input", cfg.depth_sigma_m);
+  set("depth-win-input", cfg.depth_win);
+  set("depth-min-corners-input", cfg.depth_min_corners);
+}
+
+async function applyConfig() {
+  const frame = document.querySelector('input[name="calib-frame"]:checked')?.value || "color";
+  const curFrame = state && state.config ? state.config.calib_frame : "color";
+  const n = state ? (state.num_samples || 0) : 0;
+  if (frame !== curFrame && n > 0 &&
+      !confirm(`Switching to the ${frame} frame discards ${n} captured sample(s) (they're tied to the current frame's intrinsics). Continue?`)) {
+    return;
+  }
+  const body = {
+    calib_frame: frame,
+    use_ffs_depth: document.getElementById("use-ffs-depth-input")?.checked,
+    depth_weight: parseFloat(document.getElementById("depth-weight-input")?.value),
+    depth_sigma_m: parseFloat(document.getElementById("depth-sigma-input")?.value),
+    depth_win: parseInt(document.getElementById("depth-win-input")?.value, 10),
+    depth_min_corners: parseInt(document.getElementById("depth-min-corners-input")?.value, 10),
+  };
+  // Only command the IR emitter when the operator actually toggled it — a depth/
+  // frame tweak must NOT silently disable the projector (needed for color depth).
+  if (emitterDirty) body.ir_emitter_enabled = document.getElementById("ir-emitter-input")?.checked;
+  setStatus("config-status", "applying…", "warn");
+  try {
+    const resp = await fetch("/api/config", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await resp.json();
+    if (resp.ok && j.ok) {
+      configDirty = false;  // success -> let the WS state re-sync the form
+      emitterDirty = false;
+      let msg = `applied (frame=${j.calib_frame || frame})`;
+      if (j.emitter) msg += j.emitter.ok ? "; emitter set" : `; emitter FAILED: ${j.emitter.reason}`;
+      setStatus("config-status", msg, j.emitter && !j.emitter.ok ? "warn" : "ok");
+    } else {
+      // Keep dirty so a failed apply doesn't let the WS clobber unsaved edits.
+      setStatus("config-status", "FAIL: " + (j.reason || ("HTTP " + resp.status)), "err");
+    }
+  } catch (e) {
+    setStatus("config-status", "ERROR: " + e, "err");
+  }
+}
+const APPLY_CFG_BTN = document.getElementById("apply-config-btn");
+if (APPLY_CFG_BTN) APPLY_CFG_BTN.addEventListener("click", applyConfig);
 
 // ---- T2: Waypoints sub-panel — list + add-current + delete + save/reload --
 // Lives in the Capture tab, above the manual capture button. Reads

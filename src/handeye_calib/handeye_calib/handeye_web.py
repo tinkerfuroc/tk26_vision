@@ -47,10 +47,12 @@ def _make_node_class():
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from rclpy.action import ActionClient
+    from rclpy.callback_groups import ReentrantCallbackGroup
     from tf2_ros import Buffer, TransformListener
     from cv_bridge import CvBridge
     from sensor_msgs.msg import Image, CameraInfo, JointState
     from tinker_arm_msgs.action import JointMove
+    from tinker_vision_msgs_26.srv import FoundationStereoDepth
     from scipy.spatial.transform import Rotation as _R
 
     from handeye_calib import web_support as ws
@@ -389,14 +391,51 @@ def _make_node_class():
             self._eef_frame = self._param("eef_frame", "link_eef")
             self._aruco_dict_name = self._param("aruco_dict", "DICT_5X5_100")
             self._marker_len = float(self._param("marker_len_m", 0.03))
-            self._mount_to_color_xyz = self._param("mount_to_color_xyz", "0 0 0")
-            self._mount_to_color_rpy = self._param("mount_to_color_rpy", "0 0 0")
+            # Internal camera geometry: T_camera_link -> {color,ir}_optical, the
+            # FIXED factory transforms the hand-eye solve composes THROUGH to
+            # recover T_eef->camera_link (the stored mount). Defaults are the
+            # D435 vendor URDF values (realsense_d435i.urdf.xacro): color_frame
+            # is +15 mm in Y off camera_link then the optical rotation; left-IR
+            # frame is coincident with camera_link (0 0 0) then the SAME optical
+            # rotation. (Previously both defaulted to identity, which silently
+            # wrote T_eef->color_optical into the camera_link joint — the reason
+            # the deployed tinker2 xacro needed a manual correction. Real
+            # geometry => the tool now writes the correct camera_link directly.)
+            self._mount_to_color_xyz = self._param("mount_to_color_xyz", "0 0.015 0")
+            self._mount_to_color_rpy = self._param("mount_to_color_rpy", "-1.5707963267948966 0 -1.5707963267948966")
+            self._mount_to_ir_xyz = self._param("mount_to_ir_xyz", "0 0 0")
+            self._mount_to_ir_rpy = self._param("mount_to_ir_rpy", "-1.5707963267948966 0 -1.5707963267948966")
+            # Observation frame for the board: 'color' (default) or 'ir' (left-IR,
+            # the native FFS depth frame == camera_link). Runtime-switchable via
+            # /api/config; switching clears the (frame-specific) sample set.
+            self._calib_frame = str(self._param("calib_frame", "color")).strip().lower()
+            if self._calib_frame not in ("color", "ir"):
+                self._calib_frame = "color"
+            # IR emitter control: the wrist RealSense node exposes the projector
+            # as the settable param ``depth_module.emitter_enabled``; we flip it
+            # via an async SetParameters client (no device contention). Disable it
+            # for IR-frame capture (the dot pattern corrupts ChArUco corners; FFS
+            # is passive so depth survives). ``_ir_emitter_enabled`` tracks the
+            # last value WE set (None = unknown / never set).
+            self._camera_node_name = str(self._param("camera_node_name", "/camera/xarm_camera"))
+            self._ir_emitter_enabled = None
+            self._emitter_wait_s = 1.0
 
             self.bridge = CvBridge()
             self._frame = None
             self._frame_stamp = None   # ROS stamp of the most recent image
-            self._K = None
+            self._K = None             # ACTIVE intrinsics (color or IR, per calib_frame)
             self._D = None
+            # Per-source intrinsic caches (the active _K/_D mirror one of these).
+            self._color_K = None
+            self._color_D = None
+            self._ir_K = None
+            self._ir_D = None
+            # Latest cached native-IR FoundationStereo depth (float32 metres) +
+            # stamp, filled by _on_ir_depth from the FFS native-IR stream. Used
+            # for the depth residual when calib_frame='ir'.
+            self._ir_depth = None
+            self._ir_depth_stamp = None
             self._last_det = None              # {corners:int, reproj_px:float} or None
             self._last_corners_xy = None       # (M,2) px for overlay, or None
             self._cap = None                   # latest {T_cam_board, obs_px, corner_idx, reproj_px, area_frac}
@@ -472,6 +511,55 @@ def _make_node_class():
             self._settle_steady_ticks = int(self._param("settle_steady_ticks", 5))
             self._settle_poll_s = float(self._param("settle_poll_s", 0.1))
 
+            # ---- FoundationStereo (FFS) metric depth ------------------------
+            # The per-view T_cam_board is otherwise monocular planar PnP, whose
+            # optical-axis translation is the weakest DOF. At capture time we
+            # call the FFS get_depth service (color-aligned, same color
+            # intrinsics the solver uses), sample depth at the detected corner
+            # pixels, and store the deprojected metric points on the Sample;
+            # the solver's depth residual then pins the scale/standoff of the
+            # rigidly-mounted camera. Reuses the proven object_seg_yolo client
+            # pattern (threading.Event + add_done_callback on a Reentrant group
+            # so the blocking wait — which runs on the FastAPI/sequence thread,
+            # never the rclpy spin thread — doesn't deadlock the executor).
+            #
+            # Default ON; degrades gracefully to monocular when FFS is down
+            # (service missing / timeout / non-zero status / shape mismatch) so
+            # an FFS hiccup never blocks a capture.
+            self._use_ffs_depth = bool(self._param("use_ffs_depth", True))
+            self._ffs_service = str(self._param("ffs_service", "/foundation_stereo/get_depth"))
+            self._ffs_wait_for_service_s = float(self._param("ffs_wait_for_service_s", 1.0))
+            self._ffs_call_timeout_s = float(self._param("ffs_call_timeout_s", 10.0))
+            # Depth residual knobs forwarded to handeye_solve.solve. depth_weight
+            # 2.0 makes FFS depth (at depth_sigma_m metres of stereo noise) a
+            # dominant-but-safe scale constraint while sub-pixel reprojection
+            # keeps owning rotation; dial up to trust depth more, 0 to disable.
+            # depth_weight lowered 2026-06-22 (review) from 2.0 -> 1.0: at 2.0 the
+            # depth block out-votes the sub-pixel reprojection ~2:1, so a realistic
+            # systematic FFS metric scale bias (~0.5-1% from stereo baseline/
+            # rectification) could drag an otherwise-good calibration off and past
+            # the PASS gate. 1.0 keeps depth a co-equal constraint that pins the
+            # optical-axis DOF without steamrolling reprojection; raise it if FFS
+            # depth on this robot is validated metrically trustworthy.
+            self._depth_weight = float(self._param("depth_weight", 1.0))
+            self._depth_sigma_m = float(self._param("depth_sigma_m", 0.005))
+            self._depth_win = int(self._param("depth_win", 2))
+            # Valid-depth band (m) + minimum valid corners to use depth for a
+            # pose — exposed for parity with depth_win so a different board
+            # standoff doesn't need a rebuild.
+            self._depth_z_min = float(self._param("depth_z_min", 0.05))
+            self._depth_z_max = float(self._param("depth_z_max", 2.0))
+            self._depth_min_corners = int(self._param("depth_min_corners", 3))
+            self._ffs_cb_group = ReentrantCallbackGroup()
+            self._ffs_cli = None
+            self._last_depth_source = None  # 'ffs' | 'unavailable' | 'shape-mismatch' | ...
+            # One-time "FFS enabled but never delivering depth" hint (the usual
+            # cause is the wrist RealSense brought up without infra1/infra2 IR
+            # streams FoundationStereo needs). See _note_ffs_depth_outcome.
+            self._ffs_depth_miss_streak = 0
+            self._ffs_depth_warned = False
+            self._ffs_depth_warn_after = int(self._param("ffs_depth_warn_after", 5))
+
             self.session = CaptureSession(
                 min_diversity_deg=self._diversity_target_deg,
                 min_corners=self._min_corners,
@@ -495,6 +583,11 @@ def _make_node_class():
             # gallery row so the operator can see quality at a glance.
             self._sample_reproj_px = {}
             self._sample_area_frac = {}
+            # Per-sample FFS depth provenance ('ffs' | 'unavailable' |
+            # 'shape-mismatch' | 'ffs-too-sparse' | 'moved-during-ffs' |
+            # 'disabled') so the gallery row shows whether each accepted sample
+            # actually carried metric depth.
+            self._sample_depth_source = {}
 
             self._sx = int(self._param("squares_x", 5))
             self._sy = int(self._param("squares_y", 5))
@@ -534,6 +627,25 @@ def _make_node_class():
             self.create_subscription(
                 CameraInfo, self._param("camera_info_topic", "/camera/xarm_camera/color/camera_info"),
                 self._on_info, qos_profile_sensor_data)
+            # Left-IR observation path (calib_frame='ir'): the rectified IR image
+            # + its rectified intrinsics (P-block, zero distortion) + the native-IR
+            # FFS depth stream (run FFS with stream_enabled:=true
+            # stream_align_to_color:=false; or point ffs_ir_depth_topic at the
+            # RealSense-native /camera/xarm_camera/depth/image_rect_raw). All three
+            # are subscribed unconditionally; only the active frame drives detection.
+            self._ir_image_topic = self._param(
+                "ir_image_topic", "/camera/xarm_camera/infra1/image_rect_raw")
+            self._ir_info_topic = self._param(
+                "ir_info_topic", "/camera/xarm_camera/infra1/camera_info")
+            self._ffs_ir_depth_topic = self._param(
+                "ffs_ir_depth_topic", "/foundation_stereo/depth/image_rect_raw")
+            self._ir_depth_max_age_s = float(self._param("ir_depth_max_age_s", 1.0))
+            self.create_subscription(
+                Image, self._ir_image_topic, self._on_ir_image, qos_profile_sensor_data)
+            self.create_subscription(
+                CameraInfo, self._ir_info_topic, self._on_ir_info, qos_profile_sensor_data)
+            self.create_subscription(
+                Image, self._ffs_ir_depth_topic, self._on_ir_depth, qos_profile_sensor_data)
             self._jm = ActionClient(self, JointMove, self._param("jointmove_action", "joint_move_action"))
 
             self._np = np
@@ -567,17 +679,11 @@ def _make_node_class():
 
         # ---- subscriptions ---------------------------------------------------
 
-        def _on_image(self, msg):
-            try:
-                bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            except Exception as exc:
-                self.get_logger().warn(
-                    f"cv_bridge conversion failed ({exc})", throttle_duration_sec=5.0)
-                return
-            with self.lock:
-                K = None if self._K is None else self._K.copy()
-                D = None if self._D is None else self._D.copy()
-
+        def _ingest_frame(self, bgr, K, D):
+            """Run detection on ``bgr`` (with intrinsics K,D) and update the SHARED
+            active-frame state. Called only by the ACTIVE frame's image callback
+            (color OR IR per ``calib_frame``), so ``self._K``/``self._frame``/
+            ``self._cap`` always reflect the frame currently being calibrated."""
             corners_xy, last_det, cap = self._detect(bgr, K, D)
 
             # Frame-rate bookkeeping (monotonic clock, immune to wall-clock jumps).
@@ -592,6 +698,8 @@ def _make_node_class():
 
             with self.lock:
                 self._frame = bgr
+                self._K = K       # active intrinsics for do_solve/do_capture
+                self._D = D
                 # Stamp the image with ROS-time AT RECEIPT, NOT msg.header.stamp.
                 # realsense2_camera (and many other drivers) populate
                 # header.stamp from the camera HW clock, which drifts seconds
@@ -613,13 +721,237 @@ def _make_node_class():
                     self._stability_since_frames = 0
                 self._stability_steady = steady
 
+        def _on_image(self, msg):
+            """Color image. Drives detection only when calib_frame=='color'."""
+            if self._calib_frame != "color":
+                return
+            try:
+                bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"cv_bridge conversion failed ({exc})", throttle_duration_sec=5.0)
+                return
+            with self.lock:
+                K = None if self._color_K is None else self._color_K.copy()
+                D = None if self._color_D is None else self._color_D.copy()
+            self._ingest_frame(bgr, K, D)
+
+        def _on_ir_image(self, msg):
+            """Left-IR image (mono8, rectified). Drives detection only when
+            calib_frame=='ir'. Converted gray->BGR so the overlay + jpeg path is
+            uniform; ``_detect`` re-grays it."""
+            if self._calib_frame != "ir":
+                return
+            try:
+                gray = self.bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"cv_bridge IR conversion failed ({exc})", throttle_duration_sec=5.0)
+                return
+            bgr = self._cv2.cvtColor(gray, self._cv2.COLOR_GRAY2BGR)
+            with self.lock:
+                K = None if self._ir_K is None else self._ir_K.copy()
+                D = None if self._ir_D is None else self._ir_D.copy()
+            self._ingest_frame(bgr, K, D)
+
         def _on_info(self, msg):
+            """Color camera_info -> cache color intrinsics (and mirror to active)."""
             np = self._np
             K = np.array(msg.k, float).reshape(3, 3)
             D = np.array(msg.d, float).flatten() if len(msg.d) else np.zeros(5)
             with self.lock:
-                self._K = K
-                self._D = D
+                self._color_K = K
+                self._color_D = D
+                if self._calib_frame == "color":
+                    self._K = K
+                    self._D = D
+
+        def _on_ir_info(self, msg):
+            """IR camera_info -> cache rectified IR intrinsics. Prefer the P-block
+            (rectified projection K, zero distortion) over msg.k, matching how
+            realsense2_camera publishes infra1's rect intrinsics."""
+            np = self._np
+            P = np.array(msg.p, float).reshape(3, 4) if len(msg.p) >= 12 else None
+            if P is not None and np.any(P[:3, :3]):
+                K = P[:3, :3].copy()
+            else:
+                K = np.array(msg.k, float).reshape(3, 3)
+            D = np.zeros(5)  # rectified -> no distortion
+            with self.lock:
+                self._ir_K = K
+                self._ir_D = D
+                if self._calib_frame == "ir":
+                    self._K = K
+                    self._D = D
+
+        def _on_ir_depth(self, msg):
+            """Cache the latest native-IR FFS depth (float32 metres). The stream
+            may publish 16UC1 (mm) or 32FC1 (m); coerce both to metres."""
+            try:
+                d = self.bridge.imgmsg_to_cv2(msg, "passthrough")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"IR depth decode failed: {exc}",
+                                       throttle_duration_sec=10.0)
+                return
+            np = self._np
+            d = np.asarray(d)
+            d = (d.astype(np.float32) / 1000.0 if d.dtype == np.uint16
+                 else d.astype(np.float32, copy=False))
+            with self.lock:
+                self._ir_depth = d
+                self._ir_depth_stamp = self.get_clock().now().to_msg()
+
+        def _get_ir_depth(self):
+            """Latest cached native-IR FFS depth (float32 m) or None if none yet."""
+            with self.lock:
+                return None if self._ir_depth is None else self._ir_depth
+
+        def _ir_depth_too_stale(self, ref_stamp):
+            """True when the cached native-IR depth lags the captured IR frame by
+            more than ``ir_depth_max_age_s`` — guards against a frozen / dead depth
+            stream feeding geometry from a stale instant (the do_capture steady
+            recheck only proves the ARM is steady NOW, not that the depth frame is
+            contemporaneous). Unknown stamps => NOT stale (lenient; the staleness
+            guard targets an OLD stamp, not a missing one)."""
+            with self.lock:
+                ds = self._ir_depth_stamp
+            if ds is None or ref_stamp is None:
+                return False
+
+            def _sec(s):
+                return float(s.sec) + float(s.nanosec) * 1e-9
+            return abs(_sec(ref_stamp) - _sec(ds)) > float(self._ir_depth_max_age_s)
+
+        def _set_calib_frame(self, frame):
+            """Switch the observation frame ('color'|'ir'). On an ACTUAL change,
+            discard the frame-specific sample set + sidecars (each sample carries
+            that frame's intrinsics — mixing color-K and IR-K samples corrupts the
+            solve) and repoint the active intrinsics. Returns the resolved frame.
+            A bad value or a same-frame call is a no-op (samples preserved)."""
+            frame = str(frame).strip().lower()
+            if frame not in ("color", "ir") or frame == self._calib_frame:
+                return self._calib_frame
+            with self.lock:
+                self._calib_frame = frame
+                self.session.samples.clear()
+                self._thumbs.clear()
+                self._sample_joints.clear()
+                self._sample_ts.clear()
+                self._sample_reproj_px.clear()
+                self._sample_area_frac.clear()
+                self._sample_depth_source.clear()
+                self._cap = None
+                self._last_corners_xy = None
+                self._last_det = None
+                self._stability.reset()
+                self._stability_steady = False
+                self._stability_since_frames = 0
+                self._frame = None  # force a fresh frame from the new source
+                self._K = self._ir_K if frame == "ir" else self._color_K
+                self._D = self._ir_D if frame == "ir" else self._color_D
+            self.get_logger().info(
+                f"calib_frame -> {frame} (samples cleared; observing the "
+                f"{'left-IR (native depth == camera_link)' if frame == 'ir' else 'color'} frame)")
+            return self._calib_frame
+
+        def _set_ir_emitter(self, enabled):
+            """Set the wrist RealSense IR projector via the driver's settable
+            param ``depth_module.emitter_enabled`` (async SetParameters client to
+            the camera node). Returns ``{ok, reason}``. Degrades gracefully — a
+            missing camera node / timeout / error just reports ``ok:False`` and
+            never raises into the config request."""
+            from rcl_interfaces.srv import SetParameters
+            from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+            enabled = bool(enabled)
+            svc = self._camera_node_name.rstrip("/") + "/set_parameters"
+            try:
+                cli = self.create_client(SetParameters, svc,
+                                         callback_group=self._ffs_cb_group)
+                try:
+                    if not cli.wait_for_service(timeout_sec=float(self._emitter_wait_s)):
+                        return {"ok": False,
+                                "reason": f"camera node param service {svc} unavailable"}
+                    req = SetParameters.Request()
+                    req.parameters = [Parameter(
+                        name="depth_module.emitter_enabled",
+                        value=ParameterValue(type=ParameterType.PARAMETER_BOOL,
+                                             bool_value=enabled))]
+                    fut = cli.call_async(req)
+                    ev = threading.Event()
+                    fut.add_done_callback(lambda _f: ev.set())
+                    if not ev.wait(timeout=float(self._emitter_wait_s) + 1.0):
+                        return {"ok": False, "reason": "emitter set timed out"}
+                    resp = fut.result()
+                    results = list(getattr(resp, "results", []) or [])
+                    ok = bool(results and all(r.successful for r in results))
+                    self._ir_emitter_enabled = enabled if ok else self._ir_emitter_enabled
+                    reason = ("ok" if ok else
+                              (results[0].reason if results else "no result"))
+                    return {"ok": ok, "reason": reason, "enabled": enabled}
+                finally:
+                    try:
+                        self.destroy_client(cli)
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as exc:  # noqa: BLE001 — never break the config call
+                return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+        def do_set_config(self, **kw):
+            """Live-apply runtime config from the web UI. All knobs optional;
+            unknown keys ignored. Returns ``{ok, ...}`` (top-level ok reflects the
+            non-emitter knobs, which always apply; the emitter result — which may
+            fail if the camera node is absent — is a separate ``emitter`` sub-dict
+            so a projector miss never reads as a total failure)."""
+            def _num(key, cast, lo=None, hi=None):
+                if key not in kw or kw[key] is None:
+                    return None
+                try:
+                    v = cast(kw[key])
+                except (TypeError, ValueError):
+                    return None
+                if lo is not None:
+                    v = max(lo, v)
+                if hi is not None:
+                    v = min(hi, v)
+                return v
+
+            out = {"ok": True}
+            if "calib_frame" in kw and kw["calib_frame"] is not None:
+                out["calib_frame"] = self._set_calib_frame(kw["calib_frame"])
+            if "use_ffs_depth" in kw and kw["use_ffs_depth"] is not None:
+                self._use_ffs_depth = bool(kw["use_ffs_depth"])
+            for key, cast, lo, hi in (
+                ("depth_weight", float, 0.0, None),
+                ("depth_sigma_m", float, 1e-4, None),
+                ("depth_win", int, 0, None),
+                ("depth_min_corners", int, 1, None),
+                ("depth_z_min", float, 0.0, None),
+                ("depth_z_max", float, 0.0, None),
+            ):
+                v = _num(key, cast, lo, hi)
+                if v is not None:
+                    setattr(self, "_" + key, v)
+            if "ir_emitter_enabled" in kw and kw["ir_emitter_enabled"] is not None:
+                out["emitter"] = self._set_ir_emitter(kw["ir_emitter_enabled"])
+            self.get_logger().info(
+                f"config applied: calib_frame={self._calib_frame} "
+                f"use_ffs_depth={self._use_ffs_depth} depth_weight={self._depth_weight}")
+            return out
+
+        def config_dict(self):
+            """Current runtime config for the WS state push (state.config)."""
+            return {
+                "calib_frame": self._calib_frame,
+                "use_ffs_depth": bool(self._use_ffs_depth),
+                "depth_weight": float(self._depth_weight),
+                "depth_sigma_m": float(self._depth_sigma_m),
+                "depth_win": int(self._depth_win),
+                "depth_min_corners": int(self._depth_min_corners),
+                "depth_z_min": float(self._depth_z_min),
+                "depth_z_max": float(self._depth_z_max),
+                "ir_emitter_enabled": self._ir_emitter_enabled,
+                "ffs_ir_depth_topic": self._ffs_ir_depth_topic,
+            }
 
         def _on_joint_state(self, msg):
             """Stash xArm joint positions (best-effort).
@@ -719,6 +1051,123 @@ def _make_node_class():
             }
             return obs_px, {"corners": int(len(corner_idx)), "reproj_px": reproj_px}, cap
 
+        # ---- FoundationStereo depth -----------------------------------------
+
+        def _try_ffs_depth(self):
+            """Call the FFS get_depth service; return float32 depth (meters,
+            color-aligned) or ``None`` on any failure.
+
+            Mirrors ``object_detection_new.object_seg_yolo._try_ffs_depth``. The
+            safety invariant here is NOT the callback group (this node spins a
+            single-threaded executor, under which a ReentrantCallbackGroup grants
+            no parallelism — it's kept only as future-proofing if the executor
+            ever becomes multi-threaded). Safety comes purely from WHERE this
+            runs: ``do_capture`` is only ever called from the FastAPI
+            ``/api/capture`` worker or the CaptureSequenceRunner daemon — never
+            the rclpy spin thread — so blocking the calling thread on a
+            ``threading.Event`` (set from ``add_done_callback``) leaves the lone
+            spin thread free to process the response and resolve the future. (If
+            do_capture were ever called from a subscription/timer callback, this
+            would deadlock the single-threaded executor instantly.)
+            Returns ``None`` for: disabled, service unavailable within the wait
+            window, call timeout, future exception, non-zero status, or decode
+            failure — every one of which falls back to a monocular capture.
+            """
+            if not self._use_ffs_depth:
+                return None
+            # Outer guard: ANY rclpy-side failure — create_client on a malformed
+            # ffs_service name, or wait_for_service / call_async hitting an
+            # invalidated handle during a node-teardown race — must degrade to a
+            # monocular capture, never raise out of do_capture (which would 500
+            # the /api/capture request or flip the auto-capture sequence to
+            # STEP_ERROR and abort the whole run). Review finding #2.
+            try:
+                return self._try_ffs_depth_inner()
+            except Exception as exc:  # noqa: BLE001 — degrade to monocular
+                self.get_logger().warn(
+                    f"FFS depth acquisition failed "
+                    f"({type(exc).__name__}: {exc}); monocular fallback",
+                    throttle_duration_sec=10.0)
+                return None
+
+        def _try_ffs_depth_inner(self):
+            np = self._np
+            svc = self._ffs_service
+            if self._ffs_cli is None or self._ffs_cli.srv_name != svc:
+                try:
+                    if self._ffs_cli is not None:
+                        self.destroy_client(self._ffs_cli)
+                except Exception:  # noqa: BLE001 — best-effort swap
+                    pass
+                self._ffs_cli = self.create_client(
+                    FoundationStereoDepth, svc, callback_group=self._ffs_cb_group)
+            if not self._ffs_cli.wait_for_service(timeout_sec=self._ffs_wait_for_service_s):
+                return None
+            req = FoundationStereoDepth.Request()
+            req.align_to_color = True  # depth in the color optical frame == K's frame
+            fut = self._ffs_cli.call_async(req)
+            event = threading.Event()
+            fut.add_done_callback(lambda _f: event.set())
+            if not event.wait(timeout=self._ffs_call_timeout_s):
+                try:
+                    self._ffs_cli.remove_pending_request(fut)
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+            try:
+                resp = fut.result()
+            except Exception as exc:  # noqa: BLE001 — log + monocular fallback
+                self.get_logger().warn(f"FFS call raised: {exc}",
+                                       throttle_duration_sec=10.0)
+                return None
+            if resp is None or resp.status != 0:
+                return None
+            try:
+                depth = self.bridge.imgmsg_to_cv2(resp.depth_image, "passthrough")
+            except Exception as exc:  # noqa: BLE001 — bad encoding -> fallback
+                self.get_logger().warn(f"FFS depth decode failed: {exc}",
+                                       throttle_duration_sec=10.0)
+                return None
+            # Service guarantees 32FC1 meters; coerce defensively.
+            return np.asarray(depth).astype(np.float32, copy=False)
+
+        def _note_ffs_depth_outcome(self, depth_source):
+            """One-time operator hint when FFS is enabled but never yields depth.
+
+            The most common cause is the wrist RealSense being launched WITHOUT
+            the infra1/infra2 IR streams FoundationStereo needs — it then returns
+            status=1 ('no synced stereo frame') on every call, ``_try_ffs_depth``
+            returns ``None``, and every capture silently records
+            ``depth_source='unavailable'`` while the solve runs monocular. Fires
+            one WARN after ``ffs_depth_warn_after`` consecutive depth-less
+            captures so the operator isn't silently downgraded (review #5)."""
+            if depth_source == "ffs":
+                self._ffs_depth_miss_streak = 0
+                return
+            self._ffs_depth_miss_streak += 1
+            if (not self._ffs_depth_warned
+                    and self._ffs_depth_miss_streak >= self._ffs_depth_warn_after):
+                self._ffs_depth_warned = True
+                if self._calib_frame == "ir":
+                    advice = (
+                        "Most likely the native-IR FFS depth stream isn't running: "
+                        "launch foundation_stereo with 'stream_enabled:=true "
+                        "stream_align_to_color:=false' (publishing on "
+                        f"{self._ffs_ir_depth_topic}), or point ffs_ir_depth_topic "
+                        "at the RealSense-native /camera/xarm_camera/depth/image_rect_raw.")
+                else:
+                    advice = (
+                        "Most likely the wrist RealSense was launched without the "
+                        "infra1/infra2 IR streams FoundationStereo needs: relaunch it "
+                        "with 'enable_infra1:=true enable_infra2:=true' and confirm the "
+                        "foundation_stereo node is up (ros2 launch foundation_stereo "
+                        "foundation_stereo.launch.py).")
+                self.get_logger().warn(
+                    f"use_ffs_depth=True but the last {self._ffs_depth_miss_streak} "
+                    f"captures got NO FFS depth (last source='{depth_source}', "
+                    f"calib_frame={self._calib_frame}) — the solve is running MONOCULAR. "
+                    f"{advice} Set use_ffs_depth:=false to silence this.")
+
         # ---- accessors -------------------------------------------------------
 
         def get_state_dict(self):
@@ -754,6 +1203,7 @@ def _make_node_class():
                 ts_by_idx = dict(self._sample_ts)
                 reproj_by_idx = dict(self._sample_reproj_px)
                 area_by_idx = dict(self._sample_area_frac)
+                depth_src_by_idx = dict(self._sample_depth_source)
 
             # frame_hz: rolling rate across the deque. Need >= 2 timestamps to
             # measure a delta; falls back to 0.0 on a cold start.
@@ -805,6 +1255,7 @@ def _make_node_class():
                     area_frac=area_by_idx.get(i),
                     joint_positions=joints_by_idx.get(i),
                     ts=ts_by_idx.get(i),
+                    depth_source=depth_src_by_idx.get(i),
                 ))
 
             # T3: server-evaluated SafetyEnvelope check against the cached EE
@@ -823,7 +1274,7 @@ def _make_node_class():
                               if self.sequence_runner is not None
                               else dict(ws.SEQUENCE_IDLE_DEFAULT))
 
-            return ws.enriched_state_payload(
+            payload = ws.enriched_state_payload(
                 camera_connected=camera_connected,
                 intrinsics_ok=intrinsics_ok,
                 num_samples=num_samples,
@@ -832,7 +1283,8 @@ def _make_node_class():
                 frame_count=frame_count,
                 frame_hz=frame_hz,
                 frame_age_sec=frame_age_sec,
-                image_topic=image_topic,
+                image_topic=(self._ir_image_topic if self._calib_frame == "ir"
+                             else image_topic),
                 ros_domain_id=ros_domain_id,
                 t_base_ee=t_base_ee,
                 xarm_joint_positions=xarm,
@@ -846,6 +1298,10 @@ def _make_node_class():
                 waypoints=waypoints_meta,
                 sequence=sequence_state,
             )
+            # Runtime config (calib_frame + depth knobs + emitter) for the
+            # Settings controls on the Info tab.
+            payload["config"] = self.config_dict()
+            return payload
 
         def safety_preview(self):
             """Live SafetyEnvelope verdict on the cached base->ee pose.
@@ -1011,6 +1467,7 @@ def _make_node_class():
                 target = self._stab_window
                 cap, K, frame = self._cap, self._K, self._frame
                 frame_stamp = self._frame_stamp
+                snap_frame = self._calib_frame   # guard against a mid-capture switch
                 joints_snapshot = (None if self._xarm_joint_positions is None
                                    else list(self._xarm_joint_positions))
                 now_mono = self._last_frame_monotonic
@@ -1065,24 +1522,101 @@ def _make_node_class():
                 [tfm.transform.rotation.x, tfm.transform.rotation.y,
                  tfm.transform.rotation.z, tfm.transform.rotation.w])
 
-            ok, reason = self.session.try_add(
-                T_base_eef, cap["T_cam_board"], cap["obs_px"], cap["corner_idx"],
-                n_corners=len(cap["corner_idx"]), reproj_px=cap["reproj_px"],
-                area_frac=cap["area_frac"])
-            if ok:
-                # Cache a downscaled JPEG of the overlayed frame + the joint
-                # snapshot for the new sample. Index matches session.samples[-1].
-                idx = len(self.session.samples) - 1
-                try:
-                    annotated = ws.draw_charuco_overlay(
-                        frame, cap["obs_px"], ids=cap["corner_idx"],
-                        rms_px=cap["reproj_px"], image_topic=self._image_topic)
-                    jpg = ws.encode_jpeg(_downscale(annotated, 320, self._cv2))
-                except Exception as exc:  # pragma: no cover - thumb is best-effort
+            # FFS metric depth at the detected corners. The arm is settled +
+            # static here, so the FFS stereo view matches the cached color frame
+            # — but get_depth can block up to ffs_call_timeout_s, so we RE-CHECK
+            # steadiness after it returns and drop the depth if the pose moved
+            # during the call (the fresh stereo view would no longer correspond
+            # to the cached corners). Degrades to monocular on any failure —
+            # depth is a refinement, never an admission gate.
+            obs_xyz_cam, obs_xyz_valid = None, None
+            depth_source = "disabled"
+            if self._use_ffs_depth:
+                # IR mode samples the cached native-IR FFS stream; color mode
+                # calls the color-aligned get_depth service. Either way the depth
+                # is in the ACTIVE frame, matching self._K used to deproject.
+                _stale = False
+                if snap_frame == "ir":
+                    depth = self._get_ir_depth()
+                    if depth is not None and self._ir_depth_too_stale(frame_stamp):
+                        # A frozen/dead native-IR depth stream would otherwise feed
+                        # geometry from a stale instant; drop it -> monocular.
+                        self.get_logger().warn(
+                            "native-IR depth stale vs the IR frame; dropping depth "
+                            "(monocular this pose)", throttle_duration_sec=10.0)
+                        depth, _stale = None, True
+                else:
+                    depth = self._try_ffs_depth()
+                if depth is None:
+                    depth_source = "ir-depth-stale" if _stale else "unavailable"
+                elif depth.shape[:2] != frame.shape[:2]:
+                    depth_source = "shape-mismatch"
                     self.get_logger().warn(
-                        f"thumb encode failed for sample {idx} ({exc})")
-                    jpg = None
-                with self.lock:
+                        f"FFS depth {depth.shape[:2]} != color {frame.shape[:2]}; "
+                        "capturing monocular this pose",
+                        throttle_duration_sec=10.0)
+                else:
+                    with self.lock:
+                        still_steady = self._stability_steady
+                    if not still_steady:
+                        depth_source = "moved-during-ffs"
+                        self.get_logger().warn(
+                            "pose moved during the FFS depth call; dropping depth "
+                            "(monocular this pose)", throttle_duration_sec=10.0)
+                    else:
+                        from handeye_calib import depth_sample as _hds
+                        xyz, valid = _hds.deproject_corners(
+                            cap["obs_px"], depth, K, win=self._depth_win,
+                            z_min=self._depth_z_min, z_max=self._depth_z_max)
+                        n_valid = int(np.count_nonzero(valid))
+                        if n_valid >= self._depth_min_corners:
+                            obs_xyz_cam, obs_xyz_valid = xyz, valid
+                            depth_source = "ffs"
+                            self.get_logger().info(
+                                f"capture: FFS depth {n_valid}/{len(valid)} "
+                                f"corners valid")
+                        else:
+                            depth_source = "ffs-too-sparse"
+                            self.get_logger().info(
+                                f"capture: FFS depth only {n_valid}/{len(valid)} "
+                                f"corners valid (<{self._depth_min_corners}); "
+                                "monocular this pose")
+                # One-time operator hint if FFS is on but never delivers depth.
+                self._note_ffs_depth_outcome(depth_source)
+
+            # Commit ATOMICALLY under the lock, re-checking that calib_frame
+            # hasn't switched since the snapshot. A concurrent /api/config frame
+            # switch clears the session under the same lock; without this guard
+            # the (stale-frame) sample could land in the freshly-cleared
+            # new-frame session — the exact color-K/IR-K mixing the clear
+            # prevents. try_add + the sidecar writes share one critical section
+            # so the index can't drift either.
+            with self.lock:
+                if self._calib_frame != snap_frame:
+                    return {"ok": False,
+                            "reason": "calib_frame switched during capture; sample dropped",
+                            "num_samples": len(self.session.samples)}
+                self._last_depth_source = depth_source
+                ok, reason = self.session.try_add(
+                    T_base_eef, cap["T_cam_board"], cap["obs_px"], cap["corner_idx"],
+                    n_corners=len(cap["corner_idx"]), reproj_px=cap["reproj_px"],
+                    area_frac=cap["area_frac"],
+                    obs_xyz_cam=obs_xyz_cam, obs_xyz_valid=obs_xyz_valid)
+                if ok:
+                    # Downscaled JPEG of the overlayed frame + the joint snapshot
+                    # for the new sample. Index matches session.samples[-1].
+                    idx = len(self.session.samples) - 1
+                    try:
+                        annotated = ws.draw_charuco_overlay(
+                            frame, cap["obs_px"], ids=cap["corner_idx"],
+                            rms_px=cap["reproj_px"],
+                            image_topic=(self._ir_image_topic if snap_frame == "ir"
+                                         else self._image_topic))
+                        jpg = ws.encode_jpeg(_downscale(annotated, 320, self._cv2))
+                    except Exception as exc:  # pragma: no cover - thumb is best-effort
+                        self.get_logger().warn(
+                            f"thumb encode failed for sample {idx} ({exc})")
+                        jpg = None
                     if jpg is not None:
                         self._thumbs[idx] = jpg
                     self._sample_joints[idx] = joints_snapshot
@@ -1090,8 +1624,10 @@ def _make_node_class():
                                             else float(self._time.monotonic()))
                     self._sample_reproj_px[idx] = float(cap["reproj_px"])
                     self._sample_area_frac[idx] = float(cap["area_frac"])
-            return {"ok": ok, "reason": reason,
-                    "num_samples": len(self.session.samples)}
+                    self._sample_depth_source[idx] = depth_source
+                num = len(self.session.samples)
+            return {"ok": ok, "reason": reason, "depth_source": depth_source,
+                    "num_samples": num}
 
         def do_delete_sample(self, idx):
             """Pop sample idx + recompact thumbnail/joint sidecars.
@@ -1138,6 +1674,10 @@ def _make_node_class():
                     (k if k < idx else k - 1): v
                     for k, v in self._sample_area_frac.items() if k != idx
                 }
+                self._sample_depth_source = {
+                    (k if k < idx else k - 1): v
+                    for k, v in self._sample_depth_source.items() if k != idx
+                }
                 num = len(samples)
             return {"ok": True, "num_samples": num}
 
@@ -1181,7 +1721,9 @@ def _make_node_class():
                 res = hs.solve(samples, K, D, self._board_pts,
                                methods=methods_subset,
                                reject_sigma=(float(reject_sigma)
-                                             if reject_sigma is not None else None))
+                                             if reject_sigma is not None else None),
+                               depth_weight=self._depth_weight,
+                               depth_sigma_m=self._depth_sigma_m)
             except Exception as exc:
                 # seed_handeye raises when every OpenCV method fails (e.g. all
                 # samples colinear); bundle_adjust may also blow up on a
@@ -1230,13 +1772,29 @@ def _make_node_class():
                 d_spread_pct = 100.0 * (d_max - d_min) / max(d_min, 1e-6)
                 rej_str = (f" | rejected_indices={payload['rejected_indices']}"
                            if payload.get("rejected_indices") else "")
+                # FFS-depth usage: how many samples carried metric depth, and
+                # the honest depth-grounded held-out accuracy when present.
+                n_depth_samples = sum(
+                    1 for s in samples if getattr(s, "obs_xyz_cam", None) is not None)
+                held_depth = payload["heldout_metrics_mm_deg"].get("depth_point_rmse_mm")
+                # "monocular vs depth" keys off n_depth_samples (did ANY sample
+                # carry depth), not the held-out metric — the random train/test
+                # split can leave the held-out set depth-free even when depth was
+                # used in training, which must NOT read as "monocular solve".
+                if n_depth_samples == 0:
+                    depth_str = f" | depth: 0/{len(samples)} samples (MONOCULAR solve)"
+                else:
+                    hd = (f"{held_depth:.2f}mm" if held_depth is not None
+                          else "n/a (no depth in held-out split)")
+                    depth_str = (f" | depth: {n_depth_samples}/{len(samples)} samples, "
+                                 f"held_depth_rmse={hd} (w={self._depth_weight})")
                 self.get_logger().info(
                     f"solve: N={len(samples)} method={method_str} "
                     f"train_trans={payload['train_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm "
                     f"held_trans={payload['heldout_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm | "
                     f"per-sample reproj_px=[{fmt}] | "
                     f"cam-board-dist_m=[{d_fmt}] (spread {d_spread_pct:.1f}%)"
-                    f"{rej_str}")
+                    f"{depth_str}{rej_str}")
             except Exception:
                 pass  # diagnostic only — never fail the solve over a log line
             return {"ok": True, **payload}
@@ -1799,13 +2357,25 @@ def _make_node_class():
             return str(cands[-1]) if cands else None
 
         def _yaml_half_for_diff(self):
-            """Build the yaml side of the promote diff (always computed)."""
+            """Build the yaml side of the promote diff (always computed).
+
+            Frame-agnostic output: ``self.last_solve.X`` is ``T_eef->observed_optical``
+            (color OR left-IR, per calib_frame). Compose back to the camera body
+            via the matching internal transform — ``T_eef->camera_link = X .
+            inv(T_camera_link->observed_optical)`` — and ALWAYS derive the
+            color_optical reference from camera_link, so the yaml reports the same
+            ``arm_to_camera`` (camera_link mount) + ``color_optical`` regardless of
+            which frame was observed. The xacro mount joint (camera_link_joint) is
+            the single deployment target either way."""
             import difflib
             import yaml
-            T_mount_color = self._mount_to_color_matrix()
-            T_eef_mount = ah.compose_eef_to_mount(self.last_solve.X, T_mount_color)
+            T_mount_observed = self._mount_to_optical_matrix()
+            T_eef_mount = ah.compose_eef_to_mount(self.last_solve.X, T_mount_observed)
+            # color_optical reference, always derived from camera_link:
+            #   T_eef->color_optical = T_eef->camera_link . T_camera_link->color_optical
+            T_eef_color = np.asarray(T_eef_mount) @ self._mount_to_color_matrix()
             proposed_dict = ah.handeye_yaml_dict(
-                T_eef_mount, self.last_solve.X, len(self.session.samples),
+                T_eef_mount, T_eef_color, len(self.session.samples),
                 self.last_solve.heldout_metrics,
                 date=self._calibration_date_or_unset(),
                 square_len_m=self._sq,
@@ -2040,13 +2610,13 @@ def _make_node_class():
 
         # ---- internal helpers ------------------------------------------------
 
-        def _mount_to_color_matrix(self):
-            """Parse mount_to_color_xyz / _rpy string params ("x y z" / "r p y")
-            into a 4x4. Defaults to identity when both are zero/empty."""
+        def _xyz_rpy_to_matrix(self, xyz_str, rpy_str):
+            """Parse "x y z" / "r p y" strings into a 4x4 (URDF fixed-axis rpy).
+            Returns identity on malformed input (defensive — never crash a solve)."""
             np = self._np
             try:
-                xyz = [float(v) for v in str(self._mount_to_color_xyz).split()]
-                rpy = [float(v) for v in str(self._mount_to_color_rpy).split()]
+                xyz = [float(v) for v in str(xyz_str).split()]
+                rpy = [float(v) for v in str(rpy_str).split()]
             except ValueError:
                 return np.eye(4)
             if len(xyz) != 3 or len(rpy) != 3:
@@ -2055,6 +2625,25 @@ def _make_node_class():
             T[:3, :3] = self._R.from_euler("xyz", rpy).as_matrix()
             T[:3, 3] = xyz
             return T
+
+        def _mount_to_color_matrix(self):
+            """T_camera_link -> color_optical (factory geometry, +15 mm + optical rot)."""
+            return self._xyz_rpy_to_matrix(self._mount_to_color_xyz, self._mount_to_color_rpy)
+
+        def _mount_to_ir_optical_matrix(self):
+            """T_camera_link -> left_ir_optical (factory geometry).
+
+            On a D435 the left-IR / depth frame is COINCIDENT with camera_link
+            (vendor URDF left_ir joint origin "0 0 0"), so this is a pure optical
+            rotation with zero translation — observing in IR measures the camera
+            body (camera_link) directly."""
+            return self._xyz_rpy_to_matrix(self._mount_to_ir_xyz, self._mount_to_ir_rpy)
+
+        def _mount_to_optical_matrix(self):
+            """T_camera_link -> the CURRENTLY-OBSERVED optical frame (per calib_frame).
+            This is the transform the solve composes through to recover camera_link."""
+            return (self._mount_to_ir_optical_matrix() if self._calib_frame == "ir"
+                    else self._mount_to_color_matrix())
 
         def _hand_eye_path(self, robot):
             """Resolve <ws>/src/.../tinker_robot_config/robots/<robot>/hand_eye.yaml.
@@ -2351,6 +2940,32 @@ def make_app(node):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None,
             lambda: node.do_mount_test(**kwargs))
+        return JSONResponse(result)
+
+    @app.post("/api/config")
+    async def set_config(request: Request):
+        """Runtime config: calib_frame (color|ir), depth knobs, IR emitter.
+
+        Body (all optional): ``{calib_frame, use_ffs_depth, depth_weight,
+        depth_sigma_m, depth_win, depth_min_corners, depth_z_min, depth_z_max,
+        ir_emitter_enabled}``. Switching calib_frame discards the (frame-specific)
+        captured samples. The emitter set runs off the event loop (parameter
+        client to the camera node) so it can't stall the UI."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        # Whitelist known keys before **-expanding into do_set_config — a stray
+        # body key (e.g. "self", or a non-identifier string) would otherwise raise
+        # a TypeError and surface as a plain-text 500 the UI can't parse.
+        _allowed = {"calib_frame", "use_ffs_depth", "depth_weight", "depth_sigma_m",
+                    "depth_win", "depth_min_corners", "depth_z_min", "depth_z_max",
+                    "ir_emitter_enabled"}
+        body = {k: v for k, v in body.items() if k in _allowed}
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: node.do_set_config(**body))
         return JSONResponse(result)
 
     @app.websocket("/ws")

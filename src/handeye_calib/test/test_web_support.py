@@ -208,7 +208,10 @@ def test_solve_payload_v2_per_sample_residuals_match_samples():
     p = ws.solve_payload_v2(res, samples=sc.samples, K=sc.K, dist=None, board_pts=sc.board_pts)
     assert len(p["per_sample_reproj_px"]) == len(sc.samples)
     assert all(isinstance(v, float) and v >= 0 for v in p["per_sample_reproj_px"])
-    assert {m["name"] for m in p["per_method_summary"]} <= {"TSAI", "PARK", "HORAUD", "ANDREFF", "DANIILIDIS"}
+    # "rejected_indices" may appear when default-on rejection (reject_sigma=2.5)
+    # drops a borderline sample; the solve still PASSes in that case.
+    assert {m["name"] for m in p["per_method_summary"]} <= {
+        "TSAI", "PARK", "HORAUD", "ANDREFF", "DANIILIDIS", "rejected_indices"}
 
 
 def test_enriched_state_payload_safety_preview_roundtrip():

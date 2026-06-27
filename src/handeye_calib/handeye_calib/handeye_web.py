@@ -1883,7 +1883,7 @@ def _make_node_class():
                     return None
                 return self._thumbs.get(idx)
 
-        def do_solve(self, method: str = "auto", reject_sigma: float = None):
+        def do_solve(self, method: str = "auto", reject_sigma="default"):
             """Run the hand-eye solve with optional method picker.
 
             ``method`` is one of ``"auto"`` (default — sweep all five OpenCV
@@ -1894,6 +1894,11 @@ def _make_node_class():
             degrade-rather-than-422 philosophy). On success returns
             ``{"ok": True, **solve_payload_v2(...)}``; on degraded paths returns
             ``{"ok": False, "reason": ...}``.
+
+            ``reject_sigma``: sentinel ``"default"`` (default) lets
+            :func:`handeye_solve.solve` use its own default (2.5 — default-on
+            per-axis MAD rejection).  Pass ``None`` to disable rejection
+            entirely; pass a float to override the threshold.
             """
             with self.lock:
                 samples, K, D = list(self.session.samples), self._K, self._D
@@ -1911,11 +1916,20 @@ def _make_node_class():
                 # Unknown method: degrade to auto rather than 422; same
                 # philosophy as do_capture's "no detection" fallthrough.
                 methods_subset = None
+            # Translate the sentinel to a keyword for hs.solve:
+            #   "default" → omit reject_sigma (solver uses its own default 2.5)
+            #   None      → explicitly disable rejection
+            #   float     → use that threshold
+            if reject_sigma == "default":
+                rs_kwarg = {}
+            elif reject_sigma is None:
+                rs_kwarg = {"reject_sigma": None}
+            else:
+                rs_kwarg = {"reject_sigma": float(reject_sigma)}
             try:
                 res = hs.solve(samples, K, D, self._board_pts,
                                methods=methods_subset,
-                               reject_sigma=(float(reject_sigma)
-                                             if reject_sigma is not None else None),
+                               **rs_kwarg,
                                depth_weight=self._depth_weight,
                                depth_sigma_m=self._depth_sigma_m,
                                anchor_Tbb=anchor)
@@ -2947,15 +2961,18 @@ def make_app(node):
         except Exception:
             body = {}
         body_d = body or {}
-        # Optional outlier rejection: {reject_sigma: float} — when set, the
-        # solver iteratively drops train samples whose post-BA reproj
-        # exceeds reject_sigma × median. Useful when the operator's
-        # physical setup produces bimodal per-sample reproj.
-        rs = body_d.get("reject_sigma")
-        try:
-            rs = float(rs) if rs is not None else None
-        except (TypeError, ValueError):
-            rs = None
+        # Optional outlier rejection: sentinel "default" when reject_sigma is
+        # absent from the body (solver picks its own default, currently 2.5 —
+        # default-on per-axis MAD rejection).  Explicit null → None (disables).
+        # Any number → float threshold.  Invalid values fall back to "default".
+        if "reject_sigma" not in body_d:
+            rs = "default"
+        else:
+            raw = body_d["reject_sigma"]
+            try:
+                rs = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                rs = "default"
         return JSONResponse(node.do_solve(
             method=body_d.get("method", "auto"),
             reject_sigma=rs))

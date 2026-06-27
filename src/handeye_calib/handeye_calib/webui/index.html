@@ -96,6 +96,30 @@
 
       <h2>Safety envelope</h2>
       <pre class="matrix-block" id="info-safety">–</pre>
+
+      <h2>Calibration settings</h2>
+      <div class="settings-panel" id="settings-panel">
+        <div class="settings-section">
+          <label class="settings-label">observe board in</label>
+          <label><input type="radio" name="calib-frame" value="color" checked> color</label>
+          <label><input type="radio" name="calib-frame" value="ir"> left-IR (native depth ≡ camera_link)</label>
+          <div class="settings-hint" id="calib-frame-hint">switching frame discards captured samples</div>
+        </div>
+        <div class="settings-section">
+          <label><input type="checkbox" id="use-ffs-depth-input" checked> use FoundationStereo depth</label>
+          <label><input type="checkbox" id="ir-emitter-input"> IR emitter on (turn OFF for IR-frame capture)</label>
+        </div>
+        <div class="settings-section settings-grid">
+          <label>depth_weight<input type="number" id="depth-weight-input" step="0.1" min="0" value="1.0"></label>
+          <label>depth_sigma_m<input type="number" id="depth-sigma-input" step="0.001" min="0.0001" value="0.005"></label>
+          <label>depth_win<input type="number" id="depth-win-input" step="1" min="0" value="2"></label>
+          <label>depth_min_corners<input type="number" id="depth-min-corners-input" step="1" min="1" value="3"></label>
+        </div>
+        <div class="settings-section">
+          <button id="apply-config-btn" class="btn">Apply settings</button>
+          <span class="status-line" id="config-status"></span>
+        </div>
+      </div>
     </section>
     <section class="side-panel-content" data-panel="capture">
       <!-- Right-side capture content. The joint editor + Move (joints) live

@@ -79,14 +79,24 @@ def solve_payload(res):
 
 def _metrics_mm_deg(m):
     """Convert a ``{trans_rmse_m, rot_rmse_rad, reproj_px}`` block into the
-    mm/deg-rendered shape the Solve tab displays directly."""
+    mm/deg-rendered shape the Solve tab displays directly.
+
+    When the block carries the FFS-depth-grounded metric
+    (``depth_point_rmse_mm`` / ``n_depth_corners``), they are passed through so
+    the UI can show the honest metric real-world accuracy next to the
+    reprojection number. They are *absent* (never a fake ``0``) for a
+    monocular-only solve, so the UI can branch on presence."""
     if not m:
         return {}
-    return {
+    out = {
         "trans_rmse_mm": mm(m.get("trans_rmse_m", 0.0)),
         "rot_rmse_deg": deg(m.get("rot_rmse_rad", 0.0)),
         "reproj_px": float(m.get("reproj_px", 0.0)),
     }
+    if m.get("depth_point_rmse_mm") is not None:
+        out["depth_point_rmse_mm"] = round(float(m["depth_point_rmse_mm"]), 4)
+        out["n_depth_corners"] = int(m.get("n_depth_corners", 0))
+    return out
 
 
 def solve_payload_v2(res, samples, K, dist, board_pts):
@@ -247,14 +257,17 @@ def compute_diversity_deg(samples):
 
 def sample_metadata(idx, sample, prev_sample=None, *,
                     n_corners=None, reproj_px=None, area_frac=None,
-                    joint_positions=None, ts=None):
+                    joint_positions=None, ts=None, depth_source=None):
     """JSON-friendly per-sample dict for the Capture-tab gallery row.
 
     Composed off the accepted :class:`Sample` plus the original
     capture-time scalars (which aren't stored on the dataclass).
     ``angular_delta_deg`` is the rotation between this sample's
     ``T_base_eef[:3,:3]`` and ``prev_sample.T_base_eef[:3,:3]`` (or
-    ``None`` for the first sample).
+    ``None`` for the first sample). ``depth_source`` records whether this
+    sample carried FFS metric depth ('ffs') or fell back to monocular
+    ('unavailable' / 'shape-mismatch' / 'ffs-too-sparse' / 'moved-during-ffs'
+    / 'disabled'), so the gallery can show per-sample depth provenance.
     """
     if prev_sample is None:
         ang = None
@@ -272,6 +285,7 @@ def sample_metadata(idx, sample, prev_sample=None, *,
         "joint_positions": (None if joint_positions is None
                             else [float(j) for j in joint_positions]),
         "ts": (None if ts is None else float(ts)),
+        "depth_source": (None if depth_source is None else str(depth_source)),
     }
 
 

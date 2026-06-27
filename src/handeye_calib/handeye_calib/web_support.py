@@ -74,6 +74,9 @@ def solve_payload(res):
         "X_rpy": rpy,
         "heldout_metrics": res.heldout_metrics,
         "train_metrics": res.train_metrics,
+        # Which seed produced X ("closed_form" | "board_anchor") so the operator
+        # can confirm whether the head warm-start anchor rescued the solve.
+        "seed_used": getattr(res, "seed_used", ""),
     }
 
 

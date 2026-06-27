@@ -1951,6 +1951,9 @@ def _make_node_class():
                                   "diverse waypoints (vary EE rotation, not just "
                                   "translation) and re-solve"}
             self.last_solve = res
+            self.get_logger().info(
+                f"solve: seed_used={res.seed_used!r}, status={res.status}"
+                + ("" if anchor is None else " (head anchor available)"))
             payload = ws.solve_payload_v2(res, samples, K, D, self._board_pts)
             # Surface outlier-rejection results at the top level — the
             # per_method_summary projection only carries (name, reproj_px),

@@ -450,6 +450,20 @@ if (CAPTURE_BTN) {
   });
 }
 
+const btnAnchor = document.getElementById('btn-anchor');
+if (btnAnchor) btnAnchor.onclick = async () => {
+  const r = await fetch('/api/anchor', {method: 'POST'});
+  const j = await r.json();
+  setStatus('anchor-status', j.ok
+    ? `head anchor: ${j.n_anchor_obs} obs (scatter ${j.scatter ? j.scatter.trans_mm.toFixed(1) : '?'}mm)`
+    : `anchor failed: ${j.reason}`);
+};
+const btnAnchorClear = document.getElementById('btn-anchor-clear');
+if (btnAnchorClear) btnAnchorClear.onclick = async () => {
+  await fetch('/api/anchor/clear', {method: 'POST'});
+  setStatus('anchor-status', 'no head anchor');
+};
+
 async function _deleteSample(idx) {
   if (!confirm(`Delete sample #${idx}?`)) return;
   setStatus("capture-status", `deleting #${idx}…`, "warn");

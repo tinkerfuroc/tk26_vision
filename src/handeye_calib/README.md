@@ -199,6 +199,47 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.8.0 (2026-06-27): **Head-Orbbec warm-start + pan_tilt parity ports.** Two
+  threads landed together (plan: `../../docs/plans/2026-06-27-handeye-headassist-parity.md`).
+  - **Head warm-start (optional).** The already-calibrated pan-tilt head Orbbec
+    observes the *same fixed board* and supplies `T_base_board`; that measured
+    board pose becomes a basin-immune **seed** (`seed_from_board_anchor`,
+    `solve(anchor_Tbb=...)`) fed into a **multi-start** bundle adjust alongside
+    the existing `calibrateHandEye` seed (`_solve_once` keeps the lowest post-BA
+    reprojection). `Tbb` stays a FREE bundle-adjust parameter, so the head's
+    absolute bias only picks the convergence basin and is NOT injected into the
+    final `X` — wrist reprojection + FFS depth still own sub-3 mm accuracy. New
+    node surface: head camera subs (`head_image_topic` / `head_info_topic` /
+    `head_optical_frame`), `do_anchor_board()` + `POST /api/anchor`
+    (+ `/api/anchor/clear`), a Capture-tab "Anchor board (head)" button, and an
+    `anchor` block in the WS state. The head TF is looked up relative to the arm
+    `base_frame` (chains through `base_link`); anchors are averaged over repeated
+    looks with a scatter readout (`average_board_anchors`). Honest ceiling:
+    anchoring cuts the required pose count / rescues degenerate or wrong-basin
+    seeds; it cannot beat the head's ~3 mm/0.5° (systematic) base-frame accuracy,
+    so it is a seed + cross-check, never the promoted result.
+  - **Consensus capture (pan_tilt parity).** `do_capture` averages the last N
+    steady detections' corners (`consensus_corners`, per-corner median over a 60%
+    frame quorum) and re-PnPs them with an IPPE-seed → ITERATIVE refine
+    (`_pnp_ippe_refine`, planar-flip safe), replacing the single-shot pose; falls
+    back to the single frame when quorum / the ≥6-corner PnP floor can't be met.
+    Kills the single-frame PnP noise the 0.5° held-out rotation gate previously ate.
+  - **Observability diagnostic.** `rotation_observability` flags AX=XB
+    rank-deficiency (relative-rotation axes nearly collinear ⇒ `X` rotation
+    unobservable) via the 2nd singular value of the stacked pairwise axes;
+    surfaced in the Solve payload + a UI WARN.
+  - **Outlier rejection ON by default.** `solve()` defaults `reject_sigma=2.5`,
+    `max_reject_frac=0.25`; the loop scores per-sample **SE(3) chain error** with
+    separate per-axis modified z-scores (catches a bad-FK / bad-depth sample a
+    reprojection-only metric misses) and drops the single worst per round, then
+    re-solves. A sample must be **both** a statistical outlier **and** beyond an
+    absolute physical band (`reject_min_trans_m=0.01` = 10 mm,
+    `reject_min_rot_rad=3.0°`) to be dropped, so clean right-skewed residuals at
+    small N aren't trimmed (validated zero-reject across a 40-seed clean sweep;
+    catches a 5 cm FK outlier on 10/10 seeds). The held-out split is never
+    rejected. Override via `/api/solve` `reject_sigma` (omit → default 2.5;
+    `null` → off; number → that). Floors are plain `solve()` kwargs (retunable
+    against arena rosbags; not UI-exposed).
 - 0.7.0 (2026-06-22): **Calibrate in color OR left-IR (`calib_frame`), runtime-
   adjustable in the UI; compose to the true `camera_link`.** The hand-eye unknown
   is the rigid camera *body* (`camera_link`); every optical frame is a fixed

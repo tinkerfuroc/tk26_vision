@@ -44,6 +44,50 @@ def _estimate_board_in_base(X, samples):
     return tf.se3_average([s.T_base_eef @ X @ s.T_cam_board for s in samples])
 
 
+def _per_sample_chain_errors(X, Tbb, samples):
+    """Per-sample SE(3) chain error against the wrist PnP observation.
+
+    For each sample computes:
+        T_pred = inv(T_base_eef @ X) @ Tbb   (predicted board-in-cam)
+    then measures the SE(3) deviation from the observed T_cam_board.  Returns
+    ``(trans_m, rot_rad)`` as float arrays of length ``len(samples)``.  This is
+    the same metric as :func:`evaluate` but without the RMS aggregation, so the
+    caller can score outliers per sample independently on each axis.
+    """
+    trans_e, rot_e = [], []
+    for s in samples:
+        T_pred = tf.invert(s.T_base_eef @ X) @ Tbb
+        T_obs = s.T_cam_board
+        trans_e.append(float(np.linalg.norm(T_pred[:3, 3] - T_obs[:3, 3])))
+        rot_e.append(float(np.radians(tf.rotation_angle_deg(T_pred[:3, :3],
+                                                             T_obs[:3, :3]))))
+    return np.asarray(trans_e, float), np.asarray(rot_e, float)
+
+
+def _modified_zscores(arr):
+    """Modified z-score: 0.6745 * (x − median(x)) / max(MAD(x), 1e-6).
+
+    Robust to existing outliers (unlike standard z-score which uses the mean
+    and stdev — both of which are pulled by extreme values).  For Gaussian
+    data, 0.6745 × MAD ≈ stdev, so z-scores are comparable across methods.
+    One-sided upper-tail rejection (z > threshold) is the intended use.
+
+    The floor ``1e-6`` is a practical calibration floor (1 µm / 1 µrad)
+    rather than a purely numerical epsilon: when all residuals cluster at the
+    sub-micron / sub-microradian level — as happens on noiseless synthetic
+    data — the MAD is driven to zero by floating-point coincidences, and a
+    pure numeric floor (e.g. 1e-9) would amplify those coincidences into
+    spurious z-score spikes that reject perfectly good samples.  At 1e-6 the
+    floor is still far below the MAD of any realistic noisy-data chain-error
+    distribution (typical noisy MAD: 1e-4 – 1e-3 m / rad), so it does not
+    blunt detection of genuine physical outliers.
+    """
+    arr = np.asarray(arr, float)
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med)))
+    return 0.6745 * (arr - med) / max(mad, 1e-6)
+
+
 def seed_handeye(samples, K, dist, board_pts, *, methods=None):
     """Run hand-eye methods, return the X with lowest reprojection RMS.
 
@@ -299,23 +343,46 @@ def gate(metrics):
 
 
 def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
-          methods=None, reject_sigma=None, max_reject_frac=0.5,
+          methods=None, reject_sigma=2.5, max_reject_frac=0.25,
+          reject_min_trans_m=0.01, reject_min_rot_rad=np.radians(3.0),
           depth_weight=1.0, depth_sigma_m=0.005, anchor_Tbb=None):
     """Full solve pipeline. ``methods`` is forwarded to :func:`seed_handeye`
     so a single-method run (e.g. ``methods={"TSAI": cv2.CALIB_HAND_EYE_TSAI}``)
     skips the multi-method best-of step; ``None`` keeps the default 5-method
     sweep.
 
-    ``reject_sigma``: when set, iteratively drop samples whose post-BA
-    per-sample reprojection RMS exceeds ``reject_sigma × median`` and re-solve.
-    Loop terminates when no further outliers exceed the threshold OR when
-    cumulative drops reach ``max_reject_frac`` (default 50%). Mirrors the
-    polish-phase rejection in pan_tilt's calibration. Use when the operator's
-    physical setup yields a bimodal per-sample reproj (some good, some bad)
-    — the rejection isolates the consistent-data subset so the calibration
-    is usable even before the mechanical disturbance is found and fixed.
-    ``rejected_indices`` (indices into the original ``samples``) is attached
-    to the returned ``SolveResult.per_method[-1]`` for operator visibility.
+    ``anchor_Tbb``: an external board-in-base measurement (e.g. from the
+    pan-tilt head via TF) used as a basin-immune warm-start seed; forwarded
+    through the rejection loop via :func:`_solve_once` so the anchor is
+    available on every re-solve. ``None`` (default) skips the anchor branch.
+
+    ``reject_sigma``: default-on (2.5) iterative per-axis outlier rejection
+    on the TRAIN split only — held-out is never touched.  Each iteration
+    computes per-sample SE(3) chain errors (translation in metres, rotation
+    in radians) via :func:`_per_sample_chain_errors`, turns each axis into
+    one-sided modified z-scores via :func:`_modified_zscores`, and drops the
+    SINGLE worst qualifying sample, then RE-SOLVES via :func:`_solve_once`
+    before scoring again.  Single-worst-then-resolve (not batch-drop) is
+    deliberate: after the worst outlier is removed and the fit improves,
+    borderline samples that looked marginal often fall back under threshold
+    and are kept — batch dropping would over-reject them.
+
+    Absolute physical floor: a sample must be BOTH a statistical outlier
+    (z > ``reject_sigma``) AND beyond an absolute physical band
+    (translation chain error > ``reject_min_trans_m`` = 10 mm, OR rotation
+    chain error > ``reject_min_rot_rad`` = 3.0°) on the SAME axis to be
+    dropped, so clean right-skewed residuals at small n (where the symmetric
+    modified z-score over-fires on the upper tail) aren't trimmed.  Real FK
+    outliers (≥ several cm / degrees) clear the floor with a high z-score and
+    are still caught.  On clean data nothing qualifies, so the result is
+    identical to ``reject_sigma=None``.  Use ``reject_sigma=None`` to disable
+    entirely.  The loop stops when no sample qualifies OR when the active set
+    has shrunk to the min-keep floor
+    ``max(6, ceil((1 - max_reject_frac) * n_orig))`` (default 25% max drop),
+    checked at the TOP of each round so a would-be over-drop simply stops
+    rather than dropping zero.  ``rejected_indices`` (indices into the train
+    list) is attached to ``SolveResult.per_method[-1]`` for operator
+    visibility.
     """
     train, test = split_train_test(samples, heldout_frac, rng_seed)
     X, Tbb, per_method, _seed_used = _solve_once(
@@ -325,43 +392,36 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
 
     rejected = []
     if reject_sigma is not None and len(train) >= 6:
-        # Iterative MAD-based outlier rejection on the TRAIN set only —
-        # held-out stays intact as the honest evaluator.
-        #
-        # Threshold: median + sigma * MAD (one-sided, since reproj is
-        # bounded below by zero — only the high tail is "outlier"). MAD
-        # is robust to existing outliers (unlike stdev), so the metric
-        # stays stable as the rejection loop iterates.
+        # Single-worst-drop-then-resolve outlier rejection on the TRAIN set
+        # only — held-out stays intact as the honest evaluator.
         active = list(range(len(train)))
         n_orig = len(train)
+        # Min-keep floor checked at the TOP of each round: never drop below
+        # max(6, ceil((1 - max_reject_frac) * n_orig)) samples.
+        min_keep = max(6, int(np.ceil((1.0 - max_reject_frac) * n_orig)))
         for _ in range(20):  # safety cap on iterations
-            _, per_sample = _reproj_rms(X, Tbb, [train[i] for i in active],
-                                        K, dist, board_pts, per_sample=True)
-            arr = np.asarray(per_sample, float)
-            if arr.size < 6:
-                break
-            med = float(np.median(arr))
-            mad = float(np.median(np.abs(arr - med)))
-            # Floor MAD at a tiny value so a perfectly-clean active set
-            # doesn't divide-by-zero on the next-round threshold.
-            threshold = med + float(reject_sigma) * max(mad, 1e-6)
-            keep_mask = arr <= threshold
-            n_drop = int((~keep_mask).sum())
-            cumulative_drop = n_orig - int(keep_mask.sum())
-            if n_drop == 0:
-                break
-            if cumulative_drop > int(max_reject_frac * n_orig):
-                break
-            new_active = [active[i] for i, k in enumerate(keep_mask) if k]
-            if len(new_active) == len(active):
-                break
-            rejected.extend([active[i] for i, k in enumerate(keep_mask) if not k])
-            active = new_active
             sub = [train[i] for i in active]
-            X0r, Tbb0r, _ = seed_handeye(sub, K, dist, board_pts, methods=methods)
-            X, Tbb, _ = bundle_adjust(sub, K, dist, board_pts, X0r, Tbb0r,
-                                      depth_weight=depth_weight,
-                                      depth_sigma_m=depth_sigma_m)
+            if len(sub) <= min_keep:
+                break
+            t_e, r_e = _per_sample_chain_errors(X, Tbb, sub)
+            zt = _modified_zscores(t_e)
+            zr = _modified_zscores(r_e)
+            # A sample qualifies only if it is BOTH a statistical outlier AND
+            # physically significant on the SAME axis (z AND abs-floor anded
+            # per axis, then OR'd across axes).
+            cand_t = (zt > reject_sigma) & (t_e > reject_min_trans_m)
+            cand_r = (zr > reject_sigma) & (r_e > reject_min_rot_rad)
+            cand = cand_t | cand_r
+            if not cand.any():
+                break
+            score = np.where(cand, np.maximum(zt, zr), -np.inf)
+            k = int(np.argmax(score))
+            rejected.append(active.pop(k))
+            sub = [train[i] for i in active]
+            X, Tbb, _pm, _seed = _solve_once(
+                sub, K, dist, board_pts, methods=methods,
+                depth_weight=depth_weight, depth_sigma_m=depth_sigma_m,
+                anchor_Tbb=anchor_Tbb)
         train = [train[i] for i in active]
 
     train_m = evaluate(X, Tbb, train, K, dist, board_pts)

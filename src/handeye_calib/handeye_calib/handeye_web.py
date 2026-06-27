@@ -458,6 +458,13 @@ def _make_node_class():
             self._last_corners_xy = None       # (M,2) px for overlay, or None
             self._cap = None                   # latest {T_cam_board, obs_px, corner_idx, reproj_px, area_frac}
 
+            # Rolling buffer of recent (ids, px) detections for multi-frame
+            # consensus at capture time (pan_tilt parity: cluster_consensus).
+            # Only pushed while a board pose is present; reset on lost detection.
+            self._consensus_frames = int(self._param("consensus_frames", 10))
+            self._consensus_min_frac = float(self._param("consensus_min_frac", 0.6))
+            self._det_history = collections.deque(maxlen=self._consensus_frames)
+
             # Frame-rate bookkeeping. Each _on_image bumps the counter and pushes
             # a monotonic timestamp onto a rolling 30-sample deque; frame_hz is
             # derived from the deque span (delta-time across all samples).
@@ -723,6 +730,15 @@ def _make_node_class():
                 self._frame = bgr
                 self._K = K       # active intrinsics for do_solve/do_capture
                 self._D = D
+                # Consensus ring write — kept under the SAME lock as the
+                # do_capture read so the mutual exclusion is real, not just
+                # GIL-incidental.
+                if cap is not None:
+                    self._det_history.append(
+                        (self._np.asarray(cap["corner_idx"]).copy(),
+                         self._np.asarray(cap["obs_px"], float).copy()))
+                else:
+                    self._det_history.clear()
                 # Stamp the image with ROS-time AT RECEIPT, NOT msg.header.stamp.
                 # realsense2_camera (and many other drivers) populate
                 # header.stamp from the camera HW clock, which drifts seconds
@@ -1154,6 +1170,41 @@ def _make_node_class():
                 "area_frac": area_frac,
             }
             return obs_px, {"corners": int(len(corner_idx)), "reproj_px": reproj_px}, cap
+
+        # ---- IPPE-seeded re-PnP (consensus helper) ---------------------------
+
+        def _pnp_ippe_refine(self, obj_pts, img_pts, K, D):
+            """IPPE-seeded ITERATIVE PnP (planar two-fold-ambiguity safe).
+
+            Returns (T_cam_board 4x4, reproj_px) or (None, None) on failure.
+            Mirrors pan_tilt.aruco_detect._solve_iterative: IPPE seed picks the
+            correct planar branch, ITERATIVE refines it."""
+            np = self._np
+            cv2 = self._cv2
+            obj_pts = np.asarray(obj_pts, float).reshape(-1, 1, 3)
+            img_pts = np.asarray(img_pts, float).reshape(-1, 1, 2)
+            if len(obj_pts) < 6:
+                return None, None
+            try:
+                n_sol, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+                    obj_pts, img_pts, K, D, flags=cv2.SOLVEPNP_IPPE)
+                if not n_sol:
+                    return None, None
+                rvec, tvec = rvecs[0], tvecs[0]
+                ok, rvec, tvec = cv2.solvePnP(
+                    obj_pts, img_pts, K, D, rvec, tvec, useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE)
+                if not ok:
+                    return None, None
+            except cv2.error:
+                return None, None
+            proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, D)
+            reproj = float(np.sqrt(np.mean(np.sum(
+                (proj.reshape(-1, 2) - img_pts.reshape(-1, 2)) ** 2, axis=1))))
+            T = np.eye(4)
+            T[:3, :3] = cv2.Rodrigues(rvec)[0]
+            T[:3, 3] = tvec.reshape(3)
+            return T, reproj
 
         # ---- FoundationStereo depth -----------------------------------------
 
@@ -1632,6 +1683,37 @@ def _make_node_class():
                 [tfm.transform.rotation.x, tfm.transform.rotation.y,
                  tfm.transform.rotation.z, tfm.transform.rotation.w])
 
+            # Multi-frame consensus (pan_tilt parity): average the last N steady
+            # detections' corners and re-PnP, replacing the single-shot cap so
+            # the stored obs_px AND T_cam_board are denoised. Falls back to the
+            # single-frame cap when consensus can't reach quorum.
+            np = self._np
+            with self.lock:
+                hist = list(self._det_history)
+            cons_ids, cons_px = hs.consensus_corners(
+                hist, min_frac=self._consensus_min_frac)
+            n_consensus = 0
+            if cons_ids is not None and K is not None:
+                try:
+                    obj_pts, img_pts = self._board.matchImagePoints(
+                        cons_px.reshape(-1, 1, 2).astype(np.float32),
+                        cons_ids.reshape(-1, 1).astype(np.int32))
+                except Exception:
+                    obj_pts = None
+                if obj_pts is not None and len(obj_pts) >= 6:
+                    T_c, reproj_c = self._pnp_ippe_refine(
+                        obj_pts, img_pts, K, (self._D if self._D is not None
+                                              else np.zeros(5)))
+                    if T_c is not None:
+                        h, w = frame.shape[:2]
+                        xs, ys = cons_px[:, 0], cons_px[:, 1]
+                        area_frac = (float((xs.max() - xs.min()) *
+                                           (ys.max() - ys.min())) / float(h * w))
+                        cap = {"T_cam_board": T_c, "obs_px": cons_px,
+                               "corner_idx": cons_ids, "reproj_px": reproj_c,
+                               "area_frac": area_frac}
+                        n_consensus = len(hist)
+
             # FFS metric depth at the detected corners. The arm is settled +
             # static here, so the FFS stereo view matches the cached color frame
             # — but get_depth can block up to ffs_call_timeout_s, so we RE-CHECK
@@ -1737,6 +1819,7 @@ def _make_node_class():
                     self._sample_depth_source[idx] = depth_source
                 num = len(self.session.samples)
             return {"ok": ok, "reason": reason, "depth_source": depth_source,
+                    "n_consensus_frames": n_consensus,
                     "num_samples": num}
 
         def do_delete_sample(self, idx):

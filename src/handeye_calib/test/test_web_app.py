@@ -765,3 +765,21 @@ def test_anchor_clear_is_idempotent():
         assert r.json()["n_anchor_obs"] == 0
     finally:
         node.destroy_node()
+
+
+def test_pnp_ippe_refine_recovers_known_pose():
+    import numpy as np
+    node, c = _client()
+    try:
+        # Project the node's own board with a known pose, then recover it.
+        from handeye_calib import handeye_model as hm
+        bp = node._board_pts
+        K = np.array([[615., 0, 320.], [0, 615., 240.], [0, 0, 1.]])
+        T = np.eye(4); T[:3, 3] = [0.02, -0.01, 0.5]
+        px = hm.project_corners(bp, T, K)
+        T_rec, reproj = node._pnp_ippe_refine(bp.astype(float), px.astype(float), K, np.zeros(5))
+        assert T_rec is not None
+        assert np.linalg.norm(T_rec[:3, 3] - T[:3, 3]) < 1e-3
+        assert reproj < 0.5
+    finally:
+        node.destroy_node()

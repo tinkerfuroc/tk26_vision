@@ -264,6 +264,10 @@ class SolveResult:
     heldout_metrics: dict
     status: str
     per_method: list
+    # Which seed produced the promoted X: "closed_form" (best-of-5
+    # calibrateHandEye) or "board_anchor" (the head warm-start). Surfaced so an
+    # operator can confirm whether the head anchor actually rescued the solve.
+    seed_used: str = ""
 
 
 # pan-tilt parity thresholds
@@ -385,7 +389,7 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
     visibility.
     """
     train, test = split_train_test(samples, heldout_frac, rng_seed)
-    X, Tbb, per_method, _seed_used = _solve_once(
+    X, Tbb, per_method, seed_used = _solve_once(
         train, K, dist, board_pts, methods=methods,
         depth_weight=depth_weight, depth_sigma_m=depth_sigma_m,
         anchor_Tbb=anchor_Tbb)
@@ -418,7 +422,7 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
             k = int(np.argmax(score))
             rejected.append(active.pop(k))
             sub = [train[i] for i in active]
-            X, Tbb, _pm, _seed = _solve_once(
+            X, Tbb, _pm, seed_used = _solve_once(
                 sub, K, dist, board_pts, methods=methods,
                 depth_weight=depth_weight, depth_sigma_m=depth_sigma_m,
                 anchor_Tbb=anchor_Tbb)
@@ -431,7 +435,8 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
                                           "rejected_indices": sorted(rejected),
                                           "X": X, "Tbb": Tbb,
                                           "reproj_px": float("nan")}]
-    return SolveResult(X, Tbb, train_m, held_m, gate(held_m), per_method)
+    return SolveResult(X, Tbb, train_m, held_m, gate(held_m), per_method,
+                       seed_used=seed_used)
 
 
 def rotation_observability(samples, *, min_singular=0.3):

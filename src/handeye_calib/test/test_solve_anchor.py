@@ -72,3 +72,21 @@ def test_observability_flags_low_diversity_and_passes_diverse():
     assert o_div["ok"] is True
     assert o_deg["ok"] is False
     assert o_deg["second_singular"] <= o_div["second_singular"]
+
+
+def test_seed_used_surfaced_on_result():
+    # No anchor -> the closed-form best-of-5 seed is reported.
+    sc = syn.make_scenario(n_poses=20, pixel_noise=0.3, seed=11)
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts, heldout_frac=0.25,
+                   reject_sigma=None)
+    assert res.seed_used == "closed_form"
+    # On the degenerate TSAI-only set the board-anchor branch wins, and that is
+    # surfaced so an operator can confirm the head warm-start rescued the solve.
+    methods = {"TSAI": hs._METHODS["TSAI"]}
+    deg = syn.make_scenario(n_poses=12, pixel_noise=0.3, seed=7, rot_range=0.05)
+    rng = np.random.default_rng(2)
+    anchor = deg.Tbb_true @ tf.T_from_vec(np.concatenate([
+        rng.normal(0, np.radians(0.3), 3), rng.normal(0, 0.005, 3)]))
+    res2 = hs.solve(deg.samples, deg.K, None, deg.board_pts, heldout_frac=0.25,
+                    reject_sigma=None, anchor_Tbb=anchor, methods=methods)
+    assert res2.seed_used == "board_anchor"

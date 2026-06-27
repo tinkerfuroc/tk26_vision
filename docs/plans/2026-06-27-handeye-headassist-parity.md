@@ -10,9 +10,10 @@
 
 ## Global Constraints
 
-- **Working directories & paths (authoritative):** the git repo root is `/home/tinker/tk25_ws/src/tk26_vision` (`tk25_ws` is NOT a git repo — it is the colcon workspace root). Run **build + pytest from `/home/tinker/tk25_ws`** (after sourcing the venv + `install/setup.bash`); run **all `git` commands from `/home/tinker/tk25_ws/src/tk26_vision`**. `Files:` bullets are paths relative to the git repo root (`src/handeye_calib/...`); command-line paths are absolute. `handeye_calib` is symlink-installed at `/home/tinker/tk25_ws/install/handeye_calib`.
-- **Venv:** all Python runs under `src/tk26_vision/.venv-vision-main/`. Activate before any pytest/build.
-- **Build wrapper:** `./src/tk26_vision/scripts/build.sh --packages-select handeye_calib` (plain `colcon build` writes `#!/usr/bin/python3` shebangs that can't see the venv). With `--symlink-install`, **edits to existing `.py` files and new `.py` files inside an already-built package are picked up live — no rebuild needed for pure-Python changes**; only rebuild once up front (Task 0) and again only if entry points change.
+- **Working directories & paths (authoritative):** the git repo root is `/home/tinker/tk25_ws/src/tk26_vision` (`tk25_ws` is NOT a git repo — it is the colcon workspace root). Run **build + pytest from `/home/tinker/tk25_ws`**; run **all `git` commands from `/home/tinker/tk25_ws/src/tk26_vision`**. `Files:` bullets are paths relative to the git repo root (`src/handeye_calib/...`); command-line paths are absolute.
+- **Venv:** the venv is `src/tk26_vision/.venv-vision-main/`; `tkbuild` auto-sources it. For a bare pytest run (no rebuild) activate it yourself.
+- **Build (canonical — use `tkbuild`, NOT the wrapper or bare colcon):** from `/home/tinker/tk25_ws` run `tkbuild tk26_vision --packages-select handeye_calib`. `tkbuild` auto-sources `.venv-vision-main`, **strips `--symlink-install`** (it breaks ament_python entry points), builds into the **top-level** `/home/tinker/tk25_ws/install/`, patches entry-point shebangs, and sources `install/setup.bash` at the end. **The install is COPY-based: edits to `src/` are NOT live** — after ANY source change you MUST `tkbuild tk26_vision --packages-select handeye_calib` before pytest, or the tests run against stale installed code. Do NOT use `--symlink-install` and do NOT use `./scripts/build.sh` (its `--symlink-install` produces a non-importable layout here).
+- **Run tests:** from `/home/tinker/tk25_ws`, after a `tkbuild` (which already sources install) OR after `source src/tk26_vision/.venv-vision-main/bin/activate && source install/setup.bash`, run `pytest <absolute test path>`.
 - **Pure modules stay ROS-free:** `handeye_solve.py`, `transforms.py`, `web_support.py`, `synthetic.py` must import only numpy/scipy/cv2 — no rclpy/fastapi (mirrors the existing import discipline so they unit-test under the plain venv).
 - **Dependency direction:** do NOT add a `tk26_vision → tk25_basic` code dependency. The head warm-start reads the head pose via **TF at runtime** (`tf2_ros`), never by importing pan_tilt's URDF/config.
 - **Frames:** arm base = `link_base` (the node's `self._base_frame`), flange = `link_eef` (`self._eef_frame`). The head pose is looked up relative to `self._base_frame` so TF chains through `base_link` automatically; **never** hard-code `base_link` in the lookup.
@@ -45,9 +46,7 @@
 Run:
 ```bash
 cd /home/tinker/tk25_ws
-source src/tk26_vision/.venv-vision-main/bin/activate
-./src/tk26_vision/scripts/build.sh --packages-select handeye_calib
-source install/setup.bash
+tkbuild tk26_vision --packages-select handeye_calib   # auto-sources venv + install, copy-install into top-level install/
 ```
 Expected: build SUCCESS for `handeye_calib`.
 
@@ -646,8 +645,10 @@ def consensus_corners(frames, *, min_frac=0.6):
     sub-pixel corner pixels. A corner id is kept only if it was detected in at
     least ``ceil(min_frac * N)`` frames; its consensus pixel is the per-corner
     MEDIAN over the frames that saw it (robust to the occasional mis-localized
-    corner). Returns ``(ids, px)`` sorted by id, or ``(None, None)`` when fewer
-    than 4 corners reach quorum (caller falls back to the single-frame pose).
+    corner). Returns ``(ids, px)`` sorted by id, or ``(None, None)`` only when NO
+    corner reaches quorum. (consensus_corners just denoises the quorum-surviving
+    corners; the downstream Task-5 PnP enforces the >=6-corner requirement and
+    falls back to the single-frame pose otherwise.)
     """
     n = len(frames)
     if n == 0:
@@ -665,7 +666,7 @@ def consensus_corners(frames, *, min_frac=0.6):
         if len(pts) >= quorum:
             kept_ids.append(cid)
             kept_px.append(np.median(pts, axis=0))
-    if len(kept_ids) < 4:
+    if not kept_ids:
         return None, None
     return np.asarray(kept_ids, int), np.asarray(kept_px, float)
 ```
@@ -735,7 +736,7 @@ After `self._cap = None` (~line 441) add:
 
 - [ ] **Step 4: Push detections in `_ingest_frame`**
 
-In `_ingest_frame`, inside the `if cap is not None:` branch (~line 693), record the per-frame corners; and reset on loss. Change:
+In `_ingest_frame`, compute `steady` in the pre-lock region (unchanged), and write `_det_history` INSIDE the existing `with self.lock:` block so the write shares the lock `do_capture` uses to read it (a write outside the lock makes the reader's lock a false guarantee — GIL-safe today but architecturally wrong). The pre-lock region stays:
 ```python
             if cap is not None:
                 steady = self._stability.update(cap["T_cam_board"])
@@ -743,19 +744,16 @@ In `_ingest_frame`, inside the `if cap is not None:` branch (~line 693), record 
                 self._stability.reset()
                 steady = False
 ```
-to:
+and inside the existing `with self.lock:` block (the one that sets `self._frame = bgr`, `self._K = K`, … ), add the history write at the end:
 ```python
-            if cap is not None:
-                steady = self._stability.update(cap["T_cam_board"])
-                self._det_history.append(
-                    (np.asarray(cap["corner_idx"]).copy(),
-                     np.asarray(cap["obs_px"], float).copy()))
-            else:
-                self._stability.reset()
-                self._det_history.clear()
-                steady = False
+                if cap is not None:
+                    self._det_history.append(
+                        (self._np.asarray(cap["corner_idx"]).copy(),
+                         self._np.asarray(cap["obs_px"], float).copy()))
+                else:
+                    self._det_history.clear()
 ```
-(`np` here is the module-level numpy alias used throughout `_ingest_frame`; it's available as `self._np` — use `self._np` if `np` is not in local scope. Grep the function to confirm; the file consistently uses `self._np` inside methods, so write `self._np.asarray(...)`.)
+(Inside node methods use `self._np` — the file consistently uses it rather than a bare `np`.)
 
 - [ ] **Step 5: Add `_pnp_ippe_refine` and use consensus in `do_capture`**
 

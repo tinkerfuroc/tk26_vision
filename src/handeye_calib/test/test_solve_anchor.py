@@ -62,3 +62,13 @@ def test_solve_default_no_anchor_is_unchanged():
     res = hs.solve(sc.samples, sc.K, None, sc.board_pts, heldout_frac=0.25,
                    rng_seed=0, reject_sigma=None)
     assert res.status == "PASS"
+
+
+def test_observability_flags_low_diversity_and_passes_diverse():
+    diverse = syn.make_scenario(n_poses=15, pixel_noise=0.0, seed=4, rot_range=0.6)
+    degen = syn.make_scenario(n_poses=15, pixel_noise=0.0, seed=4, rot_range=0.01)
+    o_div = hs.rotation_observability(diverse.samples)
+    o_deg = hs.rotation_observability(degen.samples)
+    assert o_div["ok"] is True
+    assert o_deg["ok"] is False
+    assert o_deg["second_singular"] <= o_div["second_singular"]

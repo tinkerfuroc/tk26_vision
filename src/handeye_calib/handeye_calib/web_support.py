@@ -125,8 +125,10 @@ def solve_payload_v2(res, samples, K, dist, board_pts):
         from handeye_calib import handeye_solve as hs  # local import to keep ws ROS-free
         _, per_sample = hs._reproj_rms(
             res.X, res.Tbb, samples, K, dist, board_pts, per_sample=True)
+        observability = hs.rotation_observability(samples)
     else:
         per_sample = []
+        observability = None
     base.update({
         "X_xyz_mm": [mm(v) for v in xyz_m],
         "X_rpy_deg": [deg(v) for v in rpy_rad],
@@ -138,6 +140,7 @@ def solve_payload_v2(res, samples, K, dist, board_pts):
             for m in (res.per_method or [])
         ],
         "per_sample_reproj_px": [float(v) for v in per_sample],
+        "observability": observability,
     })
     return base
 

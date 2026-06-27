@@ -30,7 +30,7 @@ def _pnp(board_pts, px, K):
 
 def make_scenario(n_poses=15, pixel_noise=0.3, seed=0,
                   squares_x=5, squares_y=5, square_len=0.04,
-                  with_depth=False, depth_noise=0.0):
+                  with_depth=False, depth_noise=0.0, rot_range=0.6):
     rng = np.random.default_rng(seed)
     K = np.array([[615., 0, 320.], [0, 615., 240.], [0, 0, 1.]])
     board_pts = hm.board_corners(squares_x, squares_y, square_len)
@@ -58,7 +58,7 @@ def make_scenario(n_poses=15, pixel_noise=0.3, seed=0,
     while len(samples) < n_poses and tries < n_poses * 20:
         tries += 1
         # Random flange pose that keeps the camera looking at the board with diversity.
-        rot = R.from_euler('xyz', rng.uniform(-0.6, 0.6, 3)).as_matrix()
+        rot = R.from_euler('xyz', rng.uniform(-rot_range, rot_range, 3)).as_matrix()
         trans = np.array([0.45, 0.0, 0.35]) + rng.uniform(-0.12, 0.12, 3)
         A = tf.T_from_Rt(rot, trans)
         T_cam_board = tf.invert(A @ X_true) @ Tbb_true

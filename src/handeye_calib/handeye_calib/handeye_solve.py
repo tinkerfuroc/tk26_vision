@@ -1,4 +1,10 @@
-"""Eye-in-hand solver: multi-method seed -> bundle-adjust refine -> held-out evaluation."""
+"""Eye-in-hand solver: multi-method seed -> bundle-adjust refine -> full-set evaluation.
+
+The solve fits X (T_eef_cam) + Tbb on ALL captured samples (no train/held-out
+split — pan-tilt-calibration parity). Outlier rejection (MAD) screens every
+sample, and the reported residual is over the full surviving set. A separate
+validation pose set is recorded later to measure generalization independently.
+"""
 from dataclasses import dataclass
 import numpy as np
 import cv2
@@ -143,29 +149,76 @@ def seed_from_board_anchor(samples, anchor_Tbb):
     return tf.se3_average(Xs), np.asarray(anchor_Tbb, float)
 
 
-def average_board_anchors(anchors):
-    """SE(3)-average a list of board-in-base measurements and report scatter.
-
-    ``anchors`` is a list of 4x4 ``T_base_board`` observations (e.g. the head
-    at several pan/tilt poses). Returns ``(Tbb_mean, scatter)`` where scatter is
-    ``{"trans_mm", "rot_deg", "n"}`` — the RMS deviation of the observations
-    from their mean, a data-driven confidence readout (large scatter => the
-    anchor is unreliable; widen the prior / re-check the head TF).
-    """
-    Ts = [np.asarray(T, float) for T in anchors]
-    if not Ts:
-        raise ValueError("average_board_anchors needs >=1 anchor")
-    mean = tf.se3_average(Ts)
+def _anchor_devs(Ts, mean):
+    """Per-observation SE(3) deviation (trans_m, rot_rad arrays) from ``mean``."""
     inv_mean = tf.invert(mean)
     t_dev, r_dev = [], []
     for T in Ts:
         D = inv_mean @ T
         t_dev.append(float(np.linalg.norm(D[:3, 3])))
-        r_dev.append(np.radians(tf.rotation_angle_deg(np.eye(3), D[:3, :3])))
+        r_dev.append(float(np.radians(tf.rotation_angle_deg(np.eye(3), D[:3, :3]))))
+    return np.asarray(t_dev, float), np.asarray(r_dev, float)
+
+
+def average_board_anchors(anchors, *, reject_sigma=2.5, max_reject_frac=0.34,
+                          reject_min_trans_m=0.01,
+                          reject_min_rot_rad=np.radians(3.0),
+                          min_obs_for_reject=4):
+    """Robustly SE(3)-average board-in-base measurements (head warm-start).
+
+    ``anchors`` is a list of 4x4 ``T_base_board`` observations (e.g. the head
+    at several pan/tilt poses). Before averaging, the same per-axis MAD outlier
+    rejection the wrist solve uses screens the observations themselves, so a
+    single bad pan/tilt read (a TF glitch or a misdetection at one head pose)
+    can't drag the anchor off — directly parity with how :func:`solve` weeds the
+    wrist samples. Each iteration takes the SE(3) median, scores every
+    observation's translation + rotation deviation as one-sided modified
+    z-scores, and drops the single worst that is BOTH a statistical outlier
+    (z > ``reject_sigma``) AND past the absolute physical floor
+    (``reject_min_trans_m`` / ``reject_min_rot_rad``) — then re-medians.
+    Screening only runs with at least ``min_obs_for_reject`` observations (MAD
+    needs a few points to be meaningful) and never drops below the min-keep
+    floor ``max(2, ceil((1 - max_reject_frac) * n))``.
+
+    Returns ``(Tbb_mean, scatter)`` where scatter is
+    ``{"trans_mm", "rot_deg", "n", "n_total", "n_rejected", "rejected"}``:
+    RMS deviation of the SURVIVING observations from their mean (a data-driven
+    confidence readout — large scatter => widen the prior / re-check the head
+    TF), the kept count ``n``, the original count ``n_total``, and the ORIGINAL
+    indices ``rejected`` that were dropped.
+    """
+    Ts = [np.asarray(T, float) for T in anchors]
+    if not Ts:
+        raise ValueError("average_board_anchors requires at least 1 anchor; got 0")
+    n_total = len(Ts)
+    active = list(range(n_total))
+    rejected = []
+    if reject_sigma is not None and n_total >= min_obs_for_reject:
+        min_keep = max(2, int(np.ceil((1.0 - max_reject_frac) * n_total)))
+        for _ in range(n_total):
+            if len(active) <= min_keep:
+                break
+            sub = [Ts[i] for i in active]
+            m = tf.se3_average(sub)
+            t_dev, r_dev = _anchor_devs(sub, m)
+            zt, zr = _modified_zscores(t_dev), _modified_zscores(r_dev)
+            cand = ((zt > reject_sigma) & (t_dev > reject_min_trans_m)) | \
+                   ((zr > reject_sigma) & (r_dev > reject_min_rot_rad))
+            if not cand.any():
+                break
+            score = np.where(cand, np.maximum(zt, zr), -np.inf)
+            k = int(np.argmax(score))
+            rejected.append(active.pop(k))
+    kept = [Ts[i] for i in active]
+    mean = tf.se3_average(kept)
+    t_dev, r_dev = _anchor_devs(kept, mean)
     scatter = {
         "trans_mm": float(np.sqrt(np.mean(np.square(t_dev))) * 1000.0),
         "rot_deg": float(np.degrees(np.sqrt(np.mean(np.square(r_dev))))),
-        "n": len(Ts),
+        "n": len(kept),
+        "n_total": n_total,
+        "n_rejected": len(rejected),
+        "rejected": sorted(rejected),
     }
     return mean, scatter
 
@@ -210,7 +263,8 @@ def _residuals(params, samples, K, dist, board_pts,
 
 
 def bundle_adjust(samples, K, dist, board_pts, X0, Tbb0,
-                  depth_weight=0.0, depth_sigma_m=0.005):
+                  depth_weight=0.0, depth_sigma_m=0.005, loss="soft_l1",
+                  xtol=None, ftol=None, gtol=None, max_nfev=None):
     """Jointly refine X (T_eef_cam) and Tbb (T_base_board) minimizing corner
     reprojection, plus the optional FFS-depth 3D residual (``depth_weight>0``).
 
@@ -218,11 +272,25 @@ def bundle_adjust(samples, K, dist, board_pts, X0, Tbb0,
     pixel-only synthetic tests) get the unchanged monocular solve; the higher-
     level :func:`solve` passes a non-zero default which no-ops anyway on samples
     that carry no depth.
+
+    ``loss`` is forwarded to :func:`scipy.optimize.least_squares`.  Default
+    ``"soft_l1"`` is robust to large outliers; ``"linear"`` (L2) gives tighter
+    convergence on a clean, already-screened sample set (used by :func:`polish`).
+    Pass ``xtol``/``ftol``/``gtol``/``max_nfev`` to override scipy defaults — the
+    L2 polish path uses ``1e-12``/``20000`` for tight convergence.
     """
     p0 = np.concatenate([tf.vec_from_T(X0), tf.vec_from_T(Tbb0)])
-    sol = least_squares(_residuals, p0, loss="soft_l1", method="trf",
-                        args=(samples, K, dist, board_pts,
-                              depth_weight, depth_sigma_m))
+    kw = dict(loss=loss, method="trf",
+              args=(samples, K, dist, board_pts, depth_weight, depth_sigma_m))
+    if xtol is not None:
+        kw["xtol"] = xtol
+    if ftol is not None:
+        kw["ftol"] = ftol
+    if gtol is not None:
+        kw["gtol"] = gtol
+    if max_nfev is not None:
+        kw["max_nfev"] = max_nfev
+    sol = least_squares(_residuals, p0, **kw)
     X = tf.T_from_vec(sol.x[:6])
     Tbb = tf.T_from_vec(sol.x[6:])
     info = {"final_reproj_px": _reproj_rms(X, Tbb, samples, K, dist, board_pts),
@@ -260,29 +328,31 @@ def _solve_once(samples, K, dist, board_pts, *, methods=None,
 class SolveResult:
     X: np.ndarray
     Tbb: np.ndarray
-    train_metrics: dict
-    heldout_metrics: dict
+    # Residual over the FULL surviving sample set (post-MAD-rejection). There is
+    # no train/held-out split — the calibration is fit on, and scored against,
+    # all kept samples. A separately-recorded validation set measures
+    # generalization later.
+    metrics: dict
     status: str
     per_method: list
     # Which seed produced the promoted X: "closed_form" (best-of-5
     # calibrateHandEye) or "board_anchor" (the head warm-start). Surfaced so an
     # operator can confirm whether the head anchor actually rescued the solve.
     seed_used: str = ""
+    # ORIGINAL-sample indices (into the `samples` passed to solve) that the
+    # MAD rejection dropped. Surfaced so the UI / dumps can mark them and
+    # exclude them from the per-sample residual view.
+    rejected_indices: list = None
+    # Per-drop diagnostics, one dict per rejected sample (sorted by idx):
+    # {idx, trans_mm, rot_deg, reproj_px, z_trans, z_rot, z_reproj} captured at
+    # the moment of rejection. Drives the pan-tilt-style "why was this dropped"
+    # readout in the UI. None/empty when nothing was rejected.
+    rejection_log: list = None
 
 
 # pan-tilt parity thresholds
 _PASS = {"trans_rmse_m": 0.003, "rot_rmse_rad": 0.00873, "reproj_px": 1.5}
 _WARN = {"trans_rmse_m": 0.006, "rot_rmse_rad": 0.01745, "reproj_px": 3.0}
-
-
-def split_train_test(samples, heldout_frac, rng_seed=0):
-    rng = np.random.default_rng(rng_seed)
-    idx = np.arange(len(samples))
-    rng.shuffle(idx)
-    n_te = max(1, int(round(len(samples) * heldout_frac)))
-    te = sorted(idx[:n_te].tolist())
-    tr = sorted(idx[n_te:].tolist())
-    return [samples[i] for i in tr], [samples[i] for i in te]
 
 
 def _depth_point_metrics(X, Tbb, samples, board_pts):
@@ -292,12 +362,10 @@ def _depth_point_metrics(X, Tbb, samples, board_pts):
     PnP pose — itself biased when intrinsics/board-scale are off), this compares
     against an independent *metric* measurement.
 
-    Honest only on the HELD-OUT split: those poses never entered the bundle
-    adjust, so the metric genuinely cross-validates the depth-grounded solve.
-    The TRAIN value is in-sample (X/Tbb were fit to these same points with
-    ``depth_weight>0``), so it can read deceptively low if the depth term
-    over-fits a systematic FFS bias — read the held-out value as the real-world
-    error budget. Returns ``(rmse_mm_or_None, n_corners)``."""
+    This is an IN-SAMPLE metric (all samples enter the fit — there is no held-out
+    split), so it can read deceptively low if the depth term over-fits a
+    systematic FFS bias; treat the separately-recorded validation set as the
+    real-world error budget. Returns ``(rmse_mm_or_None, n_corners)``."""
     sq = []
     for s in samples:
         if getattr(s, "obs_xyz_cam", None) is None:
@@ -346,30 +414,39 @@ def gate(metrics):
     return "FAIL"
 
 
-def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
+def solve(samples, K, dist, board_pts, *,
           methods=None, reject_sigma=2.5, max_reject_frac=0.25,
           reject_min_trans_m=0.01, reject_min_rot_rad=np.radians(3.0),
-          depth_weight=1.0, depth_sigma_m=0.005, anchor_Tbb=None):
-    """Full solve pipeline. ``methods`` is forwarded to :func:`seed_handeye`
-    so a single-method run (e.g. ``methods={"TSAI": cv2.CALIB_HAND_EYE_TSAI}``)
-    skips the multi-method best-of step; ``None`` keeps the default 5-method
-    sweep.
+          reject_min_reproj_px=3.0,
+          depth_weight=1.0, depth_sigma_m=0.005, anchor_Tbb=None,
+          progress_cb=None):
+    """Full solve pipeline over ALL samples — there is NO train/held-out split
+    (pan-tilt-calibration parity).  X/Tbb are fit on, and the residual reported
+    over, every surviving sample; generalization is measured separately later
+    with a freshly-recorded validation pose set.
+
+    ``methods`` is forwarded to :func:`seed_handeye` so a single-method run
+    (e.g. ``methods={"TSAI": cv2.CALIB_HAND_EYE_TSAI}``) skips the multi-method
+    best-of step; ``None`` keeps the default 5-method sweep.
 
     ``anchor_Tbb``: an external board-in-base measurement (e.g. from the
     pan-tilt head via TF) used as a basin-immune warm-start seed; forwarded
     through the rejection loop via :func:`_solve_once` so the anchor is
     available on every re-solve. ``None`` (default) skips the anchor branch.
 
-    ``reject_sigma``: default-on (2.5) iterative per-axis outlier rejection
-    on the TRAIN split only — held-out is never touched.  Each iteration
-    computes per-sample SE(3) chain errors (translation in metres, rotation
-    in radians) via :func:`_per_sample_chain_errors`, turns each axis into
-    one-sided modified z-scores via :func:`_modified_zscores`, and drops the
-    SINGLE worst qualifying sample, then RE-SOLVES via :func:`_solve_once`
-    before scoring again.  Single-worst-then-resolve (not batch-drop) is
-    deliberate: after the worst outlier is removed and the fit improves,
-    borderline samples that looked marginal often fall back under threshold
-    and are kept — batch dropping would over-reject them.
+    ``reject_sigma``: default-on (2.5) iterative per-axis MAD outlier rejection
+    over the FULL sample set.  Each iteration fits X/Tbb on the active set,
+    computes per-sample SE(3) chain errors (translation in metres, rotation in
+    radians) via :func:`_per_sample_chain_errors` plus per-sample reprojection
+    (px), turns each axis into one-sided modified z-scores via
+    :func:`_modified_zscores`, and drops the SINGLE worst qualifying sample,
+    then RE-SOLVES via :func:`_solve_once` before scoring again.
+    Single-worst-then-resolve (not batch-drop) is deliberate: after the worst
+    outlier is removed and the fit improves, borderline samples that looked
+    marginal often fall back under threshold and are kept — batch dropping
+    would over-reject them.  Screening the WHOLE set (not a train subset) means
+    an outlier is caught wherever it sits — the prior train-only loop left
+    outliers that happened to land in the held-out split un-weeded.
 
     Absolute physical floor: a sample must be BOTH a statistical outlier
     (z > ``reject_sigma``) AND beyond an absolute physical band
@@ -384,59 +461,237 @@ def solve(samples, K, dist, board_pts, heldout_frac=0.2, rng_seed=0, *,
     has shrunk to the min-keep floor
     ``max(6, ceil((1 - max_reject_frac) * n_orig))`` (default 25% max drop),
     checked at the TOP of each round so a would-be over-drop simply stops
-    rather than dropping zero.  ``rejected_indices`` (indices into the train
-    list) is attached to ``SolveResult.per_method[-1]`` for operator
-    visibility.
+    rather than dropping zero.  A pose can also be dropped on the
+    REPROJECTION axis (per-sample reproj > ``reject_min_reproj_px`` AND a
+    statistical outlier) — this catches a camera-to-flange-inconsistent pose
+    (mid-ring / mount-flex capture) whose chain rotation sits below the 3°
+    floor, which is the dominant real-hardware failure mode.
+    ``rejected_indices`` (ORIGINAL indices into ``samples``, so they map onto
+    the per-sample residual arrays / the gallery) is on
+    ``SolveResult.rejected_indices`` and attached to
+    ``SolveResult.per_method[-1]``; per-drop residual+z diagnostics are on
+    ``SolveResult.rejection_log``.
     """
-    train, test = split_train_test(samples, heldout_frac, rng_seed)
+    def _emit(ev):
+        # ``progress_cb`` lets a caller (the web node) stream per-iteration MAD
+        # rejection events to the UI as they happen. A callback bug must never
+        # break the solve, so every call is guarded.
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(ev)
+        except Exception:
+            pass
+
+    orig_of = {id(s): i for i, s in enumerate(samples)}
     X, Tbb, per_method, seed_used = _solve_once(
-        train, K, dist, board_pts, methods=methods,
+        samples, K, dist, board_pts, methods=methods,
         depth_weight=depth_weight, depth_sigma_m=depth_sigma_m,
         anchor_Tbb=anchor_Tbb)
 
-    rejected = []
-    if reject_sigma is not None and len(train) >= 6:
-        # Single-worst-drop-then-resolve outlier rejection on the TRAIN set
-        # only — held-out stays intact as the honest evaluator.
-        active = list(range(len(train)))
-        n_orig = len(train)
+    rejected = []          # ORIGINAL-sample indices (into `samples`)
+    rejection_log = []     # per-drop {idx, trans_mm, rot_deg, reproj_px, z_*}
+    active = list(range(len(samples)))
+    if reject_sigma is not None and len(samples) >= 6:
+        # Single-worst-drop-then-resolve MAD rejection over the WHOLE set.
+        n_orig = len(samples)
         # Min-keep floor checked at the TOP of each round: never drop below
         # max(6, ceil((1 - max_reject_frac) * n_orig)) samples.
         min_keep = max(6, int(np.ceil((1.0 - max_reject_frac) * n_orig)))
-        for _ in range(20):  # safety cap on iterations
-            sub = [train[i] for i in active]
+        _emit({"phase": "start", "n_orig": n_orig, "n_active": len(active),
+               "min_keep": min_keep, "iteration": 0, "last_drop": None})
+        for _ in range(n_orig + 1):  # safety cap; min_keep bounds real drops
+            sub = [samples[i] for i in active]
             if len(sub) <= min_keep:
                 break
             t_e, r_e = _per_sample_chain_errors(X, Tbb, sub)
+            _, reproj_ps = _reproj_rms(X, Tbb, sub, K, dist, board_pts,
+                                       per_sample=True)
+            reproj_ps = np.asarray(reproj_ps, float)
             zt = _modified_zscores(t_e)
             zr = _modified_zscores(r_e)
+            zp = _modified_zscores(reproj_ps)
             # A sample qualifies only if it is BOTH a statistical outlier AND
-            # physically significant on the SAME axis (z AND abs-floor anded
-            # per axis, then OR'd across axes).
+            # physically significant on the SAME axis: translation chain error
+            # (> reject_min_trans_m), rotation chain error (> reject_min_rot_rad),
+            # OR reprojection (> reject_min_reproj_px). The reprojection axis is
+            # the discriminator that catches a pose whose camera-to-flange
+            # transform is inconsistent with the rest (a mid-ring / mount-flex
+            # capture) even when its chain rotation sits below the 3° floor —
+            # the dominant real-hardware failure mode. Clean data reprojects
+            # well under the px floor, so nothing qualifies there.
             cand_t = (zt > reject_sigma) & (t_e > reject_min_trans_m)
             cand_r = (zr > reject_sigma) & (r_e > reject_min_rot_rad)
-            cand = cand_t | cand_r
+            cand_p = (zp > reject_sigma) & (reproj_ps > reject_min_reproj_px)
+            cand = cand_t | cand_r | cand_p
             if not cand.any():
                 break
-            score = np.where(cand, np.maximum(zt, zr), -np.inf)
+            score = np.where(cand, np.maximum(np.maximum(zt, zr), zp), -np.inf)
             k = int(np.argmax(score))
-            rejected.append(active.pop(k))
-            sub = [train[i] for i in active]
+            oi = orig_of[id(sub[k])]
+            rejection_log.append({
+                "idx": oi,
+                "trans_mm": float(t_e[k] * 1000.0),
+                "rot_deg": float(np.degrees(r_e[k])),
+                "reproj_px": float(reproj_ps[k]),
+                "z_trans": float(zt[k]), "z_rot": float(zr[k]),
+                "z_reproj": float(zp[k]),
+            })
+            rejected.append(oi)
+            active.pop(k)
+            _emit({"phase": "rejecting", "n_orig": n_orig,
+                   "n_active": len(active), "min_keep": min_keep,
+                   "iteration": len(rejected), "last_drop": rejection_log[-1]})
             X, Tbb, _pm, seed_used = _solve_once(
-                sub, K, dist, board_pts, methods=methods,
+                [samples[i] for i in active], K, dist, board_pts, methods=methods,
                 depth_weight=depth_weight, depth_sigma_m=depth_sigma_m,
                 anchor_Tbb=anchor_Tbb)
-        train = [train[i] for i in active]
 
-    train_m = evaluate(X, Tbb, train, K, dist, board_pts)
-    held_m = evaluate(X, Tbb, test, K, dist, board_pts)
+    kept = [samples[i] for i in active]
+    metrics = evaluate(X, Tbb, kept, K, dist, board_pts)
+    rejected = sorted(rejected)
+    # Re-score each rejected pose's residual MAGNITUDES against the FINAL clean
+    # fit (the kept-set solution), so the reported numbers show how far the pose
+    # truly sits from the converged calibration. The at-drop-time snapshot is
+    # measured on a fit that still contains that pose plus any not-yet-dropped
+    # outliers — so the FIRST drop (the worst outlier) reads absurdly large
+    # (e.g. 757 mm) purely because it was polluting its own reference fit. The
+    # z-scores are LEFT as captured: they are population-relative trigger
+    # evidence ("how much it stood out at the moment it was dropped"), which is
+    # exactly what justified the rejection and is not meaningful post-hoc.
+    if rejection_log:
+        rej_samples = [samples[e["idx"]] for e in rejection_log]
+        rt, rr = _per_sample_chain_errors(X, Tbb, rej_samples)
+        _, rpx = _reproj_rms(X, Tbb, rej_samples, K, dist, board_pts,
+                             per_sample=True)
+        for e, t, r, p in zip(rejection_log, rt, rr, rpx):
+            e["trans_mm"] = float(t * 1000.0)
+            e["rot_deg"] = float(np.degrees(r))
+            e["reproj_px"] = float(p)
+    rejection_log = sorted(rejection_log, key=lambda d: d["idx"])
     if rejected:
         per_method = list(per_method) + [{"name": "rejected_indices",
-                                          "rejected_indices": sorted(rejected),
+                                          "rejected_indices": rejected,
                                           "X": X, "Tbb": Tbb,
                                           "reproj_px": float("nan")}]
-    return SolveResult(X, Tbb, train_m, held_m, gate(held_m), per_method,
-                       seed_used=seed_used)
+    return SolveResult(X, Tbb, metrics, gate(metrics), per_method,
+                       seed_used=seed_used, rejected_indices=rejected,
+                       rejection_log=rejection_log)
+
+
+def polish(result, samples, K, dist, board_pts, *,
+           n_restarts=12, polish_sigma=2.5, max_reject_frac=0.20,
+           depth_weight=0.0, depth_sigma_m=0.005, perturb_scale=5e-4):
+    """L2 polish pass — pan-tilt calibration parity.
+
+    Starting from the MAD-cleaned :class:`SolveResult`, runs a multi-restart
+    L2 (``loss='linear'``) bundle adjust over the **kept** samples, then
+    applies a tight per-axis MAD rejection loop (sigma=``polish_sigma``,
+    max_reject_frac=``max_reject_frac``) where each re-solve also uses L2.
+    Unlike the soft-L1 used in :func:`solve`, L2 rewards tight inlier agreement
+    rather than robustness to large outliers — so it is appropriate only AFTER
+    the main outlier-rejection pass has cleaned the sample set.
+
+    Returns a fresh :class:`SolveResult`.  ``rejected_indices`` and
+    ``rejection_log`` on the return value accumulate ALL rejections (MAD phase +
+    polish phase); ``seed_used`` gains a ``+polish_l2`` suffix.
+
+    On non-rigid mounts where rigid_closure_deg dominates the error floor, this
+    pass will not break through the metric ceiling — but on genuinely rigid-mount
+    data it typically tightens reproj_px by 5–15% vs the soft_l1 minimum.
+    """
+    rng = np.random.default_rng(42)
+
+    # Reconstruct the kept set from the seed result's rejection list.
+    rej_set = set(result.rejected_indices or [])
+    kept = [s for i, s in enumerate(samples) if i not in rej_set]
+    if len(kept) < 6:
+        return result
+
+    # Map Python object id → original index in `samples` for bookkeeping.
+    orig_of = {id(s): i for i, s in enumerate(samples)}
+
+    def _ba_l2(X0, Tbb0, samps):
+        Xr, Tbbr, info = bundle_adjust(
+            samps, K, dist, board_pts, X0, Tbb0,
+            depth_weight=depth_weight, depth_sigma_m=depth_sigma_m,
+            loss="linear", xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=20000)
+        return Xr, Tbbr, info["cost"]
+
+    # Multi-restart: seed + n_restarts-1 small random perturbations.
+    p_seed = np.concatenate([tf.vec_from_T(result.X), tf.vec_from_T(result.Tbb)])
+    best_cost = None
+    X, Tbb = result.X.copy(), result.Tbb.copy()
+    for r in range(n_restarts):
+        p = p_seed + (rng.standard_normal(p_seed.shape) * perturb_scale
+                      if r > 0 else np.zeros_like(p_seed))
+        Xr, Tbbr, cost = _ba_l2(tf.T_from_vec(p[:6]), tf.T_from_vec(p[6:]), kept)
+        if best_cost is None or cost < best_cost:
+            best_cost, X, Tbb = cost, Xr, Tbbr
+
+    # Tight MAD rejection loop with L2 re-solve (no absolute floor — the main
+    # solve pass has already screened gross outliers; L2 is sensitive to them).
+    n_orig = len(kept)
+    min_keep = max(6, int(np.ceil((1.0 - max_reject_frac) * n_orig)))
+    rejected_extra = []
+    rejection_log_extra = []
+    active_kept = list(range(n_orig))
+
+    for _ in range(n_orig + 1):
+        sub = [kept[i] for i in active_kept]
+        if len(sub) <= min_keep:
+            break
+        t_e, r_e = _per_sample_chain_errors(X, Tbb, sub)
+        _, reproj_ps = _reproj_rms(X, Tbb, sub, K, dist, board_pts, per_sample=True)
+        reproj_ps = np.asarray(reproj_ps, float)
+        zt = _modified_zscores(t_e)
+        zr = _modified_zscores(r_e)
+        zp = _modified_zscores(reproj_ps)
+        cand = (zt > polish_sigma) | (zr > polish_sigma) | (zp > polish_sigma)
+        if not cand.any():
+            break
+        score = np.where(cand, np.maximum(np.maximum(zt, zr), zp), -np.inf)
+        k = int(np.argmax(score))
+        oi = orig_of[id(sub[k])]
+        rejection_log_extra.append({
+            "idx": oi,
+            "trans_mm": float(t_e[k] * 1000.0),
+            "rot_deg": float(np.degrees(r_e[k])),
+            "reproj_px": float(reproj_ps[k]),
+            "z_trans": float(zt[k]), "z_rot": float(zr[k]), "z_reproj": float(zp[k]),
+        })
+        rejected_extra.append(oi)
+        active_kept.pop(k)
+        sub2 = [kept[i] for i in active_kept]
+        X, Tbb, _ = _ba_l2(X, Tbb, sub2)
+
+    final_kept = [kept[i] for i in active_kept]
+    metrics = evaluate(X, Tbb, final_kept, K, dist, board_pts)
+
+    all_rejected = sorted((result.rejected_indices or []) + rejected_extra)
+    # Re-score rejected-in-polish poses against the final clean fit.
+    if rejection_log_extra:
+        rs = [samples[e["idx"]] for e in rejection_log_extra]
+        rt, rr = _per_sample_chain_errors(X, Tbb, rs)
+        _, rpx = _reproj_rms(X, Tbb, rs, K, dist, board_pts, per_sample=True)
+        for e, t, r, p in zip(rejection_log_extra, rt, rr, rpx):
+            e["trans_mm"] = float(t * 1000.0)
+            e["rot_deg"] = float(np.degrees(r))
+            e["reproj_px"] = float(p)
+    all_rej_log = sorted(
+        (result.rejection_log or []) + rejection_log_extra,
+        key=lambda d: d["idx"])
+
+    per_method_out = list(result.per_method or []) + [{
+        "name": "polish_l2",
+        "n_restarts": n_restarts,
+        "n_dropped_in_polish": len(rejected_extra),
+        "reproj_px": metrics["reproj_px"],
+    }]
+    return SolveResult(X, Tbb, metrics, gate(metrics), per_method_out,
+                       seed_used=(result.seed_used or "") + "+polish_l2",
+                       rejected_indices=all_rejected,
+                       rejection_log=all_rej_log)
 
 
 def rotation_observability(samples, *, min_singular=0.3):
@@ -473,6 +728,60 @@ def rotation_observability(samples, *, min_singular=0.3):
                        "the flange about a DIFFERENT axis")}
 
 
+def rigid_closure_deg(samples, *, min_rel_deg=5.0, rigid_tol_deg=0.5):
+    """Intrinsics-free rigid-MOUNT diagnostic (AX=XB rotation conjugacy).
+
+    For a RIGID camera-to-flange mount the flange motion between two poses
+    ``A_ij = inv(A_i) @ A_j`` and the camera motion ``B_ij = inv(B_i) @ B_j``
+    are conjugate (``A_ij X = X B_ij``), so they have the SAME rotation ANGLE
+    regardless of the hand-eye X, the camera intrinsics, board scale,
+    translation, or depth. The per-pair residual ``|angle(R_A_ij) -
+    angle(R_B_ij)|`` over all pose pairs with a meaningful relative rotation
+    (> ``min_rel_deg``) therefore isolates MECHANICAL non-rigidity (wrist-camera
+    bracket flex / arm-FK compliance) from every camera-side error — none of
+    which can move it.
+
+    This is a conservative LOWER bound on non-rigidity (it compares rotation
+    magnitudes only, not the conjugated axis), so a clean pass means the mount is
+    genuinely rigid, while any meaningful residual is a definitive flex signal.
+    Returns a JSON-safe dict ``{"ok","mean_deg","median_deg","max_deg",
+    "n_pairs","detail"}``. ``ok`` (median < ``rigid_tol_deg``) is the go/no-go an
+    operator should check BEFORE trusting a solve: if it FAILs, no hand-eye solve
+    can reach the gate — rigidify the mount (and/or fix the arm kinematics) and
+    recapture; tuning the solver is wasted effort.
+    """
+    A = [np.asarray(s.T_base_eef, float) for s in samples]
+    B = [np.asarray(s.T_cam_board, float) for s in samples]
+    diffs = []
+    n = len(samples)
+    for i in range(n):
+        for j in range(i + 1, n):
+            Aij = tf.invert(A[i]) @ A[j]
+            Bij = tf.invert(B[i]) @ B[j]
+            a = tf.rotation_angle_deg(np.eye(3), Aij[:3, :3])
+            b = tf.rotation_angle_deg(np.eye(3), Bij[:3, :3])
+            if a < min_rel_deg and b < min_rel_deg:
+                continue  # near-static pair: no well-defined motion angle
+            diffs.append(abs(a - b))
+    if not diffs:
+        return {"ok": False, "mean_deg": 0.0, "median_deg": 0.0,
+                "max_deg": 0.0, "n_pairs": 0,
+                "detail": "no pose pairs exceed the relative-rotation threshold "
+                          "— add poses that rotate the flange"}
+    diffs = np.asarray(diffs, float)
+    med = float(np.median(diffs))
+    ok = bool(med < rigid_tol_deg)
+    return {"ok": ok, "mean_deg": float(diffs.mean()), "median_deg": med,
+            "max_deg": float(diffs.max()), "n_pairs": int(diffs.size),
+            "detail": (f"rigid mount (median pair closure {med:.2f}° < "
+                       f"{rigid_tol_deg:.1f}°)" if ok else
+                       f"NON-RIGID: {med:.2f}° median flange-vs-camera rotation "
+                       "mismatch — the camera bracket flexes or the arm FK is "
+                       "pose-dependent. NO hand-eye solve can reach the gate; "
+                       "rigidify the mount and recapture (tuning the solver "
+                       "will not help).")}
+
+
 def consensus_corners(frames, *, min_frac=0.6):
     """Per-corner sub-pixel consensus across N steady frames.
 
@@ -504,3 +813,134 @@ def consensus_corners(frames, *, min_frac=0.6):
     if not kept_ids:
         return None, None
     return np.asarray(kept_ids, int), np.asarray(kept_px, float)
+
+
+def _residuals_multi(p, placements_samples, K, dist, board_pts,
+                     depth_weight, depth_sigma_m):
+    """Stacked residuals for a joint multi-placement solve.
+
+    ``p = [X_6dof | Tbb_0_6dof | ... | Tbb_{n-1}_6dof]``.  Each placement's
+    residual is computed by delegating to :func:`_residuals` with the shared X
+    and that placement's Tbb slice, then all residual vectors are concatenated.
+    """
+    X_vec = p[:6]
+    all_res = []
+    for i, samples in enumerate(placements_samples):
+        Tbb_vec = p[6 + 6 * i: 12 + 6 * i]
+        all_res.append(_residuals(np.concatenate([X_vec, Tbb_vec]), samples,
+                                  K, dist, board_pts, depth_weight, depth_sigma_m))
+    return np.concatenate(all_res)
+
+
+def bundle_adjust_multi(placements_samples, K, dist, board_pts, X0, Tbb0s,
+                        depth_weight=0.0, depth_sigma_m=0.005, loss="soft_l1",
+                        xtol=None, ftol=None, gtol=None, max_nfev=None):
+    """Joint bundle adjust over multiple placements sharing a single X (T_eef_cam).
+
+    Each placement has its own independent Tbb (T_base_board).  The parameter
+    vector is ``[X_6dof | Tbb_0_6dof | ... | Tbb_{n-1}_6dof]``.  Returns
+    ``(X, Tbbs, info)`` where ``Tbbs`` is a list of 4x4 matrices in the same
+    order as ``placements_samples`` and ``info`` contains ``success`` and ``cost``.
+    """
+    n = len(placements_samples)
+    p0 = np.concatenate([tf.vec_from_T(X0)] + [tf.vec_from_T(T) for T in Tbb0s])
+    kw = dict(loss=loss, method="trf",
+              args=(placements_samples, K, dist, board_pts, depth_weight, depth_sigma_m))
+    if xtol is not None:
+        kw["xtol"] = xtol
+    if ftol is not None:
+        kw["ftol"] = ftol
+    if gtol is not None:
+        kw["gtol"] = gtol
+    if max_nfev is not None:
+        kw["max_nfev"] = max_nfev
+    sol = least_squares(_residuals_multi, p0, **kw)
+    X = tf.T_from_vec(sol.x[:6])
+    Tbbs = [tf.T_from_vec(sol.x[6 + 6 * i: 12 + 6 * i]) for i in range(n)]
+    return X, Tbbs, {"success": bool(sol.success), "cost": float(sol.cost)}
+
+
+@dataclass
+class MultiPlacementSolveResult:
+    X: np.ndarray
+    placement_Tbbs: list
+    placement_results: list
+    combined_metrics: dict
+    status: str
+    seed_placement_id: str
+
+
+def solve_multi_placement(placements, K, dist, board_pts, *,
+                          methods=None, reject_sigma=2.5, max_reject_frac=0.25,
+                          depth_weight=1.0, depth_sigma_m=0.005,
+                          anchor_Tbbs=None, progress_cb=None):
+    """Jointly calibrate X (T_eef_cam) across multiple board placements.
+
+    ``placements: list[tuple[str, list[Sample]]]`` — each element is a
+    ``(placement_id, samples)`` pair where the board is at a fixed but unknown
+    position for that placement.  A shared X is fit across all placements
+    simultaneously, with one independent Tbb (T_base_board) per placement.
+
+    ``anchor_Tbbs: dict[str, np.ndarray] | None`` — optional per-placement
+    head-measured board anchor, forwarded to :func:`solve` as ``anchor_Tbb``.
+
+    Algorithm:
+    1. Independent :func:`solve` per placement.
+    2. Seed the joint optimise from the placement with the lowest
+       ``trans_rmse_m`` (best per-placement result).
+    3. :func:`bundle_adjust_multi` over ALL original samples.
+    4. Aggregate per-placement :func:`evaluate` into combined RMS metrics.
+    5. :func:`gate` the combined metrics.
+
+    Raises ``ValueError`` if any placement has fewer than 6 samples.
+    """
+    short = [pid for pid, samples in placements if len(samples) < 6]
+    if short:
+        raise ValueError(f"placements with fewer than 6 samples: {short}")
+
+    placement_results = []
+    for pid, samples in placements:
+        anchor_Tbb = (anchor_Tbbs or {}).get(pid)
+        result = solve(samples, K, dist, board_pts,
+                       methods=methods,
+                       reject_sigma=reject_sigma,
+                       max_reject_frac=max_reject_frac,
+                       depth_weight=depth_weight,
+                       depth_sigma_m=depth_sigma_m,
+                       anchor_Tbb=anchor_Tbb,
+                       progress_cb=progress_cb)
+        placement_results.append(result)
+
+    seed_idx = int(np.argmin([r.metrics["trans_rmse_m"] for r in placement_results]))
+    seed_placement_id = placements[seed_idx][0]
+    best_result = placement_results[seed_idx]
+
+    placements_samples = [samples for _, samples in placements]
+    X_joint, Tbbs, _ = bundle_adjust_multi(
+        placements_samples, K, dist, board_pts,
+        X0=best_result.X,
+        Tbb0s=[r.Tbb for r in placement_results],
+        depth_weight=depth_weight,
+        depth_sigma_m=depth_sigma_m)
+
+    per_placement_metrics = [
+        evaluate(X_joint, Tbbs[i], placements_samples[i], K, dist, board_pts)
+        for i in range(len(placements))
+    ]
+    all_trans = [m["trans_rmse_m"] for m in per_placement_metrics]
+    all_rot = [m["rot_rmse_rad"] for m in per_placement_metrics]
+    all_repr = [m["reproj_px"] for m in per_placement_metrics]
+    combined_metrics = {
+        "trans_rmse_m": float(np.sqrt(np.mean(np.square(all_trans)))),
+        "rot_rmse_rad": float(np.sqrt(np.mean(np.square(all_rot)))),
+        "reproj_px": float(np.sqrt(np.mean(np.square(all_repr)))),
+    }
+
+    return MultiPlacementSolveResult(
+        X=X_joint,
+        placement_Tbbs=Tbbs,
+        placement_results=placement_results,
+        combined_metrics=combined_metrics,
+        status=gate(combined_metrics),
+        seed_placement_id=seed_placement_id,
+    )

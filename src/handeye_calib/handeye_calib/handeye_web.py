@@ -63,6 +63,8 @@ def _make_node_class():
     from handeye_calib.handeye_collect import CaptureSession
     from handeye_calib import waypoints as hwp
     from handeye_calib.waypoints import WaypointStore
+    from handeye_calib import handeye_sessions as hsx
+    from handeye_calib.placement_state import PlacementState, make_placement, slug_id  # noqa: F401
     # Detection + safety reuse from pan_tilt. aruco_detect's Detection does NOT
     # surface per-corner charuco pixels/IDs (only pose + corner count + reproj
     # RMS), so for capture we call cv2.aruco.CharucoDetector.detectBoard directly
@@ -435,9 +437,6 @@ def _make_node_class():
             self._head_frame_stamp = None
             self._head_K = None
             self._head_D = None
-            self._tbb_head = None          # 4x4 averaged T_base_board, or None
-            self._anchor_obs = []          # list of 4x4 per-snap T_base_board
-            self._anchor_scatter = None    # {"trans_mm","rot_deg","n"} or None
 
             self.bridge = CvBridge()
             self._frame = None
@@ -511,12 +510,16 @@ def _make_node_class():
             self._stability_since_frames = 0
 
             # Diversity threshold for the per-sample dedup gate (gates.is_diverse).
-            # Default lowered 2026-06-21 from 30° -> 5° because the all-vs-all
-            # 30° rule rejected ~half of any 20+ waypoint set regardless of
-            # actual input diversity (SO(3) packing limits). 5° still catches
-            # camera-shake duplicates of the same authored pose; set to 0 to
-            # disable the gate entirely.
-            self._diversity_target_deg = float(self._param("min_diversity_deg", 5.0))
+            # Default DISABLED (0°) 2026-06-28 at operator request: every
+            # authored, settled, detected position must be RECORDED — the dedup
+            # gate was silently dropping ~half of a 20+ waypoint set (its 30°->5°
+            # history below is the same SO(3)-packing problem in miniature).
+            # Redundant / inconsistent poses are now culled where they belong:
+            # at solve time by the per-axis MAD rejection + the per-sample
+            # residual view, not silently at capture. Set min_diversity_deg>0 to
+            # re-enable the old camera-shake dedup (5° catches duplicates of the
+            # same authored pose; 30° was the original, over-aggressive default).
+            self._diversity_target_deg = float(self._param("min_diversity_deg", 0.0))
 
             # Per-sample quality gates (gates.quality_ok). Exposed as ROS
             # params so the operator can dial without rebuilding when the
@@ -585,34 +588,36 @@ def _make_node_class():
             self._ffs_depth_warned = False
             self._ffs_depth_warn_after = int(self._param("ffs_depth_warn_after", 5))
 
-            self.session = CaptureSession(
-                min_diversity_deg=self._diversity_target_deg,
-                min_corners=self._min_corners,
-                max_reproj_px=self._max_reproj_px,
-                min_area_frac=self._min_area_frac,
-            )
+            # --- multi-placement state ---
+            _default_label = "default"
+            _default_id = "default"
+            self._placements = {
+                _default_id: make_placement(
+                    _default_label,
+                    min_diversity_deg=self._diversity_target_deg,
+                    min_corners=self._min_corners,
+                    max_reproj_px=self._max_reproj_px,
+                    min_area_frac=self._min_area_frac,
+                )
+            }
+            self._active_placement_id = _default_id
             self.last_solve = None
+            # JSON solve payload (not the raw SolveResult) cached so the WS push
+            # can rehydrate the Solve tab on reconnect/reload, and live MAD
+            # rejection progress streamed from hs.solve's progress callback.
+            self._last_solve_payload = None
+            self._solve_progress = {
+                "running": False, "phase": "idle", "n_orig": 0, "n_active": 0,
+                "min_keep": 0, "iteration": 0, "rejection_log": [],
+                "last_drop": None, "solve_ts": 0.0,
+            }
 
-            # T4: per-sample sidecars (kept parallel to ``self.session.samples``).
-            # ``_thumbs[idx]`` is a downscaled (~320 px wide) JPEG of the
-            # frame+overlay at capture time, served via /api/samples/{idx}/thumb.jpg.
-            # ``_sample_joints[idx]`` is the xArm joint snapshot at capture time
-            # (or None when /joint_states hasn't arrived yet).
-            # ``_sample_ts[idx]`` is a monotonic timestamp for the gallery row.
-            # All three are recompacted on delete so the keys stay 0..N-1.
-            self._thumbs = {}
-            self._sample_joints = {}
-            self._sample_ts = {}
-            # reproj_px + area_frac are scalars from the per-frame detection;
-            # the Sample dataclass doesn't keep them. Stash here for the
-            # gallery row so the operator can see quality at a glance.
-            self._sample_reproj_px = {}
-            self._sample_area_frac = {}
-            # Per-sample FFS depth provenance ('ffs' | 'unavailable' |
-            # 'shape-mismatch' | 'ffs-too-sparse' | 'moved-during-ffs' |
-            # 'disabled') so the gallery row shows whether each accepted sample
-            # actually carried metric depth.
-            self._sample_depth_source = {}
+            # Name of the on-disk capture session the live samples persist into
+            # (``<HANDEYE_DUMP_DIR|calibration_data>/wrist_handeye_sessions/<name>``).
+            # Lazily created at the first capture of an empty set and reset to
+            # None whenever the set is cleared, so each capture run is its own
+            # browsable history entry; set to an existing name by do_load_session.
+            self._session_name = None
 
             self._sx = int(self._param("squares_x", 5))
             self._sy = int(self._param("squares_y", 5))
@@ -699,6 +704,115 @@ def _make_node_class():
             self.sequence_runner = None
 
             self.get_logger().info("handeye_web node ready")
+
+        # ---- multi-placement properties -------------------------------------
+
+        @property
+        def _active_placement(self) -> PlacementState:
+            return self._placements[self._active_placement_id]
+
+        @property
+        def session(self):
+            return self._active_placement.session
+
+        @property
+        def _thumbs(self):
+            return self._active_placement.thumbs
+
+        @property
+        def _sample_joints(self):
+            return self._active_placement.sample_joints
+
+        @property
+        def _sample_ts(self):
+            return self._active_placement.sample_ts
+
+        @property
+        def _sample_reproj_px(self):
+            return self._active_placement.sample_reproj_px
+
+        @property
+        def _sample_area_frac(self):
+            return self._active_placement.sample_area_frac
+
+        @property
+        def _sample_depth_source(self):
+            return self._active_placement.sample_depth_source
+
+        @property
+        def _anchor_obs(self):
+            return self._active_placement.anchor_obs
+
+        @_anchor_obs.setter
+        def _anchor_obs(self, v):
+            self._active_placement.anchor_obs = v
+
+        @property
+        def _tbb_head(self):
+            return self._active_placement.tbb_head
+
+        @_tbb_head.setter
+        def _tbb_head(self, v):
+            self._active_placement.tbb_head = v
+
+        @property
+        def _anchor_scatter(self):
+            return self._active_placement.anchor_scatter
+
+        @_anchor_scatter.setter
+        def _anchor_scatter(self, v):
+            self._active_placement.anchor_scatter = v
+
+        # ---- placement management -------------------------------------------
+
+        def do_add_placement(self, label: str) -> dict:
+            """Create and activate a new empty placement. Returns {ok, id, label, count}."""
+            label = str(label).strip()
+            if not label:
+                return {"ok": False, "reason": "label must be non-empty"}
+            with self.lock:
+                pid = slug_id(label, set(self._placements.keys()))
+                self._placements[pid] = make_placement(
+                    label,
+                    min_diversity_deg=self._diversity_target_deg,
+                    min_corners=self._min_corners,
+                    max_reproj_px=self._max_reproj_px,
+                    min_area_frac=self._min_area_frac,
+                )
+                self._active_placement_id = pid
+                count = len(self._placements)
+            return {"ok": True, "id": pid, "label": label, "count": count}
+
+        def do_activate_placement(self, pid: str) -> dict:
+            """Switch active placement. Returns {ok, id}."""
+            with self.lock:
+                if pid not in self._placements:
+                    return {"ok": False, "reason": f"placement {pid!r} not found"}
+                self._active_placement_id = pid
+            return {"ok": True, "id": pid}
+
+        def do_rename_placement(self, pid: str, new_label: str) -> dict:
+            """Rename a placement label. Returns {ok, id, label}."""
+            new_label = str(new_label).strip()
+            if not new_label:
+                return {"ok": False, "reason": "label must be non-empty"}
+            with self.lock:
+                if pid not in self._placements:
+                    return {"ok": False, "reason": f"placement {pid!r} not found"}
+                self._placements[pid].label = new_label
+            return {"ok": True, "id": pid, "label": new_label}
+
+        def do_delete_placement(self, pid: str) -> dict:
+            """Remove a placement. Cannot remove the only one. Returns {ok, deleted}."""
+            with self.lock:
+                if len(self._placements) <= 1:
+                    return {"ok": False, "reason": "cannot delete the only placement"}
+                if pid not in self._placements:
+                    return {"ok": False, "reason": f"placement {pid!r} not found"}
+                del self._placements[pid]
+                if self._active_placement_id == pid:
+                    self._active_placement_id = next(iter(self._placements))
+            return {"ok": True, "deleted": pid}
 
         # ---- param helper ----------------------------------------------------
 
@@ -960,6 +1074,9 @@ def _make_node_class():
                 self._sample_reproj_px.clear()
                 self._sample_area_frac.clear()
                 self._sample_depth_source.clear()
+                # Detach from the current on-disk session (left intact as
+                # history) so the next capture starts a fresh session entry.
+                self._session_name = None
                 self._cap = None
                 self._last_corners_xy = None
                 self._last_det = None
@@ -1348,6 +1465,9 @@ def _make_node_class():
                         else list(self._xarm_joint_positions))
                 camera_connected = self._frame is not None
                 intrinsics_ok = self._K is not None
+                # Active intrinsics for the Coverage canvas (3x3 -> JSON list).
+                K_snapshot = (None if self._K is None
+                              else [[float(v) for v in row] for row in self._K])
                 samples_snapshot = list(self.session.samples)
                 num_samples = len(samples_snapshot)
                 last_det = self._last_det
@@ -1359,6 +1479,12 @@ def _make_node_class():
                 reproj_by_idx = dict(self._sample_reproj_px)
                 area_by_idx = dict(self._sample_area_frac)
                 depth_src_by_idx = dict(self._sample_depth_source)
+                # Cached solve payload (rehydrates the Solve tab on reconnect) +
+                # live MAD progress snapshot (shallow-copy rejection_log list).
+                last_solve_payload = self._last_solve_payload
+                solve_progress = dict(self._solve_progress)
+                solve_progress["rejection_log"] = list(
+                    solve_progress.get("rejection_log") or [])
 
             # frame_hz: rolling rate across the deque. Need >= 2 timestamps to
             # measure a delta; falls back to 0.0 on a cold start.
@@ -1448,10 +1574,12 @@ def _make_node_class():
                 stability=stability,
                 samples=samples_metadata,
                 diversity=diversity,
-                last_solve=None,  # T5 populates this from the last solve result
+                last_solve=last_solve_payload,  # cached JSON payload (rehydrate)
                 safety_preview=safety_preview,
                 waypoints=waypoints_meta,
                 sequence=sequence_state,
+                K=K_snapshot,
+                solve_progress=solve_progress,
             )
             # Runtime config (calib_frame + depth knobs + emitter) for the
             # Settings controls on the Info tab.
@@ -1818,6 +1946,11 @@ def _make_node_class():
                     self._sample_area_frac[idx] = float(cap["area_frac"])
                     self._sample_depth_source[idx] = depth_source
                 num = len(self.session.samples)
+            if ok:
+                # Persist the capture to disk immediately (outside the lock —
+                # _persist_session re-acquires it) so a restart/crash can't lose
+                # it and the history browser can re-open it.
+                self._persist_session()
             return {"ok": ok, "reason": reason, "depth_source": depth_source,
                     "n_consensus_frames": n_consensus,
                     "num_samples": num}
@@ -1847,31 +1980,34 @@ def _make_node_class():
                 samples.pop(idx)
                 # Recompact thumbnails + joint snapshots + ts: shift down
                 # every key > idx, drop the popped one.
-                self._thumbs = {
+                self._active_placement.thumbs = {
                     (k if k < idx else k - 1): v
                     for k, v in self._thumbs.items() if k != idx
                 }
-                self._sample_joints = {
+                self._active_placement.sample_joints = {
                     (k if k < idx else k - 1): v
                     for k, v in self._sample_joints.items() if k != idx
                 }
-                self._sample_ts = {
+                self._active_placement.sample_ts = {
                     (k if k < idx else k - 1): v
                     for k, v in self._sample_ts.items() if k != idx
                 }
-                self._sample_reproj_px = {
+                self._active_placement.sample_reproj_px = {
                     (k if k < idx else k - 1): v
                     for k, v in self._sample_reproj_px.items() if k != idx
                 }
-                self._sample_area_frac = {
+                self._active_placement.sample_area_frac = {
                     (k if k < idx else k - 1): v
                     for k, v in self._sample_area_frac.items() if k != idx
                 }
-                self._sample_depth_source = {
+                self._active_placement.sample_depth_source = {
                     (k if k < idx else k - 1): v
                     for k, v in self._sample_depth_source.items() if k != idx
                 }
                 num = len(samples)
+            # Re-persist (outside the lock) so session.json + thumbs/ on disk
+            # match the recompacted 0..N-1 indexing after the delete.
+            self._persist_session()
             return {"ok": True, "num_samples": num}
 
         def sample_thumb(self, idx):
@@ -1926,18 +2062,45 @@ def _make_node_class():
                 rs_kwarg = {"reject_sigma": None}
             else:
                 rs_kwarg = {"reject_sigma": float(reject_sigma)}
+            # Live MAD-rejection progress: reset, then stream each drop into
+            # _solve_progress (read by get_state_dict -> WS push) so the UI shows
+            # rejections AS THEY HAPPEN. _cb runs on this (executor) thread; the
+            # state read runs on the loop thread; self.lock serializes both.
+            with self.lock:
+                self._solve_progress = {
+                    "running": True, "phase": "start", "n_orig": len(samples),
+                    "n_active": len(samples), "min_keep": 0, "iteration": 0,
+                    "rejection_log": [], "last_drop": None, "solve_ts": 0.0,
+                }
+
+            def _cb(ev):
+                with self.lock:
+                    sp = self._solve_progress
+                    sp["running"] = True
+                    sp["phase"] = ev.get("phase", sp["phase"])
+                    for k in ("n_orig", "n_active", "min_keep", "iteration"):
+                        if ev.get(k) is not None:
+                            sp[k] = ev[k]
+                    if ev.get("phase") == "rejecting" and ev.get("last_drop"):
+                        sp["last_drop"] = ev["last_drop"]
+                        sp["rejection_log"] = sp["rejection_log"] + [ev["last_drop"]]
+
             try:
                 res = hs.solve(samples, K, D, self._board_pts,
                                methods=methods_subset,
                                **rs_kwarg,
                                depth_weight=self._depth_weight,
                                depth_sigma_m=self._depth_sigma_m,
-                               anchor_Tbb=anchor)
+                               anchor_Tbb=anchor,
+                               progress_cb=_cb)
             except Exception as exc:
                 # seed_handeye raises when every OpenCV method fails (e.g. all
                 # samples colinear); bundle_adjust may also blow up on a
                 # singular Jacobian. Surface the failure as a JSON-safe ok:False
                 # rather than a 500 the UI would render as a JSON.parse crash.
+                with self.lock:
+                    self._solve_progress["running"] = False
+                    self._solve_progress["phase"] = "error"
                 return {"ok": False,
                         "reason": f"solve failed ({type(exc).__name__}): {exc} — "
                                   "try collecting more diverse poses (vary EE rotation, "
@@ -1946,6 +2109,9 @@ def _make_node_class():
                 # Numerically valid (no exception) but the recovered transform
                 # is non-finite — JSONResponse would render plain-text 500.
                 # Don't cache it (Promote tab must not diff against NaN).
+                with self.lock:
+                    self._solve_progress["running"] = False
+                    self._solve_progress["phase"] = "error"
                 return {"ok": False,
                         "reason": "solve produced non-finite transform — add more "
                                   "diverse waypoints (vary EE rotation, not just "
@@ -1970,7 +2136,7 @@ def _make_node_class():
             # to eyeball; an outlier > 5x median is almost certainly the cause.
             try:
                 ps = payload.get("per_sample_reproj_px", [])
-                fmt = ", ".join(f"{v:.2f}" for v in ps if np.isfinite(v))
+                fmt = ", ".join(f"{v:.2f}" for v in ps if v is not None and np.isfinite(v))
                 # Per-sample camera-to-board distance (norm of T_cam_board
                 # translation). When board geometry matches the configured
                 # square_len_m, this clusters tightly around the physical
@@ -1982,34 +2148,245 @@ def _make_node_class():
                 d_fmt = ", ".join(f"{d:.3f}" for d in dists)
                 d_min, d_max = (min(dists), max(dists)) if dists else (0, 0)
                 d_spread_pct = 100.0 * (d_max - d_min) / max(d_min, 1e-6)
+                # Pan-tilt-style per-drop "why" lines (residual + robust-z).
+                rej_log = payload.get("rejection_log") or []
+                if rej_log:
+                    for r in rej_log:
+                        self.get_logger().info(
+                            f"  MAD reject sample #{r['idx']}: residual "
+                            f"{r['trans_mm']:.1f} mm / {r['rot_deg']:.2f} deg / "
+                            f"{r['reproj_px']:.1f} px (robust-z trans {r['z_trans']:.2f}, "
+                            f"rot {r['z_rot']:.2f}, reproj {r['z_reproj']:.2f})")
                 rej_str = (f" | rejected_indices={payload['rejected_indices']}"
                            if payload.get("rejected_indices") else "")
-                # FFS-depth usage: how many samples carried metric depth, and
-                # the honest depth-grounded held-out accuracy when present.
+                # FFS-depth usage: how many samples carried metric depth, and the
+                # depth-grounded accuracy when present (in-sample — no split).
                 n_depth_samples = sum(
                     1 for s in samples if getattr(s, "obs_xyz_cam", None) is not None)
-                held_depth = payload["heldout_metrics_mm_deg"].get("depth_point_rmse_mm")
-                # "monocular vs depth" keys off n_depth_samples (did ANY sample
-                # carry depth), not the held-out metric — the random train/test
-                # split can leave the held-out set depth-free even when depth was
-                # used in training, which must NOT read as "monocular solve".
+                depth_rmse = payload["metrics_mm_deg"].get("depth_point_rmse_mm")
                 if n_depth_samples == 0:
                     depth_str = f" | depth: 0/{len(samples)} samples (MONOCULAR solve)"
                 else:
-                    hd = (f"{held_depth:.2f}mm" if held_depth is not None
-                          else "n/a (no depth in held-out split)")
+                    hd = (f"{depth_rmse:.2f}mm" if depth_rmse is not None else "n/a")
                     depth_str = (f" | depth: {n_depth_samples}/{len(samples)} samples, "
-                                 f"held_depth_rmse={hd} (w={self._depth_weight})")
+                                 f"depth_rmse={hd} (w={self._depth_weight})")
                 self.get_logger().info(
                     f"solve: N={len(samples)} method={method_str} "
-                    f"train_trans={payload['train_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm "
-                    f"held_trans={payload['heldout_metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm | "
+                    f"trans={payload['metrics_mm_deg'].get('trans_rmse_mm', float('nan')):.2f}mm "
+                    f"rot={payload['metrics_mm_deg'].get('rot_rmse_deg', float('nan')):.2f}deg "
+                    f"reproj={payload['metrics_mm_deg'].get('reproj_px', float('nan')):.2f}px "
+                    f"(over {len(samples) - len(payload.get('rejected_indices') or [])} kept) | "
                     f"per-sample reproj_px=[{fmt}] | "
                     f"cam-board-dist_m=[{d_fmt}] (spread {d_spread_pct:.1f}%)"
                     f"{depth_str}{rej_str}")
             except Exception:
                 pass  # diagnostic only — never fail the solve over a log line
+            try:
+                self._dump_solve(samples, res, payload)
+            except Exception as exc:  # persistence is best-effort, never blocks
+                self.get_logger().warn(f"solve dump failed: {exc}")
+            # Fold the solve result into the browsable on-disk session too, so the
+            # history entry shows its verdict + per-sample residuals.
+            self._persist_session(res, payload)
+            # Cache the JSON payload + stamp it so the WS push can rehydrate the
+            # Solve tab on reconnect/reload (not just on the POST response), and
+            # mark progress done.
+            solve_ts = float(self._time.monotonic())
+            cached = dict(payload)
+            cached["solve_ts"] = solve_ts
+            with self.lock:
+                self._last_solve_payload = cached
+                self._solve_progress["running"] = False
+                self._solve_progress["phase"] = "done"
+                self._solve_progress["solve_ts"] = solve_ts
             return {"ok": True, **payload}
+
+        def _build_session_dict(self, samples, res=None, payload=None):
+            """Serialize the live capture (+ optional solve result) into the
+            canonical session dict written to disk. ``res``/``payload`` None at
+            capture time (samples only); populated at solve time."""
+            import time
+            np = self._np
+
+            def m2l(M):
+                return None if M is None else np.asarray(M, float).tolist()
+
+            samp = []
+            for i, s in enumerate(samples):
+                samp.append({
+                    "idx": i,
+                    "T_base_eef": m2l(s.T_base_eef),
+                    "T_cam_board": m2l(s.T_cam_board),
+                    "obs_px": m2l(s.obs_px),
+                    "corner_idx": np.asarray(s.corner_idx).astype(int).tolist(),
+                    "obs_xyz_cam": m2l(getattr(s, "obs_xyz_cam", None)),
+                    "capture_reproj_px": self._sample_reproj_px.get(i),
+                    "depth_source": self._sample_depth_source.get(i),
+                    "joints": self._sample_joints.get(i),
+                })
+            out = {
+                "schema": "wrist_handeye_session/1",
+                "timestamp": time.strftime("%Y%m%d_%H%M%S"),
+                "robot": self._robot_name,
+                "calib_frame": self._calib_frame,
+                "board": {"squares_x": self._sx, "squares_y": self._sy,
+                          "square_len_m": self._sq,
+                          "aruco_dict": self._aruco_dict_name},
+                "K": m2l(self._K), "D": m2l(self._D),
+                "anchor_have": self._tbb_head is not None,
+                "Tbb_head": m2l(self._tbb_head),
+                "samples": samp,
+            }
+            if res is not None:
+                p = payload or {}
+                out["result"] = {
+                    "status": res.status,
+                    "seed_used": getattr(res, "seed_used", ""),
+                    "rejected_sample_indices": list(
+                        getattr(res, "rejected_indices", None) or []),
+                    "rejection_log": list(getattr(res, "rejection_log", None) or []),
+                    "X_eef_cam": m2l(res.X),
+                    "Tbb_base_board": m2l(res.Tbb),
+                    "metrics": res.metrics,
+                    "per_sample_reproj_px": p.get("per_sample_reproj_px"),
+                    "per_sample_trans_mm": p.get("per_sample_trans_mm"),
+                    "per_sample_rot_deg": p.get("per_sample_rot_deg"),
+                    "observability": p.get("observability"),
+                    "X_xyz_mm": p.get("X_xyz_mm"),
+                    "X_rpy_deg": p.get("X_rpy_deg"),
+                }
+            return out
+
+        def _persist_session(self, res=None, payload=None):
+            """Write the live capture (+ optional solve) to its on-disk session
+            dir so a restart/crash never loses captures and the history browser
+            can re-open them. Lazily names the session at the first persisted
+            capture. Best-effort: a disk hiccup must never break capture/solve."""
+            try:
+                import os as _os
+                import time
+                with self.lock:
+                    if not self.session.samples and self._session_name is None:
+                        return  # nothing to persist yet
+                    if self._session_name is None:
+                        # Timestamped to the second; dedup against existing dirs
+                        # so a clear+recapture within one second can't collide.
+                        base_name = hsx.new_session_name(time.localtime())
+                        name = base_name
+                        k = 1
+                        while _os.path.isdir(hsx.session_dir(name)):
+                            k += 1
+                            name = f"{base_name}_{k}"
+                        self._session_name = name
+                    name = self._session_name
+                    out = ws.json_safe(self._build_session_dict(
+                        self.session.samples, res, payload))
+                    thumbs = dict(self._thumbs)
+                hsx.write_session(name, out)
+                hsx.rewrite_thumbs(name, thumbs)
+                return name
+            except Exception as exc:  # pragma: no cover - persistence is best-effort
+                self.get_logger().warn(f"session persist failed: {exc}")
+                return None
+
+        def _dump_solve(self, samples, res, payload):
+            """Flat per-solve replay archive (one timestamped file under
+            ``$HANDEYE_DUMP_DIR``/``calibration_data`` ``/wrist_handeye_dumps``),
+            kept alongside the browsable session dir for offline re-analysis.
+            Best-effort — the caller guards exceptions."""
+            import os
+            import json
+            import time
+            root = os.environ.get("HANDEYE_DUMP_DIR", "calibration_data")
+            ddir = os.path.join(root, "wrist_handeye_dumps")
+            os.makedirs(ddir, exist_ok=True)
+            out = self._build_session_dict(samples, res, payload)
+            path = os.path.join(ddir, f"solve_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            with open(path, "w") as f:
+                json.dump(ws.json_safe(out), f, indent=2)
+            self.get_logger().info(f"solve dump saved: {os.path.abspath(path)}")
+
+        def do_load_session(self, name):
+            """Re-hydrate a historical capture session into the LIVE state so it
+            can be inspected and RE-SOLVED with the current solver. Restores the
+            samples, per-sample sidecars, thumbnails, intrinsics/board, and head
+            anchor from disk, and points the active session name at ``name`` so a
+            subsequent solve folds its result back into the same history entry."""
+            import os as _os
+            np = self._np
+            try:
+                data = hsx.read_session(name)
+            except Exception as exc:
+                return {"ok": False, "reason": f"load failed: {exc}"}
+
+            def l2m(v):
+                return None if v is None else np.asarray(v, float)
+
+            raw_samples = data.get("samples") or []
+            rebuilt = []
+            for s in raw_samples:
+                rebuilt.append(hm.Sample(
+                    np.asarray(s["T_base_eef"], float),
+                    np.asarray(s["T_cam_board"], float),
+                    np.asarray(s["obs_px"], float),
+                    np.asarray(s["corner_idx"], int),
+                    obs_xyz_cam=l2m(s.get("obs_xyz_cam")),
+                    obs_xyz_valid=None))
+            cf = data.get("calib_frame")
+            with self.lock:
+                self.session.samples = rebuilt
+                self._active_placement.thumbs = {}
+                self._active_placement.sample_joints = {}
+                self._active_placement.sample_ts = {}
+                self._active_placement.sample_reproj_px = {}
+                self._active_placement.sample_area_frac = {}
+                self._active_placement.sample_depth_source = {}
+                t0 = float(self._time.monotonic())
+                for i, s in enumerate(raw_samples):
+                    self._sample_reproj_px[i] = s.get("capture_reproj_px")
+                    self._sample_depth_source[i] = s.get("depth_source")
+                    self._sample_joints[i] = s.get("joints")
+                    self._sample_ts[i] = t0 + i
+                    try:
+                        tp = hsx.thumb_path(name, i)
+                        if _os.path.isfile(tp):
+                            with open(tp, "rb") as f:
+                                self._thumbs[i] = f.read()
+                    except Exception:
+                        pass  # a missing thumb just shows the placeholder
+                # Restore intrinsics + board from the session so an immediate
+                # re-solve uses the geometry the samples were captured with.
+                b = data.get("board") or {}
+                if b:
+                    self._sx = int(b.get("squares_x", self._sx))
+                    self._sy = int(b.get("squares_y", self._sy))
+                    self._sq = float(b.get("square_len_m", self._sq))
+                    self._board_pts = hm.board_corners(self._sx, self._sy, self._sq)
+                if data.get("K") is not None:
+                    self._K = np.asarray(data["K"], float)
+                self._D = l2m(data.get("D"))
+                if data.get("Tbb_head") is not None:
+                    self._tbb_head = np.asarray(data["Tbb_head"], float)
+                if cf in ("color", "ir"):
+                    self._calib_frame = cf
+                self._session_name = name
+                self.last_solve = None  # stale: belongs to a different capture
+                num = len(self.session.samples)
+            self.get_logger().info(
+                f"loaded session {name!r}: {num} samples (calib_frame={cf})")
+            return {"ok": True, "name": name, "num_samples": num, "calib_frame": cf}
+
+        def do_delete_session(self, name):
+            """Delete a historical session directory. Detaches the live session
+            name if it pointed at the deleted one."""
+            try:
+                existed = hsx.delete_session(name)
+            except Exception as exc:
+                return {"ok": False, "reason": f"delete failed: {exc}"}
+            with self.lock:
+                if self._session_name == name:
+                    self._session_name = None
+            return {"ok": bool(existed), "deleted": name}
 
         # ---- T1-wp: waypoint CRUD + per-robot YAML persistence ---------------
 
@@ -2588,7 +2965,7 @@ def _make_node_class():
             T_eef_color = np.asarray(T_eef_mount) @ self._mount_to_color_matrix()
             proposed_dict = ah.handeye_yaml_dict(
                 T_eef_mount, T_eef_color, len(self.session.samples),
-                self.last_solve.heldout_metrics,
+                self.last_solve.metrics,
                 date=self._calibration_date_or_unset(),
                 square_len_m=self._sq,
             )
@@ -2887,12 +3264,14 @@ def make_app(node):
     degrade gracefully (return {"ok": False, ...}) when no hardware is present.
     """
     import asyncio
+    import os
     from pathlib import Path
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, Response
     from fastapi.responses import JSONResponse as _RawJSONResponse
     from fastapi.staticfiles import StaticFiles
     from handeye_calib import web_support as ws
+    from handeye_calib import handeye_sessions as hsx
 
     def JSONResponse(content, *args, **kwargs):
         # Boundary scrub: Starlette renders with ``allow_nan=False`` so a
@@ -2908,11 +3287,24 @@ def make_app(node):
     # package_data hook (see setup.py), so `Path(__file__).parent / "webui"`
     # resolves both from the source tree and the install tree.
     webui_dir = Path(__file__).resolve().parent / "webui"
-    app.mount("/static", StaticFiles(directory=str(webui_dir)), name="static")
+    app.mount("/static", StaticFiles(directory=str(webui_dir), html=False), name="static")
+
+    # Serve the two files that change between sessions with no-store so the
+    # browser never serves stale JS or HTML after an update.
+    @app.get("/static/app.js")
+    def _app_js():
+        return FileResponse(str(webui_dir / "app.js"), media_type="application/javascript",
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/static/index.html")
+    def _static_index():
+        return FileResponse(str(webui_dir / "index.html"), media_type="text/html",
+                            headers={"Cache-Control": "no-store"})
 
     @app.get("/")
     def index():
-        return FileResponse(str(webui_dir / "index.html"), media_type="text/html")
+        return FileResponse(str(webui_dir / "index.html"), media_type="text/html",
+                            headers={"Cache-Control": "no-store"})
 
     @app.get("/api/state")
     def state():
@@ -2976,9 +3368,17 @@ def make_app(node):
                 rs = float(raw) if raw is not None else None
             except (TypeError, ValueError):
                 rs = "default"
-        return JSONResponse(node.do_solve(
-            method=body_d.get("method", "auto"),
-            reject_sigma=rs))
+        # Offload the (blocking, multi-second, iterative) solve to a worker
+        # thread so the asyncio event loop stays free to keep pushing /ws state
+        # frames — that is what lets the UI show MAD rejections AS THEY HAPPEN
+        # (do_solve streams progress into _solve_progress, surfaced by the push).
+        # Mirrors the board_pose_check / mount_test / set_config offload below.
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: node.do_solve(method=body_d.get("method", "auto"),
+                                  reject_sigma=rs))
+        return JSONResponse(result)
 
     @app.post("/api/anchor")
     async def anchor(request: Request):
@@ -2987,6 +3387,44 @@ def make_app(node):
     @app.post("/api/anchor/clear")
     async def anchor_clear(request: Request):
         return JSONResponse(ws.json_safe(node.do_clear_anchor()))
+
+    # ---- Capture-session history (browse/re-open past captures) -------------
+    # Mirrors pan_tilt/calib_web.py's session browser: every capture is persisted
+    # to <HANDEYE_DUMP_DIR|calibration_data>/wrist_handeye_sessions/<name>/ so the
+    # operator can list past captures, inspect their gallery + solve verdict, and
+    # re-load one into the live session to re-solve with the current solver.
+    @app.get("/api/sessions")
+    def sessions_list():
+        return JSONResponse(ws.json_safe({"ok": True, "sessions": hsx.list_sessions()}))
+
+    @app.get("/api/sessions/{name}")
+    def sessions_detail(name: str):
+        try:
+            data = hsx.read_session(name)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "reason": f"no such session: {exc}"},
+                                status_code=404)
+        return JSONResponse(ws.json_safe({"ok": True, **data}))
+
+    @app.get("/api/sessions/{name}/samples/{idx}/thumb.jpg")
+    def sessions_thumb(name: str, idx: int):
+        try:
+            p = hsx.thumb_path(name, idx)
+        except Exception:
+            p = None
+        if p and os.path.isfile(p):
+            with open(p, "rb") as f:
+                return Response(content=f.read(), media_type="image/jpeg")
+        return Response(content=ws.placeholder_jpeg("no thumb"),
+                        media_type="image/jpeg")
+
+    @app.post("/api/sessions/{name}/load")
+    def sessions_load(name: str):
+        return JSONResponse(ws.json_safe(node.do_load_session(name)))
+
+    @app.delete("/api/sessions/{name}")
+    def sessions_delete(name: str):
+        return JSONResponse(ws.json_safe(node.do_delete_session(name)))
 
     @app.post("/api/promote")
     def promote():

@@ -9,7 +9,7 @@ pan_tilt_controller:
     pan_min_deg: -180.0
     pan_max_deg: 180.0
     tilt_min_deg: -30.0
-    tilt_max_deg: 30.0
+    tilt_max_deg: 90.0
     default_speed_raw: 240
     default_accel_raw: 40
     send_force_gimbal_on_startup: true

@@ -214,8 +214,7 @@ def _forge_last_solve(node):
     from handeye_calib.handeye_solve import SolveResult
     node.last_solve = SolveResult(
         X=np.eye(4), Tbb=np.eye(4),
-        train_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
-        heldout_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
+        metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
         status="PASS", per_method=[])
 
 
@@ -473,6 +472,31 @@ def test_do_capture_ffs_branch_stores_depth():
         node.destroy_node()
 
 
+def test_capture_requires_min_steady_frames():
+    """Settle floor (pan-tilt parity): the manual capture gate must wait for
+    >= capture_min_steady_frames CONSECUTIVE steady frames, not fire on the
+    first steady verdict. Below the floor -> rejected with the steady-frame
+    reason and no sample stored; at/above the floor -> captures normally."""
+    node, _ = _client()
+    try:
+        _prime_for_capture(node)
+        node._try_ffs_depth = lambda: np.full((48, 64), 0.5, np.float32)
+        node._capture_min_steady_frames = 5
+        # Steady, but the verdict has only held 3 frames -> below the floor.
+        node._stability_since_frames = 3
+        out = node.do_capture()
+        assert out["ok"] is False
+        assert "3/5" in out["reason"] and "steady frames" in out["reason"]
+        assert len(node.session.samples) == 0
+        # Held for the full floor -> captures.
+        node._stability_since_frames = 5
+        out2 = node.do_capture()
+        assert out2["ok"] is True
+        assert len(node.session.samples) == 1
+    finally:
+        node.destroy_node()
+
+
 def test_do_capture_shape_mismatch_falls_back_monocular():
     node, _ = _client()
     try:
@@ -543,8 +567,7 @@ def test_promote_yaml_invariant_across_calib_frame(monkeypatch):
             node._calib_frame = frame
             node.last_solve = SolveResult(
                 X=X, Tbb=np.eye(4),
-                train_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
-                heldout_metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
+                metrics={"trans_rmse_m": 0.001, "rot_rmse_rad": 0.001, "reproj_px": 0.5},
                 status="PASS", per_method=[])
             diff = node.compute_promote_diff()
             return _yaml.safe_load(diff["yaml"]["proposed_text"])["hand_eye"]
@@ -730,14 +753,14 @@ def test_json_response_scrubs_nan_inf():
         node.do_solve = lambda method="auto", reject_sigma=None: {
             "ok": True,
             "X_xyz_mm": [1.0, float("nan"), float("inf")],
-            "train_metrics": {"trans_rmse_m": float("nan"), "reproj_px": 0.5},
+            "metrics": {"trans_rmse_m": float("nan"), "reproj_px": 0.5},
             "per_sample_reproj_px": [0.1, float("nan"), 0.2],
         }
         r = c.post("/api/solve", json={"method": "auto"})
         assert r.status_code == 200
         body = r.json()  # would raise pre-fix
         assert body["X_xyz_mm"] == [1.0, None, None]
-        assert body["train_metrics"]["trans_rmse_m"] is None
+        assert body["metrics"]["trans_rmse_m"] is None
         assert body["per_sample_reproj_px"][1] is None
     finally:
         node.destroy_node()
@@ -781,5 +804,37 @@ def test_pnp_ippe_refine_recovers_known_pose():
         assert T_rec is not None
         assert np.linalg.norm(T_rec[:3, 3] - T[:3, 3]) < 1e-3
         assert reproj < 0.5
+    finally:
+        node.destroy_node()
+
+
+def test_state_emits_K_and_per_sample_T_cam_board_and_solve_progress():
+    """Coverage canvas needs state.K + samples[].T_cam_board; live MAD viz needs
+    state.solve_progress. Inject samples + intrinsics (no hardware) and assert
+    the wire payload carries all three."""
+    from handeye_calib import handeye_model as hm
+    node, c = _client()
+    try:
+        with node.lock:
+            node._K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1]])
+            T = np.eye(4); T[2, 3] = 0.5
+            node.session.samples = [hm.Sample(np.eye(4), T, np.zeros((4, 2)), np.arange(4))
+                                    for _ in range(3)]
+        st = c.get("/api/state").json()
+        assert st["K"] is not None and len(st["K"]) == 3 and len(st["K"][0]) == 3
+        assert "solve_progress" in st
+        assert len(st["samples"]) == 3
+        assert st["samples"][0]["T_cam_board"] is not None
+        assert len(st["samples"][0]["T_cam_board"]) == 4
+    finally:
+        node.destroy_node()
+
+
+def test_state_K_is_none_without_camera():
+    node, c = _client()
+    try:
+        st = c.get("/api/state").json()
+        assert st["K"] is None  # no camera -> no intrinsics, but key present
+        assert "solve_progress" in st
     finally:
         node.destroy_node()

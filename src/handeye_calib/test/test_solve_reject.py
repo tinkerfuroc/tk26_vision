@@ -32,8 +32,7 @@ def test_clean_data_rejects_nothing_by_default():
     vetoes the drop.  The solve must still PASS.
     """
     sc = syn.make_scenario(n_poses=20, pixel_noise=0.3, seed=11)
-    res = hs.solve(sc.samples, sc.K, None, sc.board_pts,
-                   heldout_frac=0.25, rng_seed=0)   # default reject_sigma=2.5
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts)   # default reject_sigma=2.5
     assert _get_rejected(res) == [], "clean noisy data must not reject any sample"
     assert res.status == "PASS"
 
@@ -48,7 +47,7 @@ def test_clean_data_rejects_nothing_multiseed(seed):
     flags so NO clean seed drops a sample.
     """
     sc = syn.make_scenario(n_poses=20, pixel_noise=0.3, seed=seed)
-    res = hs.solve(sc.samples, sc.K, None, sc.board_pts, heldout_frac=0.25, rng_seed=0)
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts)
     rejected = next((m["rejected_indices"] for m in (res.per_method or [])
                      if m.get("name") == "rejected_indices"), [])
     assert rejected == [], f"seed {seed} spuriously dropped clean sample(s): {rejected}"
@@ -57,28 +56,21 @@ def test_clean_data_rejects_nothing_multiseed(seed):
 def test_default_rejection_catches_translation_fk_outlier():
     """Default rejection catches a sample whose FK translation is corrupted.
 
-    Inject a ~5 cm pure-translation error into one TRAIN-split sample, leaving
-    the wrist PnP (T_cam_board) untouched.  The translation chain error for that
-    sample is large while the other clean samples constrain X/Tbb well, so the
-    single-worst-drop loop must flag and reject it.
+    Inject a ~5 cm pure-translation error into one sample, leaving the wrist PnP
+    (T_cam_board) untouched.  The translation chain error for that sample is
+    large while the other clean samples constrain X/Tbb well, so the all-sample
+    single-worst-drop loop must flag and reject it — and that specific sample.
     """
     sc = syn.make_scenario(n_poses=22, pixel_noise=0.3, seed=7)
-    # Pre-compute which original-list indices land in the train split (rng_seed=0).
-    rng = np.random.default_rng(0)
-    shuffled = np.arange(len(sc.samples))
-    rng.shuffle(shuffled)
-    n_te = max(1, int(round(len(sc.samples) * 0.2)))
-    train_orig_idxs = sorted(shuffled[n_te:].tolist())
-    # Corrupt the first train sample's FK translation by 5 cm.
-    bad = train_orig_idxs[0]
+    bad = 5
     bad_T = sc.samples[bad].T_base_eef.copy()
     bad_T[:3, 3] += 0.05  # 5 cm pure translation shift
     corrupted = list(sc.samples)
     corrupted[bad] = dataclasses.replace(sc.samples[bad], T_base_eef=bad_T)
     # Solve with default reject_sigma=2.5 — the outlier must be caught.
-    res = hs.solve(corrupted, sc.K, None, sc.board_pts, rng_seed=0)
+    res = hs.solve(corrupted, sc.K, None, sc.board_pts)
     rejected = _get_rejected(res)
-    assert len(rejected) > 0, "FK-translation outlier should have been rejected"
+    assert bad in rejected, f"FK-translation outlier #{bad} should be rejected; got {rejected}"
 
 
 def test_translation_zscore_specifically_fires_on_spiked_sample():
@@ -107,26 +99,72 @@ def test_translation_zscore_specifically_fires_on_spiked_sample():
     assert zt[k] >= zr[k], "translation axis must be the trigger, not rotation"
 
 
-def test_heldout_unaffected_by_rejection():
-    """Held-out metrics are identical whether rejection is on or off when it's a no-op.
+def test_rejection_is_noop_on_clean_data():
+    """Default rejection (2.5) must be a numerical no-op on clean data.
 
-    On realistic-noise clean data (proven a no-op by the clean-data test), the
-    solved X/Tbb and the test split are identical between the two calls, so every
-    held-out metric must be numerically identical.  This proves the held-out
-    evaluator is never reached by the rejection loop.
+    On realistic-noise clean data (proven zero-reject by the clean-data test),
+    turning rejection on must not change X/Tbb or the residual at all — every
+    metric must match the ``reject_sigma=None`` solve bit-for-bit. There is no
+    train/held-out split anymore; the whole set is fit either way.
     """
     sc = syn.make_scenario(n_poses=20, pixel_noise=0.3, seed=11)
-    res_on = hs.solve(sc.samples, sc.K, None, sc.board_pts,
-                      heldout_frac=0.25, rng_seed=0)             # default 2.5
-    res_off = hs.solve(sc.samples, sc.K, None, sc.board_pts,
-                       heldout_frac=0.25, rng_seed=0, reject_sigma=None)
+    res_on = hs.solve(sc.samples, sc.K, None, sc.board_pts)               # default 2.5
+    res_off = hs.solve(sc.samples, sc.K, None, sc.board_pts, reject_sigma=None)
     np.testing.assert_allclose(
-        res_on.heldout_metrics["trans_rmse_m"],
-        res_off.heldout_metrics["trans_rmse_m"],
-        atol=1e-12,
-        err_msg="heldout trans_rmse_m must match: rejection was not a no-op")
+        res_on.metrics["trans_rmse_m"], res_off.metrics["trans_rmse_m"],
+        atol=1e-12, err_msg="trans_rmse_m must match: rejection was not a no-op")
     np.testing.assert_allclose(
-        res_on.heldout_metrics["rot_rmse_rad"],
-        res_off.heldout_metrics["rot_rmse_rad"],
-        atol=1e-12,
-        err_msg="heldout rot_rmse_rad must match: rejection was not a no-op")
+        res_on.metrics["rot_rmse_rad"], res_off.metrics["rot_rmse_rad"],
+        atol=1e-12, err_msg="rot_rmse_rad must match: rejection was not a no-op")
+
+
+def test_reproj_axis_rejects_mount_inconsistent_poses():
+    """A pose whose camera->flange transform is inconsistent with the rest
+    (mid-ring / mount-flex capture) shows up as a high REPROJECTION outlier
+    even when its chain-rotation error sits below the 3 deg floor. The new
+    reprojection rejection axis must catch it; clean poses must NOT be dropped;
+    and rejected indices are ORIGINAL sample indices."""
+    from handeye_calib import synthetic as syn, handeye_solve as hs
+    from handeye_calib import transforms as tf, handeye_model as hm
+    sc = syn.make_scenario(n_poses=18, pixel_noise=0.3, seed=5)
+    bad = {2, 7, 11, 15}
+    rng = np.random.default_rng(1)
+    for i in bad:
+        s = sc.samples[i]
+        ax = rng.normal(size=3); ax /= np.linalg.norm(ax)
+        # ~1.5 deg board-pose rotation (below the 3 deg chain-rot floor), with
+        # obs_px reprojected to match -> clean per-frame detection, but globally
+        # inconsistent => high calibration reproj.
+        s.T_cam_board = s.T_cam_board @ tf.T_from_vec(
+            np.concatenate([np.radians(1.5) * ax, np.zeros(3)]))
+        s.obs_px = hm.project_corners(sc.board_pts[s.corner_idx], s.T_cam_board, sc.K)
+    res = hs.solve(sc.samples, sc.K, None, sc.board_pts)
+    assert res.rejected_indices, "reproj-inconsistent poses should be rejected"
+    assert set(res.rejected_indices).issubset(bad), \
+        f"rejection wrongly dropped a clean pose: {set(res.rejected_indices) - bad}"
+
+
+def test_outlier_is_rejected_regardless_of_position():
+    """REGRESSION (pan-tilt parity / live-data symptom): MAD screens ALL samples,
+    so an outlier is weeded out no matter where it sits in the list.
+
+    Pre-fix, rejection ran on the train split only, so a corrupted sample that
+    shuffled into the held-out 20% was never scored — it survived as a glaring
+    residual in the per-sample view (the exact live-data symptom: a 26 px point
+    MAD 'failed' to weed out). With no split and full-set screening, every
+    position is screened. Corrupt the LAST sample (which the old train/test
+    shuffle could push into held-out) and assert it is caught.
+    """
+    sc = syn.make_scenario(n_poses=22, pixel_noise=0.3, seed=7)
+    bad = len(sc.samples) - 1
+    bad_T = sc.samples[bad].T_base_eef.copy()
+    bad_T[:3, 3] += 0.05   # 5 cm pure translation
+    corrupted = list(sc.samples)
+    corrupted[bad] = dataclasses.replace(sc.samples[bad], T_base_eef=bad_T)
+    res = hs.solve(corrupted, sc.K, None, sc.board_pts)
+    assert bad in (res.rejected_indices or []), (
+        f"outlier #{bad} must be screened out by all-sample MAD; "
+        f"got rejected={res.rejected_indices}")
+    # And the per-drop diagnostic must explain WHY (residual + robust-z).
+    logged = {r["idx"] for r in (res.rejection_log or [])}
+    assert bad in logged, "rejection_log must record the dropped sample's residual+z"

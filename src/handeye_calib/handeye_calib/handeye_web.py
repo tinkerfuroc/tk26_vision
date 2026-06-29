@@ -147,6 +147,11 @@ def _make_node_class():
                                             self.SETTLE_STEADY_TICKS))
             self.poll_s = float(getattr(node, "_settle_poll_s",
                                         self.SETTLE_POLL_S))
+            # Frame-based settle floor shared with the manual capture gate: the
+            # cached steady verdict must have HELD for this many consecutive
+            # frames before settle is declared (in addition to the poll hold).
+            self.min_steady_frames = int(getattr(node,
+                                         "_capture_min_steady_frames", 5))
             self._state = {
                 "running": False,
                 "dry_run": False,
@@ -320,9 +325,15 @@ def _make_node_class():
                     return False
                 with self.node.lock:
                     steady = self.node._stability_steady
+                    since = self.node._stability_since_frames
                 if steady:
                     consec += 1
-                    if consec >= self.steady_ticks:
+                    # Settle requires BOTH the poll hold (steady_ticks polls)
+                    # AND the camera-frame floor (>= min_steady_frames held
+                    # frames), so a slow camera can't satisfy the poll count
+                    # with too few actual stable frames.
+                    if (consec >= self.steady_ticks
+                            and since >= self.min_steady_frames):
                         return True
                 else:
                     consec = 0
@@ -538,6 +549,18 @@ def _make_node_class():
             self._settle_timeout_s = float(self._param("settle_timeout_s", 10.0))
             self._settle_steady_ticks = int(self._param("settle_steady_ticks", 5))
             self._settle_poll_s = float(self._param("settle_poll_s", 0.1))
+            # Camera-frame settle FLOOR (pan-tilt parity): require the
+            # StabilityTracker verdict to HOLD for this many CONSECUTIVE steady
+            # frames before a capture is accepted, instead of firing on the very
+            # first steady verdict. Mirrors the pan-tilt calibration's
+            # "held for a duration" image-stability gate and gives the wrist
+            # mount extra frames to stop micro-settling after the
+            # StabilityTracker window first agrees. Applies to BOTH the manual
+            # /api/capture path and the automated waypoint sweep. Raise it for a
+            # longer settle (5 frames ~= 0.17 s at 30 Hz, ON TOP of the 5-frame
+            # StabilityTracker window).
+            self._capture_min_steady_frames = int(
+                self._param("capture_min_steady_frames", 5))
 
             # ---- FoundationStereo (FFS) metric depth ------------------------
             # The per-view T_cam_board is otherwise monocular planar PnP, whose
@@ -1590,6 +1613,17 @@ def _make_node_class():
                     "n_obs": len(self._anchor_obs),
                     "scatter": self._anchor_scatter,
                 }
+                # Multi-placement metadata: summary list + active id for the UI.
+                payload["active_placement_id"] = self._active_placement_id
+                payload["placements"] = [
+                    {
+                        "id": pid,
+                        "label": p.label,
+                        "n_samples": len(p.session.samples),
+                        "anchor_have": p.tbb_head is not None,
+                    }
+                    for pid, p in self._placements.items()
+                ]
             return payload
 
         def safety_preview(self):
@@ -1753,14 +1787,14 @@ def _make_node_class():
             with self.lock:
                 steady = self._stability_steady
                 since = self._stability_since_frames
-                target = self._stab_window
+                target = self._capture_min_steady_frames
                 cap, K, frame = self._cap, self._K, self._frame
                 frame_stamp = self._frame_stamp
                 snap_frame = self._calib_frame   # guard against a mid-capture switch
                 joints_snapshot = (None if self._xarm_joint_positions is None
                                    else list(self._xarm_joint_positions))
                 now_mono = self._last_frame_monotonic
-            if not steady:
+            if not steady or since < target:
                 return {
                     "ok": False,
                     "reason": (f"not stable yet ({int(since)}/{int(target)} "
@@ -1777,34 +1811,39 @@ def _make_node_class():
                 return {"ok": False, "reason": "no board detection",
                         "num_samples": len(self.session.samples)}
 
-            # Look up TF AT THE IMAGE TIME so T_base_eef matches the arm
-            # pose that produced cap["T_cam_board"]. Falls back to "latest
-            # available" if the image stamp is unset (defensive — should not
-            # happen post-_on_image but keeps the path robust). The TF
-            # buffer's default cache is ~10s which covers the up-to-~250ms
-            # window between image capture and do_capture firing.
+            # Look up EEF TF. The xArm TF publisher runs at ~4 Hz so the
+            # precise image-timestamp lookup almost always fails with
+            # "extrapolation into future" (image stamp = ROS-now at receipt,
+            # but latest TF data is 150–250 ms behind). Since the arm is
+            # stationary at capture the latest available transform IS correct.
+            # We only emit a warning when the lag exceeds 1 s, which would
+            # indicate the arm was still settling or the TF source died.
             from rclpy.time import Time as _RclpyTime
             tf_time = (_RclpyTime.from_msg(frame_stamp) if frame_stamp is not None
                        else self._rclpy_time())
             try:
                 tfm = self.tf_buffer.lookup_transform(
                     self._base_frame, self._eef_frame, tf_time)
-            except Exception as exc:
-                # If the precise image-time lookup fails (TF buffer doesn't
-                # extrapolate by default), fall back to "latest available"
-                # rather than refusing the whole capture — pre-fix behavior.
+            except Exception:
                 try:
                     tfm = self.tf_buffer.lookup_transform(
                         self._base_frame, self._eef_frame, self._rclpy_time())
-                    self.get_logger().warn(
-                        f"TF at image stamp unavailable ({exc}); "
-                        "fell back to latest — sample may be temporally skewed",
-                        throttle_duration_sec=10.0)
                 except Exception as exc2:
                     return {"ok": False,
                             "reason": (f"TF {self._base_frame}->{self._eef_frame}"
                                        f" unavailable: {exc2}"),
                             "num_samples": len(self.session.samples)}
+                if frame_stamp is not None:
+                    tf_s = (tfm.header.stamp.sec
+                            + tfm.header.stamp.nanosec * 1e-9)
+                    img_s = (frame_stamp.sec
+                             + frame_stamp.nanosec * 1e-9)
+                    lag_ms = (img_s - tf_s) * 1000.0
+                    if lag_ms > 1000.0:
+                        self.get_logger().warn(
+                            f"TF is {lag_ms:.0f} ms stale at capture — "
+                            "arm may still be settling; sample quality suspect",
+                            throttle_duration_sec=5.0)
             T_base_eef = ws.tf_to_matrix(
                 [tfm.transform.translation.x, tfm.transform.translation.y,
                  tfm.transform.translation.z],
@@ -2182,7 +2221,7 @@ def _make_node_class():
             except Exception:
                 pass  # diagnostic only — never fail the solve over a log line
             try:
-                self._dump_solve(samples, res, payload)
+                self._dump_solve(res, payload)
             except Exception as exc:  # persistence is best-effort, never blocks
                 self.get_logger().warn(f"solve dump failed: {exc}")
             # Fold the solve result into the browsable on-disk session too, so the
@@ -2201,64 +2240,93 @@ def _make_node_class():
                 self._solve_progress["solve_ts"] = solve_ts
             return {"ok": True, **payload}
 
-        def _build_session_dict(self, samples, res=None, payload=None):
-            """Serialize the live capture (+ optional solve result) into the
-            canonical session dict written to disk. ``res``/``payload`` None at
-            capture time (samples only); populated at solve time."""
+        def _build_session_dict(self, res=None, payload=None, combined_res=None, combined_payload=None):
+            """Serialize all placements (+ optional solve result) into the
+            canonical v2 session dict written to disk. ``res``/``payload`` None at
+            capture time (samples only); populated at solve time for the active
+            placement. ``combined_res``/``combined_payload`` carry the result of a
+            multi-placement bundle-adjust (T5+)."""
             import time
             np = self._np
 
             def m2l(M):
                 return None if M is None else np.asarray(M, float).tolist()
 
-            samp = []
-            for i, s in enumerate(samples):
-                samp.append({
-                    "idx": i,
-                    "T_base_eef": m2l(s.T_base_eef),
-                    "T_cam_board": m2l(s.T_cam_board),
-                    "obs_px": m2l(s.obs_px),
-                    "corner_idx": np.asarray(s.corner_idx).astype(int).tolist(),
-                    "obs_xyz_cam": m2l(getattr(s, "obs_xyz_cam", None)),
-                    "capture_reproj_px": self._sample_reproj_px.get(i),
-                    "depth_source": self._sample_depth_source.get(i),
-                    "joints": self._sample_joints.get(i),
+            placements_out = []
+            with self.lock:
+                placements_snapshot = list(self._placements.items())
+                active_pid = self._active_placement_id
+
+            for pid, p in placements_snapshot:
+                samp = []
+                for i, s in enumerate(p.session.samples):
+                    samp.append({
+                        "idx": i,
+                        "T_base_eef": m2l(s.T_base_eef),
+                        "T_cam_board": m2l(s.T_cam_board),
+                        "obs_px": m2l(s.obs_px),
+                        "corner_idx": np.asarray(s.corner_idx).astype(int).tolist(),
+                        "obs_xyz_cam": m2l(getattr(s, "obs_xyz_cam", None)),
+                        "capture_reproj_px": p.sample_reproj_px.get(i),
+                        "depth_source": p.sample_depth_source.get(i),
+                        "joints": p.sample_joints.get(i),
+                    })
+                # Per-placement result: only if this is the active placement and res is provided
+                placement_result = None
+                if pid == active_pid and res is not None:
+                    pp = payload or {}
+                    placement_result = {
+                        "status": res.status,
+                        "seed_used": getattr(res, "seed_used", ""),
+                        "rejected_sample_indices": list(getattr(res, "rejected_indices", None) or []),
+                        "rejection_log": list(getattr(res, "rejection_log", None) or []),
+                        "X_eef_cam": m2l(res.X),
+                        "Tbb_base_board": m2l(res.Tbb),
+                        "metrics": res.metrics,
+                        "per_sample_reproj_px": pp.get("per_sample_reproj_px"),
+                        "per_sample_trans_mm": pp.get("per_sample_trans_mm"),
+                        "per_sample_rot_deg": pp.get("per_sample_rot_deg"),
+                        "observability": pp.get("observability"),
+                        "X_xyz_mm": pp.get("X_xyz_mm"),
+                        "X_rpy_deg": pp.get("X_rpy_deg"),
+                    }
+                placements_out.append({
+                    "id": pid,
+                    "label": p.label,
+                    "anchor_have": p.tbb_head is not None,
+                    "Tbb_head": m2l(p.tbb_head),
+                    "samples": samp,
+                    "result": placement_result,
                 })
-            out = {
-                "schema": "wrist_handeye_session/1",
-                "timestamp": time.strftime("%Y%m%d_%H%M%S"),
-                "robot": self._robot_name,
-                "calib_frame": self._calib_frame,
-                "board": {"squares_x": self._sx, "squares_y": self._sy,
-                          "square_len_m": self._sq,
-                          "aruco_dict": self._aruco_dict_name},
-                "K": m2l(self._K), "D": m2l(self._D),
-                "anchor_have": self._tbb_head is not None,
-                "Tbb_head": m2l(self._tbb_head),
-                "samples": samp,
-            }
-            if res is not None:
-                p = payload or {}
-                out["result"] = {
-                    "status": res.status,
-                    "seed_used": getattr(res, "seed_used", ""),
-                    "rejected_sample_indices": list(
-                        getattr(res, "rejected_indices", None) or []),
-                    "rejection_log": list(getattr(res, "rejection_log", None) or []),
-                    "X_eef_cam": m2l(res.X),
-                    "Tbb_base_board": m2l(res.Tbb),
-                    "metrics": res.metrics,
-                    "per_sample_reproj_px": p.get("per_sample_reproj_px"),
-                    "per_sample_trans_mm": p.get("per_sample_trans_mm"),
-                    "per_sample_rot_deg": p.get("per_sample_rot_deg"),
-                    "observability": p.get("observability"),
-                    "X_xyz_mm": p.get("X_xyz_mm"),
-                    "X_rpy_deg": p.get("X_rpy_deg"),
+
+            with self.lock:
+                out = {
+                    "schema": "wrist_handeye_session/2",
+                    "timestamp": time.strftime("%Y%m%d_%H%M%S"),
+                    "robot": self._robot_name,
+                    "calib_frame": self._calib_frame,
+                    "board": {"squares_x": self._sx, "squares_y": self._sy,
+                              "square_len_m": self._sq,
+                              "aruco_dict": self._aruco_dict_name},
+                    "K": m2l(self._K), "D": m2l(self._D),
+                    "active_placement": active_pid,
+                    "placements": placements_out,
                 }
+            # Combined result (from multi-placement solve)
+            if combined_res is not None:
+                cp = combined_payload or {}
+                out["combined_result"] = {
+                    "status": combined_res.status,
+                    "X_eef_cam": m2l(combined_res.X),
+                    "combined_metrics": combined_res.combined_metrics,
+                    "seed_placement_id": combined_res.seed_placement_id,
+                }
+            else:
+                out["combined_result"] = None
             return out
 
-        def _persist_session(self, res=None, payload=None):
-            """Write the live capture (+ optional solve) to its on-disk session
+        def _persist_session(self, res=None, payload=None, combined_res=None, combined_payload=None):
+            """Write all placements (+ optional solve) to the on-disk session
             dir so a restart/crash never loses captures and the history browser
             can re-open them. Lazily names the session at the first persisted
             capture. Best-effort: a disk hiccup must never break capture/solve."""
@@ -2266,7 +2334,9 @@ def _make_node_class():
                 import os as _os
                 import time
                 with self.lock:
-                    if not self.session.samples and self._session_name is None:
+                    has_any_samples = any(len(p.session.samples) > 0
+                                          for p in self._placements.values())
+                    if not has_any_samples and self._session_name is None:
                         return  # nothing to persist yet
                     if self._session_name is None:
                         # Timestamped to the second; dedup against existing dirs
@@ -2279,17 +2349,18 @@ def _make_node_class():
                             name = f"{base_name}_{k}"
                         self._session_name = name
                     name = self._session_name
-                    out = ws.json_safe(self._build_session_dict(
-                        self.session.samples, res, payload))
-                    thumbs = dict(self._thumbs)
+                    placements_snapshot = list(self._placements.items())
+                # _build_session_dict acquires self.lock internally for its own snapshot
+                out = ws.json_safe(self._build_session_dict(res, payload, combined_res, combined_payload))
                 hsx.write_session(name, out)
-                hsx.rewrite_thumbs(name, thumbs)
+                for pid, p in placements_snapshot:
+                    hsx.rewrite_placement_thumbs(name, pid, p.thumbs)
                 return name
             except Exception as exc:  # pragma: no cover - persistence is best-effort
                 self.get_logger().warn(f"session persist failed: {exc}")
                 return None
 
-        def _dump_solve(self, samples, res, payload):
+        def _dump_solve(self, res, payload):
             """Flat per-solve replay archive (one timestamped file under
             ``$HANDEYE_DUMP_DIR``/``calibration_data`` ``/wrist_handeye_dumps``),
             kept alongside the browsable session dir for offline re-analysis.
@@ -2300,7 +2371,7 @@ def _make_node_class():
             root = os.environ.get("HANDEYE_DUMP_DIR", "calibration_data")
             ddir = os.path.join(root, "wrist_handeye_dumps")
             os.makedirs(ddir, exist_ok=True)
-            out = self._build_session_dict(samples, res, payload)
+            out = self._build_session_dict(res, payload)
             path = os.path.join(ddir, f"solve_{time.strftime('%Y%m%d_%H%M%S')}.json")
             with open(path, "w") as f:
                 json.dump(ws.json_safe(out), f, indent=2)
@@ -2308,10 +2379,12 @@ def _make_node_class():
 
         def do_load_session(self, name):
             """Re-hydrate a historical capture session into the LIVE state so it
-            can be inspected and RE-SOLVED with the current solver. Restores the
-            samples, per-sample sidecars, thumbnails, intrinsics/board, and head
-            anchor from disk, and points the active session name at ``name`` so a
-            subsequent solve folds its result back into the same history entry."""
+            can be inspected and RE-SOLVED with the current solver. Restores all
+            placements with their samples, per-sample sidecars, thumbnails,
+            intrinsics/board, and head anchors from disk, and points the active
+            session name at ``name`` so a subsequent solve folds its result back
+            into the same history entry. Handles both v1 (single-placement flat)
+            and v2 (multi-placement) session schemas."""
             import os as _os
             np = self._np
             try:
@@ -2322,38 +2395,61 @@ def _make_node_class():
             def l2m(v):
                 return None if v is None else np.asarray(v, float)
 
-            raw_samples = data.get("samples") or []
-            rebuilt = []
-            for s in raw_samples:
-                rebuilt.append(hm.Sample(
-                    np.asarray(s["T_base_eef"], float),
-                    np.asarray(s["T_cam_board"], float),
-                    np.asarray(s["obs_px"], float),
-                    np.asarray(s["corner_idx"], int),
-                    obs_xyz_cam=l2m(s.get("obs_xyz_cam")),
-                    obs_xyz_valid=None))
+            # V1 compat: synthesize v2 structure from legacy flat format
+            if "placements" not in data:
+                data = {**data, "schema": "wrist_handeye_session/2",
+                        "placements": [{"id": "default", "label": "default",
+                                        "anchor_have": data.get("anchor_have", False),
+                                        "Tbb_head": data.get("Tbb_head"),
+                                        "samples": data.get("samples") or [],
+                                        "result": data.get("result")}],
+                        "active_placement": "default"}
+
             cf = data.get("calib_frame")
-            with self.lock:
-                self.session.samples = rebuilt
-                self._active_placement.thumbs = {}
-                self._active_placement.sample_joints = {}
-                self._active_placement.sample_ts = {}
-                self._active_placement.sample_reproj_px = {}
-                self._active_placement.sample_area_frac = {}
-                self._active_placement.sample_depth_source = {}
-                t0 = float(self._time.monotonic())
+            t0 = float(self._time.monotonic())
+            new_placements = {}
+            for pd in data["placements"]:
+                pid = pd.get("id", "default")
+                label = pd.get("label", pid)
+                raw_samples = pd.get("samples") or []
+                rebuilt = []
+                for s in raw_samples:
+                    rebuilt.append(hm.Sample(
+                        np.asarray(s["T_base_eef"], float),
+                        np.asarray(s["T_cam_board"], float),
+                        np.asarray(s["obs_px"], float),
+                        np.asarray(s["corner_idx"], int),
+                        obs_xyz_cam=l2m(s.get("obs_xyz_cam")),
+                        obs_xyz_valid=None))
+                p = make_placement(label,
+                                   min_diversity_deg=self._diversity_target_deg,
+                                   min_corners=self._min_corners,
+                                   max_reproj_px=self._max_reproj_px,
+                                   min_area_frac=self._min_area_frac)
+                p.session.samples = rebuilt
                 for i, s in enumerate(raw_samples):
-                    self._sample_reproj_px[i] = s.get("capture_reproj_px")
-                    self._sample_depth_source[i] = s.get("depth_source")
-                    self._sample_joints[i] = s.get("joints")
-                    self._sample_ts[i] = t0 + i
+                    p.sample_reproj_px[i] = s.get("capture_reproj_px")
+                    p.sample_depth_source[i] = s.get("depth_source")
+                    p.sample_joints[i] = s.get("joints")
+                    p.sample_ts[i] = t0 + i
                     try:
-                        tp = hsx.thumb_path(name, i)
+                        # Placement-aware path first; fall back to v1 legacy flat path
+                        tp = hsx.placement_thumb_path(name, pid, i)
+                        if not _os.path.isfile(tp):
+                            tp = hsx.thumb_path(name, i)
                         if _os.path.isfile(tp):
                             with open(tp, "rb") as f:
-                                self._thumbs[i] = f.read()
+                                p.thumbs[i] = f.read()
                     except Exception:
                         pass  # a missing thumb just shows the placeholder
+                if pd.get("Tbb_head") is not None:
+                    p.tbb_head = np.asarray(pd["Tbb_head"], float)
+                new_placements[pid] = p
+
+            with self.lock:
+                self._placements = new_placements
+                self._active_placement_id = data.get(
+                    "active_placement", next(iter(new_placements)))
                 # Restore intrinsics + board from the session so an immediate
                 # re-solve uses the geometry the samples were captured with.
                 b = data.get("board") or {}
@@ -2365,16 +2461,17 @@ def _make_node_class():
                 if data.get("K") is not None:
                     self._K = np.asarray(data["K"], float)
                 self._D = l2m(data.get("D"))
-                if data.get("Tbb_head") is not None:
-                    self._tbb_head = np.asarray(data["Tbb_head"], float)
                 if cf in ("color", "ir"):
                     self._calib_frame = cf
                 self._session_name = name
                 self.last_solve = None  # stale: belongs to a different capture
-                num = len(self.session.samples)
+
+            total_samples = sum(len(p.session.samples) for p in new_placements.values())
             self.get_logger().info(
-                f"loaded session {name!r}: {num} samples (calib_frame={cf})")
-            return {"ok": True, "name": name, "num_samples": num, "calib_frame": cf}
+                f"loaded session {name!r}: {total_samples} samples across "
+                f"{len(new_placements)} placement(s) (calib_frame={cf})")
+            return {"ok": True, "name": name, "num_samples": total_samples,
+                    "n_placements": len(new_placements), "calib_frame": cf}
 
         def do_delete_session(self, name):
             """Delete a historical session directory. Detaches the live session
@@ -2419,6 +2516,16 @@ def _make_node_class():
                 return {"ok": True, "count": count}
             return {"ok": False, "count": count,
                     "reason": f"idx {idx} out of range (store has {count} waypoints)"}
+
+        def do_clear_waypoints(self):
+            """Remove ALL waypoints from the in-memory store.
+
+            Returns ``{ok: True, cleared: N}``.
+            """
+            with self.lock:
+                n = len(self.waypoint_store.list())
+                self.waypoint_store.clear()
+            return {"ok": True, "cleared": n}
 
         def do_save_waypoints(self):
             """Persist the in-memory waypoint list to the per-robot YAML.
@@ -3485,6 +3592,11 @@ def make_app(node):
     def waypoints_delete(idx: int):
         """DELETE /api/waypoints/{idx} → do_delete_waypoint(idx)."""
         return JSONResponse(node.do_delete_waypoint(idx))
+
+    @app.delete("/api/waypoints")
+    def waypoints_clear():
+        """DELETE /api/waypoints → remove ALL waypoints from the in-memory store."""
+        return JSONResponse(node.do_clear_waypoints())
 
     @app.post("/api/waypoints/save")
     def waypoints_save():

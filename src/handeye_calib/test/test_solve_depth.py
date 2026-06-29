@@ -92,16 +92,16 @@ def test_solve_reports_depth_metrics_when_present():
     sc = syn.make_scenario(n_poses=16, pixel_noise=0.3, seed=11, with_depth=True)
     res = hs.solve(sc.samples, sc.K, None, sc.board_pts,
                    depth_weight=1.0, depth_sigma_m=0.003)
-    # depth-grounded honest metric surfaces in the held-out block
-    assert "depth_point_rmse_mm" in res.heldout_metrics
-    assert res.heldout_metrics["depth_point_rmse_mm"] is not None
-    assert res.heldout_metrics["n_depth_corners"] > 0
+    # depth-grounded metric surfaces in the (all-sample) residual block
+    assert "depth_point_rmse_mm" in res.metrics
+    assert res.metrics["depth_point_rmse_mm"] is not None
+    assert res.metrics["n_depth_corners"] > 0
 
 
 def test_solve_omits_depth_metrics_when_absent():
     sc = syn.make_scenario(n_poses=16, pixel_noise=0.3, seed=11)  # no depth
     res = hs.solve(sc.samples, sc.K, None, sc.board_pts)
-    assert res.heldout_metrics.get("depth_point_rmse_mm") is None
+    assert res.metrics.get("depth_point_rmse_mm") is None
 
 
 def test_depth_residual_tolerates_nan_rows_without_mask():

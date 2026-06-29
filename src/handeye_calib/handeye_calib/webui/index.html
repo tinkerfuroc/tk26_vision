@@ -4,7 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>handeye_web · calibrate</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <!-- ?v bumped on every webui release so browsers can't serve a stale cached
+       app.js/style.css (the "I fixed it but nothing changed" trap). Bump on edit. -->
+  <link rel="stylesheet" href="/static/style.css?v=0.11.0">
 </head>
 <body>
   <header class="bg-panel">
@@ -58,6 +60,7 @@
       <button class="side-tab active" data-tab="info">Info</button>
       <button class="side-tab" data-tab="capture">Capture</button>
       <button class="side-tab" data-tab="solve">Solve</button>
+      <button class="side-tab" data-tab="history">History</button>
       <button class="side-tab" data-tab="promote">Promote</button>
     </nav>
     <section class="side-panel-content active" data-panel="info">
@@ -165,6 +168,7 @@
           <button id="waypoint-add-current-btn" type="button">+ Add current joints</button>
           <button id="waypoint-save-btn" type="button">Save to disk</button>
           <button id="waypoint-reload-btn" type="button">Reload from disk</button>
+          <button id="waypoint-clear-btn" type="button" style="color:var(--err,#c00)">Clear all</button>
         </div>
         <div class="status-line" id="waypoints-status"></div>
         <ul class="waypoints-list" id="waypoints-list">
@@ -231,17 +235,21 @@
         <div class="status-line" id="solve-status"></div>
         <span class="gate-pill" id="solve-verdict" hidden></span>
 
+        <!-- Intrinsics-free rigid-mount go/no-go. If this FAILs, no solve can
+             pass regardless of the residual numbers below — fix the mount. -->
+        <h3>Rigid-mount check</h3>
+        <div class="status-line" id="rigid-closure">rigid-mount check: (solve to compute)</div>
+
         <h3>Per-method comparison</h3>
         <table class="method-table" id="method-table"></table>
 
-        <h3>Metrics</h3>
+        <h3>Residual (all kept samples — no train/held-out split)</h3>
         <table class="kv-table" id="solve-metrics">
-          <tr><td>train trans_rmse</td><td data-k="train_trans">–</td></tr>
-          <tr><td>train rot_rmse</td><td data-k="train_rot">–</td></tr>
-          <tr><td>train reproj</td><td data-k="train_reproj">–</td></tr>
-          <tr><td>heldout trans_rmse</td><td data-k="held_trans">–</td></tr>
-          <tr><td>heldout rot_rmse</td><td data-k="held_rot">–</td></tr>
-          <tr><td>heldout reproj</td><td data-k="held_reproj">–</td></tr>
+          <tr><td>trans_rmse</td><td data-k="res_trans">–</td></tr>
+          <tr><td>rot_rmse</td><td data-k="res_rot">–</td></tr>
+          <tr><td>reproj</td><td data-k="res_reproj">–</td></tr>
+          <tr><td>depth_point_rmse</td><td data-k="res_depth">–</td></tr>
+          <tr><td>kept / total</td><td data-k="res_kept">–</td></tr>
         </table>
 
         <h3>X (T<sub>eef→cam</sub>)</h3>
@@ -255,6 +263,13 @@
           <canvas id="resid-hist" width="360" height="140"></canvas>
           <canvas id="resid-scatter" width="360" height="140"></canvas>
         </div>
+        <!-- Per-sample residual in human-readable units (mm / deg) next to the
+             pixel value, since pixels are hard to judge. Rejected rows are
+             struck through. -->
+        <table class="method-table" id="per-sample-table"></table>
+
+        <h3>Rejected samples (MAD outliers — why)</h3>
+        <table class="method-table" id="rejection-table"></table>
 
         <h3>Coverage (board centroids projected to image)</h3>
         <canvas id="coverage" width="600" height="400"></canvas>
@@ -299,8 +314,38 @@
         </div>
       </div>
     </section>
+    <section class="side-panel-content" data-panel="history">
+      <!-- Historical capture sessions. Every capture is persisted to disk
+           (<HANDEYE_DUMP_DIR|calibration_data>/wrist_handeye_sessions/<name>/),
+           so a restart never loses a capture and the operator can re-open and
+           re-solve a past capture — mirrors the pan-tilt calibration history. -->
+      <div class="history-panel">
+        <div class="row">
+          <button id="history-refresh-btn" type="button">Refresh</button>
+          <span class="status-line" id="history-status">–</span>
+        </div>
+        <h3>Sessions</h3>
+        <table class="method-table" id="history-table"></table>
+
+        <div id="history-detail" hidden>
+          <h3>Selected: <span id="history-sel-name">–</span></h3>
+          <div class="row">
+            <button class="primary" id="history-load-btn" type="button">Load into live session (then Solve)</button>
+            <button id="history-delete-btn" type="button">Delete</button>
+            <span class="status-line" id="history-detail-status"></span>
+          </div>
+          <table class="kv-table" id="history-summary"></table>
+          <h3>Capture gallery</h3>
+          <div class="gallery" id="history-gallery"></div>
+          <h3>Per-sample residuals (if solved)</h3>
+          <table class="method-table" id="history-per-sample"></table>
+          <h3>Rejected (MAD) — why</h3>
+          <table class="method-table" id="history-rejection"></table>
+        </div>
+      </div>
+    </section>
     </div><!-- /.controls-col -->
   </main>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=0.11.0"></script>
 </body>
 </html>

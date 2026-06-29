@@ -381,15 +381,8 @@ collector:
     - -0.171
     - -1.2873
     - -0.5874
-  - - 0.01
-    - 0.01
-    - 0.01
-    - 0.01
-    - 0.01
-    - 0.01
-    - 0
   phase1_custom_park_pan_deg: 0.0
-  phase1_custom_park_tilt_deg: 0.0
+  phase1_custom_park_tilt_deg: 15.0
   phase2_waypoints:
   - - 1.0593
     - -0.5625

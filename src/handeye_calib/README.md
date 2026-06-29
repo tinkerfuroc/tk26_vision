@@ -62,8 +62,12 @@ as launch args (`bind`, `port`, `robot_name`, camera topics, `base_frame`/`eef_f
 and the FFS/depth knobs `use_ffs_depth`, `ffs_service`, `depth_weight`, `depth_sigma_m`,
 `depth_win`, `depth_z_min`/`depth_z_max`, `depth_min_corners`, `ffs_wait_for_service_s`,
 `ffs_call_timeout_s`, `ffs_depth_warn_after`). A few niche params (e.g. `settle_timeout_s`,
-`min_corners`, `joint_states_topic`) are not declared in the launch file yet — set those
-via `ros2 run … --ros-args -p name:=value`.
+`settle_steady_ticks`, `settle_poll_s`, `capture_min_steady_frames`, `min_corners`,
+`joint_states_topic`) are not declared in the launch file yet — set those
+via `ros2 run … --ros-args -p name:=value`. `capture_min_steady_frames` (default 5) is the
+settle floor: the board-stability verdict must HOLD for that many consecutive frames before
+a capture is accepted (manual click and the auto sweep both honor it) — raise it for a longer
+settle.
 The RealSense camera (`realsense2_camera`, `camera_name:=xarm_camera`) must be launched
 **separately** — the UI shows `no camera` until color frames arrive. `ros2 launch`
 teardown (SIGINT/SIGTERM) shuts the server down cleanly.
@@ -112,7 +116,7 @@ The `handeye_web` tool is a single-page calibration UI with four tabs:
   - Joint editor (rad/deg toggle), Load-current / Zero / Move (joints) / presets, with a live SafetyEnvelope verdict on the current EE pose before sending.
   - Waypoints sub-panel: record an ordered list of arm poses, save/reload per-robot (see [Waypoints + auto-capture](#waypoints--auto-capture) below).
   - Auto-capture sequence controls: Run / Run dry / Cancel + live progress + bounded log.
-  - Manual capture: stability-gated single-shot button (three steady frames at < 0.0003 m / 0.1° drift), sample gallery with per-capture thumbnails + per-sample delete, diversity meter (max pairwise rotation° / 30° target).
+  - Manual capture: stability-gated single-shot button — the board-pose StabilityTracker (last 5 poses within < 3 mm / 0.5°) must stay steady for ≥ `capture_min_steady_frames` consecutive frames (default 5) before the shot is accepted, so the button waits out the mount's post-move micro-settle instead of firing on the first steady frame. Sample gallery with per-capture thumbnails + per-sample delete, diversity meter (max pairwise rotation° / 30° target).
 - **Solve** — method picker (auto / TSAI / PARK / HORAUD / ANDREFF / DANIILIDIS), per-method reprojection comparison table, residual histogram + scatter, sample-coverage canvas, PASS / WARN / FAIL gate pill with mm / deg / px units.
 - **Promote** — side-by-side unified-diff preview for **both** `hand_eye.yaml` AND a per-robot `wrist_camera.xacro` override, ROBOT_NAME-scoped, confirm-before-apply, backup paths surfaced for each write. Reload-from-disk clears the cached solve so the operator can re-run.
 
@@ -199,6 +203,119 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.12.0 (2026-06-28): **Longer, pan-tilt-style settle: capture waits for held steadiness.**
+  - New param `capture_min_steady_frames` (default **5**). A capture is now accepted
+    only after the `StabilityTracker` verdict has HELD for ≥ this many consecutive
+    steady frames, instead of firing on the first steady verdict — mirroring the
+    pan-tilt calibration's "held for a duration" image-stability gate. Gives the
+    wrist mount extra frames to stop micro-settling after the 5-frame stability
+    window first agrees. Raise it for an even longer settle.
+  - Applies to BOTH capture paths: the manual `/api/capture` gate (was: any single
+    steady frame) and the automated waypoint sweep's `_wait_for_settle` (now requires
+    the poll hold AND the ≥N-frame floor, so a slow camera can't satisfy the poll
+    count with too few real stable frames). Reject reason reads `not stable yet
+    (k/N steady frames)`.
+  - Does NOT change the static error floor (mount flex / FK compliance) — settle only
+    addresses transient/ring-down error; see the rigid-mount check for the real gate.
+- 0.11.1 (2026-06-28): **Test-pollution fix + MAD audit + honest rejection log.**
+  - **MAD rejection audited and confirmed correct** (no over-/under-rejection):
+    each drop is a genuine outlier (gross board-flip, or a translation/rotation/
+    reprojection outlier past both the robust-z and the physical floor), kept
+    borderline poses are typical of the dataset, deterministic per config. A
+    clean MAD pass does NOT imply a good calibration — the rigid-mount check is
+    the real gate.
+  - **Captures were NOT failing to accumulate** — that was a test-hygiene bug:
+    `do_capture` now persists each capture to `$HANDEYE_DUMP_DIR` (default
+    `calibration_data/`), and the no-hardware capture tests didn't isolate that
+    dir, so they wrote synthetic identity-matrix n=1 sessions into the operator's
+    real `wrist_handeye_sessions/`. Added `test/conftest.py` with an **autouse
+    fixture pinning `HANDEYE_DUMP_DIR` to a tmp dir** for every test, so no test
+    can ever touch the real tree. (Removed 48 polluted sessions; real captures
+    were unaffected.)
+  - **Rejection-log residuals re-scored against the final clean fit** so the
+    reported mm/deg/px are each measured against one consistent reference (the
+    at-drop snapshot used a different intermediate fit per drop). z-scores stay
+    as the at-drop trigger evidence.
+- 0.11.0 (2026-06-28): **Web app made usable: live coverage, live MAD streaming,
+  state-driven Solve tab, and an intrinsics-free rigid-mount go/no-go.** Fixes a
+  cluster of UI/state-sync bugs found by a systematic debug pass + drives the
+  calibration verdict home.
+  - **Coverage now renders.** The state payload was missing `K` and per-sample
+    `T_cam_board`, so the projector returned null for every point. Added both
+    (`web_support.enriched_state_payload` gains `K`; `sample_metadata` gains
+    `T_cam_board`; `get_state_dict` emits them). Coverage now draws **live as
+    samples are captured**, not only after a Solve.
+  - **MAD rejections stream live.** `/api/solve` ran `do_solve` *synchronously on
+    the asyncio loop*, blocking every WebSocket push for the whole solve — so
+    nothing updated mid-solve and `last_solve` was hardcoded `None` in the push.
+    Now: the route offloads to an executor (`run_in_executor`); `hs.solve` takes
+    a `progress_cb` that fires per rejection; `do_solve` streams it into
+    `state.solve_progress` and caches the final JSON payload into
+    `state.last_solve` (with `solve_ts`). The UI shows "rejecting… dropped N
+    (kept …)" with the why-table filling in real time, and the Solve tab
+    **rehydrates on reload/reconnect** instead of blanking.
+  - **Rigid-mount check (`hs.rigid_closure_deg`).** An intrinsics-/scale-/depth-
+    independent AX=XB rotation-conjugacy diagnostic: for a rigid mount the flange
+    motion and camera motion have equal rotation angle, so the median mismatch is
+    a pure mechanical-rigidity readout. Surfaced in the solve payload + a Solve-
+    tab banner as a go/no-go: if it FAILs, **no** solve can pass — rigidify the
+    mount and recapture (don't tune the solver).
+  - **Cache-busting** (`?v=` on app.js/style.css) + defensive render guards so a
+    stale browser cache / one missing field can't make the page look broken.
+  - **Calibration verdict (no code change):** the 2026-06-28 captures fail because
+    the camera-to-flange mount is **not rigid** (≈2.5° AX=XB closure floor,
+    gravity-correlated). Recapture after rigidifying the mount; verify with the
+    rigid-mount check before trusting any solve.
+- 0.10.0 (2026-06-28): **Captures persisted to disk + historical-session browser
+  (pan-tilt parity), and MAD rejections shown where the operator looks.**
+  - **Every capture is persisted** to
+    `<HANDEYE_DUMP_DIR|calibration_data>/wrist_handeye_sessions/<name>/`
+    (`session.json` = meta + samples + optional solve result; `thumbs/<i>.jpg`).
+    Written on each capture/delete/solve, so a restart or crash never loses a
+    capture. (The flat `wrist_handeye_dumps/solve_*.json` replay archive stays.)
+    A new module `handeye_sessions.py` holds the pure FS helpers; new node hooks
+    `_persist_session` / `_build_session_dict`.
+  - **History tab.** New endpoints `GET /api/sessions`, `GET /api/sessions/{name}`,
+    `GET /api/sessions/{name}/samples/{i}/thumb.jpg`,
+    `POST /api/sessions/{name}/load`, `DELETE /api/sessions/{name}`. The History
+    tab lists past captures (date / #samples / #rejected / status), and opening
+    one shows its gallery, solve verdict + per-sample residuals + why-rejected.
+    **Load into live session** re-hydrates an old capture (samples + thumbs +
+    intrinsics + board + head anchor) so it can be **re-solved with the current
+    solver** — invaluable for re-running an old capture through the new all-sample
+    MAD.
+  - **MAD rejections visible in the Capture gallery**, not just the Solve tab:
+    a solved-then-rejected sample gets a red outline + `REJECTED (MAD)` badge in
+    the gallery where the operator actually looks (the previous UI surfaced
+    rejections only as blanked histogram points, so it read as "nothing rejected"
+    even when the backend had weeded several poses).
+- 0.9.0 (2026-06-28): **Solve on ALL samples (no train/held-out split), MAD
+  parity + visibility, mm/deg residuals.** Aligns the wrist solve with the
+  pan-tilt calibration's model and surfaces its reasoning to the operator.
+  - **No train/held-out split.** `solve()` fits X/Tbb on, and reports the
+    residual over, *every* surviving sample (pan-tilt parity). Generalization is
+    measured separately later with a freshly-recorded validation pose set.
+    `SolveResult` now carries a single `metrics` block (was
+    `train_metrics`/`heldout_metrics`); `solve()` dropped the `heldout_frac` /
+    `rng_seed` params and `split_train_test`. The yaml metadata keys were renamed
+    `heldout_* → residual_*`.
+  - **MAD screens the whole set.** The previous loop ran on the train split only,
+    so an outlier that landed in the held-out 20% was never weeded — on real data
+    a 26 px pose survived in plain sight. Rejection now iterates over all samples
+    (single-worst-drop-then-resolve, same per-axis floors), so an outlier is
+    caught wherever it sits.
+  - **Anchor (head) MAD.** `average_board_anchors` now runs the same per-axis MAD
+    rejection on the head observations before averaging, so one bad pan/tilt read
+    can't drag the warm-start; scatter reports `n` / `n_total` / `n_rejected` /
+    `rejected`.
+  - **Visibility (pan-tilt parity).** `SolveResult.rejection_log` records, per
+    dropped sample, the residual (mm / deg / px) and the robust-z that triggered
+    it; surfaced in the solve log, the JSON dump, and the UI (per-sample residual
+    table + "rejected samples — why" table). The anchor button shows kept/total +
+    which observations were rejected.
+  - **Human-readable residuals.** Per-sample residuals are now reported in
+    `per_sample_trans_mm` / `per_sample_rot_deg` alongside `per_sample_reproj_px`
+    (pixels alone are hard to judge).
 - 0.8.0 (2026-06-27): **Head-Orbbec warm-start + pan_tilt parity ports.** Two
   threads landed together (plan: `../../docs/plans/2026-06-27-handeye-headassist-parity.md`).
   - **Head warm-start (optional).** The already-calibrated pan-tilt head Orbbec

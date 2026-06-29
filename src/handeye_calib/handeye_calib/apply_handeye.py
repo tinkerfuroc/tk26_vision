@@ -39,9 +39,11 @@ def handeye_yaml_dict(T_eef_mount, T_eef_color, num_poses, metrics, date,
         "calibration_method": "calibrateHandEye+BA",
         "board": {"type": "charuco", "squares": "5x5", "square_len_m": square_len_m},
         "num_poses": int(num_poses),
-        "heldout_trans_rmse_m": round(float(metrics["trans_rmse_m"]), 6),
-        "heldout_rot_rmse_rad": round(float(metrics["rot_rmse_rad"]), 6),
-        "heldout_reproj_px": round(float(metrics["reproj_px"]), 4),
+        # Residual over ALL samples used in the fit (no train/held-out split);
+        # an independently-recorded validation set measures generalization.
+        "residual_trans_rmse_m": round(float(metrics["trans_rmse_m"]), 6),
+        "residual_rot_rmse_rad": round(float(metrics["rot_rmse_rad"]), 6),
+        "residual_reproj_px": round(float(metrics["reproj_px"]), 4),
     }}
 
 

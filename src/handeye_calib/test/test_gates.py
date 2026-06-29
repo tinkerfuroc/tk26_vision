@@ -26,6 +26,10 @@ def test_is_diverse():
     assert gates.is_diverse(near, accepted, min_deg=30) is False
     assert gates.is_diverse(far, accepted, min_deg=30) is True
     assert gates.is_diverse(near, [], min_deg=30) is True     # first pose always ok
+    # min_deg<=0 disables the gate: every position is recorded, even a near-
+    # duplicate of an already-accepted pose. This backs the live default
+    # (min_diversity_deg=0) — "record all positions; cull at solve time".
+    assert gates.is_diverse(near, accepted, min_deg=0) is True
 
 
 def test_quality_ok_reasons():

@@ -603,6 +603,7 @@ class SeatRecommendBboxService(Node):
             provider_used = sel.provider
             box_px = tuple(sel.box_xyxy) if sel.box_xyxy else None
             point_xy = None
+            overridden_from = sel.overridden_from
         else:
             if self.fewshot_enabled:
                 fewshots = load_fewshots(self.max_fewshots, logger=self.get_logger())
@@ -625,6 +626,14 @@ class SeatRecommendBboxService(Node):
             except VlmSeatError as exc:
                 return self._fail(response, f'VLM unavailable: {exc}')
             provider_used = 'gemini'
+            overridden_from = None
+
+        if overridden_from:
+            self.get_logger().info(
+                f'Suitability re-rank: overrode VLM choice {overridden_from!r} '
+                f'-> {label!r} (stool/bench or narrower seat than a better '
+                f'unoccupied option).'
+            )
 
         if self.log_prompts:
             self.get_logger().info(
@@ -650,6 +659,7 @@ class SeatRecommendBboxService(Node):
             'n_fewshots': int(len(fewshots)) if fewshots is not None else 0,
             'vlm_strategy': self.vlm_strategy,
             'vlm_provider': provider_used,
+            'overridden_from': overridden_from,
         }
         log_timings = {'vlm': vlm_elapsed}
         log_extras: dict = {}

@@ -30,7 +30,7 @@ def _pnp(board_pts, px, K):
 
 def make_scenario(n_poses=15, pixel_noise=0.3, seed=0,
                   squares_x=5, squares_y=5, square_len=0.04,
-                  with_depth=False, depth_noise=0.0):
+                  with_depth=False, depth_noise=0.0, rot_range=0.6):
     rng = np.random.default_rng(seed)
     K = np.array([[615., 0, 320.], [0, 615., 240.], [0, 0, 1.]])
     board_pts = hm.board_corners(squares_x, squares_y, square_len)
@@ -58,7 +58,7 @@ def make_scenario(n_poses=15, pixel_noise=0.3, seed=0,
     while len(samples) < n_poses and tries < n_poses * 20:
         tries += 1
         # Random flange pose that keeps the camera looking at the board with diversity.
-        rot = R.from_euler('xyz', rng.uniform(-0.6, 0.6, 3)).as_matrix()
+        rot = R.from_euler('xyz', rng.uniform(-rot_range, rot_range, 3)).as_matrix()
         trans = np.array([0.45, 0.0, 0.35]) + rng.uniform(-0.12, 0.12, 3)
         A = tf.T_from_Rt(rot, trans)
         T_cam_board = tf.invert(A @ X_true) @ Tbb_true
@@ -96,14 +96,14 @@ def make_scenario(n_poses=15, pixel_noise=0.3, seed=0,
 def main():
     from handeye_calib import handeye_solve as hs
     # seed=11 reliably exercises the PASS path. X recovery is sub-mm for every seed;
-    # the held-out rotation gate (vs noisy single-shot PnP on the small 5x5 board) is
+    # the rotation gate (vs noisy single-shot PnP on the small 5x5 board) is
     # seed-marginal, so the demo pins a seed that clears it cleanly.
     sc = make_scenario(n_poses=20, pixel_noise=0.3, seed=11)
     res = hs.solve(sc.samples, sc.K, None, sc.board_pts)
     dt = np.linalg.norm(res.X[:3, 3] - sc.X_true[:3, 3]) * 1000
     dr = tf.rotation_angle_deg(res.X[:3, :3], sc.X_true[:3, :3])
     print(f"recovered X error: {dt:.3f} mm, {dr:.4f} deg; status={res.status}")
-    print(f"held-out: {res.heldout_metrics}")
+    print(f"residual (all samples): {res.metrics}")
 
 
 if __name__ == "__main__":

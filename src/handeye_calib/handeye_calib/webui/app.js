@@ -450,6 +450,31 @@ if (CAPTURE_BTN) {
   });
 }
 
+function _fmtAnchorScatter(s, nObs) {
+  // Surface the head anchor's own MAD rejection (pan-tilt parity): how many
+  // observations survived, how many were dropped as outliers, and the scatter
+  // of the survivors in mm / deg.
+  if (!s) return `${nObs} obs`;
+  const kept = (s.n !== undefined) ? s.n : nObs;
+  const rej = s.n_rejected || 0;
+  const rejStr = rej ? `, ${rej} rejected [${(s.rejected || []).join(",")}]` : "";
+  return `${kept}/${s.n_total !== undefined ? s.n_total : nObs} obs kept${rejStr} `
+    + `(scatter ${Number(s.trans_mm).toFixed(1)}mm / ${Number(s.rot_deg).toFixed(2)}deg)`;
+}
+const btnAnchor = document.getElementById('btn-anchor');
+if (btnAnchor) btnAnchor.onclick = async () => {
+  const r = await fetch('/api/anchor', {method: 'POST'});
+  const j = await r.json();
+  setStatus('anchor-status', j.ok
+    ? `head anchor: ${_fmtAnchorScatter(j.scatter, j.n_anchor_obs)}`
+    : `anchor failed: ${j.reason}`);
+};
+const btnAnchorClear = document.getElementById('btn-anchor-clear');
+if (btnAnchorClear) btnAnchorClear.onclick = async () => {
+  await fetch('/api/anchor/clear', {method: 'POST'});
+  setStatus('anchor-status', 'no head anchor');
+};
+
 async function _deleteSample(idx) {
   if (!confirm(`Delete sample #${idx}?`)) return;
   setStatus("capture-status", `deleting #${idx}…`, "warn");
@@ -474,11 +499,22 @@ async function _deleteSample(idx) {
 // and rebuilds the gallery's per-row ✕ delete button. Cache a samples
 // signature so we only rebuild when state.samples actually changes.
 let _lastGallerySig = null;
+let _lastSamplesSig = null;
+// Indices the most recent solve's MAD rejected. Marked in the gallery so the
+// operator SEES which captures were weeded — they were only ever shown in the
+// Solve tab before. Cleared whenever the sample set itself changes (a new
+// capture/delete shifts indices, making the old rejection set stale).
+let _solveRejected = new Set();
 function _renderGallery(s) {
   const gal = document.getElementById("gallery");
   if (!gal) return;
   const samples = Array.isArray(s.samples) ? s.samples : [];
-  const sig = JSON.stringify(samples);
+  const samplesSig = JSON.stringify(samples);
+  if (samplesSig !== _lastSamplesSig) {
+    _lastSamplesSig = samplesSig;
+    _solveRejected = new Set();   // sample set changed -> stale rejections
+  }
+  const sig = samplesSig + "|rej:" + [..._solveRejected].sort((a, b) => a - b).join(",");
   if (sig === _lastGallerySig) return;
   _lastGallerySig = sig;
   if (samples.length === 0) {
@@ -490,13 +526,16 @@ function _renderGallery(s) {
   const frag = document.createDocumentFragment();
   for (const m of samples) {
     const idx = Number(m.idx);
+    const rejected = _solveRejected.has(idx);
     const item = document.createElement("div");
-    item.className = "gallery-item";
+    item.className = "gallery-item" + (rejected ? " rejected" : "");
+    if (rejected) item.style.outline = "2px solid #d33";
     const thumb = document.createElement("img");
     thumb.className = "gallery-thumb";
     thumb.alt = `sample ${idx}`;
     thumb.loading = "lazy";
     thumb.src = `/api/samples/${idx}/thumb.jpg`;
+    if (rejected) thumb.style.opacity = "0.45";
     thumb.addEventListener("error", () => { thumb.style.visibility = "hidden"; });
     item.appendChild(thumb);
 
@@ -510,8 +549,11 @@ function _renderGallery(s) {
     const ang = Number.isFinite(m.angular_delta_deg)
       ? "Δ" + m.angular_delta_deg.toFixed(1) + "°"
       : "Δ—";
+    const rejBadge = rejected
+      ? ` · <span class="gallery-rejected" style="color:#d33;font-weight:bold">REJECTED (MAD)</span>`
+      : "";
     meta.innerHTML =
-      `<span class="gallery-idx">#${idx}</span> · corners ${corners}<br>` +
+      `<span class="gallery-idx">#${idx}</span> · corners ${corners}${rejBadge}<br>` +
       `rms ${rms} · area ${area} · ${ang}`;
     item.appendChild(meta);
 
@@ -535,9 +577,17 @@ function _renderDiversityMeter(s) {
   if (!fill || !label) return;
   const d = s.diversity || {};
   const cov = Number.isFinite(d.coverage_deg) ? d.coverage_deg : 0;
-  const target = Number.isFinite(d.target_deg) && d.target_deg > 0
-    ? d.target_deg
-    : 30;
+  // target_deg<=0 means the capture-time dedup gate is DISABLED (record all
+  // positions); don't fabricate a 30° goal — just report coverage as a span.
+  const hasTarget = Number.isFinite(d.target_deg) && d.target_deg > 0;
+  if (!hasTarget) {
+    fill.style.width = "100%";
+    fill.classList.remove("warn");
+    fill.classList.add("ok");
+    label.textContent = `${cov.toFixed(1)}° span (dedup disabled)`;
+    return;
+  }
+  const target = d.target_deg;
   const pct = Math.max(0, Math.min(100, (cov / target) * 100));
   fill.style.width = pct + "%";
   fill.classList.remove("ok", "warn");
@@ -661,6 +711,7 @@ function render() {
 
   // T3: Info-tab kv-tables / matrix / board / safety + Move-tab safety line.
   renderInfoTab(state);
+  renderSettings(state);
   renderMoveSafety(state);
   // T4: Capture-tab stability badge + gallery + diversity meter.
   renderCaptureTab(state);
@@ -668,7 +719,137 @@ function render() {
   renderWaypointsList();
   // T4: Auto-capture sequence UI (below waypoints, above manual capture).
   renderSequenceUI();
+  // Solve tab is now STATE-DRIVEN (was POST-only): coverage populates live as
+  // samples arrive, the last solve rehydrates on reconnect/reload, and MAD
+  // rejections stream in as they happen.
+  renderSolveTabFromState(state);
+  // Anchor status reflects the live head-anchor state, not just button clicks.
+  renderAnchorFromState(state);
 }
+
+let _lastRenderedSolveTs = 0;
+function renderSolveTabFromState(state) {
+  if (!state) return;
+  // Live coverage — draw board centroids as samples are captured, BEFORE any
+  // Solve press (the canvas no longer waits for a POST). Needs state.K +
+  // state.samples[].T_cam_board, both now emitted by the server.
+  try { drawCoverage("coverage", state.samples || [], state.K || null); } catch (_) {}
+
+  // Live MAD rejection progress: show drops as they happen.
+  const sp = state.solve_progress;
+  if (sp && sp.running) {
+    setStatus(SOLVE_STATUS,
+      `solving — rejecting outliers: dropped ${sp.iteration || 0} `
+      + `(kept ${sp.n_active != null ? sp.n_active : "?"}/${sp.n_orig != null ? sp.n_orig : "?"}, `
+      + `floor ${sp.min_keep != null ? sp.min_keep : "?"})`, "warn");
+    try { _renderRejectionTable(sp.rejection_log || []); } catch (_) {}
+  }
+
+  // Rehydrate the full Solve tab from the cached last_solve payload (only when
+  // it's newer than what we've drawn, so the POST path and this don't fight).
+  const ls = state.last_solve;
+  if (ls && Number.isFinite(ls.solve_ts) && ls.solve_ts > _lastRenderedSolveTs) {
+    _lastRenderedSolveTs = ls.solve_ts;
+    try {
+      renderSolvePayload(ls);
+      const v = ls.status || "?";
+      setStatus(SOLVE_STATUS, `solve ${v}`,
+        v === "PASS" ? "ok" : (v === "WARN" ? "warn" : "err"));
+    } catch (e) { console.warn("rehydrate solve failed", e); }
+  }
+}
+
+function renderAnchorFromState(state) {
+  const el = document.getElementById("anchor-status");
+  if (!el || !state || !state.anchor) return;
+  const a = state.anchor;
+  // Don't clobber a fresh click-result while the user is mid-anchor; only
+  // hydrate when we actually have anchor info from the server.
+  if (a.have) {
+    el.textContent = `head anchor: ${_fmtAnchorScatter(a.scatter, a.n_obs)}`;
+  }
+}
+
+// ---- Calibration settings (Info tab): calib_frame + depth knobs + emitter ----
+// Mirrors state.config from the WS push into the form, and POSTs /api/config on
+// Apply. While the operator is mid-edit (configDirty), the 10 Hz render loop must
+// NOT clobber their inputs — so we only sync from state when not dirty.
+let configDirty = false;
+let emitterDirty = false;  // separate: the emitter command is ONLY sent when the
+                           // operator actually touched the checkbox, so a routine
+                           // depth/frame Apply in color mode never kills the projector.
+const CFG_INPUTS = [
+  "use-ffs-depth-input", "depth-weight-input",
+  "depth-sigma-input", "depth-win-input", "depth-min-corners-input",
+];
+function markConfigDirty() { configDirty = true; }
+CFG_INPUTS.forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("change", markConfigDirty);
+});
+$$('input[name="calib-frame"]').forEach((r) => r.addEventListener("change", markConfigDirty));
+const EMITTER_INPUT = document.getElementById("ir-emitter-input");
+if (EMITTER_INPUT) EMITTER_INPUT.addEventListener("change", () => { configDirty = true; emitterDirty = true; });
+
+function renderSettings(s) {
+  const cfg = s.config;
+  if (!cfg || configDirty) return;  // don't clobber in-progress edits
+  const r = document.querySelector(`input[name="calib-frame"][value="${cfg.calib_frame}"]`);
+  if (r) r.checked = true;
+  const set = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
+  const chk = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.checked = !!v; };
+  chk("use-ffs-depth-input", cfg.use_ffs_depth);
+  if (cfg.ir_emitter_enabled !== null && cfg.ir_emitter_enabled !== undefined) {
+    chk("ir-emitter-input", cfg.ir_emitter_enabled);
+  }
+  set("depth-weight-input", cfg.depth_weight);
+  set("depth-sigma-input", cfg.depth_sigma_m);
+  set("depth-win-input", cfg.depth_win);
+  set("depth-min-corners-input", cfg.depth_min_corners);
+}
+
+async function applyConfig() {
+  const frame = document.querySelector('input[name="calib-frame"]:checked')?.value || "color";
+  const curFrame = state && state.config ? state.config.calib_frame : "color";
+  const n = state ? (state.num_samples || 0) : 0;
+  if (frame !== curFrame && n > 0 &&
+      !confirm(`Switching to the ${frame} frame discards ${n} captured sample(s) (they're tied to the current frame's intrinsics). Continue?`)) {
+    return;
+  }
+  const body = {
+    calib_frame: frame,
+    use_ffs_depth: document.getElementById("use-ffs-depth-input")?.checked,
+    depth_weight: parseFloat(document.getElementById("depth-weight-input")?.value),
+    depth_sigma_m: parseFloat(document.getElementById("depth-sigma-input")?.value),
+    depth_win: parseInt(document.getElementById("depth-win-input")?.value, 10),
+    depth_min_corners: parseInt(document.getElementById("depth-min-corners-input")?.value, 10),
+  };
+  // Only command the IR emitter when the operator actually toggled it — a depth/
+  // frame tweak must NOT silently disable the projector (needed for color depth).
+  if (emitterDirty) body.ir_emitter_enabled = document.getElementById("ir-emitter-input")?.checked;
+  setStatus("config-status", "applying…", "warn");
+  try {
+    const resp = await fetch("/api/config", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await resp.json();
+    if (resp.ok && j.ok) {
+      configDirty = false;  // success -> let the WS state re-sync the form
+      emitterDirty = false;
+      let msg = `applied (frame=${j.calib_frame || frame})`;
+      if (j.emitter) msg += j.emitter.ok ? "; emitter set" : `; emitter FAILED: ${j.emitter.reason}`;
+      setStatus("config-status", msg, j.emitter && !j.emitter.ok ? "warn" : "ok");
+    } else {
+      // Keep dirty so a failed apply doesn't let the WS clobber unsaved edits.
+      setStatus("config-status", "FAIL: " + (j.reason || ("HTTP " + resp.status)), "err");
+    }
+  } catch (e) {
+    setStatus("config-status", "ERROR: " + e, "err");
+  }
+}
+const APPLY_CFG_BTN = document.getElementById("apply-config-btn");
+if (APPLY_CFG_BTN) APPLY_CFG_BTN.addEventListener("click", applyConfig);
 
 // ---- T2: Waypoints sub-panel — list + add-current + delete + save/reload --
 // Lives in the Capture tab, above the manual capture button. Reads
@@ -677,9 +858,10 @@ function render() {
 // DELETE /api/waypoints/{idx}; Save/Reload hit the matching POST endpoints.
 // All confirm()/status semantics copied verbatim from pan_tilt/webui/app.js.
 const WP_LIST     = document.getElementById("waypoints-list");
-const WP_ADD_BTN  = document.getElementById("waypoint-add-current-btn");
-const WP_SAVE_BTN = document.getElementById("waypoint-save-btn");
-const WP_REL_BTN  = document.getElementById("waypoint-reload-btn");
+const WP_ADD_BTN   = document.getElementById("waypoint-add-current-btn");
+const WP_SAVE_BTN  = document.getElementById("waypoint-save-btn");
+const WP_REL_BTN   = document.getElementById("waypoint-reload-btn");
+const WP_CLEAR_BTN = document.getElementById("waypoint-clear-btn");
 
 if (WP_ADD_BTN) WP_ADD_BTN.addEventListener("click", async () => {
   setStatus("waypoints-status", "adding…", "warn");
@@ -715,6 +897,20 @@ if (WP_REL_BTN) WP_REL_BTN.addEventListener("click", async () => {
     const body = await r.json();
     setStatus("waypoints-status",
       body.ok ? `loaded ${body.count} waypoint(s) from ${body.path}` : `reload failed: ${body.reason}`,
+      body.ok ? "ok" : "err");
+  } catch (e) {
+    setStatus("waypoints-status", "ERROR: " + e, "err");
+  }
+});
+
+if (WP_CLEAR_BTN) WP_CLEAR_BTN.addEventListener("click", async () => {
+  if (!confirm("Clear ALL waypoints from memory?\n(Disk file is unchanged — use Reload to restore them.)")) return;
+  setStatus("waypoints-status", "clearing…", "warn");
+  try {
+    const r = await fetch("/api/waypoints", {method: "DELETE"});
+    const body = await r.json();
+    setStatus("waypoints-status",
+      body.ok ? `cleared ${body.cleared} waypoint(s)` : `clear failed: ${body.reason}`,
       body.ok ? "ok" : "err");
   } catch (e) {
     setStatus("waypoints-status", "ERROR: " + e, "err");
@@ -1023,24 +1219,78 @@ function _renderMethodTable(rows) {
   METHOD_TABLE.appendChild(tbody);
 }
 
+function _renderPerSampleTable(p) {
+  // One row per captured sample: residual in mm / deg / px (pixels alone are
+  // hard for a human to judge). Rejected samples are struck through (their
+  // residual entries arrive as null = "deleted" from the view).
+  const tbl = document.querySelector("#per-sample-table");
+  if (!tbl) return;
+  const px = p.per_sample_reproj_px || [];
+  const mm = p.per_sample_trans_mm || [];
+  const dg = p.per_sample_rot_deg || [];
+  const rej = new Set(p.rejected_sample_indices || []);
+  const n = Math.max(px.length, mm.length, dg.length);
+  let html = "<thead><tr><th>#</th><th>trans (mm)</th><th>rot (deg)</th>"
+    + "<th>reproj (px)</th><th></th></tr></thead><tbody>";
+  const f = (v, d) => (v === null || v === undefined || !Number.isFinite(v)) ? "–" : Number(v).toFixed(d);
+  for (let i = 0; i < n; i++) {
+    const dropped = rej.has(i);
+    html += `<tr style="${dropped ? "text-decoration:line-through;opacity:0.55" : ""}">`
+      + `<td>${i}</td><td>${f(mm[i], 1)}</td><td>${f(dg[i], 2)}</td>`
+      + `<td>${f(px[i], 1)}</td><td>${dropped ? "rejected" : ""}</td></tr>`;
+  }
+  tbl.innerHTML = html + "</tbody>";
+}
+
+function _renderRejectionTable(log) {
+  // Pan-tilt-style "why was this dropped" readout: residual + robust-z per axis.
+  const tbl = document.querySelector("#rejection-table");
+  if (!tbl) return;
+  const rows = log || [];
+  if (!rows.length) { tbl.innerHTML = "<tbody><tr><td>none rejected</td></tr></tbody>"; return; }
+  let html = "<thead><tr><th>#</th><th>trans (mm)</th><th>rot (deg)</th>"
+    + "<th>reproj (px)</th><th>z trans</th><th>z rot</th><th>z reproj</th></tr></thead><tbody>";
+  // Defensive formatter: a missing/NaN field must render "–", never throw (an
+  // exception here would abort the whole solve render mid-way).
+  const f = (v, d) => (v === null || v === undefined || !Number.isFinite(v)) ? "–" : Number(v).toFixed(d);
+  for (const r of rows) {
+    html += `<tr><td>${r.idx}</td><td>${f(r.trans_mm, 1)}</td>`
+      + `<td>${f(r.rot_deg, 2)}</td><td>${f(r.reproj_px, 1)}</td>`
+      + `<td>${f(r.z_trans, 2)}</td><td>${f(r.z_rot, 2)}</td>`
+      + `<td>${f(r.z_reproj, 2)}</td></tr>`;
+  }
+  tbl.innerHTML = html + "</tbody>";
+}
+
 function renderSolvePayload(p) {
   lastSolve = p;
+  // Mark the MAD-rejected captures in the Capture gallery too, so the operator
+  // sees the weeding where they look, not only in the Solve tab tables.
+  _solveRejected = new Set(p.rejected_sample_indices || []);
+  if (typeof state !== "undefined" && state) {
+    // Pin the samples-signature to the current set so _renderGallery's
+    // "samples changed -> clear rejections" branch doesn't wipe the marks we
+    // just set (the solve ran on exactly this set).
+    _lastSamplesSig = JSON.stringify(Array.isArray(state.samples) ? state.samples : []);
+    _lastGallerySig = null;                  // force a gallery rebuild with marks
+    _renderGallery(state);
+  }
   _renderVerdict(p.status);
   _renderMethodTable(p.per_method_summary || []);
-  const tm = p.train_metrics_mm_deg || {};
-  const hm = p.heldout_metrics_mm_deg || {};
-  _setKv("#solve-metrics", "train_trans",
-    Number.isFinite(tm.trans_rmse_mm) ? tm.trans_rmse_mm.toFixed(3) + " mm" : "–");
-  _setKv("#solve-metrics", "train_rot",
-    Number.isFinite(tm.rot_rmse_deg) ? tm.rot_rmse_deg.toFixed(3) + " deg" : "–");
-  _setKv("#solve-metrics", "train_reproj",
-    Number.isFinite(tm.reproj_px) ? tm.reproj_px.toFixed(3) + " px" : "–");
-  _setKv("#solve-metrics", "held_trans",
-    Number.isFinite(hm.trans_rmse_mm) ? hm.trans_rmse_mm.toFixed(3) + " mm" : "–");
-  _setKv("#solve-metrics", "held_rot",
-    Number.isFinite(hm.rot_rmse_deg) ? hm.rot_rmse_deg.toFixed(3) + " deg" : "–");
-  _setKv("#solve-metrics", "held_reproj",
-    Number.isFinite(hm.reproj_px) ? hm.reproj_px.toFixed(3) + " px" : "–");
+  const m = p.metrics_mm_deg || {};
+  _setKv("#solve-metrics", "res_trans",
+    Number.isFinite(m.trans_rmse_mm) ? m.trans_rmse_mm.toFixed(3) + " mm" : "–");
+  _setKv("#solve-metrics", "res_rot",
+    Number.isFinite(m.rot_rmse_deg) ? m.rot_rmse_deg.toFixed(3) + " deg" : "–");
+  _setKv("#solve-metrics", "res_reproj",
+    Number.isFinite(m.reproj_px) ? m.reproj_px.toFixed(3) + " px" : "–");
+  _setKv("#solve-metrics", "res_depth",
+    Number.isFinite(m.depth_point_rmse_mm)
+      ? m.depth_point_rmse_mm.toFixed(2) + " mm (" + (m.n_depth_corners || 0) + " corners)"
+      : "n/a (monocular)");
+  const nTotal = (p.per_sample_reproj_px || []).length;
+  const nRej = (p.rejected_sample_indices || []).length;
+  _setKv("#solve-metrics", "res_kept", nTotal ? `${nTotal - nRej} / ${nTotal}` : "–");
   const xyz = p.X_xyz_mm || [];
   const rpy = p.X_rpy_deg || [];
   _setKv("#solve-X", "X_xyz_mm",
@@ -1048,15 +1298,40 @@ function renderSolvePayload(p) {
   _setKv("#solve-X", "X_rpy_deg",
     rpy.length === 3 ? `[${rpy.map((v) => Number(v).toFixed(3)).join(", ")}] deg` : "–");
 
-  const resids = p.per_sample_reproj_px || [];
+  _renderPerSampleTable(p);
+  _renderRejectionTable(p.rejection_log || []);
+
+  // Rigid-mount go/no-go (intrinsics-free). This is the DOMINANT diagnostic:
+  // if the mount flexes, no solve can pass no matter the data — surface it
+  // loudly above the residual numbers.
+  const rcEl = document.getElementById("rigid-closure");
+  const rc = p.rigid_closure;
+  if (rcEl) {
+    if (!rc || !rc.n_pairs) {
+      rcEl.textContent = "rigid-mount check: n/a (need poses that rotate the flange)";
+      rcEl.className = "status-line";
+    } else if (rc.ok) {
+      rcEl.textContent = `rigid-mount check: PASS — ${rc.median_deg.toFixed(2)}° median flange↔camera closure (rigid)`;
+      rcEl.className = "status-line ok";
+    } else {
+      rcEl.textContent = `rigid-mount check: FAIL — ${rc.median_deg.toFixed(2)}° median (max ${rc.max_deg.toFixed(1)}°) flange↔camera mismatch. Mount flexes / arm FK is pose-dependent; NO solve can pass — rigidify the mount and recapture.`;
+      rcEl.className = "status-line err";
+    }
+  }
+
+  // Histogram/scatter skip rejected (null) entries automatically.
+  const resids = (p.per_sample_reproj_px || []).filter((v) => v !== null && Number.isFinite(v));
   drawHistogram("resid-hist", resids, { bins: 20 });
   drawScatter("resid-scatter", resids);
-  // Coverage uses sample metadata (T_cam_board + K) which T4 will publish via
-  // state.samples + state.K. Until then we fall back to whatever the latest
-  // state push exposes; an empty array just yields the "no samples" message.
+  // Coverage from the live state push (state.K + per-sample T_cam_board).
   const samples = (state && Array.isArray(state.samples)) ? state.samples : [];
   const K = (state && state.K) || (state && state.intrinsics && state.intrinsics.K) || null;
   drawCoverage("coverage", samples, K);
+  // Observability is a secondary WARN — only show it if the mount check passed
+  // (a failing mount is the real story).
+  if (rc && rc.ok && p.observability && p.observability.ok === false) {
+    setStatus(SOLVE_STATUS, 'WARN: ' + p.observability.detail);
+  }
 }
 
 async function runSolve() {
@@ -1335,3 +1610,168 @@ if (PROMOTE_RELOAD_BTN)      PROMOTE_RELOAD_BTN.addEventListener("click", reload
 window.fetchPromoteDiff = fetchPromoteDiff;
 window.applyPromote = applyPromote;
 window.reloadPromote = reloadPromote;
+
+// ---- History: browse / re-open past capture sessions ----------------------
+// Mirrors the pan-tilt calibration's session browser. Every capture is
+// persisted server-side; here we list sessions, inspect one (gallery + solve
+// verdict + per-sample residuals + why-rejected), and load one back into the
+// live session to re-solve with the current solver.
+let HISTORY_SEL = null;
+
+function _histStatusKind(status) {
+  return status === "PASS" ? "ok" : (status === "WARN" ? "warn" : (status ? "err" : ""));
+}
+
+async function historyLoadList() {
+  setStatus("history-status", "loading…", "warn");
+  try {
+    const r = await fetch("/api/sessions");
+    const body = await r.json();
+    const sessions = (body && body.sessions) || [];
+    const tbl = document.querySelector("#history-table");
+    if (!sessions.length) {
+      tbl.innerHTML = "<tbody><tr><td>no saved captures yet</td></tr></tbody>";
+      setStatus("history-status", "0 sessions", "");
+      return;
+    }
+    let html = "<thead><tr><th>session</th><th>captured</th><th>samples</th>"
+      + "<th>rejected</th><th>status</th></tr></thead><tbody>";
+    for (const s of sessions) {
+      const st = s.status || (s.has_solve ? "?" : "unsolved");
+      html += `<tr class="hist-row" data-name="${s.name}" style="cursor:pointer">`
+        + `<td>${s.name}</td><td>${s.timestamp || "–"}</td>`
+        + `<td>${s.n_samples}</td><td>${s.n_rejected || 0}</td>`
+        + `<td>${st}</td></tr>`;
+    }
+    tbl.innerHTML = html + "</tbody>";
+    tbl.querySelectorAll(".hist-row").forEach((row) => {
+      row.addEventListener("click", () => historySelect(row.dataset.name));
+    });
+    setStatus("history-status", `${sessions.length} session(s)`, "");
+  } catch (e) {
+    setStatus("history-status", "ERROR: " + e, "err");
+  }
+}
+
+async function historySelect(name) {
+  HISTORY_SEL = name;
+  document.querySelector("#history-detail").hidden = false;
+  document.querySelector("#history-sel-name").textContent = name;
+  setStatus("history-detail-status", "loading…", "warn");
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(name)}`);
+    const d = await r.json();
+    if (!d.ok) { setStatus("history-detail-status", "FAIL: " + (d.reason || ""), "err"); return; }
+    const res = d.result || null;
+    const samples = d.samples || [];
+    const rej = new Set((res && res.rejected_sample_indices) || []);
+
+    // summary kv
+    const sm = document.querySelector("#history-summary");
+    const f = (v, d2, u) => (v === null || v === undefined || !Number.isFinite(v)) ? "–" : Number(v).toFixed(d2) + (u || "");
+    const m = (res && res.metrics) || {};
+    let smHtml = `<tr><td>robot</td><td>${d.robot || "–"}</td></tr>`
+      + `<tr><td>calib_frame</td><td>${d.calib_frame || "–"}</td></tr>`
+      + `<tr><td>samples</td><td>${samples.length}</td></tr>`;
+    if (res) {
+      smHtml += `<tr><td>status</td><td>${res.status || "–"}</td></tr>`
+        + `<tr><td>seed_used</td><td>${res.seed_used || "–"}</td></tr>`
+        + `<tr><td>trans_rmse</td><td>${f(m.trans_rmse_m * 1000, 2, " mm")}</td></tr>`
+        + `<tr><td>rot_rmse</td><td>${f(m.rot_rmse_rad * 180 / Math.PI, 2, " deg")}</td></tr>`
+        + `<tr><td>reproj</td><td>${f(m.reproj_px, 2, " px")}</td></tr>`
+        + `<tr><td>rejected</td><td>${rej.size} / ${samples.length}</td></tr>`;
+    } else {
+      smHtml += `<tr><td>status</td><td>not solved yet</td></tr>`;
+    }
+    sm.innerHTML = smHtml;
+
+    // gallery (thumbnails served from the session dir on disk)
+    const gal = document.querySelector("#history-gallery");
+    gal.innerHTML = samples.map((_s, i) => {
+      const dropped = rej.has(i);
+      return `<figure class="thumb${dropped ? " rejected" : ""}" style="${dropped ? "opacity:0.5" : ""}">`
+        + `<img src="/api/sessions/${encodeURIComponent(name)}/samples/${i}/thumb.jpg" `
+        + `alt="sample ${i}" width="120"/>`
+        + `<figcaption>#${i}${dropped ? " ✗" : ""}</figcaption></figure>`;
+    }).join("");
+
+    // per-sample residual table (mm / deg / px) from the stored result
+    const ps = document.querySelector("#history-per-sample");
+    if (res && res.per_sample_reproj_px) {
+      const px = res.per_sample_reproj_px, mm = res.per_sample_trans_mm || [], dg = res.per_sample_rot_deg || [];
+      let h = "<thead><tr><th>#</th><th>trans (mm)</th><th>rot (deg)</th><th>reproj (px)</th><th></th></tr></thead><tbody>";
+      for (let i = 0; i < px.length; i++) {
+        const dr = rej.has(i);
+        h += `<tr style="${dr ? "text-decoration:line-through;opacity:0.55" : ""}"><td>${i}</td>`
+          + `<td>${f(mm[i], 1)}</td><td>${f(dg[i], 2)}</td><td>${f(px[i], 1)}</td>`
+          + `<td>${dr ? "rejected" : ""}</td></tr>`;
+      }
+      ps.innerHTML = h + "</tbody>";
+    } else {
+      ps.innerHTML = "<tbody><tr><td>not solved — load + Solve to compute residuals</td></tr></tbody>";
+    }
+
+    // rejection "why" table
+    const rt = document.querySelector("#history-rejection");
+    const log = (res && res.rejection_log) || [];
+    if (log.length) {
+      let h = "<thead><tr><th>#</th><th>trans (mm)</th><th>rot (deg)</th><th>reproj (px)</th>"
+        + "<th>z trans</th><th>z rot</th><th>z reproj</th></tr></thead><tbody>";
+      const ff = (v, dd) => (v === null || v === undefined || !Number.isFinite(v)) ? "–" : Number(v).toFixed(dd);
+      for (const r2 of log) {
+        h += `<tr><td>${r2.idx}</td><td>${ff(r2.trans_mm, 1)}</td><td>${ff(r2.rot_deg, 2)}</td>`
+          + `<td>${ff(r2.reproj_px, 1)}</td><td>${ff(r2.z_trans, 2)}</td>`
+          + `<td>${ff(r2.z_rot, 2)}</td><td>${ff(r2.z_reproj, 2)}</td></tr>`;
+      }
+      rt.innerHTML = h + "</tbody>";
+    } else {
+      rt.innerHTML = "<tbody><tr><td>none rejected</td></tr></tbody>";
+    }
+    setStatus("history-detail-status", "", "");
+  } catch (e) {
+    setStatus("history-detail-status", "ERROR: " + e, "err");
+  }
+}
+
+async function historyLoadIntoLive() {
+  if (!HISTORY_SEL) return;
+  setStatus("history-detail-status", "loading into live session…", "warn");
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(HISTORY_SEL)}/load`, { method: "POST" });
+    const body = await r.json();
+    if (!body.ok) { setStatus("history-detail-status", "FAIL: " + (body.reason || ""), "err"); return; }
+    setStatus("history-detail-status",
+      `loaded ${body.num_samples} samples — switch to Solve and press Solve to re-solve`, "ok");
+    activateTab("solve");
+  } catch (e) {
+    setStatus("history-detail-status", "ERROR: " + e, "err");
+  }
+}
+
+async function historyDeleteSel() {
+  if (!HISTORY_SEL) return;
+  if (!window.confirm(`Delete capture session ${HISTORY_SEL}? This cannot be undone.`)) return;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(HISTORY_SEL)}`, { method: "DELETE" });
+    const body = await r.json();
+    if (!body.ok) { setStatus("history-detail-status", "FAIL: " + (body.reason || ""), "err"); return; }
+    document.querySelector("#history-detail").hidden = true;
+    HISTORY_SEL = null;
+    historyLoadList();
+  } catch (e) {
+    setStatus("history-detail-status", "ERROR: " + e, "err");
+  }
+}
+
+const HISTORY_REFRESH_BTN = document.querySelector("#history-refresh-btn");
+const HISTORY_LOAD_BTN = document.querySelector("#history-load-btn");
+const HISTORY_DELETE_BTN = document.querySelector("#history-delete-btn");
+if (HISTORY_REFRESH_BTN) HISTORY_REFRESH_BTN.addEventListener("click", historyLoadList);
+if (HISTORY_LOAD_BTN) HISTORY_LOAD_BTN.addEventListener("click", historyLoadIntoLive);
+if (HISTORY_DELETE_BTN) HISTORY_DELETE_BTN.addEventListener("click", historyDeleteSel);
+// Auto-refresh the list whenever the History tab is opened.
+$$(".side-tab").forEach((b) => {
+  if (b.dataset.tab === "history") b.addEventListener("click", historyLoadList);
+});
+window.historyLoadList = historyLoadList;
+window.historySelect = historySelect;

@@ -8,6 +8,8 @@ vision_log/
 .ros/
 log/
 
+debug_renders/**
+
 .venv**/
 !.venv*.uv-project/
 

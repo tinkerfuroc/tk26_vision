@@ -64,10 +64,13 @@ def rigid_3d_3d(src, dst):
     +1) and translations ``t``. ``src`` and ``dst`` are ``(N, 3)`` arrays of
     corresponding points.
 
-    Used by the FFS-depth path: ``src`` = board-frame ChArUco corner model
-    points, ``dst`` = the FFS-deprojected metric camera-frame points, so the
-    returned ``T`` is a depth-grounded ``T_cam_board`` whose optical-axis
-    translation is *measured* rather than inferred by monocular PnP.
+    Standalone utility for the FFS-depth work (NOT currently on the solve path —
+    the solver injects depth as a soft 3D residual in the bundle adjust, not a
+    per-view 3D-3D fit). Intended use: ``src`` = board-frame ChArUco corner model
+    points, ``dst`` = the FFS-deprojected metric camera-frame points, giving a
+    depth-only ``T_cam_board`` whose optical-axis translation is *measured*
+    rather than inferred by monocular PnP — useful as a per-view depth-vs-PnP
+    disagreement check or a metric seed if wired in later.
 
     The ``np.diag([1, 1, sign(det(V Uᵀ))])`` correction forbids a reflection
     when the point set is planar (the ChArUco board is exactly z=0 in board

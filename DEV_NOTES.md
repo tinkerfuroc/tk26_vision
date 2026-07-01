@@ -16,6 +16,32 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-06-27 — handeye 0.8.0: head warm-start + pan_tilt parity ports (needs operator-in-the-loop)
+
+Landed the head-Orbbec warm-start + four pan_tilt parity ports for `handeye_calib`
+(plan: `docs/plans/2026-06-27-handeye-headassist-parity.md`; README §Changelog
+0.8.0). All verified against the synthetic suite (168 passed) — the hardware path
+is **not yet exercised**.
+
+**Still needs operator-in-the-loop (T4-class):**
+- **Head warm-start end-to-end.** With wrist RealSense + head Orbbec + RSP +
+  `/joint_states` up and the board fixed and co-visible: confirm `/tf
+  <base_frame> → <head_optical_frame>` tracks the live head angle (guards the JSP
+  zero-clobber bug), click **Anchor board (head)** from 2–3 head poses, then
+  **Solve** on a deliberately sparse / low-rotation wrist set, and confirm the
+  board-anchor seed is selected (rescues a degenerate set the closed-form seed
+  alone would miss). Pre-flight: the deployed head body frame is named
+  `camera_link` (same as the Orbbec driver's own) — confirm RSP owns
+  `base_link→camera_link` and the driver publishes only optical children, else TF
+  double-parents; and confirm the head ChArUco origin matches the wrist board.
+  Honest ceiling: head-anchored values inherit the head's ~3 mm/0.5° systematic
+  base-frame error — use as a seed/cross-check, not a promoted result.
+- **Consensus capture.** Confirm `do_capture` returns `n_consensus_frames > 0`
+  on a settled pose and that the held-out rotation RMSE drops vs single-shot.
+- **Rejection floors.** `reject_min_rot_rad=3.0°` / `reject_min_trans_m=10 mm`
+  were tuned against synthetic `pixel_noise=0.3`; re-check against an arena
+  rosbag that the floors don't trim legitimate poses or pass a real bad one.
+
 ## 2026-06-10 — follow-demo debugging round (reacquire, announce, stop-all, dashboard lag, launch crash)
 
 Operator ran the full Follow Demo (`track_web_control.launch.py` + the webui

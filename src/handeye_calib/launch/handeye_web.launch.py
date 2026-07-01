@@ -6,6 +6,8 @@ Brings up the handeye_web node (FastAPI UI + rclpy). The RealSense camera
 (realsense2_camera, camera_name:=xarm_camera) must be launched separately —
 the UI shows 'no camera' until color frames arrive.
 """
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -14,7 +16,12 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 _STR = [
     ("bind", "127.0.0.1"),
-    ("robot_name", ""),
+    # Default mirrors $ROBOT_NAME so the ``robot_name`` param can't silently
+    # contradict the env var the node's _resolve_robot_name() prefers. An
+    # explicit ``robot_name:=…`` launch arg still overrides. Without this the
+    # param defaulted to '' and `ros2 param get /handeye_web robot_name` read
+    # empty even with ROBOT_NAME exported — a misleading "unset" signal.
+    ("robot_name", os.environ.get("ROBOT_NAME", "")),
     # Matches the realsense2_camera launch convention used in this workspace
     # (namespace=/camera, node=xarm_camera) — topics land at
     # /camera/xarm_camera/color/*. Override via launch arg if the wrist camera

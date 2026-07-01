@@ -38,6 +38,31 @@ The wrapper sources `.venv-fs/`, runs `colcon build --packages-select
 foundation_stereo` (or the args you pass), then re-shebangs the entry-point
 script. Provisioning the venv once: see `src/foundation_stereo/README.md`.
 
+**`pan_tilt` extrinsic calibration builds under a fourth venv (`.venv-calib`).**
+`calibrate_web` / `calibrate_collect` / `pan_tilt.calibration.*` need
+`cv2.aruco` for ChArUco detection, and the code targets the OpenCV **4.7+**
+`ArucoDetector` / `CharucoDetector` API — that module only ships in
+`opencv-contrib-python`, **not** the `opencv-python` that the system / main
+vision env carries (symptom: `AttributeError: module 'cv2' has no attribute
+'aruco'`). `.venv-calib` holds `opencv-contrib-python==4.10.0.84` plus
+scipy / fastapi / uvicorn / aiofiles / pyserial, fully isolated from
+`~/.local`. Use the dedicated wrapper:
+
+```bash
+./src/tk26_vision/scripts/build_pan_tilt_calib.sh [colcon args...]
+```
+
+It sources `.venv-calib`, runs `colcon build --packages-select pan_tilt`,
+then pins the calibration-workflow entry points (`calibrate_web`,
+`calibrate_collect`, `controller`, `state_publisher`) to the venv python.
+**`follow_head` is deliberately left on `/usr/bin/python3`** (`FOLLOW_HEAD_PY`
+override) — it needs `ultralytics`/`torch`, which this lean calib venv does
+not carry. Provision the venv once (header of the wrapper has the exact
+commands): `python3.10 -m venv .venv-calib --system-site-packages --symlinks`
+then `pip install --ignore-installed numpy==1.23.4 scipy==1.12.0
+opencv-contrib-python==4.10.0.84 PyYAML fastapi 'uvicorn[standard]' aiofiles
+pyserial`. Diff-target: `.venv-calib/freeze.lock.txt`.
+
 ## Environment
 
 ### Python deps

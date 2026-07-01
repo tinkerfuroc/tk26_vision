@@ -59,6 +59,7 @@ from .utils import (
     pose_error_scalars,
     pose_to_matrix,
     sample_to_matrices,
+    wrap_to_pi,
 )
 
 
@@ -140,10 +141,10 @@ def _params_to_dict(p: PanTiltParams) -> dict:
         "t_b_rotvec": p.t_b_rotvec.tolist(),
         "t_ee_marker_rotvec": p.t_ee_marker_rotvec.tolist(),
         "t_ee_marker_trans": p.t_ee_marker_trans.tolist(),
-        "theta_t_offset_rad": float(p.theta_t_offset),
-        "theta_t_offset_deg": float(np.degrees(p.theta_t_offset)),
-        "theta_p_offset_rad": float(p.theta_p_offset),
-        "theta_p_offset_deg": float(np.degrees(p.theta_p_offset)),
+        "theta_t_offset_rad": wrap_to_pi(p.theta_t_offset),
+        "theta_t_offset_deg": float(np.degrees(wrap_to_pi(p.theta_t_offset))),
+        "theta_p_offset_rad": wrap_to_pi(p.theta_p_offset),
+        "theta_p_offset_deg": float(np.degrees(wrap_to_pi(p.theta_p_offset))),
         "l_pan": float(p.l_pan),
     }
 
@@ -369,8 +370,15 @@ def cmd_handeye(args):
     # (the operator forgot to re-collect after touching the EE/board). Either
     # way, the downstream chain + polish silently produce huge errors.
     # Catch it here, before anyone wastes 8 minutes on a poisoned solve.
-    sibling = "handeye_custom.json" if out_name == "handeye.json" else "handeye.json"
-    sibling_path = Path(args.out) / sibling
+    # With several named custom datasets there can be many handeye_custom*.json.
+    # A canonical solve (handeye.json) cross-checks against any one existing
+    # custom solve; a custom solve cross-checks against the canonical anchor.
+    out_dir = Path(args.out)
+    if out_name == "handeye.json":
+        _customs = sorted(out_dir.glob("handeye_custom*.json"))
+        sibling_path = _customs[0] if _customs else out_dir / "handeye_custom.json"
+    else:
+        sibling_path = out_dir / "handeye.json"
     if sibling_path.is_file() and not getattr(args, "allow_t_ee_marker_mismatch", False):
         try:
             sib = json.loads(sibling_path.read_text())
@@ -395,7 +403,7 @@ def cmd_handeye(args):
                     f"\n[WARNING] T_ee_marker sibling cross-check disagrees (advisory, NOT blocking).\n"
                     f"  new solve   ({out_name}, from {phase1_path.name} @ {phase1_mtime}):\n"
                     f"    trans={np.round(t_ee_marker[:3,3],4).tolist()}\n"
-                    f"  sibling     ({sibling} @ {sib_mtime}):\n"
+                    f"  sibling     ({sibling_path.name} @ {sib_mtime}):\n"
                     f"    trans={np.round(em_sib[:3,3],4).tolist()}\n"
                     f"  disagreement: {te*1000:.1f} mm trans, {np.degrees(re_):.2f} deg rot\n"
                     f"  (advisory gate: 5 mm / 1 deg)\n\n"

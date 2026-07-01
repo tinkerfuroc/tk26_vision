@@ -399,7 +399,13 @@ def _make_node_class():
 
             self.bind_host = self._param("bind", "127.0.0.1")
             self.bind_port = int(self._param("port", 8766))
-            self._robot_name = self._param("robot_name", os.environ.get("ROBOT_NAME", ""))
+            # Declare robot_name at startup so `ros2 param get/set /handeye_web
+            # robot_name` works immediately; the default mirrors $ROBOT_NAME so
+            # the param can't contradict the env var. Do NOT cache the resolved
+            # name on self — _resolve_robot_name() (env-var-first, re-read per
+            # request) is the single source of truth; a startup snapshot would
+            # go stale after a live `ros2 param set`.
+            self._param("robot_name", os.environ.get("ROBOT_NAME", ""))
             self._base_frame = self._param("base_frame", "link_base")
             self._eef_frame = self._param("eef_frame", "link_eef")
             self._aruco_dict_name = self._param("aruco_dict", "DICT_5X5_100")
@@ -2949,11 +2955,15 @@ def _make_node_class():
         def _resolve_robot_name(self):
             """ROBOT_NAME env var wins; falls back to the ``robot_name`` param.
 
-            Empty string => unset (UI shows the yaml-only banner). The env-var
-            precedence mirrors the existing ``_param("robot_name", os.environ
-            .get("ROBOT_NAME", ""))`` init pattern; we re-read both at call
-            time so the operator can ``export ROBOT_NAME=…`` and reload
-            without re-launching.
+            Empty string => unset (UI shows the yaml-only banner). Both inputs
+            are re-read at call time, so a runtime ``ros2 param set /handeye_web
+            robot_name <name>`` takes effect on the next reload without
+            re-launching.
+
+            The env var, by contrast, canNOT be changed at runtime: a process's
+            ``os.environ`` is frozen at spawn, so ``export ROBOT_NAME=…`` in
+            another shell has no effect on an already-running node. Set the env
+            var *before* launch, or use ``ros2 param set`` to override live.
             """
             import os
             return (os.environ.get("ROBOT_NAME", "")

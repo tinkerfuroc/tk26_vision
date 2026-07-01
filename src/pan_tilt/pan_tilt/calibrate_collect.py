@@ -62,6 +62,11 @@ from .calibration.aruco_detect import (
     cluster_consensus,
     detect_pose,
 )
+from .calibration.custom_naming import (
+    custom_dataset_filenames,
+    migrate_custom_datasets,
+    sanitize_custom_name,
+)
 from .calibration.safety import SafetyEnvelope
 from .calibration.utils import (
     matrix_to_pose_dict,
@@ -99,6 +104,12 @@ class CollectConfig:
     safety: SafetyEnvelope = field(default_factory=SafetyEnvelope)
 
     phase1_waypoints: list = field(default_factory=list)   # list of joint-angle lists (rad), used at firmware (pan=0, tilt=level_tilt_deg) — the canonical "level" park
+    # Named CUSTOM hand-eye datasets — each {name, park_pan_deg, park_tilt_deg,
+    # waypoints}. Populated by `migrate_custom_datasets` after load so a legacy
+    # single-custom yaml (the flat keys below) still works.
+    phase1_custom_datasets: list = field(default_factory=list)
+    # LEGACY single-custom fields. Still read from old YAMLs by `_load_config`'s
+    # flat override, then folded into `phase1_custom_datasets`. Not serialized.
     phase1_waypoints_custom: list = field(default_factory=list)  # used at the operator-chosen custom park
     # Custom Phase-1 park pose (firmware degrees). Defaults to (0, 0) so old
     # behavior (camera looking 30° down) holds for unconfigured installs.
@@ -296,6 +307,11 @@ def _load_config(path: Optional[str]) -> CollectConfig:
                 cfg.board.dict_id = getattr(cv2.aruco, v)
             elif hasattr(cfg.board, k):
                 setattr(cfg.board, k, v)
+    # Normalize custom datasets: prefer the named-list form, else migrate the
+    # legacy flat keys (phase1_waypoints_custom + phase1_custom_park_*) into a
+    # single entry named "custom". Operates on the raw collector dict so both
+    # shapes round-trip without data loss.
+    cfg.phase1_custom_datasets = migrate_custom_datasets(data.get("collector", {}))
     return cfg
 
 
@@ -312,12 +328,16 @@ class CalibrateCollectNode(Node):
         self.declare_parameter("config", _default_calib_config_path())
         self.declare_parameter("out_dir", "calibration_data")
         self.declare_parameter("phase", "both")  # both | phase1 | phase1_custom | phase2 | sanity | phase4_validation | dry_run
+        # Which named custom dataset to collect when phase==phase1_custom. Empty
+        # selects the sole dataset (error if there are several).
+        self.declare_parameter("custom_name", "")
 
         config_path = self.get_parameter("config").value or None
         self._cfg = _load_config(config_path)
         self._out_dir = Path(self.get_parameter("out_dir").value)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._phase_select = self.get_parameter("phase").value
+        self._custom_name = (self.get_parameter("custom_name").value or "").strip()
 
         # Echo waypoint counts so an unexpectedly-pruned sidecar config is
         # obvious in the terminal -- if the operator points -p config:= at a
@@ -326,10 +346,14 @@ class CalibrateCollectNode(Node):
         n_p2_cells = (len(self._cfg.phase2_grid_pairs)
                       if self._cfg.phase2_grid_pairs
                       else len(self._cfg.pan_grid_deg) * len(self._cfg.tilt_grid_deg))
+        custom_summary = ", ".join(
+            f"{d['name']}({len(d.get('waypoints', []))})"
+            for d in self._cfg.phase1_custom_datasets
+        ) or "(none)"
         self.get_logger().info(
             f"loaded config from {config_path}: "
             f"phase1={len(self._cfg.phase1_waypoints)} "
-            f"phase1_custom={len(self._cfg.phase1_waypoints_custom)} "
+            f"phase1_custom_datasets=[{custom_summary}] "
             f"phase2_anchors={len(self._cfg.phase2_waypoints)} "
             f"phase2_cells={n_p2_cells}"
             + (" (pruned grid pairs)" if self._cfg.phase2_grid_pairs else "")
@@ -1306,11 +1330,11 @@ class CalibrateCollectNode(Node):
         to a 30-min collect.
         """
         results: dict = {}
-        for list_name, waypoints in (
-            ("phase1_waypoints",        self._cfg.phase1_waypoints),
-            ("phase1_waypoints_custom", self._cfg.phase1_waypoints_custom),
-            ("phase2_waypoints",        self._cfg.phase2_waypoints),
-        ):
+        lists = [("phase1_waypoints", self._cfg.phase1_waypoints)]
+        for d in self._cfg.phase1_custom_datasets:
+            lists.append((f"phase1_custom[{d['name']}]", d.get("waypoints", [])))
+        lists.append(("phase2_waypoints", self._cfg.phase2_waypoints))
+        for list_name, waypoints in lists:
             if not waypoints:
                 continue
             self.get_logger().info(
@@ -1333,6 +1357,42 @@ class CalibrateCollectNode(Node):
                 f"{len(fail)} fail (indices: {fail}) ==="
             )
         return results
+
+    def _resolve_custom_dataset(self) -> Optional[dict]:
+        """Pick the custom dataset to collect for phase==phase1_custom.
+
+        Empty `custom_name` + exactly one dataset -> that dataset. Empty +
+        several -> error (ambiguous). A given name must exist. Returns None on
+        any error after logging, so the caller can abort cleanly.
+        """
+        datasets = self._cfg.phase1_custom_datasets
+        if not datasets:
+            self.get_logger().error(
+                "phase1_custom requested but no phase1_custom_datasets are "
+                "configured -- author one in the calib web Waypoints tab"
+            )
+            return None
+        names = [d["name"] for d in datasets]
+        if not self._custom_name:
+            if len(datasets) == 1:
+                return datasets[0]
+            self.get_logger().error(
+                f"phase1_custom is ambiguous: {len(datasets)} datasets "
+                f"({names}); pass -p custom_name:=<one of them>"
+            )
+            return None
+        try:
+            want = sanitize_custom_name(self._custom_name)
+        except ValueError as exc:
+            self.get_logger().error(f"bad custom_name: {exc}")
+            return None
+        for d in datasets:
+            if d["name"] == want:
+                return d
+        self.get_logger().error(
+            f"unknown custom dataset {want!r}; configured: {names}"
+        )
+        return None
 
     def run(self):
         if not self._wait_for_streams(timeout_sec=15.0):
@@ -1363,12 +1423,17 @@ class CalibrateCollectNode(Node):
                                    waypoints=self._cfg.phase1_waypoints,
                                    label_prefix="phase1")
                   if self._phase_select in ("both", "phase1") else [])
-        phase1_custom = (self.run_phase1(
-                            park_pan_deg=self._cfg.phase1_custom_park_pan_deg,
-                            park_tilt_deg=self._cfg.phase1_custom_park_tilt_deg,
-                            waypoints=self._cfg.phase1_waypoints_custom,
-                            label_prefix="phase1_custom")
-                         if self._phase_select == "phase1_custom" else [])
+        phase1_custom: list = []
+        custom_dataset: Optional[dict] = None
+        if self._phase_select == "phase1_custom":
+            custom_dataset = self._resolve_custom_dataset()
+            if custom_dataset is None:
+                return 1
+            phase1_custom = self.run_phase1(
+                park_pan_deg=float(custom_dataset["park_pan_deg"]),
+                park_tilt_deg=float(custom_dataset["park_tilt_deg"]),
+                waypoints=custom_dataset.get("waypoints", []),
+                label_prefix=f"phase1_custom_{custom_dataset['name']}")
         phase2 = self.run_phase2() if self._phase_select in ("both", "phase2") else []
         sanity_end = self.run_sanity()
 
@@ -1377,9 +1442,14 @@ class CalibrateCollectNode(Node):
             (self._out_dir / "phase1_handeye.json").write_text(
                 json.dumps({"samples": phase1}, indent=2)
             )
-        if phase1_custom:
-            (self._out_dir / "phase1_handeye_custom.json").write_text(
-                json.dumps({"samples": phase1_custom}, indent=2)
+        if phase1_custom and custom_dataset is not None:
+            collect_fname, _ = custom_dataset_filenames(custom_dataset["name"])
+            (self._out_dir / collect_fname).write_text(
+                json.dumps({"samples": phase1_custom,
+                            "custom_name": custom_dataset["name"]}, indent=2)
+            )
+            self.get_logger().info(
+                f"wrote {len(phase1_custom)} custom samples to {collect_fname}"
             )
         if phase2:
             (self._out_dir / "phase2_chain.json").write_text(

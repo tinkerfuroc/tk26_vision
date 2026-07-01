@@ -46,6 +46,7 @@ class SeatBboxResult:
     provider: str = ""
     elapsed_s: float = 0.0
     error: Optional[str] = None              # soft selection error -> triggers fallback
+    overridden_from: Optional[str] = None    # model's own choice, if re-ranked to a better seat
 
 
 _SYSTEM = (
@@ -58,10 +59,37 @@ _SYSTEM = (
     "box_2d is the tight bounding box of the SEAT CUSHION (the flat surface "
     "a person sits on, NOT the backrest), normalized 0-1000 over the image "
     "where (0,0) is top-left and (1000,1000) is bottom-right.\n"
+    "Label the furniture TYPE by what it physically is, not by which "
+    "catalog word sounds closest: a stool or bench is small, narrow, and "
+    "backless, built for one person with no cushioned base extending "
+    "toward the camera. A wide, low, thickly-cushioned lounging section "
+    "attached to a sofa (a chaise or ottoman, often with a loose pillow on "
+    "it) is part of the SOFA, however it is positioned in frame — never "
+    "call it a stool or bench even if its shape or camera angle looks odd. "
+    "When in doubt, compare widths: a real stool is much narrower than a "
+    "sofa cushion, not comparable to or wider than one. Only report a "
+    "catalogued seat you can actually see as a distinct object in THIS "
+    "exact image — never invent a plausible box_2d for a catalogued seat "
+    "that is not visible from this viewpoint.\n"
     "A cushion is OCCUPIED if a person sits on it or a large object rests on "
-    "the cushion fabric; objects on a table/floor/armrest do not occupy it.\n"
+    "the cushion fabric; objects on a table/floor/armrest do not occupy it. "
+    "Check carefully for partially reclined, sideways, slouched, or "
+    "cross-legged sitters: a person's legs, feet, hips, or torso can extend "
+    "onto a neighboring cushion even while their head or shoulders lean "
+    "toward a different one — that neighboring cushion is still OCCUPIED. "
+    "Trace each visible person's full body against every cushion's box_2d "
+    "before deciding occupied for that cushion. If you are not certain a "
+    "cushion is fully clear of any person, mark it occupied=true rather "
+    "than guessing it is empty.\n"
     "choice — the label of one entry whose occupied is false (your "
-    'recommendation), or "none" if every seat is occupied or none are visible.'
+    'recommendation), or "none" if every seat is occupied or none are visible. '
+    "When more than one entry is unoccupied, do not just pick the first or "
+    "closest one: recommend whichever is most comfortable for a guest. Sofa/"
+    "couch cushions and standalone armchairs (private, with back support) "
+    "outrank stools and benches (backless, shared) — only choose a stool or "
+    "bench when every sofa cushion and chair is occupied or none is visible. "
+    "Among multiple unoccupied sofa cushions, prefer the physically wider one "
+    "(compare box_2d width = x2-x1): more width means more room for the guest."
 )
 
 _SCHEMA = {
@@ -133,6 +161,89 @@ def _build_text_prompt(
     return text
 
 
+# Substrings that mark a seat as backless/shared (lower comfort priority).
+# The production catalog (tk25_decision constants.json seat_catalog) spells
+# these out literally ("left stool", "front middle stool", ...) vs. sofa
+# spots, so text matching on the label is reliable for the real deployment;
+# open-vocabulary labels the model invents itself also tend to name the
+# furniture type per the system prompt's "visual anchor" instruction.
+_LOW_COMFORT_KEYWORDS = ("stool", "bench")
+
+# 2026-07-01 real-arena finding: the model does not always label furniture
+# type consistently. On one real capture it called the sofa's wide chaise/
+# ottoman section (with a pillow, ~200 px wide) "left stool", while a
+# genuinely narrow stool elsewhere in the same room was correctly ~34 px
+# wide in the same normalized units — roughly 6x narrower. A "stool" as wide
+# as most of a real sofa cushion is far more likely a mislabeled chaise than
+# an actual backless single-person stool, so its low-comfort penalty is
+# dropped when its width is within this fraction of the widest seat in the
+# same response NOT labeled stool/bench (its box geometry is trusted over
+# its text label).
+_STOOL_WIDTH_SUSPECT_RATIO = 0.7
+
+
+def _is_low_comfort_label(label: str) -> bool:
+    return any(k in label.lower() for k in _LOW_COMFORT_KEYWORDS)
+
+
+def _max_high_comfort_width(seats: Sequence[dict], w: int, h: int) -> int:
+    """Widest decodable box among seats NOT labeled stool/bench, across the
+    whole response (occupied or not) — the width reference used to sanity-
+    check suspiciously wide "stool" labels. 0 if there is nothing to compare
+    against (nothing decodes, or every seat is labeled stool/bench)."""
+    widths = []
+    for s in seats:
+        if not isinstance(s, dict) or _is_low_comfort_label(str(s.get("label", ""))):
+            continue
+        box = decode_box_xyxy(s.get("box_2d"), w, h)
+        if box is not None:
+            widths.append(box[2] - box[0])
+    return max(widths) if widths else 0
+
+
+def _seat_rank(label: str, box_xyxy: Box, max_high_comfort_width: int = 0) -> tuple:
+    """Sort key for "how suitable is this seat for a guest" — lower is
+    better. Stools/benches rank behind every other seat type unless their
+    width looks implausible for a real stool (see `_STOOL_WIDTH_SUSPECT_RATIO`
+    above); ties break on cushion width (wider = more room), widest first."""
+    width = box_xyxy[2] - box_xyxy[0]
+    is_low_comfort = (
+        _is_low_comfort_label(label)
+        and (max_high_comfort_width <= 0
+             or width < _STOOL_WIDTH_SUSPECT_RATIO * max_high_comfort_width)
+    )
+    return (1 if is_low_comfort else 0, -width)
+
+
+def _best_unoccupied_seat(
+    seats: Sequence[dict],
+    w: int,
+    h: int,
+    known_seats: Optional[Sequence[str]],
+) -> Optional[tuple]:
+    """Return (label, box_xyxy) for the most suitable seat with
+    occupied=False per `_seat_rank`, or None if none qualify. Skips entries
+    with an undecodable box or (when a catalog is supplied) a label outside
+    it — the model already restricts `seats` to catalogued+visible entries
+    per the prompt, this is defense-in-depth."""
+    max_hc_width = _max_high_comfort_width(seats, w, h)
+    best = None
+    best_key = None
+    for s in seats:
+        if not isinstance(s, dict) or s.get("occupied"):
+            continue
+        label = str(s.get("label", ""))
+        if known_seats and label not in known_seats:
+            continue
+        box = decode_box_xyxy(s.get("box_2d"), w, h)
+        if box is None:
+            continue
+        key = _seat_rank(label, box, max_hc_width)
+        if best is None or key < best_key:
+            best, best_key = (label, box), key
+    return best
+
+
 def select_box(
     parsed: dict,
     w: int,
@@ -143,7 +254,28 @@ def select_box(
 
     .error is set (and box None) for soft failures that should trigger
     provider fallback: out-of-catalog choice, choice-not-in-seats,
-    undecodable box. A "none" choice is a clean terminal answer (no error).
+    undecodable box, or choice self-inconsistent with its own seats entry
+    with no unoccupied seat to recover to. A "none" choice is a clean
+    terminal answer (no error).
+
+    Two deterministic backstops run against the model's own `seats` list
+    before this result is trusted:
+    1. Self-consistency: `choice` must name a seat `seats` itself marks
+       unoccupied. 2026-07-01 replay against a real arena scene found the
+       model return `choice="left spot on sofa"` while its own seats entry
+       for that exact label had `"occupied": true` — a plain internal
+       contradiction, not a vision judgment call. When this happens, recover
+       to the best genuinely-unoccupied seat in the same response (below);
+       if none exists, soft-error out so the caller's provider chain retries
+       rather than trusting a self-contradictory pick.
+    2. Suitability re-rank: among genuinely unoccupied seats, `choice` is
+       cross-checked against `_best_unoccupied_seat` (comfort type, then
+       cushion width) and overridden when a strictly more suitable
+       unoccupied seat is present — a backstop for the prompt's suitability
+       guidance so the outcome doesn't depend on the model following it
+       precisely.
+    `.overridden_from` records the model's original choice whenever either
+    backstop changes the answer.
     """
     res = SeatBboxResult()
     seats = parsed.get("seats", []) or []
@@ -164,11 +296,37 @@ def select_box(
     if chosen is None:
         res.error = f"choice {choice!r} not in seats list"
         return res
+
+    if chosen.get("occupied"):
+        best = _best_unoccupied_seat(res.seats, w, h, known_seats)
+        if best is None:
+            res.error = (
+                f"choice {choice!r} is marked occupied in its own seats entry, "
+                "and no unoccupied seat is available to recover to"
+            )
+            return res
+        best_label, best_box = best
+        res.overridden_from = choice
+        res.label = best_label
+        res.box_xyxy = list(best_box)
+        return res
+
     box = decode_box_xyxy(chosen.get("box_2d"), w, h)
     if box is None:
         res.error = f"chosen box for {choice!r} failed to decode"
         return res
     res.box_xyxy = list(box)
+
+    best = _best_unoccupied_seat(res.seats, w, h, known_seats)
+    if best is not None:
+        best_label, best_box = best
+        max_hc_width = _max_high_comfort_width(res.seats, w, h)
+        best_key = _seat_rank(best_label, best_box, max_hc_width)
+        chosen_key = _seat_rank(choice, box, max_hc_width)
+        if best_key < chosen_key:
+            res.overridden_from = choice
+            res.label = best_label
+            res.box_xyxy = list(best_box)
     return res
 
 

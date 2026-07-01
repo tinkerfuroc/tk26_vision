@@ -4,10 +4,33 @@ import math
 import time
 from typing import Optional
 
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import JointState
-from tinker_vision_msgs_26.msg import PanTiltState
+from .calibration.utils import wrap_to_pi
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import JointState
+    from tinker_vision_msgs_26.msg import PanTiltState
+except ImportError:  # pragma: no cover — only absent outside a sourced ROS env
+    rclpy = None  # type: ignore[assignment]
+    Node = object  # type: ignore[assignment,misc]
+    JointState = None  # type: ignore[assignment]
+    PanTiltState = None  # type: ignore[assignment]
+
+
+def _resolve_offset(raw_rad: float, name: str, logger=None) -> float:
+    """Wrap a calibration joint offset to (-pi, pi]; warn if it arrived
+    out of range. An out-of-range offset (|x| > pi) means whoever wrote the
+    config skipped normalization, and is a smell that the offset and the URDF
+    T_b may be from different solves (the 2026-06-30 camera-tilt bug)."""
+    wrapped = wrap_to_pi(raw_rad)
+    if logger is not None and abs(float(raw_rad)) > math.pi + 1e-6:
+        logger.warning(
+            f"{name}={float(raw_rad):+.4f} rad ({math.degrees(float(raw_rad)):+.1f} deg) "
+            f"was out of [-pi, pi]; wrapped to {wrapped:+.4f} rad. Verify the URDF "
+            f"camera_mount T_b came from the SAME solve as this offset."
+        )
+    return wrapped
 
 
 class PanTiltStatePublisherNode(Node):
@@ -34,8 +57,10 @@ class PanTiltStatePublisherNode(Node):
         self._pan_joint_name = self.get_parameter('pan_joint_name').value
         self._tilt_joint_name = self.get_parameter('tilt_joint_name').value
         self._stale_timeout_sec = float(self.get_parameter('stale_timeout_sec').value)
-        self._pan_offset_rad = float(self.get_parameter('pan_offset_rad').value)
-        self._tilt_offset_rad = float(self.get_parameter('tilt_offset_rad').value)
+        self._pan_offset_rad = _resolve_offset(
+            float(self.get_parameter('pan_offset_rad').value), 'pan_offset_rad', self.get_logger())
+        self._tilt_offset_rad = _resolve_offset(
+            float(self.get_parameter('tilt_offset_rad').value), 'tilt_offset_rad', self.get_logger())
         self.get_logger().info(
             f"Calibration offsets: pan={self._pan_offset_rad:+.4f} rad "
             f"({math.degrees(self._pan_offset_rad):+.2f}°), "

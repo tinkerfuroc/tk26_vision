@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import logging
 import math
 import os
 import re
@@ -48,7 +49,7 @@ from typing import Optional
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from .utils import body_yaw_from_rotvec, rotvec_to_xyz_euler
+from .utils import body_yaw_from_rotvec, rotvec_to_xyz_euler, wrap_to_pi
 from .yaml_targets import list_yaml_targets
 
 
@@ -279,6 +280,11 @@ def _patch_yaml_offsets(
     before running the patcher. Failing loudly here beats silently leaving
     the calibration half-applied.
     """
+    # Defense-in-depth: normalize even when applying an OLD json that predates
+    # the solver-side wrap (Task 1). Rotation-equivalent; keeps the deployed
+    # joint value in range. See utils.wrap_to_pi.
+    pan_offset_rad = wrap_to_pi(pan_offset_rad)
+    tilt_offset_rad = wrap_to_pi(tilt_offset_rad)
     pan_text, n_pan = _YAML_PAN_RE.subn(
         lambda m: f"{m.group('lead')}{pan_offset_rad:.10f}{m.group('trail')}",
         yaml_text, count=1,
@@ -426,6 +432,66 @@ def _resolve_overrides_yaml(
     return cand if cand.is_file() else None
 
 
+def _write_target(path: Path) -> Path:
+    """Where os.replace should land so a --symlink-install symlink is
+    preserved: write to the symlink's real target, not the link itself."""
+    return Path(os.path.realpath(path)) if path.is_symlink() else path
+
+
+# Path segments that are never part of the true colcon source tree but may
+# contain copies of source files (build artifacts, install overlays, log dirs).
+# Virtualenvs and git worktrees are caught by the hidden-segment (startswith
+# ".") check in the filter below.
+_SRC_EXCLUDE = {"build", "install", "log"}
+
+
+def resolve_source_path(install_path: Path) -> Path:
+    """Map an install-tree file to its colcon source-tree path.
+
+    (1) symlink -> follow it when it lands under a 'src/' segment;
+    (2) else glob '<ws>/src/**/<name>' (ws = parts before 'install') for a
+        unique match that shares the install file's package directory name,
+        excluding paths that contain build/install/log segments or hidden
+        directories (e.g. .claude/worktrees, .venv-*) that may contain
+        spurious copies of source files;
+    (3) else log a warning and return install_path unchanged — writing the
+        install tree, which a colcon rebuild will silently revert."""
+    install_path = Path(install_path)
+    if install_path.is_symlink():
+        resolved = install_path.resolve()
+        if "src" in resolved.parts:
+            return resolved
+    parts = install_path.parts
+    if "install" in parts:
+        ws = Path(*parts[: parts.index("install")])
+        src_root = ws / "src"
+        if src_root.is_dir():
+            # package dir name appears right after .../share/<pkg>/ or is the
+            # install package dir; use the file name + nearest parent dir name.
+            parent_name = install_path.parent.name
+            matches = [
+                m for m in src_root.glob(f"**/{install_path.name}")
+                if m.parent.name == parent_name and m.is_file()
+                and not any(
+                    part.startswith(".") or part in _SRC_EXCLUDE
+                    for part in m.parts
+                )
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        # Fell through an install path without a unique source match: the write
+        # will land in the install tree and a colcon rebuild will REVERT it.
+        # Warn loudly so the operator doesn't think the calibration stuck.
+        logging.getLogger(__name__).warning(
+            "resolve_source_path: could not map install file %s to a unique "
+            "source-tree path (0 or >1 candidates); writing the install tree, "
+            "which a colcon rebuild will REVERT. Re-apply from a "
+            "--symlink-install workspace, or patch the source file directly.",
+            install_path,
+        )
+    return install_path
+
+
 def _atomic_write_single(
     path: Path, new_text: str, *, timestamp: Optional[str] = None,
 ) -> dict:
@@ -434,19 +500,24 @@ def _atomic_write_single(
     Idempotent: when the new content matches, no write/backup happens and
     `applied` is False. Mirrors the per-file half of `_atomic_write_pair` for
     standalone targets (the override yaml) that aren't part of the URDF+offset
-    lockstep pair."""
+    lockstep pair.
+
+    When `path` is a --symlink-install symlink, writes through to the real
+    source target so the symlink is preserved and a subsequent rebuild does not
+    silently revert the calibration."""
     ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = uuid.uuid4().hex[:8]
     original = path.read_bytes()
     new_bytes = new_text.encode("utf-8")
     if new_bytes == original:
         return {"path": str(path), "applied": False, "backup_path": None}
-    tmp = path.with_name(path.name + f".tmp-{run_id}")
+    target = _write_target(path)
+    tmp = target.with_name(target.name + f".tmp-{run_id}")
     tmp.write_bytes(new_bytes)
-    bak = path.with_name(path.name + f".old-{ts}")
+    bak = target.with_name(target.name + f".old-{ts}")
     try:
         bak.write_bytes(original)
-        os.replace(tmp, path)
+        os.replace(tmp, target)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -500,13 +571,18 @@ def _atomic_write_pair(
     if not xacro_changed and not yaml_changed:
         return result
 
-    xacro_tmp = xacro.with_name(xacro.name + f".tmp-{run_id}") if xacro_changed else None
+    # Resolve real targets so writes go through --symlink-install symlinks to
+    # the source tree (preserving the link so rebuilds don't revert calibration).
+    xacro_target = _write_target(xacro)
+    yaml_target = _write_target(yaml_path) if yaml_path is not None else None
+
+    xacro_tmp = xacro_target.with_name(xacro_target.name + f".tmp-{run_id}") if xacro_changed else None
     if xacro_tmp is not None:
         xacro_tmp.write_bytes(new_xacro_bytes)
 
     yaml_tmp = (
-        yaml_path.with_name(yaml_path.name + f".tmp-{run_id}")
-        if yaml_changed and yaml_path is not None
+        yaml_target.with_name(yaml_target.name + f".tmp-{run_id}")
+        if yaml_changed and yaml_target is not None
         else None
     )
     if yaml_tmp is not None:
@@ -516,19 +592,19 @@ def _atomic_write_pair(
     yaml_bak: Optional[Path] = None
     try:
         if xacro_tmp is not None:
-            xacro_bak = xacro.with_name(xacro.name + f".old-{ts}")
+            xacro_bak = xacro_target.with_name(xacro_target.name + f".old-{ts}")
             xacro_bak.write_bytes(original_xacro_bytes)
-            os.replace(xacro_tmp, xacro)
+            os.replace(xacro_tmp, xacro_target)
             result["xacro_backup_path"] = str(xacro_bak)
-        if yaml_tmp is not None and yaml_path is not None:
-            yaml_bak = yaml_path.with_name(yaml_path.name + f".old-{ts}")
+        if yaml_tmp is not None and yaml_target is not None:
+            yaml_bak = yaml_target.with_name(yaml_target.name + f".old-{ts}")
             yaml_bak.write_bytes(original_yaml_bytes)  # type: ignore[arg-type]
-            os.replace(yaml_tmp, yaml_path)
+            os.replace(yaml_tmp, yaml_target)
             result["yaml_backup_path"] = str(yaml_bak)
     except Exception:
         # Roll back URDF if the YAML side failed mid-replace; clean up tmps.
         if xacro_bak is not None and xacro.read_bytes() != original_xacro_bytes:
-            os.replace(xacro_bak, xacro)
+            os.replace(xacro_bak, xacro_target)
         if xacro_tmp is not None:
             xacro_tmp.unlink(missing_ok=True)
         if yaml_tmp is not None:
@@ -566,6 +642,10 @@ def main(argv=None):
                              "elsewhere — without the YAML, the URDF chain "
                              "mis-represents the camera pose at any non-zero "
                              "firmware tilt.")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="permit patching the URDF or YAML alone (normally "
+                             "refused — they must stay in lockstep from the same "
+                             "solve to avoid tilting the camera)")
     parser.add_argument("--overrides-yaml", type=Path, default=None,
                         help="Path to the per-robot pan-tilt urdf_overrides.yaml "
                              "(default: auto-discover the installed "
@@ -649,6 +729,19 @@ def main(argv=None):
                 "--overrides-yaml to point at one.)"
             )
         return
+
+    # Lockstep guard: refuse a URDF-only patch unless the operator explicitly
+    # acknowledges they know what they're doing. T_b (written to the URDF) and
+    # theta_*_offset (written to pan_tilt.yaml) MUST come from the same solve
+    # or the TF chain misrepresents the camera pose. The 2026-04-30 bug came
+    # from exactly this drift. Pass --allow-partial to override.
+    if args.no_yaml and not args.allow_partial:
+        raise CalibrationApplyError(
+            "Refusing to patch the URDF without the matching pan_tilt.yaml "
+            "offsets: T_b and theta_*_offset MUST come from the same solve "
+            "(mixing them tilts the camera). Re-run without --no-yaml, or pass "
+            "--allow-partial if you really intend a partial apply."
+        )
 
     # In-place lockstep apply: URDF + YAML, atomic with backups.
     try:

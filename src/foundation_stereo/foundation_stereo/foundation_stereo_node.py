@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
+import traceback
 from typing import Optional, Tuple
 
 import cv2
@@ -975,7 +976,17 @@ class FoundationStereoNode(Node):
                 )
                 return
             except Exception as exc:  # noqa: BLE001
-                self.get_logger().exception("stream inference failed")
+                # rclpy's RcutilsLogger has NO .exception() method (unlike
+                # stdlib logging) — calling it raises AttributeError here,
+                # which is uncaught and kills this worker thread, masking the
+                # real inference error (e.g. missing TRT engines). Log at error
+                # with the exception text + traceback instead, throttled so a
+                # persistent failure doesn't spam every frame.
+                self.get_logger().error(
+                    f"stream inference failed: {type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}",
+                    throttle_duration_sec=5.0,
+                )
                 time.sleep(0.05)
                 continue
 

@@ -2,8 +2,9 @@
 
 Two services:
 - `feature_extraction_service`: calls `object_detection_generalist`, picks
-  the centermost detected person, crops to a tight bbox, runs a vision LLM
-  on the crop for a structured text description, and returns BOTH the
+  the person most likely addressing the robot (see `select_best_person_idx`:
+  size-gated then centermost/closest), crops to a tight bbox, runs a vision
+  LLM on the crop for a structured text description, and returns BOTH the
   description and the crop as `sensor_msgs/Image` for downstream image-vs-image
   matching.
 - `seat_recommend_service`: takes a list of named/feature-described people,
@@ -32,14 +33,90 @@ from ._env import base_url, default_flash_model, load_env, require_api_key
 from ._image_utils import bbox_from_mask, encode_to_data_url
 
 
-# Depth weight for an alternative "best person" selection score (F5, parked):
-#   score = (image-center offset normalized to half-diagonal, 0..1)
-#         + DEPTH_WEIGHT_M * depth_in_metres
-# 0.6 means a 1 m closer person beats a centered-but-1.7 m-farther one.
-# Currently unused — feature_extraction picks the centermost person by image
-# pixels only. Wire this back in by re-enabling the parked block in
-# `feature_extraction_srv_callback`.
-DEPTH_WEIGHT_M = 0.6  # noqa: F841
+# Minimum person bbox height, as a fraction of frame height, to be considered
+# a candidate at all — 2026-07-01 incident: a 17x23 px detection (~3% of a
+# 720 px-tall frame) of a person visible through a distant doorway won the
+# old pure pixel-center-distance selection over the actual foreground person,
+# because the foreground person's mask centroid was pulled off-center by
+# being cut off at the bottom of frame (very close to the camera). A
+# background blob that small is never the intended subject, so it is gated
+# out before scoring.
+MIN_PERSON_HEIGHT_FRAC = 0.15
+
+# How close two candidates' normalized image-center offsets must be (as a
+# fraction of the frame half-diagonal) to be treated as "roughly equidistant
+# from the optical center" and have depth break the tie. Kept small so depth
+# only refines near-ties instead of overriding a clear centering difference —
+# see the 2026-07-01 replay note on DEPTH_TIE_EPS below for why depth cannot
+# be a primary, additively-weighted term here.
+DEPTH_TIE_EPS = 0.08
+
+
+def select_best_person_idx(
+    bboxes,
+    depths_m,
+    frame_w: int,
+    frame_h: int,
+    *,
+    min_height_frac: float = MIN_PERSON_HEIGHT_FRAC,
+    depth_tie_eps: float = DEPTH_TIE_EPS,
+) -> int:
+    """Pick the index of the person most likely addressing the robot.
+
+    Two stages: (1) drop candidates whose bbox height is below
+    ``min_height_frac`` of the frame height — background clutter far from
+    the camera can never win; (2) among survivors, rank primarily by
+    image-center offset (normalized by the frame's half-diagonal); when two
+    or more survivors are within ``depth_tie_eps`` of the smallest offset
+    (i.e. "roughly equidistant from the optical center"), the closest valid
+    depth among that tied group wins instead.
+
+    Depth is deliberately only a tie-breaker, not an additive score term.
+    Replaying this against real `object_detection_generalist` logs
+    (2026-07-01) showed most small/distant detections report a sentinel
+    ``centroid.z == 0.0`` when depth lookup fails (not ``None`` — the
+    upstream depth pipeline can produce a "valid" all-zero point for a
+    depth-hole region). An additive ``offset + weight * depth`` score treats
+    that unmeasured 0.0 as "closer than anything real", so a genuinely close
+    and clearly-centered subject can lose to a small background detection
+    with a bogus zero reading. Restricting depth to break only near-ties
+    (and ignoring non-positive readings as invalid rather than "very
+    close") keeps a clear centering advantage decisive regardless of
+    upstream depth data quality.
+
+    ``bboxes``: sequence of (x1, y1, x2, y2) pixel boxes.
+    ``depths_m``: sequence of forward-distance-in-metres or ``None``,
+    aligned index-for-index with ``bboxes``. Non-positive values are
+    treated as an invalid/missing reading, not as "0 m away".
+
+    Returns -1 if no candidate survives the size gate.
+    """
+    cx_frame, cy_frame = frame_w / 2.0, frame_h / 2.0
+    half_diag = math.hypot(cx_frame, cy_frame) or 1.0
+    min_height_px = min_height_frac * frame_h
+
+    survivors = []  # (index, offset_norm, depth_or_None)
+    for i, (x1, y1, x2, y2) in enumerate(bboxes):
+        if (y2 - y1) < min_height_px:
+            continue
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        offset_norm = math.hypot(cx - cx_frame, cy - cy_frame) / half_diag
+        depth = depths_m[i] if i < len(depths_m) else None
+        if depth is not None and depth <= 0.0:
+            depth = None
+        survivors.append((i, offset_norm, depth))
+
+    if not survivors:
+        return -1
+
+    best_offset = min(s[1] for s in survivors)
+    tied = [s for s in survivors if s[1] - best_offset <= depth_tie_eps]
+
+    def _tie_key(s):
+        _, offset_norm, depth = s
+        return (0, depth) if depth is not None else (1, offset_norm)
+
+    return min(tied, key=_tie_key)[0]
 
 
 class FeatureService(Node):
@@ -158,12 +235,10 @@ class FeatureService(Node):
 
         color_img = self.bridge.imgmsg_to_cv2(detection_res.rgb_image, 'bgr8')
         h, w = color_img.shape[:2]
-        cx_frame, cy_frame = w / 2.0, h / 2.0
-        # half_diag = math.hypot(cx_frame, cy_frame)  # for depth-weighted score (F5, parked)
 
-        best_idx = -1
-        best_dist = None
-        best_bbox = None
+        candidate_indices = []  # index into detection_res.objects/segments
+        candidate_bboxes = []   # (x1, y1, x2, y2)
+        candidate_depths = []   # forward distance in metres
         n_persons_detected = 0
         for i, obj in enumerate(detection_res.objects):
             if obj.cls != 'person':
@@ -171,27 +246,21 @@ class FeatureService(Node):
             n_persons_detected += 1
             seg = self.bridge.imgmsg_to_cv2(detection_res.segments[i], '8UC1')
             y1, x1, y2, x2 = bbox_from_mask(seg)
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            d = (cx - cx_frame) ** 2 + (cy - cy_frame) ** 2
-            if best_dist is None or d < best_dist:
-                best_dist = d
-                best_idx = i
-                best_bbox = (y1, x1, y2, x2)
-            # F5 (parked): depth-weighted score — prefer the closer person when
-            # two are roughly equidistant from the optical center. Re-enable by
-            # swapping the centermost-pixel block above for this:
-            # # Forward distance: orbbec optical → z; realsense post-axis-swap → x.
-            # depth = (
-            #     obj.centroid.z if 'orbbec' in request.camera
-            #     else obj.centroid.x
-            # )
-            # img_offset_norm = math.hypot(cx - cx_frame, cy - cy_frame) / half_diag
-            # score = img_offset_norm + DEPTH_WEIGHT_M * max(depth, 0.0)
-            # if best_score is None or score < best_score:
-            #     best_score = score
-            #     best_idx = i
-            #     best_bbox = (y1, x1, y2, x2)
+            candidate_indices.append(i)
+            candidate_bboxes.append((x1, y1, x2, y2))
+            # Forward distance: orbbec optical → z; realsense post-axis-swap → x.
+            candidate_depths.append(
+                obj.centroid.z if 'orbbec' in request.camera else obj.centroid.x
+            )
+
+        sel = select_best_person_idx(candidate_bboxes, candidate_depths, w, h)
+        if sel >= 0:
+            best_idx = candidate_indices[sel]
+            x1, y1, x2, y2 = candidate_bboxes[sel]
+            best_bbox = (y1, x1, y2, x2)
+        else:
+            best_idx = -1
+            best_bbox = None
 
         detections = []
         crop = None

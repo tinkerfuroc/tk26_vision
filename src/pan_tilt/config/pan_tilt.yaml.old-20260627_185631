@@ -1,0 +1,127 @@
+pan_tilt_controller:
+  ros__parameters:
+    device: /dev/ttyUSB0
+    baudrate: 115200
+    startup_delay_sec: 4.0
+    feedback_startup_timeout_sec: 2.0
+    feedback_stale_timeout_sec: 0.5
+    state_publish_rate_hz: 20.0
+    pan_min_deg: -180.0
+    pan_max_deg: 180.0
+    tilt_min_deg: -30.0
+    tilt_max_deg: 90.0
+    default_speed_raw: 240
+    default_accel_raw: 40
+    send_force_gimbal_on_startup: true
+    send_enable_feedback_on_startup: true
+    invert_pan: false
+    invert_tilt: false
+    pan_trim_deg: 0.0
+    tilt_trim_deg: 0.0
+    initial_pan_deg: 0.0
+    initial_tilt_deg: 0.0
+
+pan_tilt_state_publisher:
+  ros__parameters:
+    state_topic: /pan_tilt_controller/state
+    # Private topic so the main-robot robot_state_publisher (grasp_bringup) does
+    # not see foreign joint names. pan_tilt's own RSP subscribes here via its
+    # namespace.
+    joint_state_topic: /pan_tilt/joint_states
+    pan_joint_name: pan_joint
+    tilt_joint_name: tilt_joint
+    stale_timeout_sec: 0.5
+    # Calibration-derived joint offsets (radians) added to firmware feedback
+    # before publishing /joint_states. Source from polish.json (preferred)
+    # or chain.json after each calibration:
+    #   theta_p_offset_rad → pan_offset_rad
+    #   theta_t_offset_rad → tilt_offset_rad
+    # Represents the firmware-zero vs URDF-zero offset. Without these the
+    # URDF chain mis-represents the camera's pose by up to ~45° (the parked
+    # tilt angle), which projects vision points below ground in the
+    # seat-recommend / arm-pointing pipeline.
+    pan_offset_rad: 3.1449570952
+    tilt_offset_rad: -1.8735174383
+
+follow_head_node:
+  ros__parameters:
+    # Runtime + I/O
+    yolo_model: yolo11s-pose.pt
+    # Vision logging does synchronous disk IO (two JPEGs + one JSON per
+    # detection). At 5 Hz this blocks the action loop ~30-40 ms per tick.
+    # Leave off for real tracking; flip on for debugging specific frames.
+    vision_logging_enabled: false
+    vision_log_folder: vision_log
+    command_topic: /pan_tilt_controller/cmd
+    state_topic: /pan_tilt_controller/state
+    home_pan_deg: 0.0
+    home_tilt_deg: 30.0
+    # Deadband on target-vs-state error (degrees). Smaller = more responsive
+    # (fires commands even for small errors); larger = less twitchy.
+    # Middle ground between bare 3.0 (too sluggish) and prior 1.5 (hunted
+    # back-and-forth on depth-noise drift at certain poses). 2.5 absorbs
+    # the typical noise band of a standing guest at 1.5-3 m while still
+    # chasing real motion within a tick or two.
+    pan_deadband_deg: 2.5
+    tilt_deadband_deg: 2.5
+    # Minimum change between successive COMMANDS to avoid micro-spam.
+    # 0.5 re-commanded for sub-degree depth jitter every tick; 1.0 still
+    # chases meaningful target shifts without flapping on noise.
+    min_command_change_deg: 1.0
+
+    # Phase B — feedback-gated settle. Lowered aggressively so new detections
+    # translate into motion fast, accepting some jerk in exchange for speed.
+    min_detection_interval_sec: 0.1       # 10 Hz YOLO cap (was 0.2 / 5 Hz)
+    max_settle_timeout_sec: 0.5           # state callback can lag under load
+    # Distance-aware command hold-off. After a command, suppress new
+    # command issuance for clamp(base + per_deg * slew_deg, base,
+    # max_settle_timeout_sec). Detection keeps running during the
+    # window so the tracker/EMA stay fresh for the next allowed command.
+    # 0.020 s/deg implies ~50 deg/s effective slew; slews >= ~22 deg
+    # saturate the 0.5 s cap. Bumped from 0.012 to give the servo time
+    # to actually arrive before the loop considers re-commanding into
+    # a half-finished motion (was a jitter contributor at small slews).
+    settle_base_sec: 0.05
+    settle_per_deg_sec: 0.020
+    steady_pan_eps_deg: 3.0               # very loose (was 0.5)
+    steady_tilt_eps_deg: 3.0              # very loose (was 0.5)
+    steady_velocity_eps_deg_per_sec: 60.0 # ω ≈ 0 threshold relaxed
+    steady_sample_count: 1                # single sample is enough
+    state_stale_timeout_sec: 0.3
+
+    # Phase C — identity continuity + smoothing. Higher alpha = faster
+    # response, less smoothing (trade: noisier).
+    target_ttl_sec: 0.8
+    # 0.7 propagated single-tick depth blips straight to the head; 0.5
+    # gives equal weight to new measurement and prior state (1-tick
+    # half-life) — still tracks 0.5 m/s walking guests in 1-2 ticks.
+    ema_alpha: 0.5
+    reassoc_dist_m: 0.4
+
+    # Pose-target params (YOLO-pose face aiming). kp_confidence_threshold is
+    # the per-keypoint conf floor used to decide which fallback branch runs
+    # (triangle > eye_window > single_eye > nose > ear > head_proxy).
+    # face_depth_window_px is the square window edge used by all non-triangle
+    # branches for depth sampling. min_triangle_valid_depth_pixels is both
+    # the triangle's minimum fill AND the floor applied to every branch's
+    # depth sample to reject sparse / all-invalid regions.
+    kp_confidence_threshold: 0.5
+    face_depth_window_px: 11
+    min_triangle_valid_depth_pixels: 10
+    # Distance gate for the eye-vs-body target switch. When the
+    # person's body-center depth is <= this value, follow_head runs
+    # the eye/face cascade for receptionist-style precise gaze. When
+    # depth exceeds this, it aims at the upper-body center with
+    # full-bbox depth median — robust at distance where the small
+    # face window loses depth pixels.
+    face_target_max_distance_m: 2.5
+
+    # Phase E — config surface + motion profile
+    blur_threshold: 80.0
+    # No speed scaling — always use controller default, which we've bumped
+    # to be fast. The tiny-error threshold is effectively moot when both
+    # branches send the same speed.
+    small_error_deg: 0.5
+    command_speed_raw_small: 0   # 0 => controller default
+    command_speed_raw_large: 0   # 0 => controller default
+    command_accel_raw: 0          # 0 => controller default

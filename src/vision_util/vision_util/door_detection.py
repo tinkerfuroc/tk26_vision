@@ -1,98 +1,125 @@
-"""Door-state detection service (depth-image based).
+"""Door-state detection service.
 
-Reads the center of the Orbbec depth image (assuming the camera is level and
-pointing forward): the door is open (is_open=1) when the center sees far / no
-depth return, closed (is_open=0) when it sees a near surface within
-open_threshold_m. Only the Orbbec camera is supported. The pure decision math
-lives in _door_logic.py.
+Ports tk23 `util/door_detection.py`. Heuristic: average depth at the 20x20
+center of the Orbbec depth frame < 1.5 m and at least 5 valid pixels => door
+is closed (is_open=0); otherwise is_open=1. Only Orbbec is supported.
+
+Bugfix vs tk23: instantiates `self.bridge = CvBridge()` (tk23 referenced it
+without ever creating one; latent because the realsense path returns early).
 """
+
+import copy
 import threading
 
+import numpy as np
 import rclpy
 import rclpy.executors
 from cv_bridge import CvBridge
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from tinker_vision_msgs_26.srv import DoorDetection
-
-from vision_util._door_logic import depth_to_meters, evaluate_door
 
 
 class DoorDetectionService(Node):
     def __init__(self):
         super().__init__('door_detection_service')
 
-        self.declare_parameter('open_threshold_m', 1.5)
-        self.declare_parameter('center_patch_px', 30)
-        self.declare_parameter('min_valid_px', 50)
-        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
-
         self.bridge = CvBridge()
-        self.lock = threading.Lock()
-        self.recent_depth = None
 
-        depth_topic = self.get_parameter('depth_topic').value
-        self.depth_sub = self.create_subscription(
-            Image,
-            depth_topic,
-            self.depth_callback,
-            qos_profile=qos_profile_sensor_data,
+        self.ptcloud_sub_orbbec = self.create_subscription(
+            PointCloud2,
+            '/camera/depth_registered/points',
+            self.points_orbbec_callback,
+            qos_profile=10,
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
-        self.srv = self.create_service(
+        self.camera_info_sub_orbbec = self.create_subscription(
+            CameraInfo,
+            '/camera/color/camera_info',
+            self.camera_info_orbbec_callback,
+            qos_profile=10,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
+
+        self.lock_img = threading.Lock()
+        self.recent_points = None
+
+        self.lock_info = threading.Lock()
+        self.recent_intrinsic = None
+
+        self.door_detection_srv = self.create_service(
             DoorDetection,
             'door_detection_srv',
             self.door_detection_srv_callback,
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
-        self.get_logger().info(
-            f'Door detection service initialized (depth topic: {depth_topic}).'
-        )
 
-    def depth_callback(self, msg: Image):
-        with self.lock:
-            self.recent_depth = msg
+        self.get_logger().info('Door detection service initialized.')
 
-    def door_detection_srv_callback(
+    async def camera_info_orbbec_callback(self, info):
+        with self.lock_info:
+            self.recent_intrinsic = info
+
+    async def points_orbbec_callback(self, depth_msg):
+        with self.lock_img:
+            self.recent_points = depth_msg
+
+    def img_orbbec_process(self, color_msg, depth_msg, intrinsic_msg):
+        color_img = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8') if color_msg is not None else None
+        K = np.array(intrinsic_msg.k).reshape((3, 3))
+
+        h, w = 720, 1280
+        arr = np.frombuffer(depth_msg.data, dtype='<f4')
+        N = len(arr) // 5
+        points = arr.reshape((N, 5))[:, [0, 1, 2]]
+        points_homo = points / np.repeat(points[:, 2:3], 3, axis=1)
+        coor_homo = (K @ points_homo.T).T
+        coor = np.rint(coor_homo[:, :2]).astype(int)
+        depth_img = np.zeros((h, w, 3))
+        depth_img[coor[:, 1], coor[:, 0], :] = points
+        validmask = (depth_img[:, :, 2] > 1e-3).astype(int)
+
+        return color_img, depth_img, validmask
+
+    async def door_detection_srv_callback(
         self,
         request: DoorDetection.Request,
         response: DoorDetection.Response,
     ):
-        if 'realsense' in request.camera:
+        camera: str = request.camera
+        if 'realsense' in camera:
             response.status = 1
             response.error_msg = 'Only orbbec camera is supported.'
             return response
 
-        with self.lock:
-            msg = self.recent_depth
+        with self.lock_img, self.lock_info:
+            depth_msg = copy.deepcopy(self.recent_points)
+            intrinsic_msg = copy.deepcopy(self.recent_intrinsic)
 
-        if msg is None:
-            self.get_logger().warn('No depth image received yet.')
+        if depth_msg is None or intrinsic_msg is None:
+            self.get_logger().warn('No camera data or intrinsic.')
             response.status = 1
-            response.error_msg = 'No depth image received yet.'
+            response.error_msg = f'No camera data or intrinsic for {request.camera}.'
             return response
 
-        try:
-            depth_raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            depth_m = depth_to_meters(depth_raw, msg.encoding)
-        except ValueError as exc:
-            response.status = 1
-            response.error_msg = str(exc)
-            return response
+        _, depth_img, validmask = self.img_orbbec_process(None, depth_msg, intrinsic_msg)
 
-        result = evaluate_door(
-            depth_m,
-            open_threshold_m=self.get_parameter('open_threshold_m').value,
-            center_patch_px=self.get_parameter('center_patch_px').value,
-            min_valid_px=self.get_parameter('min_valid_px').value,
-        )
+        W, H, L = 1280, 720, 10
+        x1, x2, y1, y2 = H // 2 - L, H // 2 + L, W // 2 - L, W // 2 + L
+
+        depth_crop = depth_img[x1:x2, y1:y2, 2]
+        validmask_crop = validmask[x1:x2, y1:y2]
+        valid_sum = validmask_crop.sum()
+        avg_depth = (depth_crop * validmask_crop).sum() / (valid_sum + 1e-6)
         self.get_logger().info(
-            f'valid={result.valid_count} median={result.median_m:.3f} m '
-            f'-> is_open={result.is_open}'
+            f'validmask sum: {valid_sum}, depth avg: {avg_depth:.3f}'
         )
-        response.is_open = result.is_open
+        if valid_sum > 5 and avg_depth < 1.5:
+            response.is_open = 0
+        else:
+            response.is_open = 1
+
         response.status = 0
         response.error_msg = ''
         return response
@@ -103,14 +130,9 @@ def main():
     node = DoorDetectionService()
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
-    try:
-        executor.spin()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+    executor.spin()
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':

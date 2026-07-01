@@ -548,9 +548,9 @@ const PHASES = [
   },
   {
     key: 'phase1_waypoints_custom',
-    label: 'Phase 1 — hand-eye (CUSTOM)',
-    customParkControls: true,
-    hint: 'OPTIONAL second hand-eye dataset. Pick park (pan, tilt) below to match your robot geometry, then add xArm poses that keep the marker in the camera FoV at that head pose. Pan range ±30°, tilt range 0..+30° firmware (where +30 = level, 0 = 30° down). Solving hand-eye on this set independently and comparing T_ee_marker vs the LEVEL solve is a powerful cross-check — they must agree to ~mm/°.',
+    label: 'Phase 1 — hand-eye (CUSTOM datasets)',
+    customDatasets: true,
+    hint: 'OPTIONAL extra hand-eye datasets. Add as many as you like — each has its own park (pan, tilt) and its own xArm poses that keep the marker in the camera FoV at that head pose. Pan range ±30°, tilt range 0..+30° firmware (where +30 = level, 0 = 30° down). Solving hand-eye on a custom set independently and comparing T_ee_marker vs the LEVEL solve is a powerful cross-check — they must agree to ~mm/°.',
   },
   {
     key: 'phase2_waypoints',
@@ -566,15 +566,28 @@ const PHASES = [
 
 const WP_ROOT = $('#waypoint-lists');
 let wpState = {
-  phase1_waypoints: [], phase1_waypoints_custom: [],
+  phase1_waypoints: [],
   phase2_waypoints: [], sanity_xarm_angles_rad: [],
 };
+// Custom hand-eye datasets: [{name, park_pan_deg, park_tilt_deg, waypoints}].
+// Waypoints for dataset <name> are mirrored into wpState['phase1_waypoints_custom:<name>']
+// so the generic add/remove/pushPhase machinery works unchanged.
+const CUSTOM_PHASE_PREFIX = 'phase1_waypoints_custom:';
+let customDatasets = [];
 
 function renderWaypoints() {
   WP_ROOT.innerHTML = '';
   PHASES.forEach(phase => {
     const group = document.createElement('div');
     group.className = 'wp-group';
+
+    // Custom datasets get a bespoke container (one sub-group per dataset).
+    if (phase.customDatasets) {
+      renderCustomDatasets(group, phase);
+      WP_ROOT.appendChild(group);
+      return;
+    }
+
     const header = document.createElement('div');
     header.className = 'wp-header';
     header.innerHTML = `<strong>${phase.label}</strong>`;
@@ -591,53 +604,54 @@ function renderWaypoints() {
       group.appendChild(hint);
     }
 
-    if (phase.customParkControls) {
-      group.appendChild(_buildCustomParkControls());
-    }
-
-    const list = document.createElement('div');
-    list.className = 'wp-list';
-
-    const wps = wpState[phase.key] || [];
-    const items = (phase.key === 'sanity_xarm_angles_rad')
-      ? (wps.length > 0 && Array.isArray(wps[0]) ? wps : (wps.length ? [wps] : []))
-      : wps;
-
-    if (items.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'wp-item empty';
-      empty.textContent = '(empty)';
-      list.appendChild(empty);
-    }
-    items.forEach((wp, i) => {
-      const row = document.createElement('div');
-      row.className = 'wp-item';
-      const txt = document.createElement('span');
-      txt.textContent = `[${i}] ${wp.map(v => Number(v).toFixed(4)).join(', ')}`;
-      row.appendChild(txt);
-      const controls = document.createElement('span');
-      const load = document.createElement('button');
-      load.textContent = 'load';
-      load.addEventListener('click', () => writeJoints(wp));
-      const del = document.createElement('button');
-      del.textContent = 'remove';
-      del.addEventListener('click', () => removeWaypoint(phase.key, i));
-      controls.appendChild(load);
-      controls.appendChild(del);
-      row.appendChild(controls);
-      list.appendChild(row);
-    });
-
-    group.appendChild(list);
+    group.appendChild(buildWaypointList(phase.key));
     WP_ROOT.appendChild(group);
   });
+}
+
+// Build the joint-list editor (rows + load/remove) for one phase key. Shared
+// by the static phases and each custom dataset's sub-group.
+function buildWaypointList(phaseKey) {
+  const list = document.createElement('div');
+  list.className = 'wp-list';
+  const wps = wpState[phaseKey] || [];
+  const items = (phaseKey === 'sanity_xarm_angles_rad')
+    ? (wps.length > 0 && Array.isArray(wps[0]) ? wps : (wps.length ? [wps] : []))
+    : wps;
+  if (items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'wp-item empty';
+    empty.textContent = '(empty)';
+    list.appendChild(empty);
+  }
+  items.forEach((wp, i) => {
+    const row = document.createElement('div');
+    row.className = 'wp-item';
+    const txt = document.createElement('span');
+    txt.textContent = `[${i}] ${wp.map(v => Number(v).toFixed(4)).join(', ')}`;
+    row.appendChild(txt);
+    const controls = document.createElement('span');
+    const load = document.createElement('button');
+    load.textContent = 'load';
+    load.addEventListener('click', () => writeJoints(wp));
+    const del = document.createElement('button');
+    del.textContent = 'remove';
+    del.addEventListener('click', () => removeWaypoint(phaseKey, i));
+    controls.appendChild(load);
+    controls.appendChild(del);
+    row.appendChild(controls);
+    list.appendChild(row);
+  });
+  return list;
 }
 
 async function fetchWaypoints() {
   try {
     const r = await fetch('/api/waypoints');
     if (r.ok) {
-      wpState = await readBody(r);
+      // Merge static phases only — never clobber the custom dataset keys that
+      // fetchCustomDatasets() seeds.
+      Object.assign(wpState, await readBody(r));
       renderWaypoints();
     }
   } catch (e) {
@@ -729,70 +743,148 @@ async function loadBoardSpec() {
 }
 loadBoardSpec();
 
-// ---- Phase-1 custom park controls -------------------------------------------
+// ---- Phase-1 custom hand-eye datasets ---------------------------------------
 
-let _phase1CustomPark = { pan_deg: 0, tilt_deg: 0 };
+function _customKey(name) { return CUSTOM_PHASE_PREFIX + name; }
 
-async function _fetchPhase1CustomPark() {
+async function fetchCustomDatasets() {
   try {
-    const r = await fetch('/api/calib/phase1_custom_park');
+    const r = await fetch('/api/calib/custom_datasets');
     if (!r.ok) return;
-    _phase1CustomPark = await readBody(r);
-    _updateCustomParkUI();
-  } catch (e) { /* ignore */ }
+    const body = await readBody(r);
+    customDatasets = body.datasets || [];
+    // Mirror each dataset's waypoints into wpState so add/remove/pushPhase work.
+    customDatasets.forEach(d => { wpState[_customKey(d.name)] = d.waypoints || []; });
+    renderWaypoints();
+    // The Calibrate-tab pickers (collect/handeye-custom + chain/polish) depend
+    // on the dataset list too.
+    populateCustomDatasetPicker();
+    rebuildHandeyeSelectors();
+  } catch (e) { console.warn('fetchCustomDatasets failed', e); }
 }
 
-async function _pushPhase1CustomPark(pan_deg, tilt_deg) {
-  const r = await fetch('/api/calib/phase1_custom_park', {
-    method: 'POST',
-    headers: {'content-type': 'application/json'},
-    body: JSON.stringify({ pan_deg, tilt_deg }),
-  });
-  if (r.ok) {
-    _phase1CustomPark = { pan_deg, tilt_deg };
-    _updateCustomParkUI();
+async function addCustomDataset() {
+  const raw = prompt('New custom dataset name (letters/digits/underscore, e.g. high_shelf):', '');
+  if (raw === null) return;
+  const name = raw.trim();
+  if (!name) return;
+  try {
+    const r = await fetch('/api/calib/custom_datasets', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({ name }),
+    });
+    const body = await readBody(r);
+    if (!r.ok) { alert('Could not add dataset: ' + (body.detail || JSON.stringify(body))); return; }
+    await fetchCustomDatasets();
+  } catch (e) { alert('add dataset failed: ' + e); }
+}
+
+async function removeCustomDataset(name) {
+  if (!confirm(`Remove custom dataset "${name}" and all its waypoints?`)) return;
+  try {
+    const r = await fetch('/api/calib/custom_datasets/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (!r.ok) { const b = await readBody(r); alert('remove failed: ' + (b.detail || JSON.stringify(b))); return; }
+    delete wpState[_customKey(name)];
+    await fetchCustomDatasets();
+  } catch (e) { alert('remove dataset failed: ' + e); }
+}
+
+async function saveCustomPark(name, pan_deg, tilt_deg, statusEl) {
+  try {
+    const r = await fetch('/api/calib/custom_datasets/' + encodeURIComponent(name) + '/park', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({ pan_deg, tilt_deg }),
+    });
+    const body = await readBody(r);
+    if (statusEl) {
+      statusEl.textContent = r.ok ? `saved: pan=${pan_deg}°, tilt=${tilt_deg}°`
+                                  : ('save failed: ' + (body.detail || ''));
+      statusEl.className = r.ok ? 'status-line ok' : 'status-line err';
+    }
+    if (r.ok) {
+      const d = customDatasets.find(x => x.name === name);
+      if (d) { d.park_pan_deg = pan_deg; d.park_tilt_deg = tilt_deg; }
+      populateCustomDatasetPicker();
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = 'save failed: ' + e; statusEl.className = 'status-line err'; }
   }
-  return r.ok;
 }
 
-function _updateCustomParkUI() {
-  const btn = $('#calib-collect-phase1-custom');
-  if (btn) {
-    btn.textContent = `Collect Phase 1 — custom (pan=${_phase1CustomPark.pan_deg.toFixed(1)}°, tilt=${_phase1CustomPark.tilt_deg.toFixed(1)}°)`;
+// Render the whole "Phase 1 — hand-eye (CUSTOM datasets)" container: an add
+// button, the hint, then one sub-group per dataset.
+function renderCustomDatasets(group, phase) {
+  const header = document.createElement('div');
+  header.className = 'wp-header';
+  header.innerHTML = `<strong>${phase.label}</strong>`;
+  const add = document.createElement('button');
+  add.textContent = '+ add custom dataset';
+  add.addEventListener('click', addCustomDataset);
+  header.appendChild(add);
+  group.appendChild(header);
+
+  if (phase.hint) {
+    const hint = document.createElement('p');
+    hint.className = 'muted wp-hint';
+    hint.textContent = phase.hint;
+    group.appendChild(hint);
   }
-  const pi = document.getElementById('phase1-custom-pan');
-  const ti = document.getElementById('phase1-custom-tilt');
-  if (pi && document.activeElement !== pi) pi.value = _phase1CustomPark.pan_deg;
-  if (ti && document.activeElement !== ti) ti.value = _phase1CustomPark.tilt_deg;
-}
 
-function _buildCustomParkControls() {
-  const wrap = document.createElement('div');
-  wrap.className = 'wp-custom-park';
-  wrap.innerHTML = `
-    <label>Park pan: <input id="phase1-custom-pan" type="number" step="0.5" min="-30" max="30" value="${_phase1CustomPark.pan_deg}"> °</label>
-    <label>Park tilt: <input id="phase1-custom-tilt" type="number" step="0.5" min="0" max="45" value="${_phase1CustomPark.tilt_deg}"> °</label>
-    <button id="phase1-custom-park-save" type="button">Save park</button>
-    <span id="phase1-custom-park-status" class="status-line muted"></span>
-  `;
-  // Bind after attach
-  setTimeout(() => {
-    const save = document.getElementById('phase1-custom-park-save');
-    const status = document.getElementById('phase1-custom-park-status');
-    if (save) save.addEventListener('click', async () => {
-      const pan = parseFloat(document.getElementById('phase1-custom-pan').value);
-      const tilt = parseFloat(document.getElementById('phase1-custom-tilt').value);
+  if (!customDatasets.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted wp-hint';
+    empty.textContent = '(no custom datasets — click "+ add custom dataset")';
+    group.appendChild(empty);
+    return;
+  }
+
+  customDatasets.forEach(d => {
+    const sub = document.createElement('div');
+    sub.className = 'wp-custom-dataset';
+
+    const subHeader = document.createElement('div');
+    subHeader.className = 'wp-header';
+    subHeader.innerHTML = `<strong>↳ ${d.name}</strong>`;
+    const addWp = document.createElement('button');
+    addWp.textContent = '+ add current joints';
+    addWp.addEventListener('click', () => addWaypoint(_customKey(d.name)));
+    subHeader.appendChild(addWp);
+    const rm = document.createElement('button');
+    rm.textContent = 'remove dataset';
+    rm.className = 'danger';
+    rm.addEventListener('click', () => removeCustomDataset(d.name));
+    subHeader.appendChild(rm);
+    sub.appendChild(subHeader);
+
+    // Per-dataset park controls.
+    const park = document.createElement('div');
+    park.className = 'wp-custom-park';
+    const panInput = document.createElement('input');
+    panInput.type = 'number'; panInput.step = '0.5'; panInput.min = '-30'; panInput.max = '30';
+    panInput.value = d.park_pan_deg;
+    const tiltInput = document.createElement('input');
+    tiltInput.type = 'number'; tiltInput.step = '0.5'; tiltInput.min = '0'; tiltInput.max = '45';
+    tiltInput.value = d.park_tilt_deg;
+    const panLbl = document.createElement('label'); panLbl.append('Park pan: ', panInput, ' °');
+    const tiltLbl = document.createElement('label'); tiltLbl.append('Park tilt: ', tiltInput, ' °');
+    const saveBtn = document.createElement('button'); saveBtn.type = 'button'; saveBtn.textContent = 'Save park';
+    const status = document.createElement('span'); status.className = 'status-line muted';
+    saveBtn.addEventListener('click', () => {
+      const pan = parseFloat(panInput.value), tilt = parseFloat(tiltInput.value);
       if (Number.isNaN(pan) || Number.isNaN(tilt)) {
         status.textContent = 'invalid number'; status.className = 'status-line err'; return;
       }
-      const ok = await _pushPhase1CustomPark(pan, tilt);
-      status.textContent = ok ? `saved: pan=${pan}°, tilt=${tilt}°` : 'save failed';
-      status.className = ok ? 'status-line ok' : 'status-line err';
+      saveCustomPark(d.name, pan, tilt, status);
     });
-  }, 0);
-  return wrap;
+    park.append(panLbl, tiltLbl, saveBtn, status);
+    sub.appendChild(park);
+
+    sub.appendChild(buildWaypointList(_customKey(d.name)));
+    group.appendChild(sub);
+  });
 }
-_fetchPhase1CustomPark();
+
+fetchCustomDatasets();
 
 async function loadWaypointPaths() {
   try {
@@ -1153,6 +1245,9 @@ async function calibLoadSessionDetail(name) {
   CALIB.lastFiles = files;
   calibRenderFiles(files);
   calibRenderGates(body.gates || []);
+  // Ensure the handeye/phase1 selectors list every custom dataset (covers the
+  // case where a session is selected before fetchCustomDatasets resolved).
+  rebuildHandeyeSelectors();
   calibRenderDatasetSelectors(files);
   calibApplyRunEnablement(files);
   // polish.json takes precedence over chain.json when both are present.
@@ -1345,12 +1440,28 @@ async function calibRun(cmd, flags) {
     CALIB_SESSION_STATUS.className = 'status-line warn';
     return;
   }
+  // collect_phase1_custom + handeye_custom act on the dataset chosen in the
+  // Calibrate-tab picker. Resolve it up front so both the confirm text and the
+  // request body see the same name.
+  let customName = '';
+  if (cmd === 'collect_phase1_custom' || cmd === 'handeye_custom') {
+    const dsel = document.getElementById('calib-custom-dataset-select');
+    customName = dsel ? dsel.value : '';
+    if (!customName) {
+      CALIB_SESSION_STATUS.textContent = 'no custom dataset selected — add one in the xArm Waypoints tab';
+      CALIB_SESSION_STATUS.className = 'status-line warn';
+      return;
+    }
+  }
   // Collection commands move the physical robot -- require an explicit confirm
   // so a stray click doesn't kick off a 20-minute sweep.
   if (cmd.startsWith('collect_')) {
+    const cd = customName ? customDatasets.find(d => d.name === customName) : null;
     const human = {
       collect_phase1:        'Phase 1 LEVEL (pan=0, head horizontal, uses phase1_waypoints)',
-      collect_phase1_custom: `Phase 1 CUSTOM (pan=${_phase1CustomPark.pan_deg}°, tilt=${_phase1CustomPark.tilt_deg}°, uses phase1_waypoints_custom)`,
+      collect_phase1_custom: cd
+        ? `Phase 1 CUSTOM "${customName}" (pan=${cd.park_pan_deg}°, tilt=${cd.park_tilt_deg}°)`
+        : `Phase 1 CUSTOM "${customName}"`,
       collect_dry_run:       'Dry-run waypoint validation (NO image capture, NO pan-tilt motion). Sends each xArm waypoint via JointMove and reports which ones fail. Cheap; safe to run before a full collect.',
       collect_phase2:        'Phase 2 (pan-tilt grid sweep at each xArm anchor)',
       collect_sanity:        'sanity pose (single pose)',
@@ -1370,6 +1481,10 @@ async function calibRun(cmd, flags) {
   // against an allowlist.
   const reqBody = {session: CALIB.currentSession, cmd, flags};
   let datasetSummary = '';
+  if (customName) {
+    reqBody.custom_name = customName;
+    datasetSummary = ` (dataset=${customName})`;
+  }
   if (cmd === 'chain') {
     const sel = document.getElementById('chain-handeye-select');
     if (sel) {
@@ -1436,11 +1551,14 @@ if (_chainHandeyeSel) {
     calibApplyRunEnablement(CALIB.lastFiles || {});
   });
 }
-$$('#polish-phase1-checks input[type="checkbox"]').forEach(cb => {
-  cb.addEventListener('change', () => {
+// Delegated: the polish phase-1 checkboxes are rebuilt whenever the custom
+// dataset list changes, so bind on the stable container, not each input.
+const _polishChecks = document.getElementById('polish-phase1-checks');
+if (_polishChecks) {
+  _polishChecks.addEventListener('change', () => {
     calibApplyRunEnablement(CALIB.lastFiles || {});
   });
-});
+}
 const _validateParamsSel = document.getElementById('validate-params-select');
 if (_validateParamsSel) {
   _validateParamsSel.addEventListener('change', () => {
@@ -1986,6 +2104,98 @@ function calibDynamicPrereqs(cmd, files) {
     return ((files[chosen] || {}).exists) ? [] : [chosen];
   }
   return [];
+}
+
+// JS mirror of pan_tilt.calibration.custom_naming.custom_dataset_filenames.
+function customSolveFile(name) {
+  return name === 'custom' ? 'handeye_custom.json' : `handeye_custom_${name}.json`;
+}
+function customPhase1File(name) {
+  return name === 'custom' ? 'phase1_handeye_custom.json' : `phase1_handeye_custom_${name}.json`;
+}
+
+// Fill the Calibrate-tab dataset picker shared by collect_phase1_custom +
+// handeye_custom.
+function populateCustomDatasetPicker() {
+  const sel = document.getElementById('calib-custom-dataset-select');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '';
+  if (!customDatasets.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = '(none — add in xArm Waypoints tab)';
+    sel.appendChild(opt);
+    return;
+  }
+  customDatasets.forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d.name;
+    opt.textContent = `${d.name} (pan=${d.park_pan_deg}°, tilt=${d.park_tilt_deg}°)`;
+    sel.appendChild(opt);
+  });
+  if (customDatasets.some(d => d.name === prev)) sel.value = prev;
+  populatePrunePhaseOptions();
+}
+
+// Inject one `phase1_waypoints_custom:<name>` option per dataset into the Prune
+// tab's phase selector (between phase1_waypoints and phase2_grid).
+function populatePrunePhaseOptions() {
+  const sel = document.getElementById('prune-phase');
+  if (!sel) return;
+  const prev = sel.value;
+  // Drop any previously-injected custom options.
+  Array.from(sel.options)
+    .filter(o => o.value.startsWith(CUSTOM_PHASE_PREFIX))
+    .forEach(o => o.remove());
+  const grid = Array.from(sel.options).find(o => o.value === 'phase2_grid');
+  customDatasets.forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = _customKey(d.name);
+    opt.textContent = `phase1_waypoints_custom: ${d.name}`;
+    sel.insertBefore(opt, grid || null);
+  });
+  if (Array.from(sel.options).some(o => o.value === prev)) sel.value = prev;
+}
+
+// Rebuild the chain `--handeye` dropdown + polish `--phase1` checkboxes so they
+// list the canonical solve plus every custom dataset's solve/phase1 file.
+function rebuildHandeyeSelectors() {
+  const sel = document.getElementById('chain-handeye-select');
+  if (sel) {
+    const prev = sel.value;
+    sel.innerHTML = '';
+    const opts = [['handeye.json', 'handeye.json (level)']];
+    customDatasets.forEach(d =>
+      opts.push([customSolveFile(d.name), `${customSolveFile(d.name)} (${d.name})`]));
+    opts.forEach(([val, label]) => {
+      const o = document.createElement('option');
+      o.value = val; o.textContent = label; sel.appendChild(o);
+    });
+    sel.value = opts.some(([v]) => v === prev) ? prev : 'handeye.json';
+  }
+  const checks = document.getElementById('polish-phase1-checks');
+  if (checks) {
+    const prevChecked = new Set(
+      $$('#polish-phase1-checks input[type="checkbox"]:checked').map(i => i.value));
+    const firstBuild = checks.dataset.built !== '1';
+    checks.innerHTML = '';
+    const items = [['phase1_handeye.json', 'level']];
+    customDatasets.forEach(d => items.push([customPhase1File(d.name), d.name]));
+    items.forEach(([val, label]) => {
+      const lbl = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.value = val;
+      cb.checked = firstBuild ? (val === 'phase1_handeye.json') : prevChecked.has(val);
+      lbl.appendChild(cb); lbl.append(' ' + label);
+      checks.appendChild(lbl);
+    });
+    checks.dataset.built = '1';
+  }
+  if (CALIB.lastFiles) {
+    calibRenderDatasetSelectors(CALIB.lastFiles);
+    calibApplyRunEnablement(CALIB.lastFiles);
+  }
 }
 
 function calibRenderDatasetSelectors(files) {

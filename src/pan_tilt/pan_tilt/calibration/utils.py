@@ -116,6 +116,24 @@ def rotvec_to_xyz_euler(rotvec) -> np.ndarray:
     return Rotation.from_rotvec(np.asarray(rotvec, dtype=float)).as_euler("xyz")
 
 
+def wrap_to_pi(angle_rad: float) -> float:
+    """Wrap an angle (radians) to (-pi, pi].
+
+    Used to normalize the calibration joint offsets (theta_t_offset /
+    theta_p_offset). The optimizer leaves these unbounded, so a valid solve
+    can land many 2*pi from zero (a real run produced +478 deg). Because
+    R_y / R_z are 2*pi-periodic, wrapping is rotation-equivalent: the camera
+    pose is identical, but the published URDF joint value stays in a sane
+    range and the offset is human-readable. The +pi boundary maps to +pi.
+    """
+    import numpy as _np
+    w = (float(angle_rad) + _np.pi) % (2.0 * _np.pi) - _np.pi
+    # Map the -pi endpoint to +pi so the half-open interval is (-pi, pi].
+    if w <= -_np.pi:
+        w += 2.0 * _np.pi
+    return float(w)
+
+
 def body_yaw_from_rotvec(rotvec) -> float:
     """Body-frame yaw (rotation about +Z) implied by a rotvec, in radians.
 

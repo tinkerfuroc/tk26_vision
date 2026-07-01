@@ -40,12 +40,8 @@ pan_tilt_state_publisher:
     # URDF chain mis-represents the camera's pose by up to ~45° (the parked
     # tilt angle), which projects vision points below ground in the
     # seat-recommend / arm-pointing pipeline.
-    # From calibration_data/wzx_0529/polish.json (2026-06-30), in lockstep with
-    # the URDF camera_mount_joint T_B in tinker_urdf/src/pan_tilt.urdf.xacro.
-    # tilt_offset normalized to [-pi,pi]: solver emitted +8.3481 rad (+478.3°),
-    # which is +2.0649 rad (+118.31°) mod 2pi — equivalent rotation, sane joint value.
-    pan_offset_rad: 3.1400375561
-    tilt_offset_rad: 2.0649000773
+    pan_offset_rad: 3.1449570952
+    tilt_offset_rad: -1.8735174383
 
 follow_head_node:
   ros__parameters:

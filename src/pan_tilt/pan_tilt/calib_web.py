@@ -36,6 +36,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -75,18 +76,47 @@ from .calibration.aruco_detect import (
     build_detector,
     detect_pose,
 )
+from .calibration.custom_naming import (
+    custom_dataset_filenames,
+    migrate_custom_datasets,
+    sanitize_custom_name,
+)
 from .calibration.run_calibration import GATES as _RC_GATES
 from .calibration.safety import SafetyEnvelope
 from .calibration.urdf_targets import list_targets as list_urdf_targets
 from .calibration.yaml_targets import list_yaml_targets
 from .calibration import apply_to_urdf as _apply_to_urdf_mod
-from .calibration.utils import matrix_to_pose, pose_to_matrix
+from .calibration.utils import matrix_to_pose, pose_to_matrix, wrap_to_pi
 from .calibration.waypoint_predict import (
     chain_predictors,
     pantilt_grid_predictor,
     replay_predictor,
 )
 from .calibration.waypoint_prune import Predicted, prune_waypoints
+
+# Matches the canonical + every named custom hand-eye file. Used to gate the
+# session-file server and to build the chain/polish input allowlists from the
+# files actually present in a session (so client-supplied basenames can never
+# inject a path).
+_HANDEYE_FILE_RE = re.compile(r"^handeye(_custom(_[a-z0-9_]+)?)?\.json$")
+_PHASE1_FILE_RE = re.compile(r"^phase1_handeye(_custom(_[a-z0-9_]+)?)?\.json$")
+
+
+def _session_handeye_files(sess_path: Path, phase1: bool) -> list:
+    """Sorted basenames of handeye (or phase1_handeye) outputs in a session.
+
+    Canonical first, then custom datasets alphabetically — gives the UI a
+    stable order and the run-dispatch a regex-validated allowlist.
+    """
+    pat = "phase1_handeye*.json" if phase1 else "handeye*.json"
+    rx = _PHASE1_FILE_RE if phase1 else _HANDEYE_FILE_RE
+    canonical = "phase1_handeye.json" if phase1 else "handeye.json"
+    names = sorted(p.name for p in sess_path.glob(pat) if rx.match(p.name))
+    # Keep the canonical file at the front when present.
+    if canonical in names:
+        names.remove(canonical)
+        names.insert(0, canonical)
+    return names
 
 
 log = logging.getLogger("calib_web")
@@ -292,8 +322,10 @@ class CalibrateRunner:
         t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
         pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
         tilt_offset_rad = float(params.get("theta_t_offset_rad", 0.0))
+        pan_offset_rad = wrap_to_pi(pan_offset_rad)
+        tilt_offset_rad = wrap_to_pi(tilt_offset_rad)
 
-        xacro = Path(xacro_path)
+        xacro = _apply_to_urdf_mod.resolve_source_path(Path(xacro_path))
         if not xacro.is_file():
             raise FileNotFoundError(f"xacro {xacro_path!r} not present")
         original_xacro = xacro.read_text()
@@ -315,7 +347,7 @@ class CalibrateRunner:
         yaml_diff_text = ""
         yaml_targets = [t for t in list_yaml_targets() if t.exists]
         if yaml_targets:
-            yaml_path = Path(yaml_targets[0].path)
+            yaml_path = _apply_to_urdf_mod.resolve_source_path(Path(yaml_targets[0].path))
             original_yaml = yaml_path.read_text()
             try:
                 patched_yaml = _apply_to_urdf_mod._patch_yaml_offsets(
@@ -407,8 +439,10 @@ class CalibrateRunner:
         t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
         pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
         tilt_offset_rad = float(params.get("theta_t_offset_rad", 0.0))
+        pan_offset_rad = wrap_to_pi(pan_offset_rad)
+        tilt_offset_rad = wrap_to_pi(tilt_offset_rad)
 
-        xacro = Path(xacro_path)
+        xacro = _apply_to_urdf_mod.resolve_source_path(Path(xacro_path))
         original_xacro = xacro.read_text()
         try:
             patched_xacro = _apply_to_urdf_mod._patched_xacro(
@@ -419,7 +453,7 @@ class CalibrateRunner:
             raise RuntimeError(str(exc)) from exc
 
         yaml_targets = [t for t in list_yaml_targets() if t.exists]
-        yaml_path = Path(yaml_targets[0].path) if yaml_targets else None
+        yaml_path = _apply_to_urdf_mod.resolve_source_path(Path(yaml_targets[0].path)) if yaml_targets else None
 
         try:
             atomic = _apply_to_urdf_mod._atomic_write_pair(
@@ -705,10 +739,19 @@ class CalibWebNode(Node):
         # of reverting to whatever was checked into git.
         self._waypoints: dict = {
             "phase1_waypoints": list(self._loaded_cfg.get("phase1_waypoints", []) or []),
-            "phase1_waypoints_custom": list(self._loaded_cfg.get("phase1_waypoints_custom", []) or []),
             "phase2_waypoints": list(self._loaded_cfg.get("phase2_waypoints", []) or []),
             "sanity_xarm_angles_rad": list(self._loaded_cfg.get("sanity_xarm_angles_rad", []) or []),
         }
+        # Named CUSTOM hand-eye datasets live OUT of `_waypoints` so they
+        # serialize as a clean `phase1_custom_datasets` list rather than ad-hoc
+        # `phase1_waypoints_custom:<name>` yaml keys. Built from the loaded
+        # config (migrating the legacy single-custom flat keys if needed); the
+        # legacy keys are then dropped so they never get re-serialized.
+        self._custom_datasets: list = migrate_custom_datasets(self._loaded_cfg)
+        for _legacy in ("phase1_waypoints_custom",
+                        "phase1_custom_park_pan_deg",
+                        "phase1_custom_park_tilt_deg"):
+            self._loaded_cfg.pop(_legacy, None)
         self._resume_from_draft()
 
         # Expose the configured pan/tilt grid so the UI can render grid-matched
@@ -1210,13 +1253,85 @@ class CalibWebNode(Node):
 
     # ---- waypoint store ------------------------------------------------------
 
+    # Custom-dataset waypoints are addressed through the generic waypoint API
+    # via a synthetic phase key `phase1_waypoints_custom:<name>`, so the
+    # existing add/remove/render frontend logic and the prune payload builder
+    # work unchanged. The data itself lives in `self._custom_datasets`.
+    CUSTOM_PHASE_PREFIX = "phase1_waypoints_custom:"
+
+    @classmethod
+    def _split_custom_phase(cls, phase: str) -> Optional[str]:
+        """Return the dataset name if `phase` is a custom phase key, else None."""
+        if phase.startswith(cls.CUSTOM_PHASE_PREFIX):
+            return phase[len(cls.CUSTOM_PHASE_PREFIX):]
+        return None
+
+    def _find_custom_locked(self, name: str) -> Optional[dict]:
+        for d in self._custom_datasets:
+            if d["name"] == name:
+                return d
+        return None
+
     def list_waypoints(self, phase: str) -> list:
         with self.lock:
+            name = self._split_custom_phase(phase)
+            if name is not None:
+                d = self._find_custom_locked(name)
+                return list(d.get("waypoints", [])) if d else []
             return list(self._waypoints.get(phase, []))
 
     def set_waypoints(self, phase: str, wps: list) -> None:
         with self.lock:
+            name = self._split_custom_phase(phase)
+            if name is not None:
+                d = self._find_custom_locked(name)
+                if d is not None:
+                    d["waypoints"] = [list(w) for w in wps]
+                return
             self._waypoints[phase] = list(wps)
+
+    # ---- custom dataset store -----------------------------------------------
+
+    def list_custom_datasets(self) -> list:
+        """Deep-ish copy of the custom datasets for read-only API responses."""
+        with self.lock:
+            return [
+                {
+                    "name": d["name"],
+                    "park_pan_deg": float(d.get("park_pan_deg", 0.0)),
+                    "park_tilt_deg": float(d.get("park_tilt_deg", 0.0)),
+                    "waypoints": [list(w) for w in d.get("waypoints", [])],
+                }
+                for d in self._custom_datasets
+            ]
+
+    def add_custom_dataset(self, name: str) -> dict:
+        """Create an empty dataset. Raises ValueError on bad/duplicate name."""
+        clean = sanitize_custom_name(name)
+        with self.lock:
+            if self._find_custom_locked(clean) is not None:
+                raise ValueError(f"custom dataset {clean!r} already exists")
+            entry = {"name": clean, "park_pan_deg": 0.0,
+                     "park_tilt_deg": 0.0, "waypoints": []}
+            self._custom_datasets.append(entry)
+            return dict(entry)
+
+    def remove_custom_dataset(self, name: str) -> bool:
+        with self.lock:
+            d = self._find_custom_locked(name)
+            if d is None:
+                return False
+            self._custom_datasets.remove(d)
+            return True
+
+    def set_custom_park(self, name: str, pan_deg: float, tilt_deg: float) -> bool:
+        with self.lock:
+            d = self._find_custom_locked(name)
+            if d is None:
+                return False
+            d["park_pan_deg"] = float(pan_deg)
+            d["park_tilt_deg"] = float(tilt_deg)
+            return True
 
     def dedupe_waypoints(self, eps_rad: float = 1e-3) -> dict:
         """Drop near-duplicate waypoints in place across all waypoint lists.
@@ -1230,6 +1345,22 @@ class CalibWebNode(Node):
         Operator-triggered only -- save no longer dedupes implicitly so
         intentional duplicates used as a self-consistency probe survive.
         """
+        def _dedup(wps: list) -> tuple[list, int]:
+            kept: list = []
+            n_dropped = 0
+            for w in wps:
+                arr = np.asarray(w, dtype=float)
+                is_dup = any(
+                    np.asarray(k).shape == arr.shape and
+                    np.allclose(np.asarray(k), arr, atol=eps_rad)
+                    for k in kept
+                )
+                if is_dup:
+                    n_dropped += 1
+                else:
+                    kept.append(list(w))
+            return kept, n_dropped
+
         removed: dict = {}
         with self.lock:
             for phase, wps in self._waypoints.items():
@@ -1237,22 +1368,21 @@ class CalibWebNode(Node):
                     continue
                 if not isinstance(wps[0], (list, tuple)):
                     continue
-                kept: list = []
-                n_dropped = 0
-                for w in wps:
-                    arr = np.asarray(w, dtype=float)
-                    is_dup = any(
-                        np.asarray(k).shape == arr.shape and
-                        np.allclose(np.asarray(k), arr, atol=eps_rad)
-                        for k in kept
-                    )
-                    if is_dup:
-                        n_dropped += 1
-                    else:
-                        kept.append(list(w))
+                kept, n_dropped = _dedup(wps)
                 if n_dropped:
                     self._waypoints[phase] = kept
                     removed[phase] = n_dropped
+            # Named custom datasets carry their own waypoint lists.
+            for d in self._custom_datasets:
+                wps = d.get("waypoints", [])
+                if not isinstance(wps, list) or not wps:
+                    continue
+                if not isinstance(wps[0], (list, tuple)):
+                    continue
+                kept, n_dropped = _dedup(wps)
+                if n_dropped:
+                    d["waypoints"] = kept
+                    removed[f"{self.CUSTOM_PHASE_PREFIX}{d['name']}"] = n_dropped
         return removed
 
     def _serialize_waypoints_yaml(self) -> str:
@@ -1263,11 +1393,26 @@ class CalibWebNode(Node):
         silently undoes that. Use the explicit dedupe action instead.
         """
         base = {k: v for k, v in self._loaded_cfg.items() if k != "__passthrough__"}
+        # Never re-emit the legacy single-custom keys -- the named-list form
+        # below is authoritative (loaders still READ the old keys for migration).
+        for _legacy in ("phase1_waypoints_custom",
+                        "phase1_custom_park_pan_deg",
+                        "phase1_custom_park_tilt_deg"):
+            base.pop(_legacy, None)
         with self.lock:
             for k, v in self._waypoints.items():
                 # Convert nested tuples from YAML loader to plain lists.
                 base[k] = [list(x) if isinstance(x, (list, tuple)) else x
                            for x in v] if isinstance(v, list) else v
+            base["phase1_custom_datasets"] = [
+                {
+                    "name": d["name"],
+                    "park_pan_deg": float(d.get("park_pan_deg", 0.0)),
+                    "park_tilt_deg": float(d.get("park_tilt_deg", 0.0)),
+                    "waypoints": [list(w) for w in d.get("waypoints", [])],
+                }
+                for d in self._custom_datasets
+            ]
         out = {"collector": base}
         passthrough = self._loaded_cfg.get("__passthrough__", {})
         if "safety_section" in passthrough:
@@ -1347,14 +1492,22 @@ class CalibWebNode(Node):
         data = yaml.safe_load(path.read_text()) or {}
         coll = data.get("collector", {}) or {}
         recovered: dict = {}
-        for k in ("phase1_waypoints", "phase1_waypoints_custom",
-                  "phase2_waypoints", "sanity_xarm_angles_rad"):
+        for k in ("phase1_waypoints", "phase2_waypoints", "sanity_xarm_angles_rad"):
             if k in coll:
                 v = coll[k]
                 recovered[k] = [list(x) if isinstance(x, (list, tuple)) else x
                                 for x in v] if isinstance(v, list) else v
         counts = {k: (len(v) if isinstance(v, list) else 0)
                   for k, v in recovered.items()}
+
+        # Named CUSTOM datasets (or a legacy single-custom yaml) — replace the
+        # store wholesale so a reload mirrors the chosen source exactly.
+        custom_present = ("phase1_custom_datasets" in coll
+                          or "phase1_waypoints_custom" in coll)
+        recovered_customs = migrate_custom_datasets(coll) if custom_present else None
+        if recovered_customs is not None:
+            for d in recovered_customs:
+                counts[f"{self.CUSTOM_PHASE_PREFIX}{d['name']}"] = len(d["waypoints"])
 
         # Phase-2 sweep config: rectangular grid + optional pruned-pair
         # override. Pulled through into `_loaded_cfg` so the Jog tab + the
@@ -1365,10 +1518,12 @@ class CalibWebNode(Node):
                 v = coll[k]
                 grid_updates[k] = list(v) if isinstance(v, list) else v
 
-        if recovered or grid_updates:
+        if recovered or grid_updates or recovered_customs is not None:
             with self.lock:
                 if recovered:
                     self._waypoints.update(recovered)
+                if recovered_customs is not None:
+                    self._custom_datasets = recovered_customs
                 if grid_updates:
                     self._loaded_cfg.update(grid_updates)
                     self._refresh_state_grid_locked()
@@ -1525,18 +1680,26 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     # symlinks individual files); explicit FileResponse routes are more
     # predictable and the asset count is tiny.
     if webui_dir.exists():
+        # `no-cache` forces the browser to revalidate (cheap ETag 304 when
+        # unchanged) so a rebuilt app.js/index.html is picked up on a plain
+        # reload — without it browsers heuristically serve a stale dev UI.
+        _NOCACHE = {"Cache-Control": "no-cache"}
+
         @app.get("/")
         def root():
-            return FileResponse(webui_dir / "index.html", media_type="text/html")
+            return FileResponse(webui_dir / "index.html", media_type="text/html",
+                                headers=_NOCACHE)
 
         @app.get("/static/style.css")
         def static_css():
-            return FileResponse(webui_dir / "style.css", media_type="text/css")
+            return FileResponse(webui_dir / "style.css", media_type="text/css",
+                                headers=_NOCACHE)
 
         @app.get("/static/app.js")
         def static_js():
             return FileResponse(webui_dir / "app.js",
-                                media_type="application/javascript")
+                                media_type="application/javascript",
+                                headers=_NOCACHE)
     else:
         @app.get("/")
         def root_missing():
@@ -1724,12 +1887,28 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         return {"ok": ok, "message": msg, "step": "finalize"}
 
     # --- waypoints ----------------------------------------------------------
-    VALID_PHASES = {"phase1_waypoints", "phase1_waypoints_custom",
-                    "phase2_waypoints", "sanity_xarm_angles_rad"}
+    STATIC_PHASES = {"phase1_waypoints", "phase2_waypoints",
+                     "sanity_xarm_angles_rad"}
+
+    def _is_valid_phase(phase: str) -> bool:
+        """Accept the static phases plus `phase1_waypoints_custom:<name>` for an
+        existing custom dataset."""
+        if phase in STATIC_PHASES:
+            return True
+        name = CalibWebNode._split_custom_phase(phase)
+        if name is None:
+            return False
+        try:
+            clean = sanitize_custom_name(name)
+        except ValueError:
+            return False
+        return any(d["name"] == clean for d in node.list_custom_datasets())
 
     @app.get("/api/waypoints")
     def api_waypoints_all():
-        return {k: node.list_waypoints(k) for k in VALID_PHASES}
+        # Static phases only; the custom datasets are served by
+        # /api/calib/custom_datasets (they carry park metadata too).
+        return {k: node.list_waypoints(k) for k in STATIC_PHASES}
 
     # /save and /promote must be declared BEFORE /{phase} so FastAPI's
     # first-match routing doesn't funnel them into the phase handler.
@@ -1819,20 +1998,40 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             "promote": str(node.promote_yaml_out) if node.promote_yaml_out else None,
         }
 
-    @app.get("/api/calib/phase1_custom_park")
-    def api_phase1_custom_park_get():
-        """Operator-chosen pan/tilt for the Phase-1 custom-park dataset.
-        Lives in the loaded yaml's collector section so it round-trips
-        through save/promote like the rest of the calibration config.
-        """
-        cfg = node._loaded_cfg
-        return {
-            "pan_deg": float(cfg.get("phase1_custom_park_pan_deg", 0.0)),
-            "tilt_deg": float(cfg.get("phase1_custom_park_tilt_deg", 0.0)),
-        }
+    # --- custom hand-eye datasets ------------------------------------------
+    #
+    # Each entry is {name, park_pan_deg, park_tilt_deg, waypoints}. Waypoints
+    # are edited through the generic /api/waypoints/phase1_waypoints_custom:<name>
+    # endpoint; these routes handle the dataset lifecycle + park pose.
 
-    @app.post("/api/calib/phase1_custom_park")
-    def api_phase1_custom_park_set(body: dict):
+    @app.get("/api/calib/custom_datasets")
+    def api_custom_datasets_list():
+        return {"datasets": node.list_custom_datasets()}
+
+    @app.post("/api/calib/custom_datasets")
+    def api_custom_datasets_create(body: dict):
+        try:
+            entry = node.add_custom_dataset(str((body or {}).get("name", "")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"ok": True, "dataset": entry}
+
+    @app.delete("/api/calib/custom_datasets/{name}")
+    def api_custom_datasets_delete(name: str):
+        try:
+            clean = sanitize_custom_name(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not node.remove_custom_dataset(clean):
+            raise HTTPException(404, f"unknown custom dataset: {clean}")
+        return {"ok": True, "name": clean}
+
+    @app.post("/api/calib/custom_datasets/{name}/park")
+    def api_custom_datasets_park(name: str, body: dict):
+        try:
+            clean = sanitize_custom_name(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         try:
             pan = float(body["pan_deg"])
             tilt = float(body["tilt_deg"])
@@ -1843,20 +2042,19 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             raise HTTPException(400, f"pan_deg out of envelope (±30): {pan}")
         if not (0.0 <= tilt <= 30.0):
             raise HTTPException(400, f"tilt_deg out of envelope (0..+30): {tilt}")
-        with node.lock:
-            node._loaded_cfg["phase1_custom_park_pan_deg"] = pan
-            node._loaded_cfg["phase1_custom_park_tilt_deg"] = tilt
-        return {"ok": True, "pan_deg": pan, "tilt_deg": tilt}
+        if not node.set_custom_park(clean, pan, tilt):
+            raise HTTPException(404, f"unknown custom dataset: {clean}")
+        return {"ok": True, "name": clean, "pan_deg": pan, "tilt_deg": tilt}
 
     @app.get("/api/waypoints/{phase}")
     def api_waypoints_get(phase: str):
-        if phase not in VALID_PHASES:
+        if not _is_valid_phase(phase):
             raise HTTPException(404, f"unknown phase: {phase}")
         return {"phase": phase, "waypoints": node.list_waypoints(phase)}
 
     @app.post("/api/waypoints/{phase}")
     async def api_waypoints_set(phase: str, req: dict):
-        if phase not in VALID_PHASES:
+        if not _is_valid_phase(phase):
             raise HTTPException(404, f"unknown phase: {phase}")
         wps = req.get("waypoints")
         if not isinstance(wps, list):
@@ -1978,11 +2176,15 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         if not sess_path.is_dir():
             raise HTTPException(404, f"unknown session: {name}")
         tracked = [
-            "phase1_handeye.json", "phase1_handeye_custom.json",
             "phase2_chain.json", "sanity.json", "phase4_validation.json",
-            "intrinsic.json", "handeye.json", "handeye_custom.json",
+            "intrinsic.json",
             "chain.json", "polish.json", "validation.json", "dry_run.json",
         ]
+        # Include every named custom dataset's collect + solve outputs that
+        # exist (canonical handeye files are surfaced by the helper too).
+        tracked = (_session_handeye_files(sess_path, phase1=True)
+                   + _session_handeye_files(sess_path, phase1=False)
+                   + tracked)
         files = {f: _parse_session_file(sess_path, f) for f in tracked}
         return {
             "name": name,
@@ -2036,8 +2238,9 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         ])
 
         out: list[dict] = []
-        for fname in ("phase1_handeye.json", "phase1_handeye_custom.json",
-                      "phase2_chain.json"):
+        scatter_files = (_session_handeye_files(sess_path, phase1=True)
+                         + ["phase2_chain.json"])
+        for fname in scatter_files:
             try:
                 data = json.loads((sess_path / fname).read_text())
             except (FileNotFoundError, json.JSONDecodeError):
@@ -2091,13 +2294,15 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             raise HTTPException(400, str(exc))
         # Only let through specific analyser files so we don't hand back
         # arbitrary blobs (the runner's sandboxing already covers ../ etc.).
-        allowed = {"handeye.json", "handeye_custom.json",
-                   "chain.json", "polish.json", "validation.json",
-                   "phase1_handeye.json", "phase1_handeye_custom.json",
+        # Named custom datasets add handeye_custom_<name>.json variants, matched
+        # by the regexes rather than enumerated.
+        allowed = {"chain.json", "polish.json", "validation.json",
                    "phase2_chain.json", "sanity.json",
                    "phase4_validation.json",
                    "intrinsic.json", "dry_run.json"}
-        if filename not in allowed:
+        if not (filename in allowed
+                or _HANDEYE_FILE_RE.match(filename)
+                or _PHASE1_FILE_RE.match(filename)):
             raise HTTPException(404, f"unknown file: {filename}")
         try:
             return json.loads((sess_path / filename).read_text())
@@ -2114,8 +2319,10 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     # operator-chosen input file. Keep these tight — `api_calib_run` pipes
     # whatever the front-end sends straight into a subprocess argv, so any
     # client-supplied filename has to be checked against these allowlists.
-    _CHAIN_HANDEYE_ALLOWLIST = {"handeye.json", "handeye_custom.json"}
-    _POLISH_PHASE1_ALLOWLIST = {"phase1_handeye.json", "phase1_handeye_custom.json"}
+    # chain `--handeye` and polish `--phase1` accept any canonical/custom solve
+    # present in the session — the allowlist is built per-request from the
+    # files actually on disk (regex-validated by `_session_handeye_files`), so
+    # an arbitrary number of named datasets is supported without enumeration.
     _POLISH_SEED_ALLOWLIST = {"chain.json"}
     # Validate (Phase 4) accepts polish.json or chain.json as the params
     # under test. Phase 4 is xArm-independent (board is fixed in base_link),
@@ -2125,7 +2332,9 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     _CALIB_PREREQS = {
         # analysis subcommands -> run_calibration.py
         "handeye":         ["phase1_handeye.json"],
-        "handeye_custom":  ["phase1_handeye_custom.json"],
+        # handeye_custom's input depends on the chosen dataset name; checked
+        # per-request below.
+        "handeye_custom":  [],
         # Chain accepts a per-request handeye file (default handeye.json), so the
         # static prereq carries only what's always required; the chosen handeye
         # file is checked per-request below.
@@ -2137,7 +2346,7 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         "validate":        ["phase4_validation.json"],
         # collection subcommands -> calibrate_collect.py (moves the robot)
         "collect_phase1":         [],     # canonical level park (pan=0, tilt=+30)
-        "collect_phase1_custom":  [],     # operator-chosen park, see /api/calib/phase1_custom_park
+        "collect_phase1_custom":  [],     # operator-chosen park, per-dataset (see custom_name)
         "collect_dry_run":        [],     # preflight: validate motion only, no image capture
         "collect_phase2": ["phase1_handeye.json"],  # not technically required,
                                                      # but Phase 2 without
@@ -2191,38 +2400,48 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
                 cmd_args.append(str(sess_path / "phase1_handeye.json"))
                 cmd_args += ["--out", str(sess_path)]
             elif cmd == "handeye_custom":
-                cmd_args.append(str(sess_path / "phase1_handeye_custom.json"))
+                # Resolve the chosen custom dataset to its collect/solve files.
+                raw_name = (req or {}).get("custom_name") or ""
+                try:
+                    cname = sanitize_custom_name(raw_name)
+                except ValueError as exc:
+                    raise HTTPException(400, f"handeye_custom: {exc}")
+                collect_fname, solve_fname = custom_dataset_filenames(cname)
+                if not (sess_path / collect_fname).is_file():
+                    raise HTTPException(
+                        400,
+                        f"handeye_custom: {collect_fname} not found in session — "
+                        f"collect the {cname!r} dataset first"
+                    )
+                cmd_args.append(str(sess_path / collect_fname))
                 cmd_args += ["--out", str(sess_path),
-                             "--out-name", "handeye_custom.json"]
+                             "--out-name", solve_fname]
             elif cmd == "chain":
+                handeye_allow = set(_session_handeye_files(sess_path, phase1=False))
                 handeye_choice = (req or {}).get("handeye") or "handeye.json"
-                if handeye_choice not in _CHAIN_HANDEYE_ALLOWLIST:
+                if handeye_choice not in handeye_allow:
                     raise HTTPException(
                         400,
                         f"chain: handeye must be one of "
-                        f"{sorted(_CHAIN_HANDEYE_ALLOWLIST)}, got {handeye_choice!r}"
-                    )
-                if not (sess_path / handeye_choice).is_file():
-                    raise HTTPException(
-                        400,
-                        f"chain: {handeye_choice} not found in session — "
-                        f"run handeye first"
+                        f"{sorted(handeye_allow)}, got {handeye_choice!r} — "
+                        f"run the corresponding handeye solve first"
                     )
                 cmd_args.append(str(sess_path / "phase2_chain.json"))
                 cmd_args += ["--handeye", str(sess_path / handeye_choice)]
                 cmd_args += ["--out", str(sess_path)]
             elif cmd == "polish":
+                phase1_allow = set(_session_handeye_files(sess_path, phase1=True))
                 phase1_choice = (req or {}).get("phase1") or ["phase1_handeye.json"]
                 if not isinstance(phase1_choice, list) or not phase1_choice:
                     raise HTTPException(
                         400, "polish: phase1 must be a non-empty list of basenames"
                     )
-                bad_phase1 = [f for f in phase1_choice if f not in _POLISH_PHASE1_ALLOWLIST]
+                bad_phase1 = [f for f in phase1_choice if f not in phase1_allow]
                 if bad_phase1:
                     raise HTTPException(
                         400,
                         f"polish: phase1 entries must be in "
-                        f"{sorted(_POLISH_PHASE1_ALLOWLIST)}, got {bad_phase1}"
+                        f"{sorted(phase1_allow)}, got {bad_phase1}"
                     )
                 missing_phase1 = [f for f in phase1_choice if not (sess_path / f).is_file()]
                 if missing_phase1:
@@ -2305,6 +2524,18 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
                 "-p", f"phase:={phase_arg}",
             ]
             label = f"calibrate_collect --phase {phase_arg}"
+            # phase1_custom selects one named dataset; pass it through so the
+            # collector parks at that dataset's pose and writes its own file.
+            if cmd == "collect_phase1_custom":
+                raw_name = (req or {}).get("custom_name") or ""
+                try:
+                    cname = sanitize_custom_name(raw_name)
+                except ValueError as exc:
+                    raise HTTPException(400, f"collect_phase1_custom: {exc}")
+                if not any(d["name"] == cname for d in node.list_custom_datasets()):
+                    raise HTTPException(404, f"unknown custom dataset: {cname}")
+                argv += ["-p", f"custom_name:={cname}"]
+                label += f" (custom={cname})"
 
         try:
             result = await node.calib_runner.spawn(session, argv, label=label)
@@ -2411,6 +2642,32 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         },
     }
 
+    def _resolve_prune_phase(phase: str) -> tuple[str, str]:
+        """Map a prune phase to (base_phase, label_prefix).
+
+        Static phases pass straight through. A custom phase key
+        `phase1_waypoints_custom:<name>` resolves to the
+        `phase1_waypoints_custom` factor/label base with a per-dataset label
+        prefix `phase1_custom_<name>`. Raises HTTPException(404) on unknown.
+        """
+        if phase in PRUNE_PHASE_LABEL_PREFIX:
+            return phase, PRUNE_PHASE_LABEL_PREFIX[phase]
+        name = CalibWebNode._split_custom_phase(phase or "")
+        if name is not None:
+            try:
+                clean = sanitize_custom_name(name)
+            except ValueError:
+                clean = None
+            if clean is not None and any(
+                d["name"] == clean for d in node.list_custom_datasets()
+            ):
+                return "phase1_waypoints_custom", f"phase1_custom_{clean}"
+        raise HTTPException(
+            404,
+            f"unknown phase: {phase!r}. valid: "
+            f"{sorted(PRUNE_PHASE_LABEL_PREFIX)} or phase1_waypoints_custom:<name>",
+        )
+
     def _list_prior_runs() -> list[dict]:
         out: list[dict] = []
         sessions = node.calib_runner.sessions_dir
@@ -2419,7 +2676,7 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         for run_dir in sessions.iterdir():
             if not run_dir.is_dir():
                 continue
-            for fname in ("phase1_handeye.json", "phase1_handeye_custom.json"):
+            for fname in _session_handeye_files(run_dir, phase1=True):
                 p = run_dir / fname
                 if not p.is_file():
                     continue
@@ -2439,8 +2696,8 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         return out
 
     def _build_payloads(phase: str) -> tuple[list[dict], dict]:
-        prefix = PRUNE_PHASE_LABEL_PREFIX[phase]
-        if phase == "phase2_grid":
+        base_phase, prefix = _resolve_prune_phase(phase)
+        if base_phase == "phase2_grid":
             with node.lock:
                 pan_grid = list(node._loaded_cfg.get("pan_grid_deg", []) or [])
                 tilt_grid = list(node._loaded_cfg.get("tilt_grid_deg", []) or [])
@@ -2472,7 +2729,8 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     def _build_predictor(phase: str, predictor_choice: str, prior_run_path: Optional[str]):
         info: dict = {"requested": predictor_choice, "prior_run_path": prior_run_path}
         predictors = []
-        if phase in ("phase1_waypoints", "phase1_waypoints_custom"):
+        base_phase, _ = _resolve_prune_phase(phase)
+        if base_phase in ("phase1_waypoints", "phase1_waypoints_custom"):
             if predictor_choice in ("auto", "replay_only") and prior_run_path:
                 try:
                     predictors.append(replay_predictor(prior_run_path))
@@ -2484,7 +2742,7 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
             # Phase-1 FK is intentionally absent: yourdfpy isn't in the venv
             # and the calibration workflow always produces a prior run.
             # Per-row failures show up in the UI as "no prediction".
-        elif phase == "phase2_grid":
+        elif base_phase == "phase2_grid":
             # Phase-2 cell similarity is determined by camera pose, which is
             # FK-only (it doesn't depend on the xArm anchor). Prior-run replay
             # would mix anchor-dependent marker poses, so it's not used here.
@@ -2493,7 +2751,8 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         return chain_predictors(predictors), info
 
     def _normalize_factors(phase: str, raw: dict) -> dict:
-        defaults = PRUNE_DEFAULT_FACTORS[phase]
+        base_phase, _ = _resolve_prune_phase(phase)
+        defaults = PRUNE_DEFAULT_FACTORS[base_phase]
         out = dict(defaults)
         if isinstance(raw, dict):
             for k in defaults:
@@ -2529,11 +2788,7 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
 
     def _run_prune(req: dict) -> tuple[dict, dict, list[dict], dict]:
         phase = (req or {}).get("phase")
-        if phase not in PRUNE_PHASE_LABEL_PREFIX:
-            raise HTTPException(
-                404,
-                f"unknown phase: {phase!r}. valid: {sorted(PRUNE_PHASE_LABEL_PREFIX)}",
-            )
+        _resolve_prune_phase(phase)  # validates; raises 404 on unknown
         factors = _normalize_factors(phase, (req or {}).get("factors", {}))
         overrides = _normalize_overrides((req or {}).get("overrides"))
         predictor_choice = str((req or {}).get("predictor_choice", "auto"))
@@ -2582,12 +2837,8 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
 
     @app.get("/api/calib/prune_inputs")
     def api_calib_prune_inputs(phase: str):
-        if phase not in PRUNE_PHASE_LABEL_PREFIX:
-            raise HTTPException(
-                404,
-                f"unknown phase: {phase!r}. valid: {sorted(PRUNE_PHASE_LABEL_PREFIX)}",
-            )
-        if phase == "phase2_grid":
+        base_phase, label_prefix = _resolve_prune_phase(phase)
+        if base_phase == "phase2_grid":
             with node.lock:
                 pan_grid = list(node._loaded_cfg.get("pan_grid_deg", []) or [])
                 tilt_grid = list(node._loaded_cfg.get("tilt_grid_deg", []) or [])
@@ -2597,8 +2848,8 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         return {
             "phase": phase,
             "n_items": n_items,
-            "default_factors": PRUNE_DEFAULT_FACTORS[phase],
-            "label_prefix": PRUNE_PHASE_LABEL_PREFIX[phase],
+            "default_factors": PRUNE_DEFAULT_FACTORS[base_phase],
+            "label_prefix": label_prefix,
             "prior_runs": _list_prior_runs(),
         }
 
@@ -2674,12 +2925,38 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         dict. Returns the modified dict — caller is responsible for writing
         it. Shared by the sidecar Apply and the in-place Overwrite paths.
         """
-        if phase == "phase2_grid":
+        base_phase, _ = _resolve_prune_phase(phase)
+        if base_phase == "phase2_grid":
             kept_pairs = [
                 [float(payloads[i]["pan_deg"]), float(payloads[i]["tilt_deg"])]
                 for i in preview["kept_indices"]
             ]
             return {**src_collector, "phase2_grid_pairs": kept_pairs}
+
+        custom_name = CalibWebNode._split_custom_phase(phase)
+        if custom_name is not None:
+            # Edit the named dataset inside phase1_custom_datasets. Migrate the
+            # source collector first so a legacy single-custom yaml is upgraded
+            # in place rather than silently dropped.
+            clean = sanitize_custom_name(custom_name)
+            datasets = migrate_custom_datasets(src_collector)
+            for d in datasets:
+                if d["name"] != clean:
+                    continue
+                existing = list(d.get("waypoints", []) or [])
+                d["waypoints"] = [
+                    list(existing[i])
+                    for i in sorted(preview["kept_indices"])
+                    if 0 <= i < len(existing)
+                ]
+                break
+            out = {k: v for k, v in src_collector.items()
+                   if k not in ("phase1_waypoints_custom",
+                                "phase1_custom_park_pan_deg",
+                                "phase1_custom_park_tilt_deg")}
+            out["phase1_custom_datasets"] = datasets
+            return out
+
         existing = list(src_collector.get(phase, []) or [])
         kept_yaml = [
             list(existing[i])
@@ -2727,13 +3004,15 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         src_data, src_coll = _read_source_yaml()
         target_dir = node.promote_yaml_out.parent
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        sidecar = target_dir / f"calibration.pruned.{phase}.{ts}.yaml"
-        report = target_dir / f"prune_report.{phase}.{ts}.json"
+        # The custom phase key carries a ':' — keep it out of filenames.
+        phase_slug = phase.replace(":", "_")
+        sidecar = target_dir / f"calibration.pruned.{phase_slug}.{ts}.yaml"
+        report = target_dir / f"prune_report.{phase_slug}.{ts}.json"
 
         n = 1
         while sidecar.exists() or report.exists():
-            sidecar = target_dir / f"calibration.pruned.{phase}.{ts}.{n}.yaml"
-            report = target_dir / f"prune_report.{phase}.{ts}.{n}.json"
+            sidecar = target_dir / f"calibration.pruned.{phase_slug}.{ts}.{n}.yaml"
+            report = target_dir / f"prune_report.{phase_slug}.{ts}.{n}.json"
             n += 1
 
         coll = _build_pruned_collector(
@@ -2778,13 +3057,14 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
         target = node.promote_yaml_out
         target_dir = target.parent
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        report = target_dir / f"prune_report.{phase}.{ts}.json"
+        phase_slug = phase.replace(":", "_")
+        report = target_dir / f"prune_report.{phase_slug}.{ts}.json"
 
         # Disambiguate the report filename if a sub-second collision lands
         # on an existing file (matches the sidecar convention).
         n = 1
         while report.exists():
-            report = target_dir / f"prune_report.{phase}.{ts}.{n}.json"
+            report = target_dir / f"prune_report.{phase_slug}.{ts}.{n}.json"
             n += 1
 
         coll = _build_pruned_collector(

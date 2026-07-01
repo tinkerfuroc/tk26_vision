@@ -268,6 +268,13 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .wp-item button { padding: 1px 6px; font-size: 11px; }
 .wp-item > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 
+/* ---- custom hand-eye datasets (multi-entry) ---- */
+.wp-custom-dataset { border: 1px solid var(--border); border-radius: 4px; padding: 8px; margin-bottom: 10px; }
+.wp-custom-dataset > .wp-header strong { color: var(--accent, #6cb6ff); }
+.wp-custom-park { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 8px; font-family: var(--mono); font-size: 11px; }
+.wp-custom-park input { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 3px 5px; width: 70px; font-family: var(--mono); }
+button.danger { color: #ff8c8c; border-color: #5a2a2a; }
+
 /* ---- pan-tilt jog ---- */
 .jog { display: flex; gap: 10px; align-items: end; margin-bottom: 10px; flex-wrap: wrap; }
 .jog label { display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; color: var(--fg-muted); }

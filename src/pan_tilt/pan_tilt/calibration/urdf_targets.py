@@ -82,7 +82,7 @@ def list_targets() -> list[UrdfTarget]:
     """
     return [
         _target(
-            label="tk25_basic macro (authoritative)",
+            label="tk25_basic macro (authoritative runtime URDF)",
             pkg="tinker_urdf",
             rel="src/pan_tilt.urdf.xacro",
             form="macro",
@@ -91,7 +91,7 @@ def list_targets() -> list[UrdfTarget]:
             workspace_hint="run from the main workspace root (e.g. ~/tk25_ws)",
         ),
         _target(
-            label="tk26_vision standalone (dev bringup)",
+            label="tk26_vision standalone (legacy — NOT the runtime URDF; runtime renders tinker_urdf/pan_tilt_standalone which includes the macro)",
             pkg="pan_tilt",
             rel="urdf/pan_tilt.urdf.xacro",
             form="standalone",

@@ -14,7 +14,7 @@
   <joint name="pan_joint" type="revolute">
     <parent link="base_link"/>
     <child link="pan_link"/>
-    <origin xyz="-0.304965 0.00676598 1.36662" rpy="0.00872538 -0.0284703 -0.000124216"/>
+    <origin xyz="-0.310913 0.00283274 1.35846" rpy="0.019631607 0.033441848 0.052035773"/>
     <axis xyz="0 0 -1"/>
     <limit lower="-3.141592653589793" upper="3.141592653589793" effort="1.0" velocity="10.0"/>
   </joint>
@@ -30,6 +30,6 @@
   <joint name="camera_mount_joint" type="fixed">
     <parent link="tilt_link"/>
     <child link="head_camera_link"/>
-    <origin xyz="0.0571352 0.0302869 -0.0388403" rpy="-3.12454 -0.865907 -0.013001"/>
+    <origin xyz="0.0400238 0.0280162 0.051396" rpy="0.0406528 -0.79457 3.0833"/>
   </joint>
 </robot>

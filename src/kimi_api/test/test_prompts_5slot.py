@@ -37,6 +37,16 @@ def test_extraction_prompt_excludes_everything_else():
     assert 'Do not mention lower-body clothing' in FEATURE_SYS_PROMPT
 
 
+def test_extraction_prompt_forces_binary_gender_and_allows_are():
+    # 2026-07-02 replay finding: ambiguous crops yielded "They is/are
+    # gender-neutral..." — ungrammatical and useless for matching. The
+    # prompt must force a male/female commitment and permit "are" for
+    # pronoun-verb agreement.
+    assert 'male or female' in FEATURE_SYS_PROMPT
+    assert 'gender-neutral' in FEATURE_SYS_PROMPT  # named in order to ban it
+    assert '"are"' in FEATURE_SYS_PROMPT
+
+
 def test_matching_prompt_text_only_cites_five_slots_not_body_shape():
     p = build_matching_sys_prompt(5, 3, True)
     for term in ('gender', 'hair color', 'glasses', 'apparent age', 'upper-body'):

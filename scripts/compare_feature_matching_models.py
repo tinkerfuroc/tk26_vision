@@ -64,7 +64,8 @@ def encode_to_data_url(img: np.ndarray) -> str:
 
 
 def _patch_result(raw, n_targets: int, n_cand: int):
-    """Copy of feature_matching.py:_patch_result (L52-93)."""
+    """Copy of kimi_api/_match_vlm.py:patch_result (moved there from
+    feature_matching.py when the provider-fallback chain was added)."""
     if not isinstance(raw, list):
         return None, f'not a list: {raw!r}'
     if len(raw) == 0 and n_targets > 0:

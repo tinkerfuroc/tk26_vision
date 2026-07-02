@@ -40,9 +40,10 @@ from tf2_geometry_msgs import do_transform_point
 from tinker_vision_msgs_26.msg import BoundingBox
 from tinker_vision_msgs_26.srv import PlacingLocation
 
+from kimi_api._env import load_env, require_dashscope_api_key
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
 
-from .placing_vlm import VlmPlacingError, request_placing_bboxes
+from .placing_vlm import VlmPlacingError, request_placing_bboxes_chain
 
 
 class PlacingLocationServer(YOLOSegmentationNode):
@@ -72,6 +73,8 @@ class PlacingLocationServer(YOLOSegmentationNode):
         self.declare_parameter('vlm_timeout_s', 8.0)
         self.declare_parameter('vlm_max_retries', 1)
         self.declare_parameter('default_max_candidates', 5)
+        self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
+        self.declare_parameter('placing_model_qwen', 'qwen3-vl-plus')
 
     def _load_parameters(self):
         super()._load_parameters()
@@ -83,6 +86,38 @@ class PlacingLocationServer(YOLOSegmentationNode):
         self.default_max_candidates = int(
             self.get_parameter('default_max_candidates').value
         )
+        self.vlm_fallback_provider = self.get_parameter('vlm_fallback_provider').value
+        self.placing_model_qwen = self.get_parameter('placing_model_qwen').value
+        self._placing_provider_chain = self._resolve_placing_provider_chain()
+
+    def _resolve_placing_provider_chain(self) -> list:
+        """Ordered (provider, model) chain for placing-region proposals:
+        Gemini (self.vlm_model) then, if configured, a Qwen fallback that
+        is dropped with a warning when its key is missing rather than
+        failing node startup."""
+        # The key probe below reads os.environ; keys conventionally live in
+        # the workspace .env, and unlike the kimi_api nodes this node's
+        # main() does not pre-load it — load here or the fallback is
+        # silently dropped at init even though request-time load_env()
+        # would have found the key.
+        load_env()
+        chain = [('gemini', self.vlm_model)]
+        fb = self.vlm_fallback_provider
+        if fb and fb != 'gemini':
+            if fb != 'qwen':
+                self.get_logger().warn(f'Unknown fallback provider {fb!r}; ignoring.')
+            else:
+                try:
+                    require_dashscope_api_key()
+                    chain.append(('qwen', self.placing_model_qwen))
+                except RuntimeError:
+                    self.get_logger().warn(
+                        f'Fallback provider {fb!r} key missing; fallback disabled.'
+                    )
+        self.get_logger().info(
+            f'placing_location provider chain: {[p for p, _ in chain]}'
+        )
+        return chain
 
     # --- service advertisement -------------------------------------------
 
@@ -154,11 +189,11 @@ class PlacingLocationServer(YOLOSegmentationNode):
         response.header = header
 
         try:
-            bboxes, ranks, vlm_elapsed = request_placing_bboxes(
+            bboxes, ranks, vlm_elapsed, provider_used = request_placing_bboxes_chain(
                 rgb_img,
                 item_description=item,
                 max_candidates=max_candidates,
-                model=self.vlm_model,
+                provider_models=self._placing_provider_chain,
                 max_retries=self.vlm_max_retries,
                 timeout_s=self.vlm_timeout_s,
                 logger=self.get_logger(),
@@ -242,7 +277,7 @@ class PlacingLocationServer(YOLOSegmentationNode):
 
         self._maybe_log(
             _t0, request, item, rgb_img, bboxes, ranks, vlm_elapsed,
-            error=response.error_msg or None,
+            error=response.error_msg or None, provider_used=provider_used,
         )
         return response
 
@@ -323,7 +358,7 @@ class PlacingLocationServer(YOLOSegmentationNode):
         return vis
 
     def _maybe_log(self, _t0, request, item, rgb_img,
-                   bboxes, ranks, vlm_elapsed, error=None):
+                   bboxes, ranks, vlm_elapsed, error=None, provider_used=''):
         if not getattr(self, '_vision_logger', None) or \
                 not self._vision_logger.enabled:
             return
@@ -347,6 +382,7 @@ class PlacingLocationServer(YOLOSegmentationNode):
             'max_candidates': int(request.max_candidates),
             'n_regions': len(bboxes),
             'error': error,
+            'vlm_provider_used': str(provider_used or ''),
         }
         timings = {'total': time.perf_counter() - _t0}
         if vlm_elapsed:

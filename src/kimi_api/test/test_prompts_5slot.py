@@ -34,3 +34,33 @@ def test_extraction_prompt_keeps_spoken_sentence_template():
 
 def test_extraction_prompt_excludes_everything_else():
     assert 'Do not mention lower-body clothing' in FEATURE_SYS_PROMPT
+
+
+from kimi_api.feature_matching import build_matching_sys_prompt
+
+
+def test_matching_prompt_text_only_cites_five_slots_not_body_shape():
+    p = build_matching_sys_prompt(5, 3, True)
+    for term in ('hair color', 'glasses', 'apparent age', 'upper-body'):
+        assert term in p, f'missing evidence term: {term}'
+    assert 'body shape' not in p
+    assert 'posture' not in p
+    # Structural contract unchanged:
+    assert '(0..4)' in p
+    assert 'length 3' in p
+    assert 'EVERY description MUST be matched' in p
+    assert 'NEVER use -1' in p
+
+
+def test_matching_prompt_image_mode_cites_five_slots_not_posture():
+    p = build_matching_sys_prompt(4, 2, False)
+    for term in ('hair color', 'glasses', 'apparent age', 'upper-body'):
+        assert term in p, f'missing evidence term: {term}'
+    assert 'body shape' not in p
+    assert 'posture' not in p
+    # Structural contract unchanged:
+    assert 'SAME' in p
+    assert 'length 2' in p
+    assert 'EVERY reference MUST be matched' in p
+    assert 'tiebreaker hint' in p
+    assert 'NEVER use -1' in p

@@ -923,11 +923,15 @@ class PersonTrackNode(Node):
         
         # Combine masks
         combined_mask = roi_mask.astype(float) * roi_valid.astype(float)
-        
-        if combined_mask.sum() < 10:
-            # Fallback: use valid depth points without segmentation mask
-            combined_mask = roi_valid.astype(float)
-        
+
+        # No all-bbox-depth fallback: with <10 valid-depth pixels under the
+        # segmentation mask, report no centroid. Substituting every valid
+        # depth pixel in the bbox returned the median of the BACKGROUND
+        # behind small/false detections — a concrete 3D point where nobody
+        # stands. A None here is fail-safe: the caller publishes nothing to
+        # /target_points and leaves is_transformation_successful=False.
+        # (mask=None still uses bbox depth via roi_mask=ones above — with no
+        # segmentation there is nothing better to gate on.)
         if combined_mask.sum() < 10:
             return None
         

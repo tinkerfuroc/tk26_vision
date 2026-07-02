@@ -324,7 +324,7 @@ LLM/VLM-backed person and scene services for Tinker (ROS2 Humble).
 | `feature_recognition` | `/feature_extraction_service`, `/seat_recommend_service` | Describe the person addressing the robot (five slots: hair color, gender, age, glasses, upper-body wear) + legacy seat recommendation |
 | `feature_matching` | `/feature_matching_service` | Locate previously described/photographed people among detected persons (image mode when one reference image per feature is supplied; text-only fallback otherwise) |
 | `grocery_categorize` | action `/grocery_categorize` | Categorize grocery items |
-| `seat_recommend_bbox` | `/seat_recommend_bbox` | VLM seat recommendation (bbox_select strategy) |
+| `seat_recommend_bbox` | `/seat_recommend_bbox_service` | VLM seat recommendation (bbox_select strategy) |
 
 Providers/keys: Gemini via `OPENROUTER_API_KEY` (primary), Qwen via
 `DASHSCOPE_API_KEY` (fallback where configured). See

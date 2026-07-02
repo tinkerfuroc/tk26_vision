@@ -34,7 +34,7 @@ from vision_util.vision_logging import VisionLogger
 from ._env import load_env, require_api_key, require_dashscope_api_key
 from ._seat_bbox_vlm import request_seat_bbox_chain, VlmSeatBboxError
 from ._seat_fewshot import load_fewshots
-from ._seat_vlm import VlmSeatError, request_seat
+from ._seat_vlm import VlmSeatError, request_seat_chain
 
 
 class SeatRecommendBboxService(Node):
@@ -202,12 +202,15 @@ class SeatRecommendBboxService(Node):
         # matches feature_recognition pattern so the T1 negative test (no .env)
         # surfaces at node init. bbox_select builds an ordered provider chain
         # (primary required, fallback dropped-with-warning if its key is absent);
-        # the legacy point path needs OpenRouter.
+        # the legacy point path keeps its historical Gemini primary
+        # (self.llm_model, needing only OPENROUTER_API_KEY) with an optional
+        # Qwen fallback — it must NOT inherit the bbox_select chain, whose
+        # default is qwen-primary with the bbox-tuned models.
         if self.vlm_strategy == 'bbox_select':
             self._provider_models = self._resolve_provider_chain()
         else:
             require_api_key()
-            self._provider_models = []
+            self._provider_models = self._resolve_point_provider_chain()
 
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.camera_cb_group = MutuallyExclusiveCallbackGroup()
@@ -240,12 +243,14 @@ class SeatRecommendBboxService(Node):
             callback_group=self.camera_cb_group,
         )
 
-        # 60 s cache: VLM seat calls take 10-25 s and the TF lookup uses the
-        # depth image's stamp (not "now"), so default 10 s buffer falls behind
-        # when the VLM stalls or retries. Sized to absorb vlm_max_retries *
-        # vlm_timeout_s (3 * 20 = 60 s default) without falling off the back.
+        # VLM seat calls take 10-25 s and the TF lookup uses the depth
+        # image's stamp (not "now"), so the default 10 s buffer falls behind
+        # when the VLM stalls or retries. Sized to absorb the provider
+        # chain's worst case — 2 providers x vlm_max_retries x vlm_timeout_s
+        # + backoff (2 x 3 x 25 + 3 ≈ 155 s at defaults) — without the
+        # successful-fallback path falling off the back.
         self.tf_buffer = Buffer(
-            cache_time=rclpy.duration.Duration(seconds=120.0)
+            cache_time=rclpy.duration.Duration(seconds=180.0)
         )
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -284,7 +289,14 @@ class SeatRecommendBboxService(Node):
         chain = [(primary, self._model_for(primary))]
         fb = self.vlm_fallback_provider
         if fb and fb != primary:
-            if self._has_provider_key(fb):
+            if fb not in ('qwen', 'gemini'):
+                # _has_provider_key maps any non-'qwen' string to the Gemini
+                # key check, so without this guard a typo'd fallback would be
+                # appended as a chain entry that errors at request time.
+                self.get_logger().warn(
+                    f'Unknown fallback provider {fb!r}; fallback disabled.'
+                )
+            elif self._has_provider_key(fb):
                 chain.append((fb, self._model_for(fb)))
             else:
                 self.get_logger().warn(
@@ -292,6 +304,29 @@ class SeatRecommendBboxService(Node):
                 )
         self.get_logger().info(
             f'bbox+select provider chain: {[p for p, _ in chain]}'
+        )
+        return chain
+
+    def _resolve_point_provider_chain(self) -> list:
+        """Ordered (provider, model) chain for the legacy 'point' strategy:
+        Gemini primary on the historical self.llm_model (rollback semantics —
+        needs only OPENROUTER_API_KEY, honors -p llm_model overrides), plus
+        the Qwen fallback (bbox_model_qwen) when its key is present.
+
+        `vlm_fallback_provider`'s default ('gemini') is oriented to the
+        bbox_select chain, whose primary is qwen; here the primary IS gemini,
+        so any non-empty fallback setting resolves to qwen — only the empty
+        string disables the fallback."""
+        chain = [('gemini', self.llm_model)]
+        if self.vlm_fallback_provider:
+            if self._has_provider_key('qwen'):
+                chain.append(('qwen', self.bbox_model_qwen))
+            else:
+                self.get_logger().warn(
+                    'Point-path qwen fallback key missing; fallback disabled.'
+                )
+        self.get_logger().info(
+            f'point provider chain: {[p for p, _ in chain]}'
         )
         return chain
 
@@ -612,20 +647,21 @@ class SeatRecommendBboxService(Node):
                     f'(max_fewshots={self.max_fewshots}).'
                 )
             try:
-                label, point_xy, visible_seats, vlm_elapsed = request_seat(
-                    color_img,
-                    request.names,
-                    request.features,
-                    model=self.llm_model,
-                    timeout_s=self.vlm_timeout_s,
-                    max_retries=self.vlm_max_retries,
-                    logger=self.get_logger(),
-                    fewshots=fewshots,
-                    known_seats=known_seats,
+                label, point_xy, visible_seats, vlm_elapsed, provider_used = (
+                    request_seat_chain(
+                        color_img,
+                        request.names,
+                        request.features,
+                        provider_models=self._provider_models,
+                        timeout_s=self.vlm_timeout_s,
+                        max_retries=self.vlm_max_retries,
+                        logger=self.get_logger(),
+                        fewshots=fewshots,
+                        known_seats=known_seats,
+                    )
                 )
             except VlmSeatError as exc:
                 return self._fail(response, f'VLM unavailable: {exc}')
-            provider_used = 'gemini'
             overridden_from = None
 
         if overridden_from:

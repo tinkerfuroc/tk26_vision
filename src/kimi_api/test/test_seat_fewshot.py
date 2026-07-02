@@ -145,7 +145,7 @@ def test_request_seat_no_fewshots_message_count(monkeypatch):
 
     fake_openai = MagicMock()
     fake_openai.OpenAI.return_value = fake_client
-    sys.modules['openai'] = fake_openai
+    monkeypatch.setitem(sys.modules, 'openai', fake_openai)
 
     rgb = np.full((48, 64, 3), 100, dtype=np.uint8)
     _seat_vlm.request_seat(rgb, [], [], model='test/model', max_retries=1)
@@ -179,7 +179,7 @@ def test_request_seat_with_fewshots_message_layout(monkeypatch):
 
     fake_openai = MagicMock()
     fake_openai.OpenAI.return_value = fake_client
-    sys.modules['openai'] = fake_openai
+    monkeypatch.setitem(sys.modules, 'openai', fake_openai)
 
     rgb = np.full((48, 64, 3), 100, dtype=np.uint8)
     fewshots = [

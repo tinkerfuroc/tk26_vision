@@ -13,17 +13,14 @@ Changes from tk23:
 - Dead Chinese-prompt block removed.
 """
 
-import json
 import threading
 import time
 
-import cv2
 import geometry_msgs.msg
 import numpy as np
 import rclpy
 import tf2_geometry_msgs  # noqa: F401  (registers PointStamped transform)
 from cv_bridge import CvBridge
-from openai import OpenAI
 from rclpy.action import ActionServer
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
@@ -34,7 +31,8 @@ from tf2_ros.transform_listener import TransformListener
 from tinker_vision_msgs_26.action import Categorize
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
-from ._env import base_url, default_model, load_env, require_api_key
+from ._categorize_vlm import ShelfVlmError, request_shelf_layer_chain
+from ._env import default_model, load_env, require_api_key, require_dashscope_api_key
 from ._image_utils import encode_to_data_url
 
 USE_SHELF_HEIGHT = False
@@ -57,8 +55,27 @@ class GroceryCategorizeAction(Node):
 
         self.declare_parameter('llm_model', default_model())
         self.declare_parameter('detection_service', 'object_detection_generalist')
+        # 60 s, not the 20 s the other kimi_api nodes use: the default model
+        # here is gemini-2.5-pro on a two-image prompt, and the seat-bench
+        # measurements for that model (n=144) put the median at 15.5 s and
+        # p90 at 28.4 s — a 20 s cap would cancel roughly a third of calls
+        # that the pre-fallback code (no per-call timeout) completed.
+        self.declare_parameter('vlm_timeout_s', 60.0)
+        self.declare_parameter('vlm_max_retries', 3)
+        self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
+        self.declare_parameter('categorize_model_qwen', 'qwen3-vl-plus')
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
+        self.vlm_timeout_s = self.get_parameter('vlm_timeout_s').get_parameter_value().double_value
+        self.vlm_max_retries = (
+            self.get_parameter('vlm_max_retries').get_parameter_value().integer_value
+        )
+        self.vlm_fallback_provider = (
+            self.get_parameter('vlm_fallback_provider').get_parameter_value().string_value
+        )
+        self.categorize_model_qwen = (
+            self.get_parameter('categorize_model_qwen').get_parameter_value().string_value
+        )
 
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
@@ -71,7 +88,8 @@ class GroceryCategorizeAction(Node):
             callback_group=self.server_cb_group,
         )
 
-        self.client = OpenAI(api_key=require_api_key(), base_url=base_url())
+        require_api_key()  # fail fast at init if the primary Gemini key is missing
+        self._categorize_provider_chain = self._resolve_categorize_provider_chain()
 
         self.orbec_pc_sub = self.create_subscription(
             PointCloud2,
@@ -101,6 +119,29 @@ class GroceryCategorizeAction(Node):
             f'GroceryCategorize initialized (model={self.llm_model}, '
             f'detection_service={detection_service}).'
         )
+
+    def _resolve_categorize_provider_chain(self) -> list:
+        """Ordered (provider, model) chain for shelf-layer categorization:
+        Gemini (self.llm_model, already required at init) then, if
+        configured, a Qwen fallback that is dropped with a warning when
+        its key is missing rather than failing node startup."""
+        chain = [('gemini', self.llm_model)]
+        fb = self.vlm_fallback_provider
+        if fb and fb != 'gemini':
+            if fb != 'qwen':
+                self.get_logger().warn(f'Unknown fallback provider {fb!r}; ignoring.')
+            else:
+                try:
+                    require_dashscope_api_key()
+                    chain.append(('qwen', self.categorize_model_qwen))
+                except RuntimeError:
+                    self.get_logger().warn(
+                        f'Fallback provider {fb!r} key missing; fallback disabled.'
+                    )
+        self.get_logger().info(
+            f'grocery_categorize provider chain: {[p for p, _ in chain]}'
+        )
+        return chain
 
     async def orbec_pc_callback(self, msg):
         if self.last_time is None or self.last_time + 0.5 < time.time():
@@ -233,7 +274,7 @@ class GroceryCategorizeAction(Node):
             '  "shelf_description": [description of items on each main visible layer and their'
             ' attributes, in detail, with the bottom layer being layer 0],\n'
             '  "reason": [reason for placing the object in the desired layer in one or two'
-            ' sentences]\n'
+            ' sentences],\n'
             '  "layer": [integer number of the layer the new object should be placed on, with the'
             ' bottom layer being layer 0]\n'
             '}'
@@ -242,47 +283,24 @@ class GroceryCategorizeAction(Node):
 
         self.get_logger().info(f'API prompt: {sys_prompt}')
 
-        completion = None
         try:
-            completion = self.client.chat.completions.create(
-                model=self.llm_model,
-                messages=[
-                    {'role': 'system', 'content': sys_prompt},
-                    {
-                        'role': 'user',
-                        'content': [
-                            {'type': 'text', 'text': 'picture of shelf'},
-                            {'type': 'image_url', 'image_url': {'url': shelf_img_url}},
-                            {'type': 'text', 'text': 'picture of new object.'},
-                            {'type': 'image_url', 'image_url': {'url': obj_seg_url}},
-                        ],
-                    },
-                ],
+            shelf_res = request_shelf_layer_chain(
+                sys_prompt, shelf_img_url, obj_seg_url,
+                provider_models=self._categorize_provider_chain,
+                timeout_s=self.vlm_timeout_s,
+                max_retries=self.vlm_max_retries,
+                logger=self.get_logger(),
             )
-        except Exception as e:
-            self.get_logger().warn(f'API call failed: {e}')
-
-        response = None
-        try:
-            response = json.loads(completion.choices[0].message.content)
-        except Exception as e:
-            self.get_logger().error(f'Failed to parse response: {e}.')
-            self.get_logger().info(f'API response: {completion}.')
+        except ShelfVlmError as exc:
+            self.get_logger().error(f'Shelf-layer VLM call failed on every provider: {exc}')
             result.status = 4
-            result.error_msg = f'Failed to parse response: {completion}.'
+            result.error_msg = f'VLM call failed on every provider: {exc}.'
             return result
 
-        if 'layer' not in response:
-            result.status = 4
-            result.error_msg = "Response missing 'layer' field."
-            return result
-        if 'shelf_description' not in response:
-            result.status = 4
-            result.error_msg = "Response missing 'shelf_description' field."
-            return result
-        self.get_logger().info(f'API response: {response}')
+        response = shelf_res.response
+        self.get_logger().info(f'API response (provider={shelf_res.provider}): {response}')
         layer = response['layer']
-        result.place_reason = response['reason']
+        result.place_reason = str(response['reason'])
 
         self.get_logger().info(f'Layer to put on: {layer}.')
         self.get_logger().info(f"Description of items on each layer: {response['shelf_description']}.")

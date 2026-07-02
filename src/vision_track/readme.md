@@ -123,6 +123,15 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-07-02 — Centroid: all-bbox-depth fallback removed.**
+  `_calculate_centroid` now returns no point when the segmentation mask
+  overlaps <10 valid-depth pixels, instead of falling back to the median of
+  every valid depth pixel in the bbox. That fallback converted small/false
+  detections into concrete 3D points on the background (phantom follow
+  targets, 2026-07-02). A tracked frame with no centroid keeps
+  `is_transformation_successful=false` and publishes nothing to
+  `/target_points`. Maskless (mask=None) detections still use bbox depth.
+  Locked by `test/test_centroid_mask_gate.py`.
 - **2026-06-15 — Tracking web UI: Follow cruise panel** (B/A toggles + min gap) →
   persisted to `~/.tk25/follow_cruise.yaml`, injected as `-p` overrides on each
   `follow_server` launch. `process_manager` gains `follow_server_argv` /

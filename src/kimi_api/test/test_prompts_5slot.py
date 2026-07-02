@@ -8,6 +8,7 @@ multi-clothing / facial-features asks, without asserting the full prompt
 verbatim (wording may be tuned; slots may not drift).
 """
 from kimi_api.feature_recognition import FEATURE_SYS_PROMPT
+from kimi_api.feature_matching import build_matching_sys_prompt
 
 
 def test_extraction_prompt_requests_exactly_five_slots():
@@ -36,12 +37,9 @@ def test_extraction_prompt_excludes_everything_else():
     assert 'Do not mention lower-body clothing' in FEATURE_SYS_PROMPT
 
 
-from kimi_api.feature_matching import build_matching_sys_prompt
-
-
 def test_matching_prompt_text_only_cites_five_slots_not_body_shape():
     p = build_matching_sys_prompt(5, 3, True)
-    for term in ('hair color', 'glasses', 'apparent age', 'upper-body'):
+    for term in ('gender', 'hair color', 'glasses', 'apparent age', 'upper-body'):
         assert term in p, f'missing evidence term: {term}'
     assert 'body shape' not in p
     assert 'posture' not in p
@@ -54,7 +52,7 @@ def test_matching_prompt_text_only_cites_five_slots_not_body_shape():
 
 def test_matching_prompt_image_mode_cites_five_slots_not_posture():
     p = build_matching_sys_prompt(4, 2, False)
-    for term in ('hair color', 'glasses', 'apparent age', 'upper-body'):
+    for term in ('gender', 'hair color', 'glasses', 'apparent age', 'upper-body'):
         assert term in p, f'missing evidence term: {term}'
     assert 'body shape' not in p
     assert 'posture' not in p

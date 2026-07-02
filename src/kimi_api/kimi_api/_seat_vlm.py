@@ -29,7 +29,13 @@ from typing import Sequence, Tuple
 
 import numpy as np
 
-from ._env import base_url, load_env, require_api_key
+from ._env import (
+    base_url,
+    dashscope_base_url,
+    load_env,
+    require_api_key,
+    require_dashscope_api_key,
+)
 from ._image_utils import encode_to_data_url
 
 
@@ -187,13 +193,15 @@ def request_seat(
     features: Sequence[str],
     *,
     model: str,
+    provider: str = 'gemini',
     max_retries: int = 3,
     timeout_s: float = 20.0,
     logger=None,
     fewshots: Sequence[object] | None = None,
     known_seats: Sequence[str] | None = None,
 ) -> tuple[str, Point | None, list, float]:
-    """Ask Gemini for a single pointing pixel + short label.
+    """Ask Gemini (or, with ``provider='qwen'``, DashScope) for a single
+    pointing pixel + short label.
 
     Returns ``(label, point_xy_or_None, visible_seats, elapsed_s)``.
     ``point_xy`` is ``None`` if the model reported no empty seat (label
@@ -209,19 +217,31 @@ def request_seat(
     model mimics the form and judgement, not the content (the few-shot
     user prompt deliberately omits per-call names/features).
 
-    Raises ``VlmSeatError`` only on configuration problems the caller
-    should propagate as `status=1` (missing API key).
+    Raises ``VlmSeatError`` on configuration problems the caller should
+    propagate as `status=1` (missing API key, unknown provider). Retry
+    exhaustion is NOT raised — it returns ``label=""`` (see
+    ``request_seat_chain``, which treats that as the fallback signal).
     """
 
     load_env()
-    try:
-        api_key = require_api_key()
-    except RuntimeError as exc:
-        raise VlmSeatError(str(exc)) from exc
+    if provider == 'qwen':
+        try:
+            api_key = require_dashscope_api_key()
+        except RuntimeError as exc:
+            raise VlmSeatError(str(exc)) from exc
+        b_url = dashscope_base_url()
+    elif provider == 'gemini':
+        try:
+            api_key = require_api_key()
+        except RuntimeError as exc:
+            raise VlmSeatError(str(exc)) from exc
+        b_url = base_url()
+    else:
+        raise VlmSeatError(f"unknown provider {provider!r} (expected qwen|gemini)")
 
     from openai import OpenAI  # lazy, see vlm_bbox.py
 
-    client = OpenAI(api_key=api_key, base_url=base_url())
+    client = OpenAI(api_key=api_key, base_url=b_url)
 
     t0 = time.perf_counter()
     try:
@@ -279,7 +299,6 @@ def request_seat(
             extra_body = {'reasoning': {'enabled': True, 'max_tokens': 2048}}
 
         last_error: Exception | None = None
-        last_label = ''
         for attempt in range(1, max_retries + 1):
             response_format = (
                 response_format_strict if use_strict else response_format_loose
@@ -303,6 +322,12 @@ def request_seat(
                 raw = completion.choices[0].message.content or ''
                 parsed = json.loads(raw)
                 label = str(parsed.get('label', '') or '')
+                # An empty label is schema-invalid (the prompt requires a seat
+                # label or the literal "none") and doubles as the caller's
+                # exhaustion sentinel — treat it as a failed attempt so the
+                # sentinel can only ever mean "every attempt failed".
+                if not label.strip():
+                    raise ValueError('response label is empty')
                 point_yx = parsed.get('point')
                 point_xy = _decode_point(point_yx, w, h)
                 visible_seats = parsed.get('visible_seats') or []
@@ -311,6 +336,13 @@ def request_seat(
                 # "none" label is a redundant no-seat signal the prompt asks for.
                 if label.strip().lower() == 'none':
                     point_xy = None
+                elif point_xy is None:
+                    # A real seat label whose point failed to decode ([0,0]
+                    # sentinel or malformed payload) is unusable localization,
+                    # not an answer — retry rather than let the caller read it
+                    # as "no empty seat".
+                    raise ValueError(
+                        f'label {label!r} has no decodable point ({point_yx!r})')
 
                 if logger is not None:
                     logger.info(
@@ -322,7 +354,6 @@ def request_seat(
                 return label, point_xy, visible_seats, time.perf_counter() - t0
             except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
                 last_error = exc
-                last_label = ''
                 if logger is not None:
                     logger.warning(
                         f'VLM seat JSON parse failed (attempt {attempt}/{max_retries}): {exc}'
@@ -351,9 +382,58 @@ def request_seat(
                 f'VLM seat request exhausted {max_retries} retries; '
                 f'last error: {last_error}'
             )
-        return last_label, None, [], time.perf_counter() - t0
+        return '', None, [], time.perf_counter() - t0
     finally:
         try:
             client.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def request_seat_chain(
+    rgb_bgr: np.ndarray,
+    names: Sequence[str],
+    features: Sequence[str],
+    *,
+    provider_models: Sequence[tuple],
+    max_retries: int = 3,
+    timeout_s: float = 20.0,
+    logger=None,
+    fewshots: Sequence[object] | None = None,
+    known_seats: Sequence[str] | None = None,
+) -> tuple[str, Point | None, list, float, str]:
+    """Try (provider, model) pairs in order for the legacy pointing path.
+
+    Returns ``(label, point_xy_or_None, visible_seats, elapsed_s,
+    provider_used)``. A missing-key ``VlmSeatError`` or a retry-exhausted
+    empty label (``request_seat``'s own signal that every attempt failed
+    to parse a valid response) falls through to the next provider. A
+    legitimate result -- including ``label == "none"`` (no empty seat
+    found) -- is returned immediately without trying further providers.
+    Raises ``VlmSeatError`` if every provider fails (or none are
+    configured), so the caller can distinguish "the VLM never answered"
+    from the semantic "no empty seat in the scene".
+    """
+    errors = []
+    for provider, model in provider_models:
+        try:
+            label, point_xy, visible_seats, elapsed_s = request_seat(
+                rgb_bgr, names, features,
+                provider=provider, model=model, max_retries=max_retries,
+                timeout_s=timeout_s, logger=logger, fewshots=fewshots,
+                known_seats=known_seats,
+            )
+        except VlmSeatError as exc:
+            errors.append(f'{provider}: {exc}')
+            if logger is not None:
+                logger.warning(
+                    f'seat VLM provider {provider} failed: {exc}; trying next.')
+            continue
+        if label != '':
+            return label, point_xy, visible_seats, elapsed_s, provider
+        errors.append(f'{provider}: exhausted {max_retries} retries')
+        if logger is not None:
+            logger.warning(
+                f'seat VLM provider {provider} exhausted retries; trying next.')
+    raise VlmSeatError(
+        'all providers failed: ' + (' | '.join(errors) or 'no providers configured'))

@@ -21,7 +21,6 @@ structurally unsalvageable output (non-list, empty list) triggers a VLM
 retry, and only after exhausting all retries is status=1 returned.
 """
 
-import ast
 import os
 import time
 
@@ -29,7 +28,6 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PointStamped
-from openai import OpenAI
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from tf2_geometry_msgs import do_transform_point
@@ -44,53 +42,56 @@ from tinker_vision_msgs_26.srv import FeatureMatching
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 from vision_util.vision_logging import VisionLogger
 
-from ._env import base_url, default_model, load_env, require_api_key
+from ._env import (
+    default_model,
+    load_env,
+    require_api_key,
+    require_dashscope_api_key,
+)
 from ._image_utils import bbox_from_mask, encode_to_data_url
+from ._match_vlm import MatchVlmError, request_match_indices_chain
+
+# Match-evidence attribute list — keep in sync with the five slots
+# feature_recognition.FEATURE_SYS_PROMPT asks for (spec:
+# docs/superpowers/specs/2026-07-02-feature-5slot-cut-design.md).
+MATCH_EVIDENCE = (
+    'hair color and length, gender, apparent age, glasses, and '
+    'upper-body clothing color and type'
+)
 
 
-def _patch_result(raw, n_targets, n_cand):
-    """Coerce a VLM result list into a valid [0, n_cand) assignment.
+def build_matching_sys_prompt(n_cand: int, n_feats: int, text_only: bool) -> str:
+    """Sys-prompt for the match call; pure so tests can pin its content.
 
-    Contract: callers (the HRI BT in particular) require one centroid per
-    requested feature so they can index `KEY_PERSON_CENTROIDS[target_id]`
-    without having to track which references the VLM hedged on. This
-    function enforces that contract — every cell is patched to a valid
-    candidate index, even when the VLM emits None / -1 / out-of-range /
-    a non-int. Only structurally unsalvageable input (not a list, or empty
-    list when targets exist) returns None to trigger a retry.
-
-    Returns (patched_list, msg). patched_list is None if the input is
-    structurally unsalvageable. Otherwise patched_list is length-n_targets
-    with every entry in [0, n_cand).
-
-    Per-cell rules (cyclic `i % n_cand` is the tk23-legacy fallback):
-      * missing  (i >= len(raw))                       -> i % n_cand
-      * None / non-int + non-coercible / bool          -> i % n_cand
-      * out-of-range int (incl. -1, the old sentinel)  -> i % n_cand
-      * numeric string ("3")                           -> int("3")
+    ``text_only`` selects the legacy descriptions-only wording; otherwise
+    the reference-image wording is produced. Both keep the JSON-list
+    output contract and the forced-match rule unchanged.
     """
-    if not isinstance(raw, list):
-        return None, f'not a list: {raw!r}'
-    if len(raw) == 0 and n_targets > 0:
-        return None, 'empty list'
-    patched = []
-    for i in range(n_targets):
-        v = raw[i] if i < len(raw) else None
-        if isinstance(v, bool):
-            v = i % n_cand
-        elif isinstance(v, int):
-            pass
-        elif v is None:
-            v = i % n_cand
-        else:
-            try:
-                v = int(v)
-            except (TypeError, ValueError):
-                v = i % n_cand
-        if v < 0 or v >= n_cand:
-            v = i % n_cand
-        patched.append(v)
-    return patched, ''
+    if text_only:
+        return (
+            f'You will be shown {n_cand} CANDIDATE crops of people and {n_feats} '
+            f'textual DESCRIPTIONS. For each description, output the candidate index '
+            f'(0..{n_cand - 1}) whose person best matches that description. '
+            f'Output ONLY a JSON list of length {n_feats}, e.g. "[0, 3, 1]". '
+            'EVERY description MUST be matched to a candidate. If you are uncertain, '
+            f'pick the candidate whose visible features ({MATCH_EVIDENCE}) '
+            'are CLOSEST to the description. NEVER use -1 or any negative number. '
+            'Multiple descriptions MAY map to the same candidate. '
+            'Do not include explanations.'
+        )
+    return (
+        f'You will be shown {n_feats} REFERENCE images of specific people, then '
+        f'{n_cand} CANDIDATE crops taken from a wider scene. For each reference '
+        f'(0..{n_feats - 1}), output the candidate index whose person is the SAME '
+        f'individual as the reference. Use {MATCH_EVIDENCE} as evidence. '
+        'The user may also provide a textual description per reference; treat it '
+        'as a tiebreaker hint only. '
+        f'Output ONLY a JSON list of length {n_feats}, e.g. "[0, 2, 1]". '
+        'EVERY reference MUST be matched to a candidate. If you are uncertain, '
+        f'pick the candidate whose features ({MATCH_EVIDENCE}, and the '
+        'description) are CLOSEST to the reference. NEVER use -1 or any '
+        'negative number. Do not include explanations.'
+    )
 
 
 class FeatureMatchingService(Node):
@@ -107,6 +108,8 @@ class FeatureMatchingService(Node):
         self.declare_parameter('detection_service', 'object_detection_generalist')
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
+        self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
+        self.declare_parameter('match_model_qwen', 'qwen3-vl-plus')
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
@@ -114,6 +117,12 @@ class FeatureMatchingService(Node):
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
         self.vlm_timeout_s = self.get_parameter('vlm_timeout_s').get_parameter_value().double_value
         self.vlm_max_retries = self.get_parameter('vlm_max_retries').get_parameter_value().integer_value
+        self.vlm_fallback_provider = (
+            self.get_parameter('vlm_fallback_provider').get_parameter_value().string_value
+        )
+        self.match_model_qwen = (
+            self.get_parameter('match_model_qwen').get_parameter_value().string_value
+        )
 
         self._vision_logger = VisionLogger(
             self,
@@ -127,14 +136,18 @@ class FeatureMatchingService(Node):
         # centroids in `request.target_frame`, but if a code path skips
         # that (or a future detection backend forgets), this node
         # transforms each centroid here so the BT always receives points
-        # in its requested frame. 60 s cache mirrors the detection node's
-        # cache window so a slow VLM pre-step doesn't drop history.
+        # in its requested frame. The lookup uses the pre-VLM detection
+        # stamp, so the cache must outlast the provider chain's worst case
+        # — 2 providers x vlm_max_retries x vlm_timeout_s + backoff
+        # (2 x 3 x 20 + 3 ≈ 125 s at defaults); 180 s keeps the successful-
+        # Qwen-fallback path from falling off the back of the buffer.
         self.tf_buffer = Buffer(
-            cache_time=rclpy.duration.Duration(seconds=60.0)
+            cache_time=rclpy.duration.Duration(seconds=180.0)
         )
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.client = OpenAI(api_key=require_api_key(), base_url=base_url())
+        require_api_key()  # fail fast at init if the primary Gemini key is missing
+        self._match_provider_chain = self._resolve_match_provider_chain()
 
         self.detection_cli = self.create_client(
             ObjectDetection, detection_service, callback_group=self.client_cb_group,
@@ -151,6 +164,29 @@ class FeatureMatchingService(Node):
             f'Feature matching service initialized (model={self.llm_model}, '
             f'detection_service={detection_service}).'
         )
+
+    def _resolve_match_provider_chain(self) -> list:
+        """Ordered (provider, model) chain for feature matching: Gemini
+        (self.llm_model, already required at init) then, if configured, a
+        Qwen fallback that is dropped with a warning when its key is
+        missing rather than failing node startup."""
+        chain = [('gemini', self.llm_model)]
+        fb = self.vlm_fallback_provider
+        if fb and fb != 'gemini':
+            if fb != 'qwen':
+                self.get_logger().warn(f'Unknown fallback provider {fb!r}; ignoring.')
+            else:
+                try:
+                    require_dashscope_api_key()
+                    chain.append(('qwen', self.match_model_qwen))
+                except RuntimeError:
+                    self.get_logger().warn(
+                        f'Fallback provider {fb!r} key missing; fallback disabled.'
+                    )
+        self.get_logger().info(
+            f'feature_matching provider chain: {[p for p, _ in chain]}'
+        )
+        return chain
 
     def _stamped_in_target_frame(
         self,
@@ -331,32 +367,7 @@ class FeatureMatchingService(Node):
         )
 
         n_cand = len(cropped_person_imgs)
-        if text_only_mode:
-            sys_prompt = (
-                f'You will be shown {n_cand} CANDIDATE crops of people and {n_feats} '
-                f'textual DESCRIPTIONS. For each description, output the candidate index '
-                f'(0..{n_cand - 1}) whose person best matches that description. '
-                f'Output ONLY a JSON list of length {n_feats}, e.g. "[0, 3, 1]". '
-                'EVERY description MUST be matched to a candidate. If you are uncertain, '
-                'pick the candidate whose visible features (clothing, hair, body shape) '
-                'are CLOSEST to the description. NEVER use -1 or any negative number. '
-                'Multiple descriptions MAY map to the same candidate. '
-                'Do not include explanations.'
-            )
-        else:
-            sys_prompt = (
-                f'You will be shown {n_feats} REFERENCE images of specific people, then '
-                f'{n_cand} CANDIDATE crops taken from a wider scene. For each reference '
-                f'(0..{n_feats - 1}), output the candidate index whose person is the SAME '
-                'individual as the reference. Use clothing, hair color/length, body shape, '
-                'and posture as evidence. The user may also provide a textual description '
-                'per reference; treat it as a tiebreaker hint only. '
-                f'Output ONLY a JSON list of length {n_feats}, e.g. "[0, 2, 1]". '
-                'EVERY reference MUST be matched to a candidate. If you are uncertain, '
-                'pick the candidate whose features (clothing, hair, body shape, description) '
-                'are CLOSEST to the reference. NEVER use -1 or any negative number. '
-                'Do not include explanations.'
-            )
+        sys_prompt = build_matching_sys_prompt(n_cand, n_feats, text_only_mode)
 
         user_content = []
         for i, ref_url in enumerate(reference_urls):
@@ -390,56 +401,26 @@ class FeatureMatchingService(Node):
 
         self.get_logger().info('Sending request to VLM...')
         result = None
-        last_error = 'no attempt'
-        for it in range(self.vlm_max_retries):
-            try:
-                completion = self.client.with_options(
-                    timeout=self.vlm_timeout_s
-                ).chat.completions.create(
-                    model=self.llm_model,
-                    messages=[
-                        {'role': 'system', 'content': sys_prompt},
-                        {'role': 'user', 'content': user_content},
-                    ],
-                )
-            except Exception as e:
-                last_error = f'API call failed: {e}'
-                self.get_logger().warn(
-                    f'VLM API call failed (attempt {it + 1}/{self.vlm_max_retries}): {e}'
-                )
-                time.sleep(0.5 * (2 ** it))
-                continue
-
-            self.get_logger().info(
-                f'LLM finished.      Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
+        provider_used = ''
+        last_error = ''
+        try:
+            match_res = request_match_indices_chain(
+                sys_prompt, user_content,
+                n_feats=n_feats, n_cand=n_cand,
+                provider_models=self._match_provider_chain,
+                timeout_s=self.vlm_timeout_s,
+                max_retries=self.vlm_max_retries,
+                logger=self.get_logger(),
             )
-
-            try:
-                raw = completion.choices[0].message.content
-                self.get_logger().info(f'LLM response: {raw}')
-                parsed = ast.literal_eval(raw)
-            except Exception as e:
-                last_error = f'parse failed: {e}'
-                self.get_logger().info(
-                    f'Parse failed ({it + 1}/{self.vlm_max_retries}): {e}'
-                )
-                continue
-
-            patched, msg = _patch_result(parsed, n_feats, n_cand)
-            if patched is not None:
-                if patched != parsed:
-                    self.get_logger().info(
-                        f'Patched VLM result: {parsed} -> {patched}'
-                    )
-                result = patched
-                self.get_logger().info(
-                    f'VLM accepted ({it + 1}/{self.vlm_max_retries}).'
-                )
-                break
-            last_error = f'unsalvageable: {msg}'
+            result = match_res.indices
+            provider_used = match_res.provider
             self.get_logger().info(
-                f'Validate failed ({it + 1}/{self.vlm_max_retries}): {msg}'
+                f'VLM accepted (provider={provider_used}). '
+                f'Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
             )
+        except MatchVlmError as exc:
+            last_error = str(exc)
+            self.get_logger().warn(f'VLM match failed on every provider: {exc}')
 
         # Build a detection record per candidate crop so the vision_log overlay
         # carries the labeled candidate index ('Cand j') the VLM sees in its
@@ -461,7 +442,7 @@ class FeatureMatchingService(Node):
                 'matched_ref_idx': None,
             })
 
-        def _emit_vision_log(parsed_result, vlm_status, vlm_error_msg):
+        def _emit_vision_log(parsed_result, vlm_status, vlm_error_msg, provider_used=''):
             extras = {
                 'reference_paths': [],
                 'features_text': list(request.features),
@@ -481,6 +462,7 @@ class FeatureMatchingService(Node):
                 ],
                 'vlm_status': int(vlm_status),
                 'vlm_error_msg': str(vlm_error_msg),
+                'vlm_provider_used': str(provider_used or ''),
             }
             request_ctx = {
                 'camera': request.camera,
@@ -516,19 +498,24 @@ class FeatureMatchingService(Node):
                     extras['reference_paths'].append(None)
 
         if result is None:
+            # last_error is the MatchVlmError text, which carries the
+            # per-provider attempt breakdown — no attempt count here, the
+            # chain makes up to retries x providers attempts.
             self.get_logger().warn(
-                f'VLM exhausted {self.vlm_max_retries} attempts; returning status=1.'
+                f'VLM match failed on every provider; returning status=1: '
+                f'{last_error}'
             )
             response.status = 1
             response.error_msg = (
-                f'VLM exhausted {self.vlm_max_retries} attempts: {last_error}.'
+                f'VLM match failed on every provider: {last_error}.'
             )
             response.centroids = []
             _emit_vision_log(None, response.status, response.error_msg)
             return response
 
-        # _patch_result guarantees every value is in [0, n_cand) — build
-        # centroids directly without per-element re-validation.
+        # patch_result (in _match_vlm.py) guarantees every value is in
+        # [0, n_cand) — build centroids directly without per-element
+        # re-validation.
         response.error_msg = ''
         response.centroids = [
             self._stamped_in_target_frame(
@@ -551,7 +538,7 @@ class FeatureMatchingService(Node):
         self.get_logger().info(
             f'Result processed.   Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
         )
-        _emit_vision_log(result, response.status, response.error_msg)
+        _emit_vision_log(result, response.status, response.error_msg, provider_used)
         return response
 
 

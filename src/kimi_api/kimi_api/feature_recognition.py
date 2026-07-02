@@ -3,7 +3,8 @@
 Two services:
 - `feature_extraction_service`: calls `object_detection_generalist`, picks
   the person most likely addressing the robot (see `select_best_person_idx`:
-  size-gated then centermost/closest), crops to a tight bbox, runs a vision
+  size-gated, largest-first; centermost/closest only breaks near-size
+  ties), crops to a tight bbox, runs a vision
   LLM on the crop for a structured text description, and returns BOTH the
   description and the crop as `sensor_msgs/Image` for downstream image-vs-image
   matching.
@@ -18,7 +19,6 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from message_filters import Subscriber
-from openai import OpenAI
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
@@ -29,7 +29,13 @@ from tinker_vision_msgs_26.srv import (
 )
 from vision_util.vision_logging import VisionLogger
 
-from ._env import base_url, default_flash_model, load_env, require_api_key
+from ._env import (
+    default_flash_model,
+    load_env,
+    require_api_key,
+    require_dashscope_api_key,
+)
+from ._feature_vlm import FeatureVlmError, request_feature_description_chain
 from ._image_utils import bbox_from_mask, encode_to_data_url
 
 
@@ -51,6 +57,39 @@ MIN_PERSON_HEIGHT_FRAC = 0.15
 # be a primary, additively-weighted term here.
 DEPTH_TIE_EPS = 0.08
 
+# Candidates whose bbox height is at least this fraction of the tallest
+# survivor's height count as "comparably sized"; only they compete on
+# centering/depth. Anyone shorter is background — 2026-07-02 incident
+# (vision_log/20260702_070449, 09:17:58): at the arena door a crowd member
+# ~3 m behind the barrier was 21.7% of frame height (past the 15% absolute
+# gate) and almost exactly on the optical center, while the guest filling
+# the frame was bottom-cut and therefore far off-center (offset 0.27 vs
+# 0.03 — outside DEPTH_TIE_EPS, so depth never got a say). Absolute size
+# gating cannot separate a close crowd from a close guest; relative size
+# can: the guest was 3x the crowd member's height.
+HEIGHT_TIE_FRAC = 0.75
+
+# Feature-description prompt, cut to five slots on 2026-07-02 (spec:
+# docs/superpowers/specs/2026-07-02-feature-5slot-cut-design.md). The
+# output sentence is spoken verbatim by the Receptionist introduction and
+# is matched against candidate crops by feature_matching — keep it a
+# natural sentence and keep the slots in sync with
+# feature_matching.MATCH_EVIDENCE.
+FEATURE_SYS_PROMPT = (
+    'You will be asked to extract features of one single designated person in an image.'
+    ' Describe EXACTLY these five attributes and nothing else: (1) gender — decide male'
+    ' or female and commit to the more likely one, never "gender-neutral" or "unknown",'
+    ' (2) approximate age in years (give in words, such as "twenty", not numeric'
+    ' numerals), (3) hair color (you may qualify it with hair length, such as "short'
+    ' black hair"), (4) whether the person is wearing glasses or not, and (5) the most'
+    ' prominent upper-body garment as color plus garment type (such as "red shirt"; if a'
+    ' jacket or coat covers the shirt, describe the jacket). Output in the format of'
+    ' "[gender pronoun] is [gender], approximately [age in words] years old, has'
+    ' [hair color] hair, is [wearing glasses | not wearing glasses], and is wearing a'
+    ' [color] [garment]" (use "are" instead of "is" where the pronoun requires it).'
+    ' Do not mention lower-body clothing, shoes, accessories, or any other information.'
+)
+
 
 def select_best_person_idx(
     bboxes,
@@ -60,16 +99,20 @@ def select_best_person_idx(
     *,
     min_height_frac: float = MIN_PERSON_HEIGHT_FRAC,
     depth_tie_eps: float = DEPTH_TIE_EPS,
+    height_tie_frac: float = HEIGHT_TIE_FRAC,
 ) -> int:
     """Pick the index of the person most likely addressing the robot.
 
-    Two stages: (1) drop candidates whose bbox height is below
-    ``min_height_frac`` of the frame height — background clutter far from
-    the camera can never win; (2) among survivors, rank primarily by
-    image-center offset (normalized by the frame's half-diagonal); when two
-    or more survivors are within ``depth_tie_eps`` of the smallest offset
-    (i.e. "roughly equidistant from the optical center"), the closest valid
-    depth among that tied group wins instead.
+    Three stages: (1) drop candidates whose bbox height is below
+    ``min_height_frac`` of the frame height — tiny background clutter can
+    never win; (2) keep only candidates whose bbox height is at least
+    ``height_tie_frac`` of the tallest survivor's — apparent size is the
+    primary signal, so a dominant (largest) person always beats clearly
+    smaller ones regardless of centering; (3) among the comparably-sized
+    rest, rank by image-center offset (normalized by the frame's
+    half-diagonal); when two or more are within ``depth_tie_eps`` of the
+    smallest offset (i.e. "roughly equidistant from the optical center"),
+    the closest valid depth among that tied group wins instead.
 
     Depth is deliberately only a tie-breaker, not an additive score term.
     Replaying this against real `object_detection_generalist` logs
@@ -95,25 +138,29 @@ def select_best_person_idx(
     half_diag = math.hypot(cx_frame, cy_frame) or 1.0
     min_height_px = min_height_frac * frame_h
 
-    survivors = []  # (index, offset_norm, depth_or_None)
+    survivors = []  # (index, height_px, offset_norm, depth_or_None)
     for i, (x1, y1, x2, y2) in enumerate(bboxes):
-        if (y2 - y1) < min_height_px:
+        height = y2 - y1
+        if height < min_height_px:
             continue
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         offset_norm = math.hypot(cx - cx_frame, cy - cy_frame) / half_diag
         depth = depths_m[i] if i < len(depths_m) else None
         if depth is not None and depth <= 0.0:
             depth = None
-        survivors.append((i, offset_norm, depth))
+        survivors.append((i, height, offset_norm, depth))
 
     if not survivors:
         return -1
 
-    best_offset = min(s[1] for s in survivors)
-    tied = [s for s in survivors if s[1] - best_offset <= depth_tie_eps]
+    max_height = max(s[1] for s in survivors)
+    comparable = [s for s in survivors if s[1] >= height_tie_frac * max_height]
+
+    best_offset = min(s[2] for s in comparable)
+    tied = [s for s in comparable if s[2] - best_offset <= depth_tie_eps]
 
     def _tie_key(s):
-        _, offset_norm, depth = s
+        _, _, offset_norm, depth = s
         return (0, depth) if depth is not None else (1, offset_norm)
 
     return min(tied, key=_tie_key)[0]
@@ -130,6 +177,8 @@ class FeatureService(Node):
         self.declare_parameter('detection_service', 'object_detection_generalist')
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
+        self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
+        self.declare_parameter('feature_model_qwen', 'qwen3-vl-plus')
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
@@ -137,6 +186,12 @@ class FeatureService(Node):
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
         self.vlm_timeout_s = self.get_parameter('vlm_timeout_s').get_parameter_value().double_value
         self.vlm_max_retries = self.get_parameter('vlm_max_retries').get_parameter_value().integer_value
+        self.vlm_fallback_provider = (
+            self.get_parameter('vlm_fallback_provider').get_parameter_value().string_value
+        )
+        self.feature_model_qwen = (
+            self.get_parameter('feature_model_qwen').get_parameter_value().string_value
+        )
 
         self._vision_logger = VisionLogger(
             self,
@@ -165,7 +220,8 @@ class FeatureService(Node):
 
         self.bridge = CvBridge()
 
-        self.client = OpenAI(api_key=require_api_key(), base_url=base_url())
+        require_api_key()  # fail fast at init if the primary Gemini key is missing
+        self._feature_provider_chain = self._resolve_feature_provider_chain()
 
         self.detection_cli = self.create_client(
             ObjectDetection, detection_service, callback_group=self.client_cb_group,
@@ -184,6 +240,29 @@ class FeatureService(Node):
             f'Feature services initialized (model={self.llm_model}, '
             f'detection_service={detection_service}).'
         )
+
+    def _resolve_feature_provider_chain(self) -> list:
+        """Ordered (provider, model) chain for feature extraction: Gemini
+        (self.llm_model, already required at init) then, if configured, a
+        Qwen fallback that is dropped with a warning when its key is
+        missing rather than failing node startup."""
+        chain = [('gemini', self.llm_model)]
+        fb = self.vlm_fallback_provider
+        if fb and fb != 'gemini':
+            if fb != 'qwen':
+                self.get_logger().warn(f'Unknown fallback provider {fb!r}; ignoring.')
+            else:
+                try:
+                    require_dashscope_api_key()
+                    chain.append(('qwen', self.feature_model_qwen))
+                except RuntimeError:
+                    self.get_logger().warn(
+                        f'Fallback provider {fb!r} key missing; fallback disabled.'
+                    )
+        self.get_logger().info(
+            f'feature_extraction provider chain: {[p for p, _ in chain]}'
+        )
+        return chain
 
     def camera_info_orbbec_callback(self, info):
         self.camera_intrinsic['orbbec'] = info
@@ -273,7 +352,7 @@ class FeatureService(Node):
                 'detection_idx': int(best_idx),
             }]
 
-        def _emit_vision_log(feature_text, status, error_msg, t_vlm_ms):
+        def _emit_vision_log(feature_text, status, error_msg, t_vlm_ms, provider_used=''):
             request_ctx = {
                 'camera': request.camera,
                 'n_persons_detected': int(n_persons_detected),
@@ -283,6 +362,7 @@ class FeatureService(Node):
                 'feature': str(feature_text or ''),
                 'vlm_status': int(status),
                 'vlm_error_msg': str(error_msg),
+                'vlm_provider_used': str(provider_used or ''),
                 'crop_size': (
                     [int(crop.shape[1]), int(crop.shape[0])]
                     if crop is not None else None
@@ -329,79 +409,41 @@ class FeatureService(Node):
         response.comparison_image = comparison_image
 
         self.get_logger().info(
-            f'Centermost person idx={best_idx}, bbox={best_bbox}. '
+            f'Selected person idx={best_idx}, bbox={best_bbox}. '
             f'Crop: {crop.shape}. Time: {(time.time_ns() - start_time) / 1e6:.2f} ms'
         )
 
         crop_url = encode_to_data_url(crop)
 
-        sys_prompt = (
-            'You will be asked to extract features of one single designated person in an image,'
-            ' including their gender, approximate age in years, facial features (hair length,'
-            ' with or without glasses), hair color, and atleast two pieces of clothing (the more'
-            ' the better, but no more than five). Output in the format of "[gender pronoun] is'
-            ' [gender], [gender pronoun] are approximately [approximate age in years (give in'
-            ' words, such as "twenty", not numeric numerals)] years-old, [gender pronoun] has'
-            ' [hair color] hair and [facial features]. [gender pronoun] is wearing [clothing]",'
-            ' do not include other information'
-        )
+        sys_prompt = FEATURE_SYS_PROMPT
 
         t_vlm_start = time.time_ns()
-        completion = None
-        last_error: Exception | None = None
-        for attempt in range(1, self.vlm_max_retries + 1):
-            try:
-                completion = self.client.with_options(
-                    timeout=self.vlm_timeout_s
-                ).chat.completions.create(
-                    model=self.llm_model,
-                    messages=[
-                        {'role': 'system', 'content': sys_prompt},
-                        {
-                            'role': 'user',
-                            'content': [
-                                {'type': 'image_url', 'image_url': {'url': crop_url}},
-                                {
-                                    'type': 'text',
-                                    'text': 'extract the features of the person shown in the image.',
-                                },
-                            ],
-                        },
-                    ],
-                )
-                break
-            except Exception as e:
-                last_error = e
-                self.get_logger().warn(
-                    f'VLM call failed (attempt {attempt}/{self.vlm_max_retries}): {e}'
-                )
-                if attempt < self.vlm_max_retries:
-                    time.sleep(0.5 * (2 ** (attempt - 1)))
-
-        t_vlm_ms = (time.time_ns() - t_vlm_start) / 1e6
-
-        if completion is None:
-            self.get_logger().error(
-                f'VLM call exhausted {self.vlm_max_retries} retries; '
-                f'last error: {last_error}'
+        try:
+            vlm_result = request_feature_description_chain(
+                crop_url, sys_prompt,
+                'extract the features of the person shown in the image.',
+                provider_models=self._feature_provider_chain,
+                timeout_s=self.vlm_timeout_s,
+                max_retries=self.vlm_max_retries,
+                logger=self.get_logger(),
             )
+        except FeatureVlmError as exc:
+            t_vlm_ms = (time.time_ns() - t_vlm_start) / 1e6
+            self.get_logger().error(f'VLM call failed on every provider: {exc}')
             response.feature = ''
             response.status = 1
-            response.error_msg = f'VLM call failed after {self.vlm_max_retries} retries.'
-            _emit_vision_log(
-                '', 1,
-                f'VLM call failed after {self.vlm_max_retries} retries: {last_error}',
-                t_vlm_ms,
-            )
+            response.error_msg = f'VLM call failed on every provider: {exc}.'
+            _emit_vision_log('', 1, str(exc), t_vlm_ms, '')
             return response
 
+        t_vlm_ms = (time.time_ns() - t_vlm_start) / 1e6
         self.get_logger().info(
             f'LLM finished. Total time: {(time.time_ns() - start_time) / 1e9:.3f} s'
         )
-        response.feature = completion.choices[0].message.content
+        response.feature = vlm_result.text
         response.status = 0
         response.error_msg = ''
-        _emit_vision_log(response.feature, 0, '', t_vlm_ms)
+        _emit_vision_log(response.feature, 0, '', t_vlm_ms, vlm_result.provider)
         return response
 
     def seat_recommend_srv_callback(
@@ -437,7 +479,7 @@ class FeatureService(Node):
         for name, feature in zip(request.names, request.features):
             text_prompt += ' The person matching description: ' + feature + ' is called ' + name + '.'
 
-        def _emit_vision_log(rec_text, status, error_msg, t_vlm_ms):
+        def _emit_vision_log(rec_text, status, error_msg, t_vlm_ms, provider_used=''):
             request_ctx = {
                 'camera': request.camera,
                 'n_named_people': len(request.names),
@@ -448,6 +490,7 @@ class FeatureService(Node):
                 'recommendation': str(rec_text or ''),
                 'vlm_status': int(status),
                 'vlm_error_msg': str(error_msg),
+                'vlm_provider_used': str(provider_used or ''),
             }
             timings = {}
             if t_vlm_ms is not None:
@@ -462,52 +505,24 @@ class FeatureService(Node):
             )
 
         start_time = time.time_ns()
-        completion = None
-        last_error: Exception | None = None
-        for attempt in range(1, self.vlm_max_retries + 1):
-            try:
-                completion = self.client.with_options(
-                    timeout=self.vlm_timeout_s
-                ).chat.completions.create(
-                    model=self.llm_model,
-                    messages=[
-                        {'role': 'system', 'content': sys_prompt_recommend},
-                        {
-                            'role': 'user',
-                            'content': [
-                                {'type': 'image_url', 'image_url': {'url': color_image_url}},
-                                {'type': 'text', 'text': text_prompt},
-                            ],
-                        },
-                    ],
-                )
-                break
-            except Exception as e:
-                last_error = e
-                self.get_logger().warn(
-                    f'Seat recommend VLM call failed '
-                    f'(attempt {attempt}/{self.vlm_max_retries}): {e}'
-                )
-                if attempt < self.vlm_max_retries:
-                    time.sleep(0.5 * (2 ** (attempt - 1)))
-
-        t_vlm_ms = (time.time_ns() - start_time) / 1e6
-
-        if completion is None:
-            self.get_logger().error(
-                f'Seat recommend VLM call exhausted {self.vlm_max_retries} retries; '
-                f'last error: {last_error}'
+        try:
+            vlm_result = request_feature_description_chain(
+                color_image_url, sys_prompt_recommend, text_prompt,
+                provider_models=self._feature_provider_chain,
+                timeout_s=self.vlm_timeout_s,
+                max_retries=self.vlm_max_retries,
+                logger=self.get_logger(),
             )
+        except FeatureVlmError as exc:
+            t_vlm_ms = (time.time_ns() - start_time) / 1e6
+            self.get_logger().error(f'Seat recommend VLM call failed on every provider: {exc}')
             response.status = 1
-            response.error_msg = f'VLM call failed after {self.vlm_max_retries} retries.'
+            response.error_msg = f'VLM call failed on every provider: {exc}.'
             response.recommendation = ''
-            _emit_vision_log(
-                '', 1,
-                f'VLM call failed after {self.vlm_max_retries} retries: {last_error}',
-                t_vlm_ms,
-            )
+            _emit_vision_log('', 1, str(exc), t_vlm_ms, '')
             return response
 
+        t_vlm_ms = (time.time_ns() - start_time) / 1e6
         self.get_logger().info(
             f'Finished, time = {(time.time_ns() - start_time) / 1e9:.3f} s'
         )
@@ -515,8 +530,8 @@ class FeatureService(Node):
             self.get_logger().info('seat recommendation prompt: ' + text_prompt)
         response.status = 0
         response.error_msg = ''
-        response.recommendation = completion.choices[0].message.content
-        _emit_vision_log(response.recommendation, 0, '', t_vlm_ms)
+        response.recommendation = vlm_result.text
+        _emit_vision_log(response.recommendation, 0, '', t_vlm_ms, vlm_result.provider)
         return response
 
 

@@ -28,6 +28,14 @@ for the full diagnosis.
         <transport_descriptor>
             <transport_id>udp_transport</transport_id>
             <type>UDPv4</type>
+            <!-- Keep DDS off transient uplinks (phone tether/hotspot) whose
+                 locators poison discovery. Loopback + wired LAN only; the
+                 tether IP is deliberately excluded. See MEMORY
+                 project_dds_tether_discovery_storm. -->
+            <interfaceWhiteList>
+                <address>127.0.0.1</address>
+                <address>192.168.1.12</address>
+            </interfaceWhiteList>
         </transport_descriptor>
     </transport_descriptors>
 

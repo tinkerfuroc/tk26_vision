@@ -773,7 +773,9 @@ def make_test_parse_exhaustion(_args, logger: TestLogger) -> Callable[[], Tuple[
           but a single cell is bad; a TOTAL-failure cyclic fallback (the old
           `result = [i % n_cand for i in range(...)]` pattern) is what we
           guard against, not per-cell patches.
-      (c) Total-failure path returns the new `'VLM exhausted'` status=1 error.
+      (c) Total-failure path returns the `'VLM match failed on every
+          provider'` status=1 error (the provider-chain successor of the
+          original `'VLM exhausted'` message).
     """
     name = 'parse_exhaustion'
 
@@ -785,7 +787,7 @@ def make_test_parse_exhaustion(_args, logger: TestLogger) -> Callable[[], Tuple[
             'asserts': [
                 'request_bboxes returns []',
                 "feature_matching source contains no `i % n_cand for i in range`",
-                "feature_matching source contains 'VLM exhausted'",
+                "feature_matching source contains 'VLM match failed on every provider'",
             ],
         })
 
@@ -807,7 +809,7 @@ def make_test_parse_exhaustion(_args, logger: TestLogger) -> Callable[[], Tuple[
         from kimi_api import feature_matching
         src = inspect.getsource(feature_matching)
         wholesale_cyclic_present = 'i % n_cand for i in range' in src
-        post_fix_msg_present = 'VLM exhausted' in src
+        post_fix_msg_present = 'VLM match failed on every provider' in src
 
         logger.write_response(name, {
             'request_bboxes_boxes': [],
@@ -820,7 +822,8 @@ def make_test_parse_exhaustion(_args, logger: TestLogger) -> Callable[[], Tuple[
         if wholesale_cyclic_present:
             return False, 'wholesale cyclic-fallback regression in feature_matching.py'
         if not post_fix_msg_present:
-            return False, "expected 'VLM exhausted' error_msg not found in feature_matching.py"
+            return False, ("expected 'VLM match failed on every provider' "
+                           'error_msg not found in feature_matching.py')
 
         return True, (
             f'request_bboxes empty in {elapsed:.2f}s; '

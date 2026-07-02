@@ -1,29 +1,36 @@
-"""Gemini structured-output client for tabletop placing-location proposals.
+"""Gemini/Qwen structured-output client for tabletop placing-location
+proposals.
 
 Sister of `object_detection_generalist.vlm_bbox` but tuned for *empty*-region
 enumeration instead of object detection: the system prompt asks the VLM to
 identify clear flat regions on a desktop large enough to fit a user-described
 item, ranked best-to-worst. Returns a parallel list of pixel-space bounding
-boxes plus the rank labels Gemini emitted (typically "rank1", "rank2", ...).
+boxes plus the rank labels the model emitted (typically "rank1", "rank2", ...).
 
-Reuses `kimi_api._env` for OpenRouter key + base URL discovery so a missing
-`OPENROUTER_API_KEY` raises a single `VlmPlacingError` the service callback
-can convert to status=-1 without crashing node startup.
+Reuses `kimi_api._env` for OpenRouter/DashScope key + base URL discovery so a
+missing `OPENROUTER_API_KEY`/`DASHSCOPE_API_KEY` raises a single
+`VlmPlacingError` the service callback can convert to status=-1 without
+crashing node startup. `request_placing_bboxes_chain` tries providers in
+order (Gemini primary, Qwen fallback by default at the node layer) so the
+service degrades to a second provider instead of a bare failure.
 """
 
 from __future__ import annotations
 
-import base64
 import json
-import os
-import tempfile
 import time
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
-import cv2
 import numpy as np
 
-from kimi_api._env import base_url, load_env, require_api_key
+from kimi_api._env import (
+    base_url,
+    dashscope_base_url,
+    load_env,
+    require_api_key,
+    require_dashscope_api_key,
+)
+from kimi_api._image_utils import encode_to_data_url
 
 
 Bbox = Tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixel coords
@@ -75,19 +82,6 @@ def _response_schema(max_candidates: int) -> dict:
     }
 
 
-def _encode_data_url(rgb_bgr: np.ndarray) -> str:
-    """Encode a BGR image as a JPEG data URL."""
-    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        cv2.imwrite(tmp_path, rgb_bgr)
-        with open(tmp_path, 'rb') as f:
-            data = f.read()
-    finally:
-        os.unlink(tmp_path)
-    return f'data:image/jpeg;base64,{base64.b64encode(data).decode("utf-8")}'
-
-
 def _decode_bbox(box_2d, w: int, h: int) -> Bbox | None:
     """Decode a Gemini [y0, x0, y1, x1] 0-1000 normalized box to xyxy pixels."""
     if not isinstance(box_2d, (list, tuple)) or len(box_2d) < 4:
@@ -123,32 +117,45 @@ def request_placing_bboxes(
     item_description: str,
     max_candidates: int = 5,
     model: str,
+    provider: str = 'gemini',
     max_retries: int = 1,
     timeout_s: float = 8.0,
     logger=None,
 ) -> tuple[List[Bbox], List[str], float]:
-    """Ask Gemini for ranked empty placing regions on the visible desktop.
+    """Ask Gemini (or, with ``provider='qwen'``, DashScope) for ranked empty
+    placing regions on the visible desktop.
 
-    Returns ``(boxes, ranks, elapsed_s)`` — parallel arrays ordered as Gemini
-    returned them (already best-to-worst). ``ranks[i]`` is the raw label string
-    (typically ``'rank1'``...). Empty lists on parse exhaustion or "no
-    suitable region" responses. Raises `VlmPlacingError` only for missing
-    OpenRouter credentials.
+    Returns ``(boxes, ranks, elapsed_s)`` — parallel arrays ordered as the
+    model returned them (already best-to-worst); ``ranks[i]`` is the raw
+    label string (typically ``'rank1'``...). Empty lists are a legitimate
+    "no suitable region" answer. Raises `VlmPlacingError` on missing
+    credentials, an unknown provider, or retry exhaustion — so "the VLM
+    never answered" is never conflated with "the desk is full".
     """
     load_env()
-    try:
-        api_key = require_api_key()
-    except RuntimeError as exc:
-        raise VlmPlacingError(str(exc)) from exc
+    if provider == 'qwen':
+        try:
+            api_key = require_dashscope_api_key()
+        except RuntimeError as exc:
+            raise VlmPlacingError(str(exc)) from exc
+        b_url = dashscope_base_url()
+    elif provider == 'gemini':
+        try:
+            api_key = require_api_key()
+        except RuntimeError as exc:
+            raise VlmPlacingError(str(exc)) from exc
+        b_url = base_url()
+    else:
+        raise VlmPlacingError(f"unknown provider {provider!r} (expected qwen|gemini)")
 
     from openai import OpenAI
 
     max_candidates = max(1, min(int(max_candidates), 10))
-    client = OpenAI(api_key=api_key, base_url=base_url())
+    client = OpenAI(api_key=api_key, base_url=b_url)
 
     _t0 = time.perf_counter()
     try:
-        data_url = _encode_data_url(rgb_bgr)
+        data_url = encode_to_data_url(rgb_bgr)
         h, w = rgb_bgr.shape[:2]
 
         messages = [
@@ -212,6 +219,13 @@ def request_placing_bboxes(
                         f'{len(boxes)} valid after decode '
                         f'(attempt {attempt}/{max_retries}).'
                     )
+                if detections and not boxes:
+                    # The model asserted regions exist but every box failed to
+                    # decode (wrong coordinate convention, malformed payload)
+                    # — unusable output, not a legitimate "no suitable
+                    # region"; retry so the fallback provider can fire.
+                    raise ValueError(
+                        f'all {len(detections)} detection(s) failed bbox decode')
                 return boxes, ranks, time.perf_counter() - _t0
             except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
                 last_error = exc
@@ -241,14 +255,50 @@ def request_placing_bboxes(
                         f'(attempt {attempt}/{max_retries}): {exc}'
                     )
 
-        if logger is not None:
-            logger.error(
-                f'VLM placing request exhausted {max_retries} retries; '
-                f'last error: {last_error}'
-            )
-        return [], [], time.perf_counter() - _t0
+        raise VlmPlacingError(
+            f'[{provider}] exhausted {max_retries} retries; last={last_error}')
     finally:
         try:
             client.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def request_placing_bboxes_chain(
+    rgb_bgr: np.ndarray,
+    *,
+    item_description: str,
+    max_candidates: int = 5,
+    provider_models: Sequence[tuple],
+    max_retries: int = 1,
+    timeout_s: float = 8.0,
+    logger=None,
+) -> tuple[List[Bbox], List[str], float, str]:
+    """Try (provider, model) pairs in order for ranked placing regions.
+
+    Returns ``(boxes, ranks, elapsed_s, provider_used)``. A
+    ``VlmPlacingError`` (missing key or retry exhaustion) falls through to
+    the next provider. A legitimate result -- including no suitable region
+    found (empty lists) -- is returned immediately without trying further
+    providers. Raises ``VlmPlacingError`` if every provider fails (or none
+    are configured), so the caller can report "VLM unavailable" rather
+    than misreading total failure as an empty desktop.
+    """
+    errors = []
+    for provider, model in provider_models:
+        try:
+            boxes, ranks, elapsed_s = request_placing_bboxes(
+                rgb_bgr, item_description=item_description,
+                max_candidates=max_candidates,
+                provider=provider, model=model, max_retries=max_retries,
+                timeout_s=timeout_s, logger=logger,
+            )
+        except VlmPlacingError as exc:
+            errors.append(f'{provider}: {exc}')
+            if logger is not None:
+                logger.warning(
+                    f'placing VLM provider {provider} failed: {exc}; trying next.')
+            continue
+        return boxes, ranks, elapsed_s, provider
+    raise VlmPlacingError(
+        'all providers failed: ' + (' | '.join(errors) or 'no providers configured'))

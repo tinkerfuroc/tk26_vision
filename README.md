@@ -81,6 +81,14 @@ Use `./scripts/build.sh`, which sources venv + ROS, runs
 `ros2 run` invokes the venv python. Plain `colcon build` produces
 `#!/usr/bin/python3` shebangs that can't import from the venv.
 
+When the repo is embedded in the full robot workspace (`<ws>/src/tk26_vision`
+with `<ws>/tkbuild` present), `build.sh` delegates to `tkbuild tk26_vision`:
+artifacts land in the canonical `<ws>/install` tree instead of creating an
+in-repo `build/`/`install/` overlay that tkbuild never updates (those go
+permanently stale — see the 2026-07-02 kimi_api incident). Set `WS_ROOT`
+explicitly (e.g. `WS_ROOT=$PWD ./scripts/build.sh`) to force the in-repo
+build; standalone worktrees behave as before.
+
 ```bash
 # From the tk26_vision repo root / worktree root
 ./scripts/build.sh

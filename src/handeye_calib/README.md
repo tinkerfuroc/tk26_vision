@@ -213,6 +213,46 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.13.0 (2026-07-03): **Fixed dead session/dump persistence (`self._robot_name` never
+  existed) + robot-tagged session/dump names.**
+  - **Root cause:** `_build_session_dict` read `self._robot_name`, an attribute the
+    node never assigned (the real accessor is `_resolve_robot_name()`). Every call
+    raised `AttributeError`, which `_persist_session`'s best-effort `except Exception`
+    swallowed — so **every** capture/solve since this line was introduced silently
+    failed to write `session.json` (returned `None`, logged only a WARN). Caught by 4
+    pre-existing `test_sessions_web.py` failures. Fixed: `"robot":
+    self._resolve_robot_name() or None`.
+  - **Robot-tagged names.** `handeye_sessions.new_session_name(now_struct=None,
+    robot='')` now optionally tags the session dir: `wrist_handeye_<robot>_<ts>`
+    (legacy positional call with no `robot` kwarg is unchanged —
+    `wrist_handeye_<ts>`). New `_safe_robot_tag(robot)` reuses the existing
+    `_safe_name` path-traversal guard and **degrades to the untagged legacy name on
+    any unsafe/empty tag rather than raising** — a raise here would silently kill
+    persistence again, the exact bug class this release fixes. `_persist_session` /
+    `_dump_solve` (`solve_<robot>_<ts>.json`) both pass `self._resolve_robot_name()`
+    through this path.
+  - **Fixed a second, related latent bug** this unmasked once real v2 (multi-placement)
+    sessions started actually reaching disk: `_summary()`'s `"n_samples"` field always
+    read the (v1-only) top-level `data["samples"]`, so every v2 session listed
+    `n_samples: 0` in the History tab regardless of real content (`n_samples_total`
+    was computed correctly but never used for the `n_samples` field itself — now it
+    is). The `GET /api/sessions/{name}` detail endpoint and the
+    `.../samples/{i}/thumb.jpg` route had the same v1-only assumption (flat
+    `data["samples"]` / flat `thumbs/<idx>.jpg`, both nonexistent for a v2 session
+    whose samples + thumbs are nested per placement) — since no v2 session had ever
+    reached these routes with real content before, the History tab's detail view and
+    thumbnail gallery were silently broken for every capture since the multi-placement
+    migration. Fixed with two new pure-FS helpers in `handeye_sessions.py`:
+    `flatten_samples(data)` (concatenates placement samples in order; passthrough for
+    v1) and `flat_thumb_path(name, flat_idx, data=None, base=None)` (maps a flat
+    gallery index to the owning placement's on-disk thumb, or the legacy flat path for
+    v1).
+  - `session.json`'s `"robot"` field is restored end-to-end (was always writing an
+    `AttributeError`-crash before this fix, never a real value). **Pending operator
+    verify:** first live capture on hardware confirming
+    `wrist_handeye_sessions/wrist_handeye_<robot>_<ts>/session.json` has `"robot":
+    "<robot>"` and schema `wrist_handeye_session/2` actually lands on disk (skipped
+    here — needs the wrist RealSense, which may be in use by the live robot).
 - 0.12.1 (2026-07-03): **Promote now writes the property-redefinition xacro form the
   vendor URDF actually consumes** (was silently inert).
   - `apply_handeye.seed_handeye_override_xacro(robot_name, xyz_str, rpy_str)` (the

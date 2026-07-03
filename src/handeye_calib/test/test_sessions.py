@@ -98,6 +98,91 @@ def test_new_session_name_is_deterministic_with_injected_time():
     assert nm == "wrist_handeye_20260628_140102"
 
 
+def test_new_session_name_carries_robot():
+    st = time.strptime('2026-07-03 10:00:00', '%Y-%m-%d %H:%M:%S')
+    assert hsx.new_session_name(st, robot='tinker1') == 'wrist_handeye_tinker1_20260703_100000'
+    assert hsx.new_session_name(st) == 'wrist_handeye_20260703_100000'
+
+
+def test_new_session_name_ignores_unsafe_robot():
+    st = time.strptime('2026-07-03 10:00:00', '%Y-%m-%d %H:%M:%S')
+    # unsafe robot tag falls back to the untagged legacy name — persistence
+    # must never die on a bad tag (that's the bug class this task fixes)
+    assert hsx.new_session_name(st, robot='../evil') == 'wrist_handeye_20260703_100000'
+
+
+def test_build_session_dict_has_no_dead_attr():
+    import inspect
+    from handeye_calib import handeye_web
+    assert 'self._robot_name' not in inspect.getsource(handeye_web)
+
+
+# ---- flatten_samples / flat_thumb_path (v2 multi-placement history browsing) ----
+# The detail/thumb HTTP endpoints (and the webui gallery) were written against
+# the v1 flat-'samples' schema and never updated for v2 placements — masked by
+# _persist_session dying silently on the dead self._robot_name attribute, so no
+# real v2 session ever reached them. These are the pure-filesystem helpers the
+# endpoints now use to bridge both schemas.
+
+def _v2_payload():
+    return {
+        "schema": "wrist_handeye_session/2",
+        "timestamp": "20260703_100000",
+        "robot": "tinker1",
+        "placements": [
+            {"id": "front", "label": "front",
+             "samples": [{"idx": 0}, {"idx": 1}], "result": None},
+            {"id": "side", "label": "side",
+             "samples": [{"idx": 0}], "result": None},
+        ],
+        "combined_result": None,
+    }
+
+
+def test_flatten_samples_concatenates_v2_placements():
+    assert hsx.flatten_samples(_v2_payload()) == [
+        {"idx": 0}, {"idx": 1}, {"idx": 0},
+    ]
+
+
+def test_flatten_samples_v1_passthrough():
+    assert hsx.flatten_samples(_payload(3)) == [
+        {"idx": 0, "capture_reproj_px": 0.2},
+        {"idx": 1, "capture_reproj_px": 0.2},
+        {"idx": 2, "capture_reproj_px": 0.2},
+    ]
+
+
+def test_flat_thumb_path_maps_flat_index_into_owning_placement(root):
+    name = "wrist_handeye_v2thumbs"
+    data = _v2_payload()
+    hsx.write_session(name, data, base=str(root))
+    hsx.write_placement_thumb(name, "front", 0, b"front0", base=str(root))
+    hsx.write_placement_thumb(name, "front", 1, b"front1", base=str(root))
+    hsx.write_placement_thumb(name, "side", 0, b"side0", base=str(root))
+
+    # flat idx 0,1 -> front[0], front[1]; flat idx 2 -> side[0]
+    assert hsx.flat_thumb_path(name, 0, data=data, base=str(root)) == \
+        hsx.placement_thumb_path(name, "front", 0, base=str(root))
+    assert hsx.flat_thumb_path(name, 2, data=data, base=str(root)) == \
+        hsx.placement_thumb_path(name, "side", 0, base=str(root))
+    with open(hsx.flat_thumb_path(name, 2, data=data, base=str(root)), "rb") as f:
+        assert f.read() == b"side0"
+
+
+def test_flat_thumb_path_out_of_range_returns_none(root):
+    assert hsx.flat_thumb_path("wrist_handeye_v2thumbs", 99,
+                                data=_v2_payload(), base=str(root)) is None
+
+
+def test_flat_thumb_path_v1_passthrough(root):
+    name = "wrist_handeye_v1thumbs"
+    hsx.write_session(name, _payload(2), base=str(root))
+    hsx.write_thumb(name, 1, b"legacy1", base=str(root))
+    assert hsx.flat_thumb_path(name, 1, data=_payload(2), base=str(root)) == \
+        hsx.thumb_path(name, 1, base=str(root))
+
+
 # ---- multi-placement additions ----
 
 def test_write_read_multi_placement(tmp_path):

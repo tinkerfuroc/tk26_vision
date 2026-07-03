@@ -2309,7 +2309,7 @@ def _make_node_class():
                 out = {
                     "schema": "wrist_handeye_session/2",
                     "timestamp": time.strftime("%Y%m%d_%H%M%S"),
-                    "robot": self._robot_name,
+                    "robot": self._resolve_robot_name() or None,
                     "calib_frame": self._calib_frame,
                     "board": {"squares_x": self._sx, "squares_y": self._sy,
                               "square_len_m": self._sq,
@@ -2347,7 +2347,7 @@ def _make_node_class():
                     if self._session_name is None:
                         # Timestamped to the second; dedup against existing dirs
                         # so a clear+recapture within one second can't collide.
-                        base_name = hsx.new_session_name(time.localtime())
+                        base_name = hsx.new_session_name(time.localtime(), robot=self._resolve_robot_name())
                         name = base_name
                         k = 1
                         while _os.path.isdir(hsx.session_dir(name)):
@@ -2378,7 +2378,8 @@ def _make_node_class():
             ddir = os.path.join(root, "wrist_handeye_dumps")
             os.makedirs(ddir, exist_ok=True)
             out = self._build_session_dict(res, payload)
-            path = os.path.join(ddir, f"solve_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            tag = hsx._safe_robot_tag(self._resolve_robot_name())
+            path = os.path.join(ddir, f"solve_{tag + '_' if tag else ''}{time.strftime('%Y%m%d_%H%M%S')}.json")
             with open(path, "w") as f:
                 json.dump(ws.json_safe(out), f, indent=2)
             self.get_logger().info(f"solve dump saved: {os.path.abspath(path)}")
@@ -3525,12 +3526,17 @@ def make_app(node):
         except Exception as exc:
             return JSONResponse({"ok": False, "reason": f"no such session: {exc}"},
                                 status_code=404)
+        # v2 (multi-placement) sessions nest samples per placement; the webui
+        # gallery + summary want a flat top-level "samples" list regardless of
+        # schema, same as a v1 session already has natively.
+        data = dict(data)
+        data.setdefault("samples", hsx.flatten_samples(data))
         return JSONResponse(ws.json_safe({"ok": True, **data}))
 
     @app.get("/api/sessions/{name}/samples/{idx}/thumb.jpg")
     def sessions_thumb(name: str, idx: int):
         try:
-            p = hsx.thumb_path(name, idx)
+            p = hsx.flat_thumb_path(name, idx)
         except Exception:
             p = None
         if p and os.path.isfile(p):

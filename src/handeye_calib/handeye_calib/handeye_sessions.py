@@ -41,11 +41,23 @@ def _safe_name(name):
     return name
 
 
-def new_session_name(now_struct=None):
-    """A fresh timestamped session name. ``now_struct`` (a ``time.struct_time``)
-    is injectable so tests are deterministic."""
-    return "wrist_handeye_" + time.strftime("%Y%m%d_%H%M%S",
-                                            now_struct or time.localtime())
+def _safe_robot_tag(robot):
+    """A robot string usable in a session name, or '' if unsafe/empty."""
+    robot = str(robot or '')
+    try:
+        return _safe_name(robot) if robot else ''
+    except ValueError:
+        return ''
+
+
+def new_session_name(now_struct=None, robot=''):
+    """Fresh timestamped session name, optionally robot-tagged
+    (``wrist_handeye_<robot>_<ts>``). ``now_struct`` (a ``time.struct_time``)
+    is injectable so tests are deterministic. An unsafe/empty robot tag
+    degrades to the legacy untagged form rather than raising."""
+    ts = time.strftime("%Y%m%d_%H%M%S", now_struct or time.localtime())
+    tag = _safe_robot_tag(robot)
+    return f"wrist_handeye_{tag}_{ts}" if tag else "wrist_handeye_" + ts
 
 
 def session_dir(name, base=None):
@@ -121,11 +133,51 @@ def read_session(name, base=None):
         return json.load(f)
 
 
+def flatten_samples(data):
+    """Flat sample list across all placements, in placement order.
+
+    v1 sessions already carry a flat top-level ``samples`` list; v2
+    (multi-placement) sessions nest samples per placement instead, so
+    callers that just want "all captured samples" (gallery, counts) get a
+    single consistent shape regardless of schema."""
+    placements = data.get("placements")
+    if placements is None:
+        return list(data.get("samples") or [])
+    out = []
+    for p in placements:
+        out.extend(p.get("samples") or [])
+    return out
+
+
+def flat_thumb_path(name, flat_idx, data=None, base=None):
+    """Resolve a flat sample index (as produced by ``flatten_samples``) to its
+    on-disk thumbnail path, whether the session is v1 (flat ``thumbs/<idx>.jpg``)
+    or v2/multi-placement (``thumbs/<placement_id>/<idx>.jpg``). Returns ``None``
+    if ``flat_idx`` is out of range for a v2 session (the flat-thumb v1 path is
+    still returned for a v1 session even if the file doesn't exist yet — same
+    "may not exist" contract as ``thumb_path``)."""
+    if data is None:
+        try:
+            data = read_session(name, base=base)
+        except Exception:
+            data = {}
+    placements = data.get("placements")
+    if placements is None:
+        return thumb_path(name, flat_idx, base=base)
+    remaining = int(flat_idx)
+    for p in placements:
+        n = len(p.get("samples") or [])
+        if remaining < n:
+            return placement_thumb_path(name, p.get("id"), remaining, base=base)
+        remaining -= n
+    return None
+
+
 def _summary(name, data, mtime):
     res = data.get("result") or {}
     placements = data.get("placements")
     if placements is not None:
-        n_samples_total = sum(len(p.get("samples") or []) for p in placements)
+        n_samples_total = len(flatten_samples(data))
         placement_summaries = [
             {"id": p.get("id"), "label": p.get("label"),
              "n_samples": len(p.get("samples") or []),
@@ -150,7 +202,7 @@ def _summary(name, data, mtime):
         "name": name,
         "mtime": mtime,
         "timestamp": data.get("timestamp"),
-        "n_samples": len(data.get("samples") or []),
+        "n_samples": n_samples_total,
         "has_solve": bool(res),
         "status": res.get("status"),
         "robot": data.get("robot"),

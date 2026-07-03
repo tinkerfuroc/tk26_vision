@@ -24,9 +24,8 @@ import openai
 
 from ._env import (
     base_url,
-    dashscope_base_url,
     require_api_key,
-    require_dashscope_api_key,
+    resolve_qwen_target,
 )
 from ._vlm_text import strip_fences
 
@@ -67,6 +66,7 @@ def request_shelf_layer(
     *,
     provider: str,
     model: str,
+    qwen_api_backend: str = 'dashscope',
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
@@ -82,10 +82,9 @@ def request_shelf_layer(
     """
     if provider == 'qwen':
         try:
-            api_key = require_dashscope_api_key()
+            b_url, api_key, model = resolve_qwen_target(qwen_api_backend, model)
         except RuntimeError as exc:
             raise ShelfVlmError(str(exc)) from exc
-        b_url = dashscope_base_url()
     elif provider == 'gemini':
         try:
             api_key = require_api_key()
@@ -175,6 +174,7 @@ def request_shelf_layer_chain(
     obj_seg_url: str,
     *,
     provider_models: Sequence[tuple],
+    qwen_api_backend: str = 'dashscope',
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
@@ -191,6 +191,7 @@ def request_shelf_layer_chain(
             return request_shelf_layer(
                 sys_prompt, shelf_img_url, obj_seg_url,
                 provider=provider, model=model,
+                qwen_api_backend=qwen_api_backend,
                 timeout_s=timeout_s, max_retries=max_retries, logger=logger,
             )
         except ShelfVlmError as exc:

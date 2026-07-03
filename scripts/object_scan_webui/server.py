@@ -14,6 +14,8 @@ import argparse
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -23,7 +25,17 @@ import scan_core
 HERE = os.path.dirname(os.path.abspath(__file__))
 PHOTOS_DIR = os.path.join(HERE, "photos")
 INDEX_HTML = os.path.join(HERE, "index.html")
+ROS_GRAB = os.path.join(HERE, "ros_grab.py")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+_SAFE_TOPIC = re.compile(r"^[A-Za-z0-9_/]+$")
+
+# Named presets shown in the UI; any valid topic can be typed as "custom".
+ROS_TOPIC_PRESETS = [
+    {"label": "orbbec (head) — /camera/color/image_raw",
+     "topic": "/camera/color/image_raw"},
+    {"label": "realsense (arm) — /camera/xarm_camera/color/image_raw",
+     "topic": "/camera/xarm_camera/color/image_raw"},
+]
 
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 
@@ -94,6 +106,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._send(200, {"photos": names})
             return
+        if path == "/api/ros_topics":
+            self._send(200, {"presets": ROS_TOPIC_PRESETS})
+            return
         if path.startswith("/photos/"):
             name = path[len("/photos/"):]
             p = self._photo_path(name)
@@ -142,6 +157,32 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(PHOTOS_DIR, name), "wb") as f:
                 f.write(raw)
             self._send(200, {"name": name})
+            return
+
+        if path == "/api/ros_capture":
+            topic = (body.get("topic") or "/camera/color/image_raw").strip()
+            if not _SAFE_TOPIC.match(topic):
+                self._send(400, {"error": f"bad topic {topic!r}"})
+                return
+            ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+            name = f"photo_{ts}_ros.jpg"
+            out = os.path.join(PHOTOS_DIR, name)
+            try:
+                proc = subprocess.run(
+                    [sys.executable, ROS_GRAB, "--topic", topic,
+                     "--out", out, "--timeout", str(float(body.get("timeout", 8.0)))],
+                    capture_output=True, text=True,
+                    timeout=float(body.get("timeout", 8.0)) + 15.0,
+                )
+            except subprocess.TimeoutExpired:
+                self._send(504, {"error": f"ROS grab timed out on {topic}"})
+                return
+            if proc.returncode == 0 and os.path.isfile(out):
+                self._send(200, {"name": name})
+            else:
+                msg = (proc.stderr or proc.stdout or "unknown error").strip().splitlines()
+                self._send(502, {"error": msg[-1] if msg else "ROS grab failed",
+                                 "detail": (proc.stderr or "")[-800:]})
             return
 
         if path in ("/api/scan", "/api/sweep"):

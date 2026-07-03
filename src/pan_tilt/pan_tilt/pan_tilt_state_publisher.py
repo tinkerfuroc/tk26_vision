@@ -18,6 +18,42 @@ except ImportError:  # pragma: no cover — only absent outside a sourced ROS en
     PanTiltState = None  # type: ignore[assignment]
 
 
+def _load_profile():
+    """Load the ROBOT_NAME-keyed profile, or None when unavailable.
+
+    Isolated for test monkeypatching. Any failure (package absent, ROBOT_NAME
+    unset, unknown robot) degrades to None — the caller falls back to the
+    package-yaml params so dev machines keep working.
+    """
+    try:
+        from tinker_robot_config import resolver
+    except ImportError:
+        return None
+    try:
+        return resolver.load()
+    except Exception:
+        return None
+
+
+def _load_per_robot_offsets(logger):
+    cfg = _load_profile()
+    if cfg is None:
+        logger.warning(
+            'tinker_robot_config profile unavailable (ROBOT_NAME unset or '
+            'package missing) — falling back to package-yaml pan/tilt offsets. '
+            'These are NOT per-robot; calibrated robots must set '
+            'robots/<robot>/pan_tilt/offsets.yaml.')
+        return None
+    pan = cfg.get('pan_tilt.offsets.pan_offset_rad')
+    tilt = cfg.get('pan_tilt.offsets.tilt_offset_rad')
+    if pan is None or tilt is None:
+        logger.warning(
+            'profile has no pan_tilt.offsets.{pan,tilt}_offset_rad — '
+            'falling back to package-yaml offsets (NOT per-robot).')
+        return None
+    return float(pan), float(tilt)
+
+
 def _resolve_offset(raw_rad: float, name: str, logger=None) -> float:
     """Wrap a calibration joint offset to (-pi, pi]; warn if it arrived
     out of range. An out-of-range offset (|x| > pi) means whoever wrote the
@@ -57,10 +93,15 @@ class PanTiltStatePublisherNode(Node):
         self._pan_joint_name = self.get_parameter('pan_joint_name').value
         self._tilt_joint_name = self.get_parameter('tilt_joint_name').value
         self._stale_timeout_sec = float(self.get_parameter('stale_timeout_sec').value)
-        self._pan_offset_rad = _resolve_offset(
-            float(self.get_parameter('pan_offset_rad').value), 'pan_offset_rad', self.get_logger())
-        self._tilt_offset_rad = _resolve_offset(
-            float(self.get_parameter('tilt_offset_rad').value), 'tilt_offset_rad', self.get_logger())
+        per_robot = _load_per_robot_offsets(self.get_logger())
+        if per_robot is not None:
+            raw_pan, raw_tilt = per_robot
+            self.get_logger().info('pan/tilt offsets: per-robot profile (ROBOT_NAME)')
+        else:
+            raw_pan = float(self.get_parameter('pan_offset_rad').value)
+            raw_tilt = float(self.get_parameter('tilt_offset_rad').value)
+        self._pan_offset_rad = _resolve_offset(raw_pan, 'pan_offset_rad', self.get_logger())
+        self._tilt_offset_rad = _resolve_offset(raw_tilt, 'tilt_offset_rad', self.get_logger())
         self.get_logger().info(
             f"Calibration offsets: pan={self._pan_offset_rad:+.4f} rad "
             f"({math.degrees(self._pan_offset_rad):+.2f}°), "

@@ -13,11 +13,12 @@ def generate_launch_description():
     launch_rsp = LaunchConfiguration('launch_robot_state_publisher')
 
     # Publish the URDF via tinker_robot_config's robot_description.launch.py
-    # wrapper, which renders pan_tilt_standalone.urdf.xacro with mappings
-    # flattened from the active robot profile's pan_tilt.urdf_overrides
-    # sub-tree (attach_xyz/attach_rpy/camera_mount_xyz/camera_mount_rpy).
-    # Runtime URDF now reflects robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml
-    # instead of the xacro's hardcoded defaults. Private topics are preserved
+    # wrapper, which renders pan_tilt_standalone.urdf.xacro. The pan/tilt
+    # joint offsets that used to be threaded through here as a
+    # 'pan_tilt.urdf_overrides' mapping are now read directly by
+    # pan_tilt_state_publisher from the per-robot profile (see
+    # pan_tilt_state_publisher._load_per_robot_offsets) — that deprecated
+    # overrides_key plumbing has been dropped. Private topics are preserved
     # (belt-and-suspenders) so this launch can run alongside grasp_bringup's
     # xArm RSP without colliding with /robot_description or /joint_states;
     # the operational disable is still launch_robot_state_publisher:=false.
@@ -31,7 +32,6 @@ def generate_launch_description():
                 FindPackageShare('tinker_urdf'), 'src',
                 'pan_tilt_standalone.urdf.xacro',
             ]),
-            'overrides_key': 'pan_tilt.urdf_overrides',
             'remappings': (
                 '/robot_description=/pan_tilt/robot_description;'
                 '/joint_states=/pan_tilt/joint_states;'

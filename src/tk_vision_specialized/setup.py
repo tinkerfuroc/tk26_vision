@@ -14,6 +14,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch',
             glob('launch/*.launch.py')),
+        ('share/' + package_name + '/config',
+            glob('config/*.yaml')),
         # Reference items map for object_match_server. Lives at
         # src/tk26_vision/src/items/ (sibling of this package); installed
         # into share/ so ament_index can resolve it after colcon build.
@@ -32,6 +34,7 @@ setup(
             'spot_on_shelf_server = tk_vision_specialized.spot_on_shelf_server:main',
             'waving_person_server = tk_vision_specialized.waving_person_server:main',
             'waving_client = tk_vision_specialized.waving_client:main',
+            'waving_bench = tk_vision_specialized.waving_bench:main',
             'check_waving_inference = tk_vision_specialized.check_waving_inference:main',
             'placing_location_server = tk_vision_specialized.placing_location_server:main',
             'object_match_server = tk_vision_specialized.object_match_server:main',

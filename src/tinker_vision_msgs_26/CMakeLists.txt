@@ -37,6 +37,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ObjectDetectionImage.srv"
   "srv/ObjectMatch.srv"
   "srv/ObjectMatchAll.srv"
+  "srv/ObjectScan.srv"
   "srv/PlacingLocation.srv"
   "srv/PointDirection.srv"
   "srv/ReseedTarget.srv"

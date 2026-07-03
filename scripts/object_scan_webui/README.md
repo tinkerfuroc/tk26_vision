@@ -9,14 +9,23 @@ fallback logic that later lifts into `kimi_api/_scan_vlm.py`.
 
 ## What it does
 
-- **Shoot photos** — capture from the browser webcam, or drag/drop / upload
-  photos you took elsewhere (phone/robot). Saved under `./photos/`.
+- **Shoot photos** — three ways:
+  - browser webcam (with a camera picker),
+  - **robot ROS camera** — a **live MJPEG preview** of a color topic (so you can
+    aim) + one-click **Capture frame** (needs the camera launched + ROS sourced;
+    this is the camera the real service uses),
+  - drag/drop / upload photos you took elsewhere (phone).
+  Saved under `./photos/`.
 - **Run tests** — split the 32-class PickAndPlace vocabulary into batches, run
-  one Gemini call per batch (Qwen fallback), union the results. Shows found
-  labels on the vocab grid (green = found, so misses are obvious), a per-batch
+  one Gemini call per batch (Qwen fallback), **all batches in parallel**, union
+  the results. Shows found labels on the vocab grid (green = found), a per-batch
   table (items / found / provider / latency), and total time.
-- **Sweep** — run several `batch_size` values on the same photo and compare
-  found-count vs latency, to pick the best batch size.
+- **Sweep (find the best batch_size)** — run several `batch_size` values, each
+  **`repeats` times** (VLM answers vary run-to-run, so repeats reveal the
+  *reliable* best), and compare avg-found + run-to-run range + latency.
+  **★-click the vocab chips** to mark what's *actually* in the photo (ground
+  truth) and the sweep ranks by **recall/precision/F1** instead of raw count, so
+  false positives don't inflate the winner.
 
 ## Vocabulary
 

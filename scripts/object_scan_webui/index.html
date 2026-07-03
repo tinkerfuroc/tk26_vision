@@ -50,8 +50,10 @@
   .controls{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
   .grid{display:flex;flex-wrap:wrap;gap:6px}
   .chip{padding:3px 9px;border-radius:16px;border:1px solid var(--line);
-    color:var(--dim);font:12px var(--mono);transition:.12s}
+    color:var(--dim);font:12px var(--mono);transition:.12s;cursor:pointer;user-select:none}
   .chip.found{background:var(--ok-bg);border-color:var(--ok);color:#7ee2a0;font-weight:600}
+  .chip.truth{box-shadow:inset 0 0 0 1.5px var(--accent)}
+  .chip.truth::before{content:"★ ";color:var(--accent)}
   .summary{margin:12px 0;font:13px var(--mono)}
   .summary b{color:var(--ink)}
   table{width:100%;border-collapse:collapse;font:12px var(--mono);margin-top:8px}
@@ -101,13 +103,16 @@
       <div class="muted" style="font-size:12px;margin-bottom:6px">Robot camera (ROS topic)</div>
       <div class="row">
         <select id="rosPreset" style="flex:1;min-width:0"></select>
+        <button id="rosPrev">Live preview</button>
         <button id="rosGrab">Capture frame</button>
       </div>
       <input id="rosCustom" placeholder="/some/color/image_raw"
         style="display:none;margin-top:6px;width:100%;font:inherit;color:var(--ink);
         background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px">
-      <div class="hint">Grabs one frame server-side (needs the camera launched +
-        ROS sourced). This is the camera the real object_scan service uses.</div>
+      <img id="rosPreview" style="display:none;width:100%;border-radius:8px;background:#000;margin-top:8px">
+      <div class="hint"><b>Live preview</b> streams the topic continuously so you
+        can aim; <b>Capture frame</b> saves the current frame. Needs the camera
+        launched + ROS sourced. This is the camera the real object_scan uses.</div>
     </div>
 
     <div id="dz" style="margin-top:14px">Drag &amp; drop photos here, or
@@ -133,8 +138,14 @@
     <div class="controls">
       <label class="f" style="flex:1">sweep batch sizes
         <input id="sweep" value="4,6,8,12,16" style="width:100%"></label>
+      <label class="f" title="runs per batch size — VLM answers vary, so repeats reveal the reliable best">repeats
+        <input id="repeats" type="number" min="1" max="10" value="3"></label>
       <button id="runSweep">Run sweep</button>
     </div>
+    <div class="hint" style="margin:-4px 0 8px">
+      Tip: click the vocab chips below to ★ mark what's <b>actually</b> in the photo
+      (ground truth). Then the sweep ranks batch sizes by <b>recall</b> instead of raw
+      count, so false positives don't inflate the "best".</div>
 
     <div id="results" style="display:none">
       <div class="summary" id="summary"></div>
@@ -226,11 +237,29 @@ $('#shoot').onclick=async()=>{
   $('#rosPreset').innerHTML=presets.map(p=>`<option value="${p.topic}">${p.label}</option>`).join('')
     +'<option value="__custom">custom topic…</option>';
 })();
+function rosTopic(){
+  let t=$('#rosPreset').value;
+  if(t==='__custom')t=$('#rosCustom').value.trim();
+  return t;
+}
 $('#rosPreset').onchange=()=>{
-  $('#rosCustom').style.display=$('#rosPreset').value==='__custom'?'block':'none';};
+  $('#rosCustom').style.display=$('#rosPreset').value==='__custom'?'block':'none';
+  if($('#rosPreview').style.display!=='none')startRosPreview();  // switch live feed
+};
+let rosPreviewing=false;
+function stopRosPreview(){
+  rosPreviewing=false;const img=$('#rosPreview');img.removeAttribute('src');
+  img.style.display='none';$('#rosPrev').textContent='Live preview';}
+function startRosPreview(){
+  const topic=rosTopic();if(!topic)return setStatus('enter a topic','err');
+  const img=$('#rosPreview');
+  img.onerror=()=>{if(rosPreviewing){setStatus('preview failed — camera launched + ROS sourced?','err');stopRosPreview();}};
+  img.src='/api/ros_stream?topic='+encodeURIComponent(topic)+'&t='+Date.now();
+  img.style.display='block';rosPreviewing=true;$('#rosPrev').textContent='Stop preview';
+  setStatus('live preview: '+topic,'ok');}
+$('#rosPrev').onclick=()=>rosPreviewing?stopRosPreview():startRosPreview();
 $('#rosGrab').onclick=async()=>{
-  let topic=$('#rosPreset').value;
-  if(topic==='__custom')topic=$('#rosCustom').value.trim();
+  const topic=rosTopic();
   if(!topic)return setStatus('enter a topic','err');
   const btn=$('#rosGrab');btn.disabled=true;btn.textContent='grabbing…';
   setStatus('grabbing a frame from '+topic+'…');
@@ -276,12 +305,20 @@ async function loadGallery(){
 function selectPhoto(n){SELECTED=n;$('#preview').src='/photos/'+n;$('#selName').textContent=n;
   $$('.thumb').forEach(t=>t.classList.toggle('sel',t.querySelector('img').src.endsWith(n)));}
 
-// ---- vocab grid ----
+// ---- vocab grid (found highlight + clickable ground-truth) ----
+let TRUTH=new Set();
 function renderVocabGrid(found){
   const set=new Set(found||[]);
   $('#vocab').innerHTML=VOCAB.map(v=>
-    `<span class="chip${set.has(v)?' found':''}">${v}</span>`).join('');
+    `<span class="chip${set.has(v)?' found':''}${TRUTH.has(v)?' truth':''}"
+      data-label="${v}">${v}</span>`).join('');
 }
+// delegate clicks so handlers survive re-render
+$('#vocab').addEventListener('click',e=>{
+  const c=e.target.closest('.chip');if(!c)return;
+  const v=c.dataset.label;TRUTH.has(v)?TRUTH.delete(v):TRUTH.add(v);
+  c.classList.toggle('truth');
+});
 
 // ---- run test ----
 $('#run').onclick=async()=>{
@@ -321,33 +358,58 @@ $('#runSweep').onclick=async()=>{
   if(!SELECTED)return setStatus('select or shoot a photo first','err');
   const sizes=$('#sweep').value.split(',').map(x=>parseInt(x.trim())).filter(Boolean);
   if(!sizes.length)return setStatus('enter batch sizes e.g. 4,8,16','err');
+  const reps=Math.max(1,+$('#repeats').value||1);
+  const truth=[...TRUTH];
   const btn=$('#runSweep');btn.disabled=true;btn.textContent='sweeping…';
-  setStatus(`sweeping ${sizes.length} batch sizes… (this runs the scan ${sizes.length}×)`);
+  setStatus(`sweeping ${sizes.length} sizes × ${reps} repeats = ${sizes.length*reps} scans…`);
   try{
     const res=await jsend('/api/sweep','POST',{photo:SELECTED,batch_sizes:sizes,
-      max_workers:+$('#workers').value,use_qwen_fallback:$('#qwen').value==='1'});
+      repeats:reps,truth,max_workers:+$('#workers').value,use_qwen_fallback:$('#qwen').value==='1'});
     if(res.error)throw new Error(res.error);
-    renderSweep(res.sweep);setStatus('sweep done','ok');
+    renderSweep(res.sweep,truth.length>0);setStatus('sweep done','ok');
   }catch(e){setStatus('sweep failed: '+e.message,'err');}
   finally{btn.disabled=false;btn.textContent='Run sweep';}
 };
-function renderSweep(rows){
-  $('#results').style.display='';
-  const best=Math.max(...rows.map(r=>r.n_found));
-  let h=`<h2 style="margin-top:16px">Batch-size sweep</h2>
-    <table><tr><th>batch_size</th><th>found</th><th>latency</th><th>labels</th></tr>`;
+function unionFound(r){const s=new Set();r.runs.forEach(x=>x.found_labels.forEach(l=>s.add(l)));return [...s];}
+function renderSweep(rows,hasTruth){
+  $('#results').style.display='';$('#batchBox').innerHTML='';
+  // rank: by recall if ground truth given, else by avg found; tie-break lower latency
+  const key=hasTruth?(r=>[r.avg_recall,-r.avg_latency_s]):(r=>[r.avg_found,-r.avg_latency_s]);
+  const cmp=(a,b)=>{const ka=key(a),kb=key(b);return kb[0]-ka[0]||kb[1]-ka[1];};
+  const ranked=[...rows].sort(cmp);const best=ranked[0];
+  let h=`<h2 style="margin-top:16px">Batch-size sweep — best: bs=${best.batch_size}</h2>
+    <table><tr><th>batch_size</th><th>avg found</th><th>range</th>`
+    +(hasTruth?`<th>recall</th><th>precision</th><th>F1</th>`:``)
+    +`<th>avg lat</th></tr>`;
   rows.forEach(r=>{
-    h+=`<tr class="${r.n_found===best?'best':''}"><td>${r.batch_size}</td>
-      <td class="found">${r.n_found}/${r.n_vocab}</td><td>${r.total_latency_s}s</td>
-      <td class="muted">${r.found_labels.join(', ')||'—'}</td></tr>`;
+    h+=`<tr class="${r===best?'best':''}"><td>${r.batch_size}</td>
+      <td class="found">${r.avg_found}/${r.n_vocab}</td>
+      <td class="muted">${r.min_found}–${r.max_found}</td>`
+      +(hasTruth?`<td class="found">${(r.avg_recall*100).toFixed(0)}%</td>
+        <td>${(r.avg_precision*100).toFixed(0)}%</td><td>${r.avg_f1}</td>`:``)
+      +`<td>${r.avg_latency_s}s</td></tr>`;
   });
-  h+=`</table><div class="hint">Highlighted row = most objects found.
-    Best batch_size balances recall (found) against latency.</div>`;
+  h+=`</table><div class="hint">`
+    +(hasTruth
+      ? `Ranked by <b>recall</b> over ${best.n_truth} ground-truth items (avg of ${best.repeats} runs). `
+        +`Higher recall = fewer misses; watch precision for false positives.`
+      : `Ranked by <b>avg found</b> over ${best.repeats} runs (no ground truth set — `
+        +`★-mark chips to rank by true recall). Range shows run-to-run variance.`)
+    +`</div>`;
+  // per-size found detail
+  h+=`<details style="margin-top:8px"><summary>per-run found labels</summary><pre>`+
+    rows.map(r=>`bs=${r.batch_size}:\n`+r.runs.map((x,i)=>
+      `  run${i+1} (${x.n_found}): ${x.found_labels.join(', ')||'—'}`
+      +(hasTruth&&x.missed.length?`\n         missed: ${x.missed.join(', ')}`:``)
+      +(hasTruth&&x.false_pos.length?`\n         false+: ${x.false_pos.join(', ')}`:``)
+      ).join('\n')).join('\n\n').replace(/</g,'&lt;')+`</pre></details>`;
   $('#sweepBox').innerHTML=h;
-  // show union of the best row on the grid
-  const b=rows.find(r=>r.n_found===best);renderVocabGrid(b?b.found_labels:[]);
-  $('#batchBox').innerHTML='';
-  $('#summary').innerHTML=`sweep of <b>${rows.length}</b> batch sizes · grid shows best (bs=<b>${b?b.batch_size:'?'}</b>)`;
+  renderVocabGrid(unionFound(best));   // grid = union of the best size's runs
+  $('#summary').innerHTML=`sweep of <b>${rows.length}</b> sizes × <b>${best.repeats}</b> repeats · `
+    +`best <b>bs=${best.batch_size}</b>`
+    +(hasTruth?` · recall <b>${(best.avg_recall*100).toFixed(0)}%</b> · precision <b>${(best.avg_precision*100).toFixed(0)}%</b>`
+              :` · avg found <b>${best.avg_found}/${best.n_vocab}</b>`)
+    +` · <b>${best.avg_latency_s}s</b>`;
 }
 </script>
 </body>

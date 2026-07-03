@@ -25,7 +25,9 @@ ros2 run tk_vision_specialized spot_on_shelf_server
 
 ## DetectWaving
 
-Request: `threshold_meters` (float, ≤0 = no limit), `target_frame` (string, e.g. `"map"` or `"base_link"`). Response: `status` (0=found, 1=none, -1=error), `error_msg`, `waving_persons[]` (PointStamped, sorted closest-first). `rgb_image`, `depth_image`, `segments[]` are declared but not populated by the current server.
+Request: `threshold_meters` (float, ≤0 = no limit), `target_frame` (string, e.g. `"map"` or `"base_link"`), `min_waving_persons` (int32, default 0). Response: `status` (0=found, 1=none, -1=error), `error_msg`, `waving_persons[]` (PointStamped, sorted closest-first). `rgb_image`, `depth_image`, `segments[]` are declared but not populated by the current server.
+
+`min_waving_persons` is an explicit per-caller opt-in to a concurrent VLM (Gemini/Qwen) fallback: if `> 0`, the server launches the VLM call on a background thread as soon as the frame is available (parallel with the YOLO+MediaPipe pass above) and blocks on it only if the CV pass alone found fewer than `min_waving_persons` wavers — otherwise the VLM call is abandoned (left running, result discarded) without adding latency. Leaving it at the default `0` (every caller except Restaurant's `BtNode_ScanForWavingPerson`) keeps the fast, VLM-free path unchanged. `enable_vlm_fallback` (node param, default `true`) is the master kill-switch; `vlm_timeout_s` (default 20.0) bounds the wait.
 
 Pipeline:
 1. Grab latest synchronized RGB + `PointCloud2` + `CameraInfo`.
@@ -93,4 +95,5 @@ Python (via `requirements.txt`, pip-installed): `ultralytics>=8.0.0`, `mediapipe
 
 ## Changelog
 
+- **2026-07-03** — `DetectWaving.min_waving_persons` now gates a concurrent VLM waving-detection fallback (was previously declared but unused — the trigger condition it fed was never satisfied by any real caller). VLM call launches on a background thread as soon as the frame is available, in parallel with the YOLO+MediaPipe pass; abandoned without waiting if CV alone already found enough wavers. Restaurant's BT node is the only caller that opts in (`min_waving_persons=2`); GPSR/EGPSR and the `track_web` bench tool never set it, so they keep the pre-existing fast-only behavior unchanged.
 - **2026-04-30** — Add `placing_location_server` (VLM-only tabletop placing-location service) + `tinker_vision_msgs_26/srv/PlacingLocation`. Subclasses `YOLOSegmentationNode` for camera I/O reuse; calls Gemini 2.5 Pro via `kimi_api._env`; returns `PointStamped[]` ranked best→worst. No automated tests added — VLM round-trip is non-deterministic.

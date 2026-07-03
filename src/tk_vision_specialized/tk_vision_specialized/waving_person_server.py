@@ -14,6 +14,7 @@ import numpy as np
 import mediapipe as mp
 from ultralytics import YOLO
 import threading
+from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError as FutureTimeoutError
 from geometry_msgs.msg import PointStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -27,6 +28,7 @@ from ._waving_vlm import (
     request_waving_persons_chain,
     build_provider_models,
     has_provider_key,
+    should_wait_for_vlm,
     WavingVlmError,
 )
 from ._waving_geometry import is_duplicate_box, centroid_from_box
@@ -163,6 +165,7 @@ class DetectWavingPersonsNode(Node):
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('vlm_dedup_iou', 0.3)
+        self.declare_parameter('vlm_skip_min_wavers', 2)
         self.enable_vlm_fallback = (
             self.get_parameter('enable_vlm_fallback').value)
         self.vlm_provider = self.get_parameter('vlm_provider').value
@@ -173,7 +176,16 @@ class DetectWavingPersonsNode(Node):
         self.vlm_timeout_s = float(self.get_parameter('vlm_timeout_s').value)
         self.vlm_max_retries = int(self.get_parameter('vlm_max_retries').value)
         self.vlm_dedup_iou = float(self.get_parameter('vlm_dedup_iou').value)
+        self.vlm_skip_min_wavers = int(
+            self.get_parameter('vlm_skip_min_wavers').value)
         self._vlm_chain = self._resolve_provider_chain()
+        # Dedicated pool for the concurrent VLM waving-fallback call. 2
+        # workers, not 1: an abandoned call from an early-exited request (see
+        # _start_vlm_call / detect_waving_callback) can still be finishing in
+        # the background when the NEXT request submits its own call -- with
+        # only 1 worker, that submission would queue behind the abandoned one
+        # and silently reintroduce the wait this whole change exists to avoid.
+        self._vlm_executor = ThreadPoolExecutor(max_workers=2)
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
         self._vision_logger = VisionLogger(
@@ -217,6 +229,7 @@ class DetectWavingPersonsNode(Node):
             self.get_logger().warn(f'Failed to spawn rqt_image_view: {exc}')
 
     def destroy_node(self):
+        self._vlm_executor.shutdown(wait=False)
         if self._viewer_proc is not None and self._viewer_proc.poll() is None:
             try:
                 self._viewer_proc.terminate()
@@ -431,27 +444,51 @@ class DetectWavingPersonsNode(Node):
                 f'Waving VLM chain: {[p for p, _ in chain]}')
         return chain
 
-    def _vlm_augment(self, rgb_image, points, validmask_points, header, request,
-                     person_records, waving_persons_centroids,
-                     waving_annotations, waving_masks, waving_sources):
-        """Call the VLM chain and append the wavers MediaPipe missed.
+    def _start_vlm_call(self, rgb_image):
+        """Launch the VLM waving-fallback call on the dedicated executor.
 
-        Mutates the four aligned waver lists in place. Returns
-        (n_added, provider_used). Never raises: any VLM failure logs a warning
-        and returns (0, '') so the service still answers with MediaPipe results.
+        Returns None immediately if the fallback is disabled or no provider
+        has a key configured -- callers treat None the same as "nothing to
+        wait for, nothing to merge." Otherwise returns a Future whose
+        .result() is a WavingVlmResult, or raises WavingVlmError on hard
+        failure (matching request_waving_persons_chain's own contract).
+        """
+        if not self.enable_vlm_fallback or not self._vlm_chain:
+            return None
+        return self._vlm_executor.submit(
+            request_waving_persons_chain, rgb_image,
+            provider_models=self._vlm_chain,
+            timeout_s=self.vlm_timeout_s, max_retries=self.vlm_max_retries,
+            logger=self.get_logger(),
+        )
+
+    def _log_discarded_vlm_result(self, future: Future):
+        """Done-callback for an abandoned (early-exited) VLM future.
+
+        Never raises: swallows whatever the call eventually produced (result
+        or exception) so an abandoned call finishing later doesn't surface as
+        an unhandled-exception warning from the executor thread.
         """
         try:
-            result = request_waving_persons_chain(
-                rgb_image, provider_models=self._vlm_chain,
-                timeout_s=self.vlm_timeout_s, max_retries=self.vlm_max_retries,
-                logger=self.get_logger())
-        except WavingVlmError as exc:
-            self.get_logger().warn(f'VLM waving fallback unavailable: {exc}')
-            return 0, ''
+            future.result()
+            self.get_logger().debug(
+                'Discarded VLM waving result (CV already found enough wavers).')
+        except Exception as exc:  # noqa: BLE001 -- intentionally swallowed
+            self.get_logger().debug(f'Discarded VLM waving call failed: {exc}')
 
+    def _merge_vlm_result(self, vlm_result, points, validmask_points, header,
+                          request, person_records, waving_persons_centroids,
+                          waving_annotations, waving_masks, waving_sources):
+        """Fold a completed WavingVlmResult into the CV-found waver lists.
+
+        Mutates the four aligned waver lists in place. Returns
+        (n_added, provider_used). Same dedup/centroid logic the old
+        _vlm_augment had, just taking an already-computed result instead of
+        fetching it itself.
+        """
         existing_boxes = [(a[0], a[1], a[2], a[3]) for a in waving_annotations]
         n_added = 0
-        for box in result.boxes:
+        for box in vlm_result.boxes:
             if is_duplicate_box(box, existing_boxes,
                                 iou_thresh=self.vlm_dedup_iou):
                 continue
@@ -480,7 +517,7 @@ class DetectWavingPersonsNode(Node):
             waving_sources.append('vlm')
             existing_boxes.append(box)
             n_added += 1
-        return n_added, result.provider
+        return n_added, vlm_result.provider
 
     def is_waving(self, pose_landmarks, person_roi):
         if pose_landmarks is None:
@@ -562,6 +599,12 @@ class DetectWavingPersonsNode(Node):
             camera_k = self.camera_k
         finally:
             self.img_lock.release()
+
+        # Launch the VLM fallback now, in parallel with the depth conversion +
+        # YOLO + MediaPipe pass below -- it only needs rgb_image, which is
+        # already available. See _start_vlm_call / the merge-or-discard logic
+        # after the CV loop.
+        vlm_future = self._start_vlm_call(rgb_image)
 
         self.get_logger().info('Data copied for processing. Starting detection...')
         transform = None
@@ -730,17 +773,32 @@ class DetectWavingPersonsNode(Node):
 
         n_vlm_added = 0
         vlm_provider_used = ''
-        if (self._vlm_chain
-                and request.min_waving_persons > 0
-                and len(waving_persons_centroids) < request.min_waving_persons):
-            n_vlm_added, vlm_provider_used = self._vlm_augment(
-                rgb_image, points, validmask_points, header, request,
-                person_records, waving_persons_centroids,
-                waving_annotations, waving_masks, waving_sources,
-            )
-            self.get_logger().info(
-                f'VLM fallback added {n_vlm_added} waver(s) '
-                f'(provider={vlm_provider_used or "none"}).')
+        if vlm_future is not None:
+            if should_wait_for_vlm(
+                    len(waving_persons_centroids), self.vlm_skip_min_wavers):
+                try:
+                    vlm_result = vlm_future.result(timeout=self.vlm_timeout_s)
+                except (WavingVlmError, FutureTimeoutError) as exc:
+                    self.get_logger().warn(
+                        f'VLM waving fallback unavailable: {exc}')
+                    vlm_result = None
+                if vlm_result is not None:
+                    n_vlm_added, vlm_provider_used = self._merge_vlm_result(
+                        vlm_result, points, validmask_points, header, request,
+                        person_records, waving_persons_centroids,
+                        waving_annotations, waving_masks, waving_sources,
+                    )
+                    self.get_logger().info(
+                        f'VLM fallback added {n_vlm_added} waver(s) '
+                        f'(provider={vlm_provider_used or "none"}).')
+            else:
+                vlm_future.add_done_callback(self._log_discarded_vlm_result)
+                self.get_logger().info(
+                    f'CV already found {len(waving_persons_centroids)} '
+                    f'waver(s) (>= vlm_skip_min_wavers='
+                    f'{self.vlm_skip_min_wavers}); discarding VLM call '
+                    f'without waiting.'
+                )
 
         # sort waving person centroids from closest to farthest (keep annotations + masks aligned)
         if waving_persons_centroids:

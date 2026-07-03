@@ -65,7 +65,7 @@
     enable_pan_tilt_follow: true
     pan_tilt_command_topic: /pan_tilt_controller/cmd
     pan_tilt_state_topic: /pan_tilt_controller/state
-    fixed_tilt_deg: 37.0
+    fixed_tilt_deg: 35.0
     pan_sign: 1.0                      # flip to -1.0 if the head turns away from the person
     pan_deadband_deg: 3.0
     pan_min_command_change_deg: 1.0

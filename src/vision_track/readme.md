@@ -123,6 +123,11 @@ ros2 run vision_track person_track_server --ros-args \
 
 ## Changelog
 
+- **2026-07-03 — Pan-follow tilt 37° → 35°.** `fixed_tilt_deg` default lowered to
+  35° (code default + `config/default.yaml`) at user request. `BtNode_RecoveryScan`'s
+  `tilt_deg` default (tk25_decision `FollowPerson/nodes.py`) moved to 35° in lockstep
+  to preserve the no-tilt-jump invariant from the 2026-06-15 entry below (same tilt
+  across normal follow and NEEDS_HELP recovery scan).
 - **2026-07-02 — Centroid: all-bbox-depth fallback removed.**
   `_calculate_centroid` now returns no point when the segmentation mask
   overlaps <10 valid-depth pixels, instead of falling back to the median of

@@ -1,0 +1,46 @@
+# Scenario suite for `ros2 run tk_vision_specialized waving_bench`.
+# Bench rig + operator protocol: docs/superpowers/specs/
+# 2026-07-03-orbbec-only-restaurant-vision-bench-design.md §4.
+# Distances are floor-tape marks measured from the camera plane.
+
+defaults:
+  threshold_meters: 8.0        # match production DETECT_WAVING_THRESHOLD_M
+  target_frame: ""             # camera optical frame unless overridden
+  min_waving_persons: 0        # VLM fallback off unless a scenario opts in
+  calls_per_case: 5
+  interval_sec: 1.0
+  pass_ratio: 0.8              # >=4/5 calls must satisfy the case expectation
+
+scenarios:
+  smoke:
+    - prompt: "one person, wave at 2 m"
+      expect: {count: 1, z_range_m: [1.7, 2.3]}
+  range_ladder:
+    - {prompt: "wave at 1 m", expect: {count: 1, z_range_m: [0.7, 1.3]}}
+    - {prompt: "wave at 2 m", expect: {count: 1, z_range_m: [1.7, 2.3]}}
+    - {prompt: "wave at 4 m", expect: {count: 1, z_range_m: [3.7, 4.3]}}
+    - {prompt: "wave at 6 m", expect: {count: 1, z_range_m: [5.6, 6.4]}}
+    - {prompt: "wave at 8 m", expect: {count: 1, z_range_m: [7.5, 8.5]}, best_effort: true}
+  gesture_matrix:
+    - {prompt: "static raised hand (above head)", expect: {count: 1}}
+    - {prompt: "hand raised above elbow, elbow at shoulder height", expect: {count: 1}}
+    - {prompt: "arms down, walk around", expect: {status: 1, count: 0}}
+    - {prompt: "point sideways at shoulder height", expect: {status: 1, count: 0}}
+  two_person_arbitration:
+    - prompt: "A waves at 2 m, B waves at 4 m"
+      expect: {count: 2, ordering: closest_first}
+    - prompt: "A idle at 2 m, B waves at 4 m"
+      expect: {count: 1, z_range_m: [3.7, 4.3]}
+  threshold_gate:
+    - prompt: "wave at 4 m"
+      overrides: {threshold_meters: 3.0}
+      expect: {status: 1, count: 0}
+  frames:                       # requires the static-TF shim (design §4.2)
+    - prompt: "wave at 2 m"
+      overrides: {target_frame: base_link}
+      expect: {count: 1, frame_id: base_link}
+  vlm_fallback:                 # requires DASHSCOPE/OPENROUTER key + network
+    - prompt: "one person waves clearly, second sits waving small/far"
+      overrides: {min_waving_persons: 2}
+      expect: {count: 2}
+      best_effort: true

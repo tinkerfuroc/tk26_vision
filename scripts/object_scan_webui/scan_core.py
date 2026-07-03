@@ -275,15 +275,24 @@ def scan_image(
     vocabulary: list[str],
     *,
     batch_size: int = 8,
-    max_workers: int = 4,
+    max_workers: int = 0,
     use_qwen_fallback: bool = True,
     timeout_s: float = 20.0,
     max_retries: int = 2,
     log=None,
 ) -> ScanResult:
-    """Split the vocabulary, scan each batch concurrently, union the results."""
+    """Split the vocabulary, scan each batch concurrently, union the results.
+
+    ALL batches fire in parallel by default (`max_workers=0`): one thread per
+    batch, so total latency is ~one VLM call regardless of batch count. Set a
+    positive `max_workers` only to cap concurrency (e.g. against provider rate
+    limits).
+    """
     chain = ("gemini", "qwen") if use_qwen_fallback else ("gemini",)
     groups = batches(vocabulary, batch_size)
+    # 0 / negative -> one worker per batch (every batch call in parallel).
+    workers = len(groups) if max_workers <= 0 else min(max_workers, len(groups))
+    workers = max(1, workers)
     t0 = time.perf_counter()
 
     def _run(batch):
@@ -292,7 +301,7 @@ def scan_image(
             timeout_s=timeout_s, max_retries=max_retries, log=log,
         )
 
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         results = list(ex.map(_run, groups))
 
     total = time.perf_counter() - t0
@@ -319,7 +328,7 @@ def sweep_batch_sizes(
     vocabulary: list[str],
     batch_sizes: list[int],
     *,
-    max_workers: int = 4,
+    max_workers: int = 0,
     use_qwen_fallback: bool = True,
     timeout_s: float = 20.0,
     max_retries: int = 2,
@@ -346,7 +355,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Batched labels-only VLM scan")
     ap.add_argument("image", help="path to a photo")
     ap.add_argument("--batch-size", type=int, default=8)
-    ap.add_argument("--max-workers", type=int, default=4)
+    ap.add_argument("--max-workers", type=int, default=0,
+                    help="0 = one worker per batch (all in parallel); >0 caps it")
     ap.add_argument("--no-qwen", action="store_true", help="disable Qwen fallback")
     ap.add_argument("--sweep", default="", help="comma list of batch sizes, e.g. 4,8,16")
     args = ap.parse_args()

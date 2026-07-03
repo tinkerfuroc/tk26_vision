@@ -195,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
                 vocab = body.get("vocabulary") or scan_core.parse_vocabulary()
                 url = scan_core.path_to_data_url(p)
                 use_qwen = bool(body.get("use_qwen_fallback", True))
-                max_workers = int(body.get("max_workers", 4))
+                max_workers = int(body.get("max_workers", 0))  # 0 = all batches parallel
                 if path == "/api/scan":
                     res = scan_core.scan_image(
                         url, vocab,

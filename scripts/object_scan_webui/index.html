@@ -92,9 +92,25 @@
       <button id="camRefresh" title="re-scan cameras">⟳</button>
     </div>
     <div class="hint">Pick a camera and it switches live. Labels appear after you
-      Start once (the browser reveals them only after camera permission).</div>
+      Start once (the browser reveals them only after camera permission).
+      The browser only sees USB/built-in webcams — the robot's Orbbec/RealSense
+      aren't here; use <b>Robot camera</b> below for those.</div>
     <video id="cam" autoplay playsinline muted style="margin-top:10px;display:none"></video>
-    <div id="dz">Drag &amp; drop photos here, or
+
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+      <div class="muted" style="font-size:12px;margin-bottom:6px">Robot camera (ROS topic)</div>
+      <div class="row">
+        <select id="rosPreset" style="flex:1;min-width:0"></select>
+        <button id="rosGrab">Capture frame</button>
+      </div>
+      <input id="rosCustom" placeholder="/some/color/image_raw"
+        style="display:none;margin-top:6px;width:100%;font:inherit;color:var(--ink);
+        background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px">
+      <div class="hint">Grabs one frame server-side (needs the camera launched +
+        ROS sourced). This is the camera the real object_scan service uses.</div>
+    </div>
+
+    <div id="dz" style="margin-top:14px">Drag &amp; drop photos here, or
       <label style="color:var(--accent);cursor:pointer">browse<input id="file" type="file"
         accept="image/*" multiple hidden></label></div>
     <div id="status"></div>
@@ -202,6 +218,28 @@ $('#shoot').onclick=async()=>{
   const url=c.toDataURL('image/jpeg',0.92);
   const res=await jsend('/api/photos','POST',{image:url,source:'cam'});
   if(res.name){await loadGallery();selectPhoto(res.name);setStatus('captured '+res.name,'ok');}
+};
+
+// ---- robot camera (ROS topic, server-side grab) ----
+(async()=>{
+  const {presets=[]}=await jget('/api/ros_topics').catch(()=>({presets:[]}));
+  $('#rosPreset').innerHTML=presets.map(p=>`<option value="${p.topic}">${p.label}</option>`).join('')
+    +'<option value="__custom">custom topic…</option>';
+})();
+$('#rosPreset').onchange=()=>{
+  $('#rosCustom').style.display=$('#rosPreset').value==='__custom'?'block':'none';};
+$('#rosGrab').onclick=async()=>{
+  let topic=$('#rosPreset').value;
+  if(topic==='__custom')topic=$('#rosCustom').value.trim();
+  if(!topic)return setStatus('enter a topic','err');
+  const btn=$('#rosGrab');btn.disabled=true;btn.textContent='grabbing…';
+  setStatus('grabbing a frame from '+topic+'…');
+  try{
+    const r=await jsend('/api/ros_capture','POST',{topic});
+    if(r.name){await loadGallery();selectPhoto(r.name);setStatus('captured '+r.name,'ok');}
+    else throw new Error(r.error||'grab failed');
+  }catch(e){setStatus('robot capture failed: '+e.message,'err');}
+  finally{btn.disabled=false;btn.textContent='Capture frame';}
 };
 
 // ---- upload / drag-drop ----

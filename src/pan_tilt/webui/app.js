@@ -1920,7 +1920,7 @@ $('#calib-urdf-diff-btn').addEventListener('click', async () => {
     $('#calib-urdf-status').className = 'status-line warn';
     return;
   }
-  const xacroPath = $('#calib-urdf-target').value;
+  // Target is per-robot ($ROBOT_NAME), resolved server-side — no path is sent.
   const resultsFile = $('#calib-urdf-results').value;
   const statusEl = $('#calib-urdf-status');
   const diffEl = $('#calib-urdf-diff');
@@ -1929,7 +1929,7 @@ $('#calib-urdf-diff-btn').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/calib/urdf_diff', {
       method: 'POST', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({session: CALIB.currentSession, xacro_path: xacroPath, results_file: resultsFile}),
+      body: JSON.stringify({session: CALIB.currentSession, results_file: resultsFile}),
     });
     const body = await readJsonResponse(r);
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
@@ -1975,13 +1975,9 @@ $('#calib-urdf-apply-btn').addEventListener('click', async () => {
     $('#calib-urdf-status').className = 'status-line warn';
     return;
   }
-  const xacroPath = $('#calib-urdf-target').value;
-  if (!xacroPath) {
-    $('#calib-urdf-status').textContent = 'pick a URDF target first';
-    $('#calib-urdf-status').className = 'status-line warn';
-    return;
-  }
-  const target = CALIB.urdfTargets.find(t => t.path === xacroPath);
+  // Target is per-robot ($ROBOT_NAME), resolved server-side — the single
+  // dropdown entry is informational; a refusal comes back as HTTP 400.
+  const target = CALIB.urdfTargets[0];
   const resultsFile = $('#calib-urdf-results').value || 'polish.json';
   const statusEl = $('#calib-urdf-status');
   const rebuildEl = $('#calib-urdf-rebuild');
@@ -1991,36 +1987,39 @@ $('#calib-urdf-apply-btn').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/calib/urdf_apply', {
       method: 'POST', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({session: CALIB.currentSession, xacro_path: xacroPath, results_file: resultsFile}),
+      body: JSON.stringify({session: CALIB.currentSession, results_file: resultsFile}),
     });
     const body = await readJsonResponse(r);
     if (!r.ok) throw new Error(body.detail || JSON.stringify(body));
     if (!body.applied) {
-      statusEl.textContent = body.reason || 'no change — xacro already matches calibration';
+      statusEl.textContent = body.reason || 'no change — per-robot files already match calibration';
       statusEl.className = 'status-line ok';
       return;
     }
-    statusEl.textContent = `patched ${target?.label || xacroPath} — rebuild required`;
+    statusEl.textContent = `applied to ${target?.label || 'per-robot files'} — rebuild required`;
     statusEl.className = 'status-line ok';
     $('#calib-urdf-rebuild-cmd').textContent = body.build_command || '';
     $('#calib-urdf-rebuild-hint').textContent = body.workspace_hint || '';
-    // Two-line backup hint: URDF + YAML. The YAML line surfaces whether
-    // the runtime offsets just changed (or were already current) so the
-    // operator never wonders whether they still need to hand-edit it.
+    // Backup hint: overrides xacro + offsets yaml. The offsets line surfaces
+    // whether the runtime offsets just changed (or were already current) so
+    // the operator never wonders whether they still need to hand-edit it.
     const backupLines = [];
+    if (body.written?.length) {
+      backupLines.push(`Wrote: ${body.written.join('\n       ')}`);
+    }
     if (body.backup_path) {
-      backupLines.push(`URDF backup: ${body.backup_path}`);
+      backupLines.push(`Overrides xacro backup: ${body.backup_path}`);
     }
     if (body.yaml_path) {
       if (body.yaml_applied && body.yaml_backup_path) {
         const pan = body.pan_offset_rad?.toFixed(10) ?? '?';
         const tilt = body.tilt_offset_rad?.toFixed(10) ?? '?';
         backupLines.push(
-          `YAML backup: ${body.yaml_backup_path}`,
+          `offsets.yaml backup: ${body.yaml_backup_path}`,
           `Runtime offsets: pan=${pan}, tilt=${tilt}`,
         );
       } else {
-        backupLines.push(`YAML: already matches calibration (no change)`);
+        backupLines.push(`offsets.yaml: already matches calibration (no change)`);
       }
     }
     $('#calib-urdf-backup-hint').textContent = backupLines.join('\n');

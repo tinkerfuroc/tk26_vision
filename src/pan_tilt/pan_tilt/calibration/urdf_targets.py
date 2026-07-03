@@ -1,30 +1,33 @@
-"""Resolve the xacro files that should receive the calibration patch.
+"""Resolve the calibration apply target for the Calibrate tab.
 
-Two distinct URDFs define the pan-tilt geometry in this workspace:
+Since the per-robot split (tk25_basic ``db1524a`` + Task 3 / Phase 1c), the
+apply target is exactly ONE location, keyed by ``$ROBOT_NAME``::
 
-* ``tk25_basic`` exposes a *macro* form (``<xacro:macro name="pan_tilt_macro" …>``)
-  at ``<share>/tinker_urdf/src/pan_tilt.urdf.xacro`` -- the macro is parameterised
-  on ``attach_xyz`` / ``attach_rpy`` and is the geometry that the main robot
-  bringup loads (combined mobile-manipulator URDF).
-* The tk26 ``pan_tilt`` package ships a *standalone* form at
-  ``<share>/pan_tilt/urdf/pan_tilt.urdf.xacro`` for dev bringup
-  (``pan_tilt.launch.py``).
+    src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/
+        pan_tilt_overrides.xacro + offsets.yaml
 
-Both need to stay in sync so RViz and the live robot agree. The Calibrate tab
-lets the operator diff against either target. ``apply_to_urdf.py`` itself
-auto-detects which form it was given (see ``MACRO_DECL_RE`` in that module)
-so we just need to feed it the right file.
+The shared xacros under ``tinker_urdf/`` are no longer patchable targets —
+``pan_tilt.urdf.xacro`` auto-includes the per-robot overrides file at
+xacro-parse time, so writing the per-robot pair IS the complete deployment.
 
-This helper resolves both share directories via ``ament_index_python`` and
-returns a uniform ``[{label, path, exists, form}, ...]`` descriptor the web UI
-can render directly. It never raises on missing packages -- a missing share
-dir just yields ``exists=False`` so the UI can grey that option out.
+``list_targets()`` returns a single-entry descriptor list (same
+``[{label, path, exists, ...}]`` shape as before so the web UI renders it
+unchanged). When ``ROBOT_NAME`` is unset or the robot has no profile, the
+entry carries ``exists=False`` and a label explaining the fix; the actual
+refusal is enforced server-side by ``apply_to_urdf`` (HTTP 400 in calib_web).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Optional
+
+from .apply_to_urdf import (
+    BUILD_COMMAND,
+    OVERRIDES_XACRO_NAME,
+    WORKSPACE_HINT,
+    CalibrationApplyError,
+    resolve_per_robot_dir,
+)
 
 
 @dataclass
@@ -32,71 +35,46 @@ class UrdfTarget:
     label: str
     path: str
     exists: bool
-    form: str          # "macro" or "standalone" -- documents the xacro shape
-    build_package: str # which colcon package to rebuild after applying the patch
-    build_command: str # exact shell command the operator should run
-    workspace_hint: str # cwd hint for the rebuild (which workspace root)
+    form: str           # "per-robot" — the only apply-target form left
+    build_package: str   # which colcon package to rebuild after applying
+    build_command: str   # exact shell command the operator should run
+    workspace_hint: str  # cwd hint for the rebuild (which workspace root)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def _share(pkg: str) -> Optional[Path]:
-    """Return the share directory for ``pkg`` or None if the package is not
-    installed in this overlay. Tolerates ament_index_python being missing
-    (e.g. during headless unit tests)."""
-    try:
-        from ament_index_python.packages import get_package_share_directory
-        from ament_index_python.packages import PackageNotFoundError
-    except ImportError:
-        return None
-    try:
-        return Path(get_package_share_directory(pkg))
-    except PackageNotFoundError:
-        return None
-
-
-def _target(label: str, pkg: str, rel: str, form: str,
-            build_package: str, build_command: str, workspace_hint: str) -> UrdfTarget:
-    share = _share(pkg)
-    if share is None:
-        return UrdfTarget(label=label, path=f"<{pkg} not installed>",
-                          exists=False, form=form, build_package=build_package,
-                          build_command=build_command, workspace_hint=workspace_hint)
-    path = share / rel
-    return UrdfTarget(label=label, path=str(path), exists=path.is_file(),
-                      form=form, build_package=build_package,
-                      build_command=build_command, workspace_hint=workspace_hint)
-
-
 def list_targets() -> list[UrdfTarget]:
-    """Two-entry list, macro first (authoritative runtime URDF).
+    """Single-entry list: ``robots/<ROBOT_NAME>/pan_tilt/``.
 
-    Both should be patched so dev and production stay in lockstep; we surface
-    both and let the operator apply whichever is relevant.
-
-    Build commands differ by package: `tinker_urdf` is a pure ament_cmake
-    URDF package and uses plain `colcon build`; `pan_tilt` lives in the tk26
-    venv-backed tree and needs the wrapper at `scripts/build.sh` so the
-    install-tree shebangs see the venv (see `src/tk26_vision/CLAUDE.md`).
+    ``exists`` is True only when the robot's ``pan_tilt_overrides.xacro`` is
+    present in the tk25_basic source tree (every onboarded robot ships one).
     """
-    return [
-        _target(
-            label="tk25_basic macro (authoritative runtime URDF)",
-            pkg="tinker_urdf",
-            rel="src/pan_tilt.urdf.xacro",
-            form="macro",
-            build_package="tinker_urdf",
-            build_command="colcon build --packages-select tinker_urdf",
-            workspace_hint="run from the main workspace root (e.g. ~/tk25_ws)",
-        ),
-        _target(
-            label="tk26_vision standalone (legacy — NOT the runtime URDF; runtime renders tinker_urdf/pan_tilt_standalone which includes the macro)",
-            pkg="pan_tilt",
-            rel="urdf/pan_tilt.urdf.xacro",
-            form="standalone",
-            build_package="pan_tilt",
-            build_command="./src/tk26_vision/scripts/build.sh --packages-select pan_tilt",
-            workspace_hint="run from the main workspace root (e.g. ~/tk25_ws)",
-        ),
-    ]
+    common = dict(
+        form="per-robot",
+        build_package="tinker_robot_config",
+        build_command=BUILD_COMMAND,
+        workspace_hint=WORKSPACE_HINT,
+    )
+    robot = os.environ.get("ROBOT_NAME", "").strip()
+    if not robot:
+        return [UrdfTarget(
+            label=("ROBOT_NAME not set — export ROBOT_NAME=tinker1|tinker2 "
+                   "and restart calib_web"),
+            path="",
+            exists=False,
+            **common,
+        )]
+    label = f"robots/{robot}/pan_tilt/ (per-robot apply target)"
+    try:
+        per_robot_dir = resolve_per_robot_dir(robot)
+    except CalibrationApplyError as exc:
+        return [UrdfTarget(
+            label=label, path=f"<unresolved: {exc}>", exists=False, **common,
+        )]
+    return [UrdfTarget(
+        label=label,
+        path=str(per_robot_dir),
+        exists=(per_robot_dir / OVERRIDES_XACRO_NAME).is_file(),
+        **common,
+    )]

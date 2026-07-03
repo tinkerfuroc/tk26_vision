@@ -177,6 +177,39 @@ There is no in-tree `config/calibration.yaml` in this package anymore (it
 was retired in P5a). Full calibration procedure docs live alongside the
 code at [`pan_tilt/calibration/readme.md`](./pan_tilt/calibration/readme.md).
 
+### Applying calibration results (per-robot only)
+
+Calibration Apply (calib_web's **Preview**/**Apply** buttons and the
+`python -m pan_tilt.calibration.apply_to_urdf` CLI) targets exactly **two
+per-robot files** in the tk25_basic SOURCE tree, keyed by `$ROBOT_NAME`:
+
+```
+src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/
+    pan_tilt_overrides.xacro   # mount geometry (attach / camera_mount xyz+rpy)
+    offsets.yaml               # runtime joint offsets (pan/tilt_offset_rad)
+```
+
+The shared xacros under `tinker_urdf/` are **never written** — since
+tk25_basic `db1524a` the macro auto-includes the per-robot overrides file at
+xacro-parse time, so writing the pair is the complete deployment and
+tinker1/tinker2 calibrations cannot overwrite each other. Apply **refuses
+when `ROBOT_NAME` is unset** (HTTP 400 in calib_web, exit 2 on the CLI).
+Both files land atomically, in lockstep, with `.old-<ts>` backups; an rpy
+the solve didn't fit (trivial/absent rotvec) is preserved from the current
+per-robot file, never zeroed. The forward-camera invariant (`|yaw| < π/2`
+unless `--allow-flipped-camera`) still guards the fitted camera rotation.
+
+```bash
+export ROBOT_NAME=tinker1
+python -m pan_tilt.calibration.apply_to_urdf --results calib_out/polish.json \
+    [--basic-root <tk25_basic root>] [--allow-flipped-camera]
+tkbuild tk25_basic --packages-select tinker_robot_config
+# then relaunch robot_state_publisher + pan_tilt state_publisher
+```
+
+Deployment rules and the incident history are in
+[pan_tilt_calibration_deployment.md](./pan_tilt_calibration_deployment.md).
+
 ## Firmware Assumptions
 
 The current controller implementation expects the firmware behavior documented

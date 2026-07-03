@@ -1,5 +1,4 @@
 import math
-import numpy as np
 from pan_tilt.calibration.utils import wrap_to_pi
 from pan_tilt.calibration.run_calibration import _params_to_dict
 from pan_tilt.calibration.pan_tilt_model import PanTiltParams
@@ -29,15 +28,13 @@ def test_params_to_dict_normalizes_offsets():
     assert math.isclose(d["theta_t_offset_deg"], math.degrees(d["theta_t_offset_rad"]), abs_tol=1e-9)
 
 
-def test_patch_yaml_offsets_normalizes():
-    from pan_tilt.calibration.apply_to_urdf import _patch_yaml_offsets
-    yaml_text = (
-        "pan_tilt_state_publisher:\n"
-        "  ros__parameters:\n"
-        "    pan_offset_rad: 0.0\n"
-        "    tilt_offset_rad: 0.0\n"
-    )
-    out = _patch_yaml_offsets(yaml_text, 3.1400375561, 8.348085384508424)
+def test_render_offsets_yaml_normalizes():
+    # The per-robot offsets renderer must wrap un-normalized offsets (from
+    # OLD result JSONs that predate the solver-side wrap) to (-pi, pi].
+    from pan_tilt.calibration.apply_to_urdf import render_offsets_yaml
+    out = render_offsets_yaml("tinker1", 3.1400375561, 8.348085384508424)
     assert "tilt_offset_rad: 2.0649" in out          # +478 deg wrapped to +118 deg
     assert "tilt_offset_rad: 8.34" not in out
     assert "pan_offset_rad: 3.1400375561" in out      # already in range, unchanged
+    # Renders the tinker_robot_config profile shape the state publisher reads.
+    assert "pan_tilt:" in out and "offsets:" in out

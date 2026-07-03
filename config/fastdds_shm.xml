@@ -17,9 +17,9 @@ See src/tk26_vision/DEV_NOTES.md §"2026-04-22 — Camera bringup performance fi
 for the full diagnosis.
 
 segment_size raised 20MB -> 64MB on 2026-07-03 to carry the HRI task's
-1920x1080 Orbbec color frames (~6.2MB raw uncompressed, vs ~1.2MB at
-720p) with headroom for several in-flight frames across multiple
-subscribers. See
+1920x1080 Orbbec color frames (~6.2MB raw uncompressed, ~2.25x the
+~2.8MB 720p frame) with headroom for several in-flight frames across
+multiple subscribers. See
 src/tk26_vision/docs/superpowers/specs/2026-07-03-orbbec-hri-resolution-bump-design.md.
 -->
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">

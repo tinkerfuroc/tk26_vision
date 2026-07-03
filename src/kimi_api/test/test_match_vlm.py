@@ -156,6 +156,28 @@ def test_request_match_indices_qwen_uses_dashscope(monkeypatch):
         'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
 
+def test_request_match_indices_qwen_openrouter_backend(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'or-key')
+    fake = _make_fake_openai(lambda kw: '[0]')
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    res = request_match_indices(
+        'sys', [], n_feats=1, n_cand=1, provider='qwen', model='',
+        qwen_api_backend='openrouter')
+
+    assert res.provider == 'qwen'
+    assert fake.last_init['base_url'] == 'https://openrouter.ai/api/v1'
+    assert fake.last_init['api_key'] == 'or-key'
+
+
+def test_request_match_indices_qwen_openrouter_missing_key_raises(monkeypatch):
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    with pytest.raises(MatchVlmError, match='OPENROUTER_API_KEY'):
+        request_match_indices(
+            'sys', [], n_feats=1, n_cand=1, provider='qwen', model='',
+            qwen_api_backend='openrouter')
+
+
 def test_request_match_indices_missing_key_raises(monkeypatch):
     monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
     with pytest.raises(MatchVlmError, match='OPENROUTER_API_KEY'):

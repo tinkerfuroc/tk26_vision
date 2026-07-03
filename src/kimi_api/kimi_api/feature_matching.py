@@ -46,7 +46,7 @@ from ._env import (
     default_model,
     load_env,
     require_api_key,
-    require_dashscope_api_key,
+    resolve_qwen_target,
 )
 from ._image_utils import bbox_from_mask, encode_to_data_url
 from ._match_vlm import MatchVlmError, request_match_indices_chain
@@ -109,7 +109,8 @@ class FeatureMatchingService(Node):
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
-        self.declare_parameter('match_model_qwen', 'qwen3-vl-plus')
+        self.declare_parameter('match_model_qwen', '')
+        self.declare_parameter('qwen_api_backend', 'dashscope')
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
@@ -123,6 +124,7 @@ class FeatureMatchingService(Node):
         self.match_model_qwen = (
             self.get_parameter('match_model_qwen').get_parameter_value().string_value
         )
+        self.qwen_api_backend = self.get_parameter('qwen_api_backend').value
 
         self._vision_logger = VisionLogger(
             self,
@@ -177,8 +179,9 @@ class FeatureMatchingService(Node):
                 self.get_logger().warn(f'Unknown fallback provider {fb!r}; ignoring.')
             else:
                 try:
-                    require_dashscope_api_key()
-                    chain.append(('qwen', self.match_model_qwen))
+                    _, _, resolved_model = resolve_qwen_target(
+                        self.qwen_api_backend, self.match_model_qwen)
+                    chain.append(('qwen', resolved_model))
                 except RuntimeError:
                     self.get_logger().warn(
                         f'Fallback provider {fb!r} key missing; fallback disabled.'
@@ -408,6 +411,7 @@ class FeatureMatchingService(Node):
                 sys_prompt, user_content,
                 n_feats=n_feats, n_cand=n_cand,
                 provider_models=self._match_provider_chain,
+                qwen_api_backend=self.qwen_api_backend,
                 timeout_s=self.vlm_timeout_s,
                 max_retries=self.vlm_max_retries,
                 logger=self.get_logger(),

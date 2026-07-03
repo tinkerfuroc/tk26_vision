@@ -31,7 +31,7 @@ from tinker_vision_msgs_26.msg import BoundingBox
 from tinker_vision_msgs_26.srv import SeatRecommendBbox
 from vision_util.vision_logging import VisionLogger
 
-from ._env import load_env, require_api_key, require_dashscope_api_key
+from ._env import load_env, require_api_key, resolve_qwen_target
 from ._seat_bbox_vlm import request_seat_bbox_chain, VlmSeatBboxError
 from ._seat_fewshot import load_fewshots
 from ._seat_vlm import VlmSeatError, request_seat_chain
@@ -112,8 +112,9 @@ class SeatRecommendBboxService(Node):
         # qwen3-vl-plus (benchmark best); 'gemini' = OpenRouter gemini-2.5-pro.
         self.declare_parameter('vlm_provider', 'qwen')
         self.declare_parameter('vlm_fallback_provider', 'gemini')  # '' to disable
-        self.declare_parameter('bbox_model_qwen', 'qwen3-vl-plus')
+        self.declare_parameter('bbox_model_qwen', '')
         self.declare_parameter('bbox_model_gemini', 'google/gemini-2.5-pro')
+        self.declare_parameter('qwen_api_backend', 'dashscope')
 
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
@@ -188,6 +189,7 @@ class SeatRecommendBboxService(Node):
         self.bbox_model_gemini = (
             self.get_parameter('bbox_model_gemini').get_parameter_value().string_value
         )
+        self.qwen_api_backend = self.get_parameter('qwen_api_backend').value
         self._vision_logger = VisionLogger(
             self,
             self.get_parameter('vision_logging_enabled')
@@ -273,7 +275,10 @@ class SeatRecommendBboxService(Node):
 
     def _has_provider_key(self, provider: str) -> bool:
         try:
-            (require_dashscope_api_key if provider == 'qwen' else require_api_key)()
+            if provider == 'qwen':
+                resolve_qwen_target(self.qwen_api_backend, '')
+            else:
+                require_api_key()
             return True
         except RuntimeError:
             return False
@@ -284,8 +289,11 @@ class SeatRecommendBboxService(Node):
         dropped with a warning."""
         primary = self.vlm_provider
         if not self._has_provider_key(primary):
-            # Re-call to raise the descriptive RuntimeError for the missing key.
-            (require_dashscope_api_key if primary == 'qwen' else require_api_key)()
+            # Re-raise the descriptive RuntimeError for the missing key.
+            if primary == 'qwen':
+                resolve_qwen_target(self.qwen_api_backend, self.bbox_model_qwen)
+            else:
+                require_api_key()
         chain = [(primary, self._model_for(primary))]
         fb = self.vlm_fallback_provider
         if fb and fb != primary:
@@ -625,6 +633,7 @@ class SeatRecommendBboxService(Node):
                     request.names,
                     request.features,
                     provider_models=self._provider_models,
+                    qwen_api_backend=self.qwen_api_backend,
                     known_seats=known_seats or None,
                     timeout_s=self.vlm_timeout_s,
                     max_retries=self.vlm_max_retries,
@@ -653,6 +662,7 @@ class SeatRecommendBboxService(Node):
                         request.names,
                         request.features,
                         provider_models=self._provider_models,
+                        qwen_api_backend=self.qwen_api_backend,
                         timeout_s=self.vlm_timeout_s,
                         max_retries=self.vlm_max_retries,
                         logger=self.get_logger(),

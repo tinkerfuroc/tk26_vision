@@ -88,6 +88,30 @@ def test_request_seat_qwen_uses_dashscope(monkeypatch):
         'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
 
+def test_request_seat_qwen_openrouter_backend(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'or-key')
+    fake = _make_fake_openai(lambda kw: _VALID_PAYLOAD)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    label, point_xy, visible_seats, _elapsed = request_seat(
+        _img(), [], [], model='', provider='qwen', qwen_api_backend='openrouter')
+
+    assert label == 'left chair'
+    assert fake.last_init['base_url'] == 'https://openrouter.ai/api/v1'
+    assert fake.last_init['api_key'] == 'or-key'
+
+
+def test_request_seat_qwen_openrouter_missing_key_raises(monkeypatch):
+    # request_seat calls load_env() (load_dotenv, override=False) on every
+    # invocation, which would silently repopulate the key from the
+    # workspace .env after delenv -- stub it out for a hermetic negative test.
+    monkeypatch.setattr('kimi_api._seat_vlm.load_env', lambda: None)
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    with pytest.raises(VlmSeatError, match='OPENROUTER_API_KEY'):
+        request_seat(
+            _img(), [], [], model='', provider='qwen', qwen_api_backend='openrouter')
+
+
 def test_request_seat_missing_key_raises(monkeypatch):
     # request_seat calls load_env() (load_dotenv, override=False) on every
     # invocation, which would silently repopulate the key from the

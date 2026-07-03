@@ -1,5 +1,11 @@
 """Unit tests for the production bbox+select seat client (no network)."""
+import json
+from types import SimpleNamespace
+
+import numpy as np
+import openai
 import pytest
+
 from kimi_api import _seat_bbox_vlm as m
 from kimi_api._seat_bbox_vlm import SeatBboxResult, VlmSeatBboxError
 
@@ -237,6 +243,75 @@ def test_select_box_self_contradictory_choice_with_no_recovery_is_error():
     res = m.select_box({"seats": seats, "choice": "left spot on sofa"}, 1000, 1000, None)
     assert res.error is not None
     assert res.box_xyxy is None
+
+
+# --- request_seat_bbox (direct client-construction coverage; added alongside
+# the qwen_api_backend toggle -- previously this module only ever exercised
+# request_seat_bbox_chain against a monkeypatched request_seat_bbox, so the
+# qwen branch's client construction had no direct test) ---
+def _completion(content: str):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
+def _make_fake_openai(script):
+    class _Fake:
+        last_init = None
+        calls = []
+
+        def __init__(self, **kw):
+            _Fake.last_init = kw
+
+        def with_options(self, **_kw):
+            return self
+
+        @property
+        def chat(self):
+            return self
+
+        @property
+        def completions(self):
+            return self
+
+        def create(self, **kw):
+            _Fake.calls.append(kw)
+            return _completion(script(kw))
+
+        def close(self):
+            pass
+
+    return _Fake
+
+
+def _img():
+    return np.zeros((48, 64, 3), dtype=np.uint8)
+
+
+_NONE_PAYLOAD = json.dumps({"seats": [], "choice": "none"})
+
+
+def test_request_seat_bbox_qwen_openrouter_backend(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'or-key')
+    fake = _make_fake_openai(lambda kw: _NONE_PAYLOAD)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    res = m.request_seat_bbox(
+        _img(), [], [], provider='qwen', model='', qwen_api_backend='openrouter')
+
+    assert res.label == 'none'
+    assert fake.last_init['base_url'] == 'https://openrouter.ai/api/v1'
+    assert fake.last_init['api_key'] == 'or-key'
+
+
+def test_request_seat_bbox_qwen_openrouter_missing_key_raises(monkeypatch):
+    # request_seat_bbox calls load_env() (load_dotenv, override=False) on
+    # every invocation, which would silently repopulate the key from the
+    # workspace .env after delenv -- stub it out for a hermetic negative test.
+    monkeypatch.setattr(m, 'load_env', lambda: None)
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    with pytest.raises(VlmSeatBboxError, match='OPENROUTER_API_KEY'):
+        m.request_seat_bbox(
+            _img(), [], [], provider='qwen', model='', qwen_api_backend='openrouter')
 
 
 # --- request_seat_bbox_chain (monkeypatch the per-provider call) ---

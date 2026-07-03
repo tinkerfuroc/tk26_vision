@@ -24,10 +24,9 @@ import numpy as np
 
 from ._env import (
     base_url,
-    dashscope_base_url,
     load_env,
     require_api_key,
-    require_dashscope_api_key,
+    resolve_qwen_target,
 )
 from ._image_utils import encode_to_data_url
 
@@ -337,6 +336,7 @@ def request_seat_bbox(
     *,
     provider: str,
     model: str,
+    qwen_api_backend: str = 'dashscope',
     known_seats: Optional[Sequence[str]] = None,
     timeout_s: float = 20.0,
     max_retries: int = 3,
@@ -347,10 +347,10 @@ def request_seat_bbox(
     load_env()
     if provider == "qwen":
         try:
-            api_key = require_dashscope_api_key()
+            b_url, api_key, model = resolve_qwen_target(qwen_api_backend, model)
         except RuntimeError as exc:
             raise VlmSeatBboxError(str(exc)) from exc
-        b_url, reasoning = dashscope_base_url(), False
+        reasoning = False
     elif provider == "gemini":
         try:
             api_key = require_api_key()
@@ -433,6 +433,7 @@ def request_seat_bbox_chain(
     features: Sequence[str],
     *,
     provider_models: Sequence[tuple],
+    qwen_api_backend: str = 'dashscope',
     known_seats: Optional[Sequence[str]] = None,
     timeout_s: float = 20.0,
     max_retries: int = 3,
@@ -447,7 +448,8 @@ def request_seat_bbox_chain(
         try:
             res = request_seat_bbox(
                 rgb_bgr, names, features,
-                provider=provider, model=model, known_seats=known_seats,
+                provider=provider, model=model,
+                qwen_api_backend=qwen_api_backend, known_seats=known_seats,
                 timeout_s=timeout_s, max_retries=max_retries, logger=logger,
             )
         except VlmSeatBboxError as exc:

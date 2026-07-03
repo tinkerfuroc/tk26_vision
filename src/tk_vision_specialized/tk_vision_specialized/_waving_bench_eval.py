@@ -141,7 +141,8 @@ def _parse_expect(scenario: str, index: int, expect_dict: dict) -> Expect:
 
     z_range_m = expect_dict.get("z_range_m")
     if z_range_m is not None:
-        if len(z_range_m) != 2 or not (z_range_m[0] <= z_range_m[1]):
+        if (not isinstance(z_range_m, (list, tuple)) or len(z_range_m) != 2
+                or not (z_range_m[0] <= z_range_m[1])):
             raise ValueError(
                 f"{scenario}[{index}]: z_range_m must be a 2-item ascending list")
         z_range_m = (float(z_range_m[0]), float(z_range_m[1]))
@@ -184,6 +185,14 @@ def evaluate_call(case: CaseSpec, call: CallRecord) -> CallVerdict:
     expect = case.expect
     frame_id = case.request["target_frame"]
     reasons = []
+
+    # status=-1 is reserved for server/transport errors (e.g. the CLI's
+    # timeout sentinel) and must fail the call regardless of `expect` —
+    # unless the case explicitly expects a transport error itself.
+    if call.status == -1 and expect.status != -1:
+        reasons.append(
+            f"transport/server error (status=-1): {call.error_msg or 'no response'}")
+        return CallVerdict(passed=False, reasons=reasons)
 
     want_status = expected_status(expect)
     if want_status is not None and call.status != want_status:

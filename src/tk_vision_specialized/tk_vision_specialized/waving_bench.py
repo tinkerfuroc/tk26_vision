@@ -66,6 +66,17 @@ def _default_config_path() -> Path:
     return Path(__file__).resolve().parent.parent / 'config' / 'waving_bench.yaml'
 
 
+def _positive_int(value: str) -> int:
+    """argparse type= for --calls: reject non-ints and values < 1."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'invalid int value: {value!r}')
+    if n < 1:
+        raise argparse.ArgumentTypeError(f'--calls must be >= 1, got {n}')
+    return n
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='waving_bench',
@@ -91,8 +102,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         '--service', default=DEFAULT_SERVICE,
         help="DetectWaving service name (default: '%(default)s').")
     parser.add_argument(
-        '--calls', type=int, default=None, metavar='N',
-        help='Override calls_per_case for every case (quick smoke).')
+        '--calls', type=_positive_int, default=None, metavar='N',
+        help='Override calls_per_case for every case (quick smoke). Must be >= 1.')
     parser.add_argument(
         '--yes', action='store_true',
         help='Non-interactive: skip operator prompts (still runs all selected cases).')
@@ -264,6 +275,13 @@ def run(ns: argparse.Namespace, suite: dict, selected_names: list,
                 'cases_run': cases_run,
                 'cases_skipped': cases_skipped,
             })
+
+        if (quit_requested or aborted) and cases_run == 0:
+            # suite_passed([]) is vacuously True — without this guard, quitting
+            # or aborting before any case completed would still print "Suite
+            # PASSED" and exit 0. Give it a distinct, honest outcome instead.
+            print(f'\nQuit before any case ran — no verdict. Results: {results_path}')
+            return 1
 
         outcome = 'ABORTED' if aborted else ('PASSED' if overall_passed else 'FAILED')
         print(f'\nSuite {outcome} '

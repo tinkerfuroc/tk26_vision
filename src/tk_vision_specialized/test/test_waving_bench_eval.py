@@ -138,6 +138,23 @@ def test_frame_id_mismatch_fails():
     assert evaluate_call(case, call).passed is False
 
 
+def test_transport_error_sentinel_fails_when_not_expected():
+    # Mirrors the CLI's timed-out-call sentinel (waving_bench.py's
+    # NO_RESPONSE_REASON path); an empty `expect:` block must not let it
+    # pass by default.
+    case = _case(Expect())
+    sentinel = CallRecord(status=-1, points=[], frame_ids=[])
+    verdict = evaluate_call(case, sentinel)
+    assert verdict.passed is False
+    assert any("status=-1" in r for r in verdict.reasons)
+
+
+def test_transport_error_sentinel_passes_when_explicitly_expected():
+    case = _case(Expect(status=-1))
+    sentinel = CallRecord(status=-1, points=[], frame_ids=[])
+    assert evaluate_call(case, sentinel).passed is True
+
+
 # --- evaluate_case / suite_passed -----------------------------------------------
 
 def test_pass_ratio_boundary_at_defaults():
@@ -195,6 +212,11 @@ def test_invalid_ordering_raises():
 def test_descending_z_range_raises():
     with pytest.raises(ValueError):
         _suite({"s": [{"prompt": "p", "expect": {"z_range_m": [2.0, 1.0]}}]})
+
+
+def test_scalar_z_range_raises():
+    with pytest.raises(ValueError):
+        _suite({"s": [{"prompt": "p", "expect": {"z_range_m": 5}}]})
 
 
 def test_unknown_defaults_key_raises():

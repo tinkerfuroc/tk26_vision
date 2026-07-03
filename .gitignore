@@ -15,7 +15,8 @@ debug_renders/**
 
 src/items/
 
-scripts/tests/logs/
+scripts/tests/logs/*
+!scripts/tests/logs/waving_bench_session_*.md
 
 # Scratch outputs from calibration CLI / tests.
 calib_log/

@@ -141,13 +141,26 @@ rejected for the scalar model params below (an operator who explicitly sets
 `vlm_fallback_models: ['dashscope/qwen3-vl-plus']` on purpose would get it
 silently rewritten). Applying that already-rejected pattern to a list
 doesn't make it safer. Instead: **fail fast at node `__init__`** if
-`qwen_api_backend='openrouter'` and either `dashscope_qwen_model` (when
-`prefer_dashscope_qwen=True`) or any entry in `vlm_fallback_models`
-(when it's false) still contains a `dashscope/`-prefixed entry — with an
-error telling the operator to pass an explicit OpenRouter-pointing value
-for whichever param is active. This costs the operator one extra explicit
-override on this one node when flipping the toggle; the alternative is
-reintroducing a silent-rewrite bug on a list.
+`qwen_api_backend='openrouter'` and any of the following is a
+`dashscope/`-prefixed value: `dashscope_qwen_model` (when
+`prefer_dashscope_qwen=True`), any entry in `vlm_fallback_models` (when
+false), **or the primary `vlm_model` param itself** if an operator
+explicitly pointed it at a `dashscope/…` model — the first two drafts of
+this check only covered the two fallback-path params and missed that
+`vlm_model` (default `'google/gemini-2.5-flash'`) can independently be set
+to a `dashscope/…` value. Error tells the operator to pass an explicit
+OpenRouter-pointing value for whichever param is active. This costs the
+operator one extra explicit override on this node when flipping the
+toggle; the alternative is reintroducing a silent-rewrite bug on a list.
+
+This check only fires under an explicit `qwen_api_backend='openrouter'` —
+`_split_provider` (`vlm_bbox.py`) still routes **per-entry**, so a
+deliberate mixed-provider fallback chain (e.g.
+`['dashscope/qwen3-vl-plus', 'openai/gpt-4o']`) remains fully expressible
+and untouched under the default `qwen_api_backend='dashscope'`. The
+fail-fast only blocks the specific combination of "this robot declared
+no-DashScope" plus "this param still points at DashScope" — it doesn't
+remove per-entry routing generally.
 
 `prefer_dashscope_qwen` as a param name becomes slightly misleading under
 this toggle (it now means "prefer the qwen leg over gemini", independent of
@@ -163,10 +176,18 @@ param to that same value on purpose (e.g. for config clarity) — it would be
 silently rewritten to a different model with no error.
 
 **Fix:** 7 of the per-node qwen-model params currently default to
-`'qwen3-vl-plus'` (`feature_model_qwen`, `match_model_qwen`,
-`categorize_model_qwen`, `bbox_model_qwen`, `placing_model_qwen`,
-`vlm_model_qwen` on `waving_person_server`/`object_match_server`) and need
-their default changed to an **empty-string sentinel** (`''`).
+`'qwen3-vl-plus'`: `feature_model_qwen` (`feature_recognition.py`),
+`match_model_qwen` (`feature_matching.py`), `categorize_model_qwen`
+(`grocery_categorize.py`), `bbox_model_qwen` (`seat_recommend_bbox.py`),
+`placing_model_qwen` (`placing_location_server.py`), `vlm_model_qwen`
+(`waving_person_server.py`), and `vlm_model` (`object_match_server.py` —
+**not** `vlm_model_qwen`, different name than waving's despite the earlier
+draft claiming a shared name). All 7 need their default changed to an
+**empty-string sentinel** (`''`). Note `object_match_server`'s `vlm_model`
+shares its literal name with `object_match_all_server.py`'s `vlm_model` —
+same string, different node, different current default (the latter already
+defaults to `''`) — worth a one-line comment in each file so the name
+collision doesn't read as a copy-paste bug later.
 `object_match_all_server.py`'s `vlm_model`/`judge_model` already default to
 `''` — no change needed there, already sentinel-shaped. `resolve_qwen_target`
 treats `''` as "use the backend's own default model" and honors any
@@ -251,10 +272,15 @@ tier).
   is no non-VLM fallback at all for that feature (e.g.
   `seat_recommend_bbox`'s `bbox_select` strategy has no non-VLM seat
   detector). Where a non-VLM fallback exists — `waving_person_server`
-  (MediaPipe) and, if it has an equivalent, `object_match_all_server` —
-  preserve today's graceful-disable regardless of which leg is "primary"
-  within the VLM-only chain. This must be checked per node during
-  implementation, not assumed from the `vlm_provider` default alone.
+  (MediaPipe) — preserve today's graceful-disable regardless of which leg
+  is "primary" within the VLM-only chain. `object_match_all_server` is
+  **confirmed to have no non-VLM fallback** (it's purely VLM-driven
+  matching/segmenting) and **already fails fast today** on a missing key
+  (`vlm_match_client.py`'s client raises `RuntimeError` at construction) —
+  so fail-fast for it is both correct and behavior-preserving, not a new
+  restriction. This must still be checked per node during implementation
+  for any site not named here, not assumed from the `vlm_provider` default
+  alone.
 - **Fallback-arming checks become backend-aware.** Several chains today
   arm their Qwen fallback only if `DASHSCOPE_API_KEY` is present. Under
   `backend='openrouter'`, that check must test for the key the *selected*
@@ -341,3 +367,16 @@ real implementation work the benchmark task's results size, not a
 guaranteed drop-in; plus a sentinel-count correction (7 params, not 9;
 `object_match_all_server` was already sentinel-shaped) and several minor
 doc/precedence items.
+
+**Round 3** verified round 2's fixes hold and returned "approve with minor
+fixes": corrected `object_match_server`'s sentinel param name (`vlm_model`,
+not the previously-claimed shared `vlm_model_qwen`) and flagged its name
+collision with `object_match_all_server`'s already-sentinel `vlm_model`;
+resolved the `object_match_all_server` fail-fast hedge definitively (no
+non-VLM fallback exists, and it already fails fast today on a missing key
+— confirmed, not assumed); extended the `generalist_node` fail-fast check
+to also cover an explicitly `dashscope/`-prefixed primary `vlm_model`
+(the prior two drafts checked only the two fallback-path params); and
+added an explicit note that the fail-fast doesn't disable legitimate
+mixed-provider fallback chains under the default backend, only the
+declared-no-DashScope-but-still-pointed-at-DashScope combination.

@@ -26,13 +26,18 @@ from ._env import base_url, require_api_key, resolve_qwen_target
 from ._vlm_text import strip_fences
 
 _SYS_PROMPT = (
-    "You are a precise visual object detector. You are given ONE photo of a "
-    "scene and a list of candidate object names. Return a JSON array "
-    "containing exactly the candidate names -- copied verbatim from the list "
-    "-- that are clearly visible in the photo. Only include a name if you are "
-    "confident the object is present. Never include a name that is not in the "
-    "list. If none are present, return []. Output ONLY the JSON array, nothing "
-    "else."
+    "You are a precise, conservative visual object detector. You are given ONE "
+    "photo of a scene and a list of candidate object names. Return a JSON array "
+    "containing only the candidate names -- copied verbatim from the list -- "
+    "that are UNMISTAKABLY present and clearly visible in the photo. "
+    "Bias strongly toward precision over recall: a missed object (false "
+    "negative) is much better than a wrong one (false positive). If you are not "
+    "certain an object is actually there -- it is ambiguous, heavily occluded, "
+    "blurry, only partially visible, or you would be guessing from context -- "
+    "DO NOT include it. Report only what you can actually see, never what is "
+    "merely plausible or expected. Never include a name that is not in the "
+    "list. If none are clearly present, return []. Output ONLY the JSON array, "
+    "nothing else."
 )
 
 

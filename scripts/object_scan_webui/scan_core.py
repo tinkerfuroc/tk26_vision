@@ -328,21 +328,71 @@ def sweep_batch_sizes(
     vocabulary: list[str],
     batch_sizes: list[int],
     *,
+    repeats: int = 1,
+    truth: list | None = None,
     max_workers: int = 0,
     use_qwen_fallback: bool = True,
     timeout_s: float = 20.0,
     max_retries: int = 2,
     log=None,
 ) -> list[dict]:
-    """Run scan_image for each batch_size; return comparable summaries."""
+    """Run scan_image for each batch_size, `repeats` times, and aggregate.
+
+    VLM answers vary run-to-run, so one run per size can't rank them; each size
+    is run `repeats` times and reported as avg/min/max found + avg latency.
+    If `truth` (the classes actually present) is given, per-run recall and
+    precision are computed and averaged, giving an honest "best size" metric.
+    """
+    truth_set = {t for t in (truth or []) if t in vocabulary}
     out = []
     for bs in batch_sizes:
-        res = scan_image(
-            image_data_url, vocabulary, batch_size=bs, max_workers=max_workers,
-            use_qwen_fallback=use_qwen_fallback, timeout_s=timeout_s,
-            max_retries=max_retries, log=log,
-        )
-        out.append(res.to_dict())
+        runs = []
+        for r in range(max(1, repeats)):
+            res = scan_image(
+                image_data_url, vocabulary, batch_size=bs,
+                max_workers=max_workers, use_qwen_fallback=use_qwen_fallback,
+                timeout_s=timeout_s, max_retries=max_retries, log=log,
+            )
+            d = res.to_dict()
+            found = set(d["found_labels"])
+            row = {
+                "found_labels": d["found_labels"],
+                "n_found": d["n_found"],
+                "latency_s": d["total_latency_s"],
+                "batches_fail": d["batches_fail"],
+            }
+            if truth_set:
+                tp = len(found & truth_set)
+                row["recall"] = round(tp / len(truth_set), 3)
+                row["precision"] = round(tp / len(found), 3) if found else 0.0
+                row["missed"] = sorted(truth_set - found)
+                row["false_pos"] = sorted(found - truth_set)
+            runs.append(row)
+
+        nf = [x["n_found"] for x in runs]
+        lat = [x["latency_s"] for x in runs]
+        agg = {
+            "batch_size": bs,
+            "n_vocab": len(vocabulary),
+            "repeats": len(runs),
+            "runs": runs,
+            "avg_found": round(sum(nf) / len(nf), 2),
+            "min_found": min(nf),
+            "max_found": max(nf),
+            "avg_latency_s": round(sum(lat) / len(lat), 2),
+        }
+        if truth_set:
+            rec = [x["recall"] for x in runs]
+            prec = [x["precision"] for x in runs]
+            agg["n_truth"] = len(truth_set)
+            agg["avg_recall"] = round(sum(rec) / len(rec), 3)
+            agg["avg_precision"] = round(sum(prec) / len(prec), 3)
+            f1s = [
+                (2 * p * rr / (p + rr)) if (p + rr) else 0.0
+                for p, rr in zip(prec, rec)
+            ]
+            agg["avg_f1"] = round(sum(f1s) / len(f1s), 3)
+        out.append(agg)
     return out
 
 
@@ -359,6 +409,7 @@ def main() -> None:
                     help="0 = one worker per batch (all in parallel); >0 caps it")
     ap.add_argument("--no-qwen", action="store_true", help="disable Qwen fallback")
     ap.add_argument("--sweep", default="", help="comma list of batch sizes, e.g. 4,8,16")
+    ap.add_argument("--repeats", type=int, default=1, help="runs per batch size in --sweep")
     args = ap.parse_args()
 
     vocab = parse_vocabulary()
@@ -368,13 +419,16 @@ def main() -> None:
     if args.sweep:
         sizes = [int(x) for x in args.sweep.split(",") if x.strip()]
         rows = sweep_batch_sizes(
-            url, vocab, sizes, max_workers=args.max_workers,
+            url, vocab, sizes, repeats=args.repeats, max_workers=args.max_workers,
             use_qwen_fallback=not args.no_qwen, log=print,
         )
-        print("\nbatch_size  n_found  latency_s  labels")
+        print("\nbatch_size  avg_found (min-max)  avg_latency")
         for r in rows:
-            print(f"{r['batch_size']:>10}  {r['n_found']:>7}  "
-                  f"{r['total_latency_s']:>9}  {r['found_labels']}")
+            print(f"{r['batch_size']:>10}  {r['avg_found']:>5} "
+                  f"({r['min_found']}-{r['max_found']})       {r['avg_latency_s']}s")
+        best = max(rows, key=lambda r: (r["avg_found"], -r["avg_latency_s"]))
+        print(f"\nbest by avg_found: batch_size={best['batch_size']} "
+              f"(avg {best['avg_found']}/{best['n_vocab']}, {best['avg_latency_s']}s)")
         return
 
     res = scan_image(

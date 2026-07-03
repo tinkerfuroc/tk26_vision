@@ -14,18 +14,16 @@ import argparse
 import json
 import os
 import re
-import subprocess
-import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import scan_core
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PHOTOS_DIR = os.path.join(HERE, "photos")
 INDEX_HTML = os.path.join(HERE, "index.html")
-ROS_GRAB = os.path.join(HERE, "ros_grab.py")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _SAFE_TOPIC = re.compile(r"^[A-Za-z0-9_/]+$")
 
@@ -38,6 +36,106 @@ ROS_TOPIC_PRESETS = [
 ]
 
 os.makedirs(PHOTOS_DIR, exist_ok=True)
+
+
+class RosCamera:
+    """Lazy in-process ROS image subscriber shared across requests.
+
+    Spins one rclpy node in a background thread; subscribes to color Image
+    topics on demand and keeps the latest JPEG-encoded frame per topic. Used
+    for both the live MJPEG preview and instant capture (the previewed frame
+    is already cached). Degrades gracefully: if rclpy/ROS is unavailable the
+    webcam + upload + scan paths keep working.
+    """
+
+    def __init__(self):
+        self.available = None      # None=unknown, True/False after first ensure
+        self.err = ""
+        self._node = None
+        self._bridge = None
+        self._exec = None
+        self._subs = {}            # topic -> subscription
+        self._frames = {}          # topic -> (jpeg_bytes, stamp)
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> bool:
+        with self._lock:
+            if self.available is not None:
+                return self.available
+            try:
+                import rclpy
+                from cv_bridge import CvBridge
+                from rclpy.executors import SingleThreadedExecutor
+                if not rclpy.ok():
+                    rclpy.init(args=None)
+                self._node = rclpy.create_node("object_scan_webui_cam")
+                self._bridge = CvBridge()
+                self._exec = SingleThreadedExecutor()
+                self._exec.add_node(self._node)
+                threading.Thread(target=self._spin, daemon=True).start()
+                self.available = True
+            except Exception as exc:   # noqa: BLE001
+                self.err = str(exc)
+                self.available = False
+            return self.available
+
+    def _spin(self):
+        try:
+            self._exec.spin()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def subscribe(self, topic: str) -> bool:
+        if not self._ensure():
+            return False
+        with self._lock:
+            if topic in self._subs:
+                return True
+        try:
+            from sensor_msgs.msg import Image
+            from rclpy.qos import qos_profile_sensor_data
+            sub = self._node.create_subscription(
+                Image, topic, lambda m, t=topic: self._cb(m, t),
+                qos_profile_sensor_data,
+            )
+            with self._lock:
+                self._subs[topic] = sub
+            return True
+        except Exception as exc:   # noqa: BLE001
+            self.err = str(exc)
+            return False
+
+    def _cb(self, msg, topic):
+        try:
+            import cv2
+            img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            ok, buf = cv2.imencode(
+                ".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok:
+                with self._lock:
+                    self._frames[topic] = (buf.tobytes(), time.time())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def latest(self, topic: str):
+        with self._lock:
+            fr = self._frames.get(topic)
+        return fr[0] if fr else None
+
+    def grab(self, topic: str, timeout: float = 8.0):
+        """Subscribe (if needed) and return the next/cached frame, or None."""
+        if not self.subscribe(topic):
+            return None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            d = self.latest(topic)
+            if d is not None:
+                return d
+            time.sleep(0.05)
+        return None
+
+
+ROS_CAM = RosCamera()
 
 
 def _data_url_to_bytes(data_url: str):
@@ -82,6 +180,39 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter default logging
         pass
 
+    def _ros_stream(self, query: str):
+        """Stream a ROS color topic as multipart MJPEG (live preview)."""
+        topic = (parse_qs(query).get("topic", ["/camera/color/image_raw"])[0])
+        if not _SAFE_TOPIC.match(topic):
+            self._send(400, {"error": f"bad topic {topic!r}"})
+            return
+        if not ROS_CAM.subscribe(topic):
+            self._send(503, {"error": f"ROS camera unavailable: {ROS_CAM.err}"})
+            return
+        self.send_response(200)
+        self.send_header(
+            "Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        last = None
+        # brief wait for the first frame so the <img> doesn't error out
+        deadline = time.time() + 5.0
+        while time.time() < deadline and ROS_CAM.latest(topic) is None:
+            time.sleep(0.05)
+        try:
+            while True:
+                frame = ROS_CAM.latest(topic)
+                if frame is not None and frame is not last:
+                    self.wfile.write(
+                        b"--frame\r\nContent-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(frame)).encode()
+                        + b"\r\n\r\n" + frame + b"\r\n")
+                    self.wfile.flush()
+                    last = frame
+                time.sleep(0.05)   # ~20 fps ceiling
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client closed the preview <img>; end the thread
+
     # -- routing ----------------------------------------------------------
     def do_GET(self):
         path = urlparse(self.path).path
@@ -108,6 +239,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/ros_topics":
             self._send(200, {"presets": ROS_TOPIC_PRESETS})
+            return
+        if path == "/api/ros_stream":
+            self._ros_stream(urlparse(self.path).query)
             return
         if path.startswith("/photos/"):
             name = path[len("/photos/"):]
@@ -164,25 +298,17 @@ class Handler(BaseHTTPRequestHandler):
             if not _SAFE_TOPIC.match(topic):
                 self._send(400, {"error": f"bad topic {topic!r}"})
                 return
+            frame = ROS_CAM.grab(topic, timeout=float(body.get("timeout", 8.0)))
+            if frame is None:
+                self._send(502, {"error":
+                    f"no frame on {topic} within timeout — is the camera "
+                    f"launched and ROS sourced? {ROS_CAM.err}".strip()})
+                return
             ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
             name = f"photo_{ts}_ros.jpg"
-            out = os.path.join(PHOTOS_DIR, name)
-            try:
-                proc = subprocess.run(
-                    [sys.executable, ROS_GRAB, "--topic", topic,
-                     "--out", out, "--timeout", str(float(body.get("timeout", 8.0)))],
-                    capture_output=True, text=True,
-                    timeout=float(body.get("timeout", 8.0)) + 15.0,
-                )
-            except subprocess.TimeoutExpired:
-                self._send(504, {"error": f"ROS grab timed out on {topic}"})
-                return
-            if proc.returncode == 0 and os.path.isfile(out):
-                self._send(200, {"name": name})
-            else:
-                msg = (proc.stderr or proc.stdout or "unknown error").strip().splitlines()
-                self._send(502, {"error": msg[-1] if msg else "ROS grab failed",
-                                 "detail": (proc.stderr or "")[-800:]})
+            with open(os.path.join(PHOTOS_DIR, name), "wb") as f:
+                f.write(frame)
+            self._send(200, {"name": name})
             return
 
         if path in ("/api/scan", "/api/sweep"):
@@ -207,8 +333,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     sizes = [int(x) for x in body.get("batch_sizes", [4, 8, 16])]
                     rows = scan_core.sweep_batch_sizes(
-                        url, vocab, sizes, max_workers=max_workers,
-                        use_qwen_fallback=use_qwen,
+                        url, vocab, sizes,
+                        repeats=int(body.get("repeats", 1)),
+                        truth=body.get("truth") or None,
+                        max_workers=max_workers, use_qwen_fallback=use_qwen,
                         log=lambda m: print(f"[sweep] {m}", flush=True),
                     )
                     self._send(200, {"photo": name, "sweep": rows})

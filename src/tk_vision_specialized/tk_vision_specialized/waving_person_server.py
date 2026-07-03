@@ -165,7 +165,6 @@ class DetectWavingPersonsNode(Node):
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('vlm_dedup_iou', 0.3)
-        self.declare_parameter('vlm_skip_min_wavers', 2)
         self.enable_vlm_fallback = (
             self.get_parameter('enable_vlm_fallback').value)
         self.vlm_provider = self.get_parameter('vlm_provider').value
@@ -176,8 +175,6 @@ class DetectWavingPersonsNode(Node):
         self.vlm_timeout_s = float(self.get_parameter('vlm_timeout_s').value)
         self.vlm_max_retries = int(self.get_parameter('vlm_max_retries').value)
         self.vlm_dedup_iou = float(self.get_parameter('vlm_dedup_iou').value)
-        self.vlm_skip_min_wavers = int(
-            self.get_parameter('vlm_skip_min_wavers').value)
         self._vlm_chain = self._resolve_provider_chain()
         # Dedicated pool for the concurrent VLM waving-fallback call. 2
         # workers, not 1: an abandoned call from an early-exited request (see
@@ -444,16 +441,21 @@ class DetectWavingPersonsNode(Node):
                 f'Waving VLM chain: {[p for p, _ in chain]}')
         return chain
 
-    def _start_vlm_call(self, rgb_image):
+    def _start_vlm_call(self, rgb_image, min_waving_persons: int):
         """Launch the VLM waving-fallback call on the dedicated executor.
 
-        Returns None immediately if the fallback is disabled or no provider
-        has a key configured -- callers treat None the same as "nothing to
-        wait for, nothing to merge." Otherwise returns a Future whose
-        .result() is a WavingVlmResult, or raises WavingVlmError on hard
-        failure (matching request_waving_persons_chain's own contract).
+        Returns None immediately if the fallback is disabled, no provider
+        has a key configured, or the caller didn't opt in
+        (min_waving_persons <= 0 -- the request-level default, so GPSR/EGPSR
+        and any other caller that never sets this field keep today's
+        fast-only behavior with no changes on their end). Otherwise returns
+        a Future whose .result() is a WavingVlmResult, or raises
+        WavingVlmError on hard failure (matching
+        request_waving_persons_chain's own contract).
         """
         if not self.enable_vlm_fallback or not self._vlm_chain:
+            return None
+        if min_waving_persons <= 0:
             return None
         return self._vlm_executor.submit(
             request_waving_persons_chain, rgb_image,
@@ -602,9 +604,12 @@ class DetectWavingPersonsNode(Node):
 
         # Launch the VLM fallback now, in parallel with the depth conversion +
         # YOLO + MediaPipe pass below -- it only needs rgb_image, which is
-        # already available. See _start_vlm_call / the merge-or-discard logic
-        # after the CV loop.
-        vlm_future = self._start_vlm_call(rgb_image)
+        # already available. Gated on request.min_waving_persons > 0: an
+        # explicit per-caller opt-in, not a node-wide default, so GPSR/EGPSR
+        # and any other caller that never sets this field (it defaults to 0)
+        # get today's fast-only behavior unchanged. See _start_vlm_call /
+        # the merge-or-discard logic after the CV loop.
+        vlm_future = self._start_vlm_call(rgb_image, request.min_waving_persons)
 
         self.get_logger().info('Data copied for processing. Starting detection...')
         transform = None
@@ -629,6 +634,8 @@ class DetectWavingPersonsNode(Node):
                     status_text=(
                         f'TF FAILED ({header.frame_id} -> {request.target_frame})'),
                 )
+                if vlm_future is not None:
+                    vlm_future.add_done_callback(self._log_discarded_vlm_result)
                 return response
 
         self.get_logger().info(
@@ -646,6 +653,8 @@ class DetectWavingPersonsNode(Node):
                 rgb_image, header, persons=0, waving=0,
                 status_text=f'DEPTH FAILED: {exc}',
             )
+            if vlm_future is not None:
+                vlm_future.add_done_callback(self._log_discarded_vlm_result)
             return response
         yolo_results = self.yolo(rgb_image, conf=self.min_person_conf, verbose=False)
 
@@ -775,13 +784,14 @@ class DetectWavingPersonsNode(Node):
         vlm_provider_used = ''
         if vlm_future is not None:
             if should_wait_for_vlm(
-                    len(waving_persons_centroids), self.vlm_skip_min_wavers):
+                    len(waving_persons_centroids), request.min_waving_persons):
                 try:
                     vlm_result = vlm_future.result(timeout=self.vlm_timeout_s)
                 except (WavingVlmError, FutureTimeoutError) as exc:
                     self.get_logger().warn(
                         f'VLM waving fallback unavailable: {exc}')
                     vlm_result = None
+                    vlm_future.add_done_callback(self._log_discarded_vlm_result)
                 if vlm_result is not None:
                     n_vlm_added, vlm_provider_used = self._merge_vlm_result(
                         vlm_result, points, validmask_points, header, request,
@@ -795,8 +805,8 @@ class DetectWavingPersonsNode(Node):
                 vlm_future.add_done_callback(self._log_discarded_vlm_result)
                 self.get_logger().info(
                     f'CV already found {len(waving_persons_centroids)} '
-                    f'waver(s) (>= vlm_skip_min_wavers='
-                    f'{self.vlm_skip_min_wavers}); discarding VLM call '
+                    f'waver(s) (>= request.min_waving_persons='
+                    f'{request.min_waving_persons}); discarding VLM call '
                     f'without waiting.'
                 )
 

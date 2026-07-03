@@ -91,6 +91,20 @@ def generate_launch_description():
                 'a consumer specifically needs aligned-to-color depth.'
             ),
         ),
+        DeclareLaunchArgument(
+            'color_width', default_value='1280',
+            description=(
+                'Orbbec color stream width. Task launch scripts override this '
+                '(e.g. HRI raises it for face/feature enrollment quality); '
+                'default matches the vendored femto_bolt.launch.py default. '
+                'Depth stream resolution is untouched -- SW alignment handles '
+                'any color/depth size mismatch.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'color_height', default_value='720',
+            description='Orbbec color stream height; see color_width.',
+        ),
     ]
 
     # SHM profile for the whole launch: the Orbbec publisher offers SHM to the
@@ -121,6 +135,8 @@ def generate_launch_description():
             'enable_colored_point_cloud': 'true',
             'enable_ir': 'false',
             'enable_frame_sync': 'false',
+            'color_width': LaunchConfiguration('color_width'),
+            'color_height': LaunchConfiguration('color_height'),
         }.items(),
         condition=IfCondition(LaunchConfiguration('enable_orbbec')),
     )

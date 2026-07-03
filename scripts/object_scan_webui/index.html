@@ -87,6 +87,12 @@
       <button id="shoot" class="primary" disabled>Shoot photo</button>
       <button id="camStop" disabled>Stop</button>
     </div>
+    <div class="row" style="margin-top:8px">
+      <select id="camSel" style="flex:1;min-width:0"><option value="">default camera</option></select>
+      <button id="camRefresh" title="re-scan cameras">⟳</button>
+    </div>
+    <div class="hint">Pick a camera and it switches live. Labels appear after you
+      Start once (the browser reveals them only after camera permission).</div>
     <video id="cam" autoplay playsinline muted style="margin-top:10px;display:none"></video>
     <div id="dz">Drag &amp; drop photos here, or
       <label style="color:var(--accent);cursor:pointer">browse<input id="file" type="file"
@@ -147,12 +153,47 @@ function setStatus(t,cls){const s=$('#status');s.textContent=t||'';s.style.color
 })();
 
 // ---- camera ----
+async function listCameras(){
+  try{
+    const devs=await navigator.mediaDevices.enumerateDevices();
+    const cams=devs.filter(d=>d.kind==='videoinput');
+    const sel=$('#camSel'),cur=sel.value;
+    sel.innerHTML='<option value="">default camera</option>'+cams.map((d,i)=>
+      `<option value="${d.deviceId}">${d.label||('Camera '+(i+1))}</option>`).join('');
+    if(cur&&cams.some(d=>d.deviceId===cur))sel.value=cur;
+    return cams;
+  }catch(e){return [];}
+}
+async function startCamera(deviceId){
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  const vc=deviceId?{deviceId:{exact:deviceId}}:{};
+  try{
+    stream=await navigator.mediaDevices.getUserMedia(
+      {video:{...vc,width:{ideal:1280},height:{ideal:720}}});
+  }catch(e){                     // exact device busy/unavailable -> any camera
+    stream=await navigator.mediaDevices.getUserMedia({video:true});
+  }
+  const v=$('#cam');v.srcObject=stream;v.style.display='block';
+  $('#shoot').disabled=false;$('#camStop').disabled=false;$('#camStart').disabled=true;
+  await listCameras();           // labels are populated now that permission is granted
+  const track=stream.getVideoTracks()[0];
+  const sid=track.getSettings&&track.getSettings().deviceId;
+  if(sid)$('#camSel').value=sid;
+  setStatus('camera: '+(track.label||'active'),'ok');
+}
 $('#camStart').onclick=async()=>{
-  try{stream=await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720}});
-    const v=$('#cam');v.srcObject=stream;v.style.display='block';
-    $('#shoot').disabled=false;$('#camStop').disabled=false;$('#camStart').disabled=true;setStatus('');
-  }catch(e){setStatus('camera unavailable: '+e.message+' — use upload instead','err');}
+  try{await startCamera($('#camSel').value||undefined);}
+  catch(e){setStatus('camera unavailable: '+e.message+' — use upload instead','err');}
 };
+$('#camSel').onchange=async()=>{
+  if(!stream)return;             // just remember the pick until Start is pressed
+  try{await startCamera($('#camSel').value||undefined);}
+  catch(e){setStatus('switch failed: '+e.message,'err');}
+};
+$('#camRefresh').onclick=()=>listCameras();
+if(navigator.mediaDevices&&navigator.mediaDevices.addEventListener)
+  navigator.mediaDevices.addEventListener('devicechange',listCameras);
+listCameras();                   // initial (generic) list; real labels after Start
 $('#camStop').onclick=()=>{if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
   $('#cam').style.display='none';$('#shoot').disabled=true;$('#camStop').disabled=true;$('#camStart').disabled=false;};
 $('#shoot').onclick=async()=>{

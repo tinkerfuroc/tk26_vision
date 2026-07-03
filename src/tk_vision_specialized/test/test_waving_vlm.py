@@ -253,3 +253,21 @@ def test_chain_all_fail_raises(monkeypatch):
     with pytest.raises(WavingVlmError, match='all providers failed'):
         request_waving_persons_chain(
             _img(), provider_models=[('qwen', 'q'), ('gemini', 'g')])
+
+
+from tk_vision_specialized._waving_vlm import should_wait_for_vlm  # noqa: E402
+
+
+def test_should_wait_for_vlm_waits_below_threshold():
+    assert should_wait_for_vlm(0, 2) is True
+    assert should_wait_for_vlm(1, 2) is True
+
+
+def test_should_wait_for_vlm_skips_at_or_above_threshold():
+    assert should_wait_for_vlm(2, 2) is False
+    assert should_wait_for_vlm(3, 2) is False
+
+
+def test_should_wait_for_vlm_never_skips_when_threshold_non_positive():
+    assert should_wait_for_vlm(5, 0) is True
+    assert should_wait_for_vlm(5, -1) is True

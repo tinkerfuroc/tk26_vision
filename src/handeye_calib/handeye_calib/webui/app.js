@@ -1547,7 +1547,9 @@ async function applyPromote(which) {
     const halfRes = body && body[which];
     const ok = halfRes && halfRes.ok !== false && halfRes.written_path;
     if (ok) {
-      setStatus(statusId, `wrote ${halfRes.written_path}`, "ok");
+      const wroteMsg = `wrote ${halfRes.written_path}`
+        + (halfRes.message ? ` — ${halfRes.message}` : "");
+      setStatus(statusId, wroteMsg, "ok");
       if (backupEl) {
         backupEl.className = "status-line ok";
         backupEl.textContent = halfRes.backup_path

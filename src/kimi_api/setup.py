@@ -52,6 +52,7 @@ setup(
             'grocery_categorize = kimi_api.grocery_categorize:main',
             'seat_recommend_bbox = kimi_api.seat_recommend_bbox:main',
             'seat_fewshot_annotator = kimi_api.fewshot_annotator:main',
+            'object_scan = kimi_api.object_scan:main',
         ],
     },
 )

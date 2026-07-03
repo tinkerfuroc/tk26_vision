@@ -34,9 +34,9 @@ Per-task groups (default OFF)
 - ``enable_gpsr``       GPSR: yolo_seg_node, person_track_server,
   waving_person_server, feature_recognition, get_image.
 - ``enable_restaurant`` Restaurant: waving_person_server, follow_head.
-- ``enable_pick_place`` PickAndPlace: no task-specific node — its only vision
-  deps (generalist + door) are already in the always-on core. The flag exists
-  for symmetry / future-proofing and currently gates nothing.
+- ``enable_pick_place`` (alias ``enable_pnp``) PickAndPlace: object_scan
+  (batched labels-only VLM table scan). Plus the always-on core (generalist +
+  door) it shares.
 
 Shared nodes spawn once even with several task flags on (each is gated by the OR
 of the tasks that need it):
@@ -104,7 +104,11 @@ def generate_launch_description():
         DeclareLaunchArgument('enable_gpsr', default_value='false'),
         DeclareLaunchArgument('enable_restaurant', default_value='false'),
         DeclareLaunchArgument('enable_pick_place', default_value='false',
-                              description='No task-specific node (core covers it).'),
+                              description='PickAndPlace: object_scan '
+                                          '(batched labels-only VLM table scan).'),
+        # Alias so `enable_pnp:=true` (operator shorthand) works identically.
+        DeclareLaunchArgument('enable_pnp', default_value='false',
+                              description='Alias for enable_pick_place.'),
     ]
 
     # SHM profile for these camera subscribers (matches the driver's publisher).
@@ -135,6 +139,9 @@ def generate_launch_description():
         _node('kimi_api', 'seat_recommend_bbox', _if('enable_hri')),
         # --- GPSR-only ---
         _node('vision_util', 'get_image', _if('enable_gpsr')),
+        # --- PickAndPlace-only ---
+        _node('kimi_api', 'object_scan',
+              _if_any('enable_pick_place', 'enable_pnp')),
     ]
 
     return LaunchDescription(args + [set_dds] + nodes)

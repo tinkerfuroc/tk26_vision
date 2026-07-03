@@ -18,9 +18,8 @@ import openai
 
 from ._env import (
     base_url,
-    dashscope_base_url,
     require_api_key,
-    require_dashscope_api_key,
+    resolve_qwen_target,
 )
 
 
@@ -42,6 +41,7 @@ def request_feature_description(
     *,
     provider: str,
     model: str,
+    qwen_api_backend: str = 'dashscope',
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
@@ -53,10 +53,9 @@ def request_feature_description(
     """
     if provider == 'qwen':
         try:
-            api_key = require_dashscope_api_key()
+            b_url, api_key, model = resolve_qwen_target(qwen_api_backend, model)
         except RuntimeError as exc:
             raise FeatureVlmError(str(exc)) from exc
-        b_url = dashscope_base_url()
     elif provider == 'gemini':
         try:
             api_key = require_api_key()
@@ -119,6 +118,7 @@ def request_feature_description_chain(
     user_text: str,
     *,
     provider_models: Sequence[tuple],
+    qwen_api_backend: str = 'dashscope',
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
@@ -135,6 +135,7 @@ def request_feature_description_chain(
             return request_feature_description(
                 image_url, sys_prompt, user_text,
                 provider=provider, model=model,
+                qwen_api_backend=qwen_api_backend,
                 timeout_s=timeout_s, max_retries=max_retries, logger=logger,
             )
         except FeatureVlmError as exc:

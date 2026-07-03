@@ -11,14 +11,14 @@ without ever creating one; latent because the realsense path returns early).
 import copy
 import threading
 
-import numpy as np
 import rclpy
 import rclpy.executors
 from cv_bridge import CvBridge
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from sensor_msgs.msg import CameraInfo, Image
 from tinker_vision_msgs_26.srv import DoorDetection
+from vision_util.depth_reproject import decode_depth_metres, depth_image_to_points
 
 
 class DoorDetectionService(Node):
@@ -27,9 +27,9 @@ class DoorDetectionService(Node):
 
         self.bridge = CvBridge()
 
-        self.ptcloud_sub_orbbec = self.create_subscription(
-            PointCloud2,
-            '/camera/depth_registered/points',
+        self.depth_sub_orbbec = self.create_subscription(
+            Image,
+            '/camera/depth/image_raw',
             self.points_orbbec_callback,
             qos_profile=10,
             callback_group=MutuallyExclusiveCallbackGroup(),
@@ -67,17 +67,10 @@ class DoorDetectionService(Node):
 
     def img_orbbec_process(self, color_msg, depth_msg, intrinsic_msg):
         color_img = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8') if color_msg is not None else None
-        K = np.array(intrinsic_msg.k).reshape((3, 3))
 
-        h, w = 720, 1280
-        arr = np.frombuffer(depth_msg.data, dtype='<f4')
-        N = len(arr) // 5
-        points = arr.reshape((N, 5))[:, [0, 1, 2]]
-        points_homo = points / np.repeat(points[:, 2:3], 3, axis=1)
-        coor_homo = (K @ points_homo.T).T
-        coor = np.rint(coor_homo[:, :2]).astype(int)
-        depth_img = np.zeros((h, w, 3))
-        depth_img[coor[:, 1], coor[:, 0], :] = points
+        depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        depth_m = decode_depth_metres(depth_raw)
+        depth_img = depth_image_to_points(depth_m, intrinsic_msg.k)
         validmask = (depth_img[:, :, 2] > 1e-3).astype(int)
 
         return color_img, depth_img, validmask
@@ -105,7 +98,8 @@ class DoorDetectionService(Node):
 
         _, depth_img, validmask = self.img_orbbec_process(None, depth_msg, intrinsic_msg)
 
-        W, H, L = 1280, 720, 10
+        H, W = depth_img.shape[:2]
+        L = 10
         x1, x2, y1, y2 = H // 2 - L, H // 2 + L, W // 2 - L, W // 2 + L
 
         depth_crop = depth_img[x1:x2, y1:y2, 2]

@@ -5,6 +5,13 @@ All notable changes to this package land here, newest first.
 ## [Unreleased]
 
 ### Changed
+- Docs correction (launch comment + README, review fix for the entry
+  below): the dropped `overrides_key='pan_tilt.urdf_overrides'` mapping
+  was URDF mount-geometry threading only (never the joint offsets), and
+  its removal does not revert the standalone launch to hardcoded macro
+  defaults — since tk25_basic `db1524a`, `pan_tilt.urdf.xacro` pulls
+  per-robot mount geometry via a `ROBOT_NAME`-guarded `<xacro:include>`
+  at xacro-parse time, independent of launch args. (Task 2 / Phase 1b)
 - `pan_tilt_state_publisher` now reads its calibration-derived pan/tilt
   joint offsets from the per-robot `tinker_robot_config` profile
   (`robots/<ROBOT_NAME>/pan_tilt/offsets.yaml`, keys

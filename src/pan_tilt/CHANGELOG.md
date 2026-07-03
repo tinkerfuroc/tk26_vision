@@ -5,6 +5,51 @@ All notable changes to this package land here, newest first.
 ## [Unreleased]
 
 ### Changed
+- **Calibration Preview/Apply is per-robot only** (Task 3 / Phase 1c).
+  `apply_to_urdf` was rewritten around a single public entry
+  `apply_calibration(params, basic_root=None, allow_flipped_camera=False)`
+  that renders and atomically writes the COMPLETE contents of exactly two
+  files in the tk25_basic SOURCE tree —
+  `robots/<ROBOT_NAME>/pan_tilt/pan_tilt_overrides.xacro` + `offsets.yaml`
+  — in lockstep with `.old-<ts>` backups (both-or-neither; rollback on
+  partial failure). It refuses when `ROBOT_NAME` is unset
+  (`CalibrationApplyError`, new alias `ApplyError`; calib_web surfaces it
+  as HTTP 400 with `detail`). rpy values the solve didn't fit
+  (trivial/absent rotvec) are copied from the current per-robot overrides
+  file, never zeroed; the forward-camera invariant (`|yaw| < π/2` unless
+  `allow_flipped_camera`) still guards fitted camera rotations. New
+  helpers: `render_overrides_xacro`, `render_offsets_yaml`,
+  `render_calibration`, `resolve_per_robot_dir` (workspace located by
+  walking up from the module — never a filename glob, which is ambiguous
+  across the three per-robot copies). CLI is now
+  `python -m pan_tilt.calibration.apply_to_urdf --results <json>
+  [--basic-root PATH] [--allow-flipped-camera]`; the old
+  `--xacro/--yaml/--no-yaml/--allow-partial/--overrides-yaml/
+  --no-overrides/--out` flags are gone. `urdf_targets.list_targets()` now
+  returns the single per-robot target ("robots/<robot>/pan_tilt/
+  (per-robot apply target)", build command `tkbuild tk25_basic
+  --packages-select tinker_robot_config`); calib_web's
+  `urdf_diff`/`urdf_apply` ignore a stray legacy `xacro_path` in POST
+  bodies and keep the response keys the web UI reads (`applied`,
+  `backup_path`, `yaml_path`/`yaml_applied`/`yaml_backup_path`,
+  `pan_offset_rad`/`tilt_offset_rad`, `build_command`, `workspace_hint`,
+  plus new `written`/`robot`). (Task 3 / Phase 1c)
+
+### Removed
+- The shared-source patching paths in `apply_to_urdf`: `_patched_macro` /
+  `_patched_standalone` / `_patched_xacro` (with `JOINT_BLOCK_RE`,
+  `ATTACH_XYZ_DEFAULT_RE`, `ATTACH_RPY_DEFAULT_RE`, `MACRO_DECL_RE`),
+  `_patch_yaml_offsets`, `_patch_urdf_overrides`, `_resolve_overrides_yaml`,
+  `_resolve_yaml_path`, and `resolve_source_path`. Rationale: the old
+  regex patchers targeted the pre-`db1524a` macro format — running them
+  against the new per-robot-include macro would silently destroy per-robot
+  behavior, and `resolve_source_path`'s `**/<name>` glob became ambiguous
+  (3 identically-named per-robot files) with a silent install-tree-write
+  fallback. A tombstone test (`test_apply_source_tree.py::
+  test_old_shared_source_patchers_are_gone`) keeps them deleted.
+  (Task 3 / Phase 1c)
+
+### Changed
 - Docs correction (launch comment + README, review fix for the entry
   below): the dropped `overrides_key='pan_tilt.urdf_overrides'` mapping
   was URDF mount-geometry threading only (never the joint offsets), and

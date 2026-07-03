@@ -84,7 +84,6 @@ from .calibration.custom_naming import (
 from .calibration.run_calibration import GATES as _RC_GATES
 from .calibration.safety import SafetyEnvelope
 from .calibration.urdf_targets import list_targets as list_urdf_targets
-from .calibration.yaml_targets import list_yaml_targets
 from .calibration import apply_to_urdf as _apply_to_urdf_mod
 from .calibration.utils import matrix_to_pose, pose_to_matrix, wrap_to_pi
 from .calibration.waypoint_predict import (
@@ -300,13 +299,15 @@ class CalibrateRunner:
 
     # ---- apply_to_urdf diff (synchronous, short-running) -------------------
     #
-    # Renders unified diffs for BOTH the xacro and pan_tilt.yaml targets in
-    # one shot — runtime offsets must be applied in lockstep with the URDF,
-    # and the operator should see both changes before clicking Apply. We
-    # call the patcher functions in-process (no subprocess) for deterministic
-    # error handling and to avoid stdout parsing.
+    # Renders unified diffs for BOTH per-robot files ($ROBOT_NAME's
+    # pan_tilt_overrides.xacro + offsets.yaml in the tk25_basic source tree)
+    # in one shot — geometry and runtime offsets must travel in lockstep, and
+    # the operator should see both changes before clicking Apply. We call the
+    # renderer in-process (no subprocess) for deterministic error handling.
+    # CalibrationApplyError (ROBOT_NAME unset, profile missing) propagates to
+    # the endpoint, which maps it to HTTP 400.
 
-    async def urdf_diff(self, session: str, results_file: str, xacro_path: str) -> dict:
+    async def urdf_diff(self, session: str, results_file: str) -> dict:
         session_path = self.session_path(session)
         results_path = session_path / results_file
         if not results_path.is_file():
@@ -315,115 +316,55 @@ class CalibrateRunner:
             )
 
         params = _apply_to_urdf_mod._load_params(results_path)
-        import numpy as _np
-        t_a = _np.asarray(params["t_a"], dtype=float)
-        t_a_rotvec = _np.asarray(params.get("t_a_rotvec", [0, 0, 0]), dtype=float)
-        t_b_trans = _np.asarray(params["t_b_trans"], dtype=float)
-        t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
-        pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
-        tilt_offset_rad = float(params.get("theta_t_offset_rad", 0.0))
-        pan_offset_rad = wrap_to_pi(pan_offset_rad)
-        tilt_offset_rad = wrap_to_pi(tilt_offset_rad)
+        robot = _apply_to_urdf_mod._require_robot_name()
+        per_robot_dir = _apply_to_urdf_mod.resolve_per_robot_dir(robot)
+        rendered = _apply_to_urdf_mod.render_calibration(
+            params, robot, per_robot_dir,
+            allow_flipped_camera=True,  # diff mode — show what would land
+        )
 
-        xacro = _apply_to_urdf_mod.resolve_source_path(Path(xacro_path))
-        if not xacro.is_file():
-            raise FileNotFoundError(f"xacro {xacro_path!r} not present")
-        original_xacro = xacro.read_text()
-        try:
-            patched_xacro = _apply_to_urdf_mod._patched_xacro(
-                original_xacro, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
-                allow_flipped_camera=True,  # diff mode — show what would land
-            )
-        except _apply_to_urdf_mod.CalibrationApplyError as exc:
-            return {"diff": "", "yaml_diff": "", "error": str(exc)}
-
+        xacro_path = rendered["xacro_path"]
+        original_xacro = xacro_path.read_text()
         urdf_diff_text = "".join(difflib.unified_diff(
             original_xacro.splitlines(keepends=True),
-            patched_xacro.splitlines(keepends=True),
-            fromfile=str(xacro),
-            tofile=str(xacro) + " (calibrated)",
+            rendered["xacro_text"].splitlines(keepends=True),
+            fromfile=str(xacro_path),
+            tofile=str(xacro_path) + " (calibrated)",
         ))
 
-        yaml_diff_text = ""
-        yaml_targets = [t for t in list_yaml_targets() if t.exists]
-        if yaml_targets:
-            yaml_path = _apply_to_urdf_mod.resolve_source_path(Path(yaml_targets[0].path))
-            original_yaml = yaml_path.read_text()
-            try:
-                patched_yaml = _apply_to_urdf_mod._patch_yaml_offsets(
-                    original_yaml, pan_offset_rad, tilt_offset_rad,
-                )
-            except _apply_to_urdf_mod.CalibrationApplyError as exc:
-                yaml_diff_text = f"# YAML patch error: {exc}\n"
-            else:
-                yaml_diff_text = "".join(difflib.unified_diff(
-                    original_yaml.splitlines(keepends=True),
-                    patched_yaml.splitlines(keepends=True),
-                    fromfile=str(yaml_path),
-                    tofile=str(yaml_path) + " (calibrated)",
-                ))
-
-        # Per-robot urdf_overrides.yaml — the file that actually wins at launch.
-        # Folded into the yaml-diff pane so it surfaces without a UI change.
-        overrides_path = None
-        try:
-            ovr = _apply_to_urdf_mod._resolve_overrides_yaml(None, no_overrides=False)
-        except _apply_to_urdf_mod.CalibrationApplyError:
-            ovr = None
-        if ovr is not None:
-            overrides_path = str(ovr)
-            original_ovr = ovr.read_text()
-            try:
-                patched_ovr, _ = _apply_to_urdf_mod._patch_urdf_overrides(
-                    original_ovr, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
-                    allow_flipped_camera=True,
-                )
-            except _apply_to_urdf_mod.CalibrationApplyError as exc:
-                yaml_diff_text += f"\n# urdf_overrides.yaml patch error: {exc}\n"
-            else:
-                yaml_diff_text += "".join(difflib.unified_diff(
-                    original_ovr.splitlines(keepends=True),
-                    patched_ovr.splitlines(keepends=True),
-                    fromfile=str(ovr),
-                    tofile=str(ovr) + " (calibrated)",
-                ))
+        offsets_path = rendered["offsets_path"]
+        original_offsets = offsets_path.read_text() if offsets_path.is_file() else ""
+        yaml_diff_text = "".join(difflib.unified_diff(
+            original_offsets.splitlines(keepends=True),
+            rendered["offsets_text"].splitlines(keepends=True),
+            fromfile=str(offsets_path),
+            tofile=str(offsets_path) + " (calibrated)",
+        ))
 
         return {
+            "robot": robot,
             "diff": urdf_diff_text,
             "yaml_diff": yaml_diff_text,
-            "yaml_path": str(yaml_targets[0].path) if yaml_targets else None,
-            "overrides_path": overrides_path,
+            "yaml_path": str(offsets_path),
+            "written_targets": [str(xacro_path), str(offsets_path)],
         }
 
-    # ---- apply_to_urdf write (atomic in-place patch with backup) -----------
+    # ---- apply_to_urdf write (atomic per-robot pair with backups) ----------
 
-    async def urdf_apply(self, session: str, results_file: str, xacro_path: str) -> dict:
-        """Patch ``xacro_path`` AND `pan_tilt.yaml` from ``<session>/<results_file>``,
-        replace in place, leave timestamped backups for both.
+    async def urdf_apply(self, session: str, results_file: str) -> dict:
+        """Apply ``<session>/<results_file>`` to $ROBOT_NAME's two per-robot
+        files (``pan_tilt_overrides.xacro`` + ``offsets.yaml`` in the
+        tk25_basic SOURCE tree), atomically, leaving ``.old-<ts>`` backups.
 
-        ``xacro_path`` must match one of the entries in ``list_urdf_targets()``.
-        That allowlist is the only thing standing between an HTTP body and
-        an arbitrary file write, so the check is mandatory here. The YAML
-        path is server-side discovered via ``list_yaml_targets()`` and is
-        never accepted from the request body.
+        No path is accepted from the request body — the target is resolved
+        server-side from ``$ROBOT_NAME``, and the shared tinker_urdf xacros
+        are never written. ``CalibrationApplyError`` (ROBOT_NAME unset,
+        profile missing, flipped camera) propagates to the endpoint, which
+        maps it to HTTP 400.
 
         Idempotent: when either file already matches the calibration, no
         backup for that file is written.
         """
-        target = next(
-            (t for t in list_urdf_targets() if t.path == xacro_path),
-            None,
-        )
-        if target is None:
-            raise ValueError(
-                f"xacro_path {xacro_path!r} is not on the URDF target allowlist"
-            )
-        if not target.exists:
-            raise FileNotFoundError(
-                f"target xacro {xacro_path!r} not present in this overlay "
-                f"(package {target.build_package} not built?)"
-            )
-
         session_path = self.session_path(session)
         results_path = session_path / results_file
         if not results_path.is_file():
@@ -432,113 +373,55 @@ class CalibrateRunner:
             )
 
         params = _apply_to_urdf_mod._load_params(results_path)
-        import numpy as _np
-        t_a = _np.asarray(params["t_a"], dtype=float)
-        t_a_rotvec = _np.asarray(params.get("t_a_rotvec", [0, 0, 0]), dtype=float)
-        t_b_trans = _np.asarray(params["t_b_trans"], dtype=float)
-        t_b_rotvec = _np.asarray(params.get("t_b_rotvec", [0, 0, 0]), dtype=float)
-        pan_offset_rad = float(params.get("theta_p_offset_rad", 0.0))
-        tilt_offset_rad = float(params.get("theta_t_offset_rad", 0.0))
-        pan_offset_rad = wrap_to_pi(pan_offset_rad)
-        tilt_offset_rad = wrap_to_pi(tilt_offset_rad)
-
-        xacro = _apply_to_urdf_mod.resolve_source_path(Path(xacro_path))
-        original_xacro = xacro.read_text()
-        try:
-            patched_xacro = _apply_to_urdf_mod._patched_xacro(
-                original_xacro, t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
-                allow_flipped_camera=True,
-            )
-        except _apply_to_urdf_mod.CalibrationApplyError as exc:
-            raise RuntimeError(str(exc)) from exc
-
-        yaml_targets = [t for t in list_yaml_targets() if t.exists]
-        yaml_path = _apply_to_urdf_mod.resolve_source_path(Path(yaml_targets[0].path)) if yaml_targets else None
-
-        try:
-            atomic = _apply_to_urdf_mod._atomic_write_pair(
-                xacro, patched_xacro,
-                yaml_path, pan_offset_rad, tilt_offset_rad,
-            )
-        except _apply_to_urdf_mod.CalibrationApplyError as exc:
-            raise RuntimeError(str(exc)) from exc
-
-        # Per-robot urdf_overrides.yaml — the file that actually wins at launch.
-        # Patched as a separate atomic write after the URDF+YAML pair (same
-        # rationale as the CLI: a failure here leaves the pair applied, and an
-        # idempotent re-run recovers). Auto-discovered via $ROBOT_NAME.
-        overrides_applied = False
-        overrides_path_str = None
-        overrides_backup = None
-        overrides_keys: list[str] = []
-        try:
-            overrides_path = _apply_to_urdf_mod._resolve_overrides_yaml(
-                None, no_overrides=False,
-            )
-        except _apply_to_urdf_mod.CalibrationApplyError as exc:
-            raise RuntimeError(str(exc)) from exc
-        if overrides_path is not None:
-            overrides_path_str = str(overrides_path)
-            try:
-                patched_ovr, overrides_keys = _apply_to_urdf_mod._patch_urdf_overrides(
-                    overrides_path.read_text(), t_a, t_b_trans, t_b_rotvec, t_a_rotvec,
-                    allow_flipped_camera=True,
-                )
-                ovr_res = _apply_to_urdf_mod._atomic_write_single(
-                    overrides_path, patched_ovr,
-                )
-            except _apply_to_urdf_mod.CalibrationApplyError as exc:
-                raise RuntimeError(str(exc)) from exc
-            overrides_applied = ovr_res["applied"]
-            overrides_backup = ovr_res["backup_path"]
+        detail = _apply_to_urdf_mod.apply_calibration_detail(
+            params, allow_flipped_camera=True,
+        )
 
         # Diff previews for the UI's success card. Compare current file
         # contents (post-replace) against the .old-<ts> backups.
+        xacro_path = Path(detail["xacro_path"])
         urdf_diff_preview = ""
-        if atomic["xacro_applied"] and atomic["xacro_backup_path"]:
+        if detail["xacro_applied"] and detail["xacro_backup_path"]:
             urdf_diff_preview = "".join(list(difflib.unified_diff(
-                Path(atomic["xacro_backup_path"]).read_text().splitlines(keepends=True),
-                xacro.read_text().splitlines(keepends=True),
-                fromfile=str(xacro),
-                tofile=str(xacro) + " (calibrated)",
+                Path(detail["xacro_backup_path"]).read_text().splitlines(keepends=True),
+                xacro_path.read_text().splitlines(keepends=True),
+                fromfile=str(xacro_path),
+                tofile=str(xacro_path) + " (calibrated)",
             ))[:24])
 
+        offsets_path = Path(detail["offsets_path"])
         yaml_diff_preview = ""
-        if atomic["yaml_applied"] and atomic["yaml_backup_path"] and yaml_path is not None:
+        if detail["offsets_applied"] and detail["offsets_backup_path"]:
             yaml_diff_preview = "".join(list(difflib.unified_diff(
-                Path(atomic["yaml_backup_path"]).read_text().splitlines(keepends=True),
-                yaml_path.read_text().splitlines(keepends=True),
-                fromfile=str(yaml_path),
-                tofile=str(yaml_path) + " (calibrated)",
+                Path(detail["offsets_backup_path"]).read_text().splitlines(keepends=True),
+                offsets_path.read_text().splitlines(keepends=True),
+                fromfile=str(offsets_path),
+                tofile=str(offsets_path) + " (calibrated)",
             ))[:12])
 
-        applied_anything = (
-            atomic["xacro_applied"] or atomic["yaml_applied"] or overrides_applied
-        )
+        applied_anything = detail["xacro_applied"] or detail["offsets_applied"]
         return {
             "applied": applied_anything,
             "reason": (
                 None if applied_anything else
-                "no change — URDF, YAML, and overrides already match calibration"
+                f"no change — {detail['robot']}'s per-robot overrides + "
+                f"offsets already match calibration"
             ),
-            "build_package": target.build_package,
-            "build_command": target.build_command,
-            "workspace_hint": target.workspace_hint,
-            # URDF surface (back-compat with old client code).
-            "backup_path": atomic["xacro_backup_path"],
+            "robot": detail["robot"],
+            "written": detail["written"],
+            "build_package": detail["build_package"],
+            "build_command": detail["build_command"],
+            "workspace_hint": detail["workspace_hint"],
+            # Overrides-xacro surface (key names kept for the web client).
+            "backup_path": detail["xacro_backup_path"],
             "diff_preview": urdf_diff_preview,
-            # YAML surface (new).
-            "yaml_path": atomic["yaml_path"],
-            "yaml_applied": atomic["yaml_applied"],
-            "yaml_backup_path": atomic["yaml_backup_path"],
+            # Offsets-yaml surface (key names kept for the web client).
+            "yaml_path": detail["offsets_path"],
+            "yaml_applied": detail["offsets_applied"],
+            "yaml_backup_path": detail["offsets_backup_path"],
             "yaml_diff_preview": yaml_diff_preview,
-            "pan_offset_rad": pan_offset_rad,
-            "tilt_offset_rad": tilt_offset_rad,
-            # Per-robot urdf_overrides.yaml surface (the file that wins at launch).
-            "overrides_path": overrides_path_str,
-            "overrides_applied": overrides_applied,
-            "overrides_backup_path": overrides_backup,
-            "overrides_keys": overrides_keys,
+            "pan_offset_rad": detail["pan_offset_rad"],
+            "tilt_offset_rad": detail["tilt_offset_rad"],
         }
 
 
@@ -2557,16 +2440,18 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     @app.post("/api/calib/urdf_diff")
     async def api_calib_urdf_diff(req: dict):
         session = (req or {}).get("session", "")
-        xacro_path = (req or {}).get("xacro_path", "")
         # Default to polish.json: the joint refinement is consistently a few
         # mm tighter than chain alone on real datasets.
         results_file = (req or {}).get("results_file", "polish.json")
-        if not xacro_path:
-            raise HTTPException(400, "xacro_path required")
+        # A stray legacy `xacro_path` in the body is tolerated and IGNORED —
+        # the apply target is per-robot ($ROBOT_NAME), resolved server-side.
         try:
-            result = await node.calib_runner.urdf_diff(session, results_file, xacro_path)
+            result = await node.calib_runner.urdf_diff(session, results_file)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
+        except _apply_to_urdf_mod.CalibrationApplyError as exc:
+            # ROBOT_NAME unset / profile missing — a refusal, not a crash.
+            raise HTTPException(400, str(exc))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         except RuntimeError as exc:
@@ -2576,18 +2461,20 @@ def make_app(node: CalibWebNode, webui_dir: Path) -> FastAPI:
     @app.post("/api/calib/urdf_apply")
     async def api_calib_urdf_apply(req: dict):
         session = (req or {}).get("session", "")
-        xacro_path = (req or {}).get("xacro_path", "")
         results_file = (req or {}).get("results_file", "polish.json")
-        if not xacro_path:
-            raise HTTPException(400, "xacro_path required")
+        # A stray legacy `xacro_path` in the body is tolerated and IGNORED —
+        # the apply target is per-robot ($ROBOT_NAME), resolved server-side.
         try:
-            result = await node.calib_runner.urdf_apply(session, results_file, xacro_path)
+            result = await node.calib_runner.urdf_apply(session, results_file)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
+        except _apply_to_urdf_mod.CalibrationApplyError as exc:
+            # ROBOT_NAME unset / profile missing / flipped camera — refusal.
+            raise HTTPException(400, str(exc))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         except PermissionError as exc:
-            raise HTTPException(500, f"cannot write xacro: {exc}")
+            raise HTTPException(500, f"cannot write per-robot files: {exc}")
         except RuntimeError as exc:
             raise HTTPException(500, str(exc))
         return result

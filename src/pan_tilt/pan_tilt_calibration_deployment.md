@@ -69,20 +69,52 @@ Verified live from the install build: at firmware tilt 45° the camera bearing i
 **+1.38° forward** (was −174°); HRI seat-pointing residual dropped from 12°+ to
 ~2°.
 
+## Current deployment flow (2026-07-03, per-robot — supersedes the flow above)
+
+Since tk25_basic `db1524a` + tk26_vision Task 3 (Phase 1c), the apply target is
+exactly **two per-robot files** in the tk25_basic SOURCE tree, keyed by
+`$ROBOT_NAME`:
+
+```
+src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/
+    pan_tilt_overrides.xacro   # mount geometry (4 xacro properties)
+    offsets.yaml               # runtime joint offsets (theta_p / theta_t)
+```
+
+`tinker_urdf/src/pan_tilt.urdf.xacro` auto-includes the per-robot overrides at
+xacro-parse time whenever `ROBOT_NAME` is set, and `pan_tilt_state_publisher`
+reads `offsets.yaml` via the `tinker_robot_config` resolver. Writing this pair
+IS the complete deployment; the shared xacros are never touched, and a tinker1
+apply can no longer overwrite tinker2's calibration (or vice versa).
+
+One command (or the calib_web **Apply** button, which does the same in-process):
+
+```bash
+export ROBOT_NAME=tinker1   # refused when unset
+python -m pan_tilt.calibration.apply_to_urdf --results calib_out/polish.json
+tkbuild tk25_basic --packages-select tinker_robot_config
+# then relaunch robot_state_publisher + pan_tilt state_publisher
+```
+
+Both files land atomically with `.old-<ts>` backups (both-or-neither — a
+failure mid-write rolls the first file back). Preview the exact diffs first via
+calib_web's **Preview** button, or pass `--basic-root <path-to-tk25_basic>` to
+target a checkout elsewhere.
+
 ## Deployment rules (read before deploying any new calibration)
 
-- **Ship the `(tilt_offset_rad, camera_mount)` pair together.** Updating
-  `pan_tilt.yaml` without the matching URDF `camera_mount` (or vice-versa) gives a
-  ~180°-wrong camera. This is the single most common way to break it.
+- **Ship the `(tilt_offset_rad, camera_mount)` pair together.** Updating the
+  offsets without the matching `camera_mount` geometry (or vice-versa) gives a
+  ~180°-wrong camera. This is the single most common way to break it — and the
+  per-robot apply now enforces it (the two files always travel atomically).
 - **`apply_to_urdf` enforces a forward-camera invariant** (`|yaw| < π/2`): it
   **rejects** `chain.json`'s `t_b` (xyz-euler yaw −178°) and **accepts**
   `polish.json`'s `t_b` (yaw −2.27°). **Deploy `polish.json`, not `chain.json`.**
-- **The runtime URDF path is the macro defaults.**
-  `tk25_basic/src/tinker_urdf/.../tracer_mini_manipulator.urdf.xacro` instantiates
-  `pan_tilt_macro` with **no args**, so grasp/HRI use the macro defaults in
-  `pan_tilt.urdf.xacro` — the per-robot `urdf_overrides.yaml` path is only the
-  standalone dev launch, and tinker1 has no overrides file. Patch the macro
-  defaults, not just the standalone args.
+- **`ROBOT_NAME` must be set.** The apply refuses outright when it is unset —
+  there is no shared fallback target anymore. (The historical rule "patch the
+  macro defaults in `pan_tilt.urdf.xacro`" is obsolete: the macro consumes the
+  per-robot `pan_tilt_overrides.xacro` include, and every robot profile ships
+  one, seeded 2026-07-03.)
 - **Firmware tilt = 45° puts the optical axis horizontal-forward.** (An older note
   saying 30° is stale.)
 

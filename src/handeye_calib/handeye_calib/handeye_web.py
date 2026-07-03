@@ -3131,7 +3131,6 @@ def _make_node_class():
             xacro_target = ah.resolve_robot_xacro_path(robot, basic_root)
             if xacro_target is None:
                 return None
-            joint_name = self._mount_joint_name()
             xyz_str = self._format_xyz_str(T_eef_mount)
             rpy_str = self._format_rpy_str(T_eef_mount)
             # Vendor-path refusal: even if some bug resolved us at the shared
@@ -3147,23 +3146,19 @@ def _make_node_class():
                     "warning": (f"refusing to write shared vendor xacro — "
                                 f"set up per-robot override at {xacro_target}"),
                 }
-            if xacro_target.exists():
-                current_xacro = xacro_target.read_text()
-                try:
-                    proposed_xacro = ah.patch_urdf_origin(
-                        current_xacro, joint_name,
-                        xyz_str.split(), rpy_str.split())
-                    mode = "patch"
-                except ValueError:
-                    # joint not in existing override file → re-seed it
-                    proposed_xacro = ah.seed_handeye_override_xacro(
-                        joint_name, xyz_str, rpy_str)
-                    mode = "seed"
-            else:
-                current_xacro = ""
-                proposed_xacro = ah.seed_handeye_override_xacro(
-                    joint_name, xyz_str, rpy_str)
-                mode = "seed"
+            # Always write the full property-redefinition form — the ONLY
+            # form xarm_description/urdf/camera/realsense_d435i.urdf.xacro's
+            # <xacro:include> actually consumes (redefines handeye_xyz/
+            # handeye_rpy). The prior <joint>-patch path silently never took
+            # effect on the real URDF (the vendor xacro's <joint> already
+            # existed and read its origin from those two properties, so a
+            # sibling <joint> block in the include was inert) — tinker2's
+            # deployed override had to be hand-copied because of this bug.
+            current_xacro = (xacro_target.read_text()
+                              if xacro_target.exists() else "")
+            proposed_xacro = ah.seed_handeye_override_xacro(
+                robot, xyz_str, rpy_str)
+            mode = "seed"
             xacro_diff = "".join(difflib.unified_diff(
                 current_xacro.splitlines(keepends=True),
                 proposed_xacro.splitlines(keepends=True),
@@ -3278,8 +3273,17 @@ def _make_node_class():
                         try:
                             backup = ah.write_with_backup(
                                 x["target_path"], x["proposed_text"])
-                            out["xacro"] = {"written_path": x["target_path"],
-                                            "backup_path": backup}
+                            out["xacro"] = {
+                                "written_path": x["target_path"],
+                                "backup_path": backup,
+                                "message": (
+                                    "Rebuild + relaunch to pick this up: "
+                                    "tkbuild tk25_basic --packages-select "
+                                    "tinker_robot_config, then relaunch the "
+                                    "arm bringup (robot_state_publisher) so "
+                                    "the new wrist-camera mount is loaded."
+                                ),
+                            }
                         except Exception as exc:
                             out["xacro"] = {
                                 "ok": False,

@@ -69,15 +69,19 @@ def test_resolve_robot_xacro_path_none_when_robot_unset(tmp_path):
     assert ah.resolve_robot_xacro_path("", tmp_path) is None
 
 
-def test_seed_handeye_override_xacro_well_formed():
-    body = ah.seed_handeye_override_xacro("camera_link_joint",
-                                          "0.07 -0.02 0.024", "3.14 -1.57 0")
-    assert "<?xml" in body
-    assert 'name="handeye_override"' in body
-    assert 'name="camera_link_joint"' in body
-    assert 'xyz="0.07 -0.02 0.024"' in body
-    assert 'rpy="3.14 -1.57 0"' in body
-    assert '<parent link="link_eef"' in body and '<child link="camera_link"' in body
+def test_override_xacro_is_property_form():
+    """The vendor d435i xacro consumes handeye_xyz/handeye_rpy PROPERTIES
+    (redefined by the per-robot include), not a <joint> block — the
+    pre-2026-07-03 <joint> writer silently never took effect on the real
+    URDF. Promote must emit the property-redefinition form."""
+    text = ah.seed_handeye_override_xacro(
+        'tinker1', '0.1 0.2 0.3', '0.4 0.5 0.6')
+    assert '<xacro:property name="handeye_xyz" value="0.1 0.2 0.3"/>' in text
+    assert '<xacro:property name="handeye_rpy" value="0.4 0.5 0.6"/>' in text
+    assert '<joint' not in text
+    assert 'handeye_override_tinker1' in text
+    import xml.etree.ElementTree as ET
+    ET.fromstring(text)
 
 
 def test_patch_urdf_origin_against_realsense_d435i_shape():

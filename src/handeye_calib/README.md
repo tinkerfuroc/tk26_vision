@@ -27,7 +27,7 @@ Module map:
 - `gates.py` — settle/stability, pose-diversity, per-frame quality gates.
 - `handeye_collect.py` — ROS node: drive arm, settle-gate, detect, accumulate.
 - `handeye_web.py` — calib_web-style author / run / verify / promote tool.
-- `apply_handeye.py` — compose to the URDF mount frame; write `hand_eye.yaml` / patch URDF.
+- `apply_handeye.py` — compose to the URDF mount frame; write `hand_eye.yaml` / the per-robot `wrist_camera.xacro` property-override.
 
 ## Board setup
 
@@ -125,30 +125,35 @@ Live state pushed via WebSocket at 5 Hz (no polling for state). The live camera 
 ## Per-robot xacro override (one-time setup)
 
 The wrist camera mount is defined in a **shared vendor xacro** at
-`src/tk25_manipulation/src/xarm_ros2/xarm_description/urdf/camera/realsense_d435i.urdf.xacro`
-(joint `camera_link_joint`). Patching the vendor file in place would
-overwrite tinker1's calibration when tinker2 calibrates and vice versa.
-
-Instead, `handeye_web` writes a **per-robot override** at:
+`src/tk25_manipulation/src/xarm_ros2/xarm_description/urdf/camera/realsense_d435i.urdf.xacro`.
+That file declares `handeye_xyz` / `handeye_rpy` xacro **properties**
+(factory-nominal defaults), then — when `ROBOT_NAME` is set — does
+`<xacro:include filename="$(find tinker_robot_config)/robots/$(optenv
+ROBOT_NAME)/wrist_camera.xacro"/>` before consuming those two properties in
+its `camera_link_joint`'s `<origin>`. Patching the vendor file in place
+would overwrite tinker1's calibration when tinker2 calibrates and vice
+versa, so instead `handeye_web` writes a **per-robot override** at:
 
 ```
 src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/wrist_camera.xacro
 ```
 
-For the override to actually take effect in the live URDF, the operator must
-do a **one-time** include from the main robot xacro (e.g.
-`src/tk25_basic/src/tinker_urdf/src/mobile_manipulator.urdf.xacro`):
+Since 2026-07-03, Promote **always** writes the full **property-redefinition
+form** — a complete `<robot>` body that redefines `handeye_xyz` /
+`handeye_rpy` (`<xacro:property name="handeye_xyz" value="..."/>` etc.),
+matching exactly what the vendor `<xacro:include>` consumes. This is the
+*only* form that actually takes effect: an earlier version of this writer
+emitted a `<joint>` block instead, which was silently inert (the vendor
+xacro already owns the one `camera_link_joint` and reads its origin from
+the two properties — a sibling `<joint>` in the include never got used).
+Every promote fully overwrites the per-robot file (with a timestamped
+backup), whether it already exists or not — there is no more separate
+"patch existing `<origin>`" mode.
 
-```xml
-<xacro:include filename="$(find tinker_robot_config)/robots/$(arg robot_name)/wrist_camera.xacro"/>
-```
-
-…and either remove the corresponding `<joint name="camera_link_joint">`
-block from the vendor d435i xacro, or guard it with
-`<xacro:unless value="$(arg use_handeye_override)">…</xacro:unless>`.
-This wiring happens once per workspace; afterwards every `handeye_web`
-calibration just overwrites the per-robot override file in place (with a
-timestamped backup).
+For the override to actually take effect, `ROBOT_NAME` must be exported
+before the URDF is parsed (see the workspace's per-robot env setup,
+`src/tk25_basic/tools/robot-env.sh`) — no additional one-time xacro wiring
+is required beyond what the vendor xacro already does.
 
 If `ROBOT_NAME` is unset when promoting, the UI offers **yaml-only
 promote** — the `hand_eye.yaml` is still written, but the xacro half is
@@ -156,11 +161,16 @@ disabled with a banner explaining why. The promote endpoint will **refuse**
 to write the shared vendor xacro under any circumstance (path-prefix
 check; see `apply_promote` in `handeye_web.py`).
 
-When the per-robot override file does not yet exist, the UI's xacro diff
-shows the **seed** template (a complete one-joint `<robot>` body with a
-header comment instructing the include + vendor-disable). When it does
-exist, the UI shows a **patch** of the existing file's `<origin>` only,
-preserving the rest of the override verbatim.
+**After a successful xacro promote, rebuild + relaunch before the new mount
+pose is live** — the promote success message says so, but to spell it out:
+
+```
+tkbuild tk25_basic --packages-select tinker_robot_config
+```
+
+...then relaunch `robot_state_publisher` / the arm bringup so the freshly
+built `tinker_robot_config` package (and the xacro include it now serves)
+is actually re-parsed.
 
 ## Waypoints + auto-capture
 
@@ -203,6 +213,34 @@ check: predicted board corners should track the real corners within a few px acr
 the workspace.
 
 ## Changelog
+- 0.12.1 (2026-07-03): **Promote now writes the property-redefinition xacro form the
+  vendor URDF actually consumes** (was silently inert).
+  - `apply_handeye.seed_handeye_override_xacro(robot_name, xyz_str, rpy_str)` (the
+    `joint_name` param is gone) now emits a `<robot>` body that redefines the
+    `handeye_xyz` / `handeye_rpy` **xacro properties**
+    (`<xacro:property name="handeye_xyz" value="..."/>`), matching exactly what
+    `xarm_description/urdf/camera/realsense_d435i.urdf.xacro`'s
+    `<xacro:include>` reads. The previous template wrote a standalone `<joint
+    name="{joint_name}">` block — the vendor xacro already owns the one
+    `camera_link_joint` and reads its `<origin>` from those two properties, so
+    that sibling `<joint>` in the include was **never used**. This is why
+    tinker2's deployed `wrist_camera.xacro` had to be hand-copied instead of
+    Promoted (see that file's changelog comments, 2026-06-22 through
+    2026-07-01) — Promote's own writer couldn't produce a file that worked.
+  - `handeye_web.py`'s `_xacro_half_for_diff` **always** writes the full
+    property-form file via `write_with_backup` now (`mode` is always `"seed"`);
+    the old `patch_urdf_origin(existing_file, joint_name, ...)` branch — which
+    tried to patch an existing override's inert `<joint>` `<origin>` in place —
+    is deleted. `patch_urdf_origin` itself is unchanged and still covered by
+    its direct tests (it has no other caller now; kept for the generic
+    `<joint>`-origin-patch utility it is).
+  - The Promote **apply** response for a successful xacro write now includes a
+    `message` field (surfaced in the UI status line) reminding the operator to
+    `tkbuild tk25_basic --packages-select tinker_robot_config` and relaunch the
+    arm bringup — the on-disk xacro alone does nothing until the package is
+    rebuilt and `robot_state_publisher` re-parses it.
+  - No change to `hand_eye.yaml` promote, to `patch_urdf_origin`'s own
+    behavior/tests, or to the vendor-xacro refusal guard.
 - 0.12.0 (2026-06-28): **Longer, pan-tilt-style settle: capture waits for held steadiness.**
   - New param `capture_min_steady_frames` (default **5**). A capture is now accepted
     only after the `StabilityTracker` verdict has HELD for ≥ this many consecutive

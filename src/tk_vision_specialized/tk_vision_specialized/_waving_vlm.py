@@ -129,6 +129,22 @@ def select_boxes(parsed: dict, w: int, h: int) -> WavingVlmResult:
     return res
 
 
+def should_wait_for_vlm(cv_waver_count: int, skip_min_wavers: int) -> bool:
+    """Return True if the caller should block on the VLM future.
+
+    False means CV alone already found skip_min_wavers or more wavers, so the
+    VLM call should be abandoned instead -- left running in the background,
+    its result discarded when it lands.
+
+    skip_min_wavers <= 0 means "never skip" (always wait) -- a 0 threshold
+    would otherwise mean cv_waver_count >= 0 is trivially true, immediately
+    discarding every call regardless of what CV found.
+    """
+    if skip_min_wavers <= 0:
+        return True
+    return cv_waver_count < skip_min_wavers
+
+
 def _resolve_key(provider: str) -> Optional[str]:
     """Resolve a provider's API key from os.environ only, or None."""
     if provider == 'qwen':

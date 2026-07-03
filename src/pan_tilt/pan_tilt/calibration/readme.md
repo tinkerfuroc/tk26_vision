@@ -245,59 +245,57 @@ Only run polish if Phase-2 residuals show *structured* (non-random) pattern — 
 
 The output `polish.json` records `phase1_sources`, `kept_indices`, `rejected_indices_manual`, and `rejected_indices_auto` so the run is self-describing.
 
-### 8. Review the URDF patch
+### 8. Apply the calibration (per-robot)
 
-The solver writes `chain.json` (and optionally `polish.json`) with the fitted parameters. There are **two xacro files** describing the same chain, both consumed at runtime:
+The solver writes `chain.json` (and optionally `polish.json`) with the fitted parameters. Since the per-robot split (tk25_basic `db1524a` + tk26_vision Task 3 / Phase 1c), the apply target is exactly **two per-robot files** in the tk25_basic SOURCE tree, keyed by `$ROBOT_NAME`:
 
-- `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` — the **authoritative** URDF, a `<xacro:macro name="pan_tilt_macro">` that `tracer_mini_manipulator.urdf.xacro` (loaded by the main robot bringup, e.g. `grasp_bringup`) instantiates with `parent=base_link`. Link name is `camera_link` here. **Patch this one** — it's what downstream TF consumers actually see.
-- `src/tk26_vision/src/pan_tilt/urdf/pan_tilt.urdf.xacro` — the standalone form used by `ros2 launch pan_tilt pan_tilt.launch.py` for dev bringup without the full robot stack. Link name is `head_camera_link` (renamed to dodge the xArm's own `link_eef → camera_link` edge when the xArm macro is also instantiated). Patch this too so RViz-based dev stays representative.
+- `src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/pan_tilt_overrides.xacro` — the four mount-geometry properties (`pan_tilt_attach_xyz`/`_rpy`, `pan_tilt_camera_mount_xyz`/`_rpy`). `tinker_urdf/src/pan_tilt.urdf.xacro` auto-includes this file at xacro-parse time whenever `ROBOT_NAME` is set, so it feeds BOTH the main robot bringup (`tracer_mini_manipulator.urdf.xacro`, e.g. `grasp_bringup`) and the standalone dev launch — there is no second xacro to keep in sync anymore.
+- `.../robots/<ROBOT_NAME>/pan_tilt/offsets.yaml` — runtime joint offsets (`pan_offset_rad` / `tilt_offset_rad` under `pan_tilt.offsets`) read by `pan_tilt_state_publisher` via the `tinker_robot_config` resolver.
 
-`apply_to_urdf.py` auto-detects which form it's given and patches the right slots. What gets updated:
+The shared xacros under `tinker_urdf/` and this package's `config/pan_tilt.yaml` are **never written** — do NOT hand-copy patched files onto them; the whole point of the per-robot split is that a tinker1 apply cannot overwrite tinker2's calibration. Apply refuses outright when `ROBOT_NAME` is unset.
 
-- **Standalone form:** `pan_joint` origin `xyz` → fitted `t_a` (rpy preserved); `camera_mount_joint` origin `xyz` → fitted `t_b_trans`, `rpy` → fitted `t_b_rotvec` (converted to XYZ Euler). If `t_b_rotvec` is zero (e.g. you're patching from `chain.json`, which froze T_B rotation), the existing `rpy` is preserved rather than zeroed.
-- **Macro form:** `attach_xyz:='...'` default in the macro params → fitted `t_a` (the `attach_rpy` default is preserved — T_A rotation is not fitted); `camera_mount_joint` origin `xyz`/`rpy` same as above.
+What gets updated:
+
+- `pan_tilt_attach_xyz` ← fitted `t_a`; `pan_tilt_attach_rpy` ← `t_a_rotvec` (converted to XYZ Euler) when non-trivial, otherwise preserved from the current per-robot file (T_A rotation is only fitted by the optional pan-axis-tilt path).
+- `pan_tilt_camera_mount_xyz` ← fitted `t_b_trans`; `pan_tilt_camera_mount_rpy` ← `t_b_rotvec` (converted to XYZ Euler) when non-trivial. If `t_b_rotvec` is zero (e.g. you're applying `chain.json`, which froze T_B rotation), the existing `rpy` is preserved rather than zeroed.
+- `offsets.yaml` ← `theta_p_offset_rad` / `theta_t_offset_rad`, wrapped to (-π, π].
 
 **Primary path: apply via the calib_web UI.** In the Calibrate tab, **URDF patch** panel:
 
-1. Pick the target from the dropdown — both targets are listed; the macro form is marked *(authoritative)*.
-2. Click **Show diff** and sanity-check it (new values within a cm and a few degrees of the existing URDF).
-3. Click **Apply patch**. The server writes a timestamped `.old-<YYYYmmdd_HHMMSS>` backup next to the xacro, swaps the patched file into place atomically, and shows the exact `colcon` command to rebuild that package — copy-and-run it from the workspace root.
-4. Repeat for the other target so RViz and the live robot stay in lockstep.
+1. The dropdown shows the single per-robot target (`robots/<robot>/pan_tilt/`); it is greyed out when `ROBOT_NAME` is unset (restart calib_web with it exported).
+2. Click **Show diff** and sanity-check it (new values within a cm and a few degrees of the existing values).
+3. Click **Apply patch**. The server writes timestamped `.old-<YYYYmmdd_HHMMSS>` backups next to BOTH files, swaps the rendered files into place atomically (both-or-neither), and shows the exact rebuild command — copy-and-run it from the workspace root.
 
-**Fallback (headless / scripted runs):** invoke the patcher from a shell. Each invocation prints a diff to stdout; pass `--out` to write the patched file.
+**Fallback (headless / scripted runs):** one CLI command applies both files:
 
 ```bash
-# Macro form (live robot)
+export ROBOT_NAME=tinker1   # refused when unset
 python -m pan_tilt.calibration.apply_to_urdf \
-    --results chain.json \
-    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro \
-    --out /tmp/patched.urdf.xacro
-diff src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro /tmp/patched.urdf.xacro
-cp /tmp/patched.urdf.xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro
+    --results polish.json \
+    [--basic-root /path/to/tk25_basic] [--allow-flipped-camera]
 ```
 
-Then rebuild both packages:
+Preview via calib_web's **Show diff** first if you want a dry run (the CLI applies directly; the `.old-<ts>` backups make any apply reversible). Then rebuild and relaunch:
+
 ```bash
-colcon build --packages-select tinker_urdf  # tk25_basic side
-./src/tk26_vision/scripts/build.sh --packages-select pan_tilt  # tk26_vision side
+tkbuild tk25_basic --packages-select tinker_robot_config
+# relaunch robot_state_publisher + pan_tilt state_publisher
 ```
 
-Restart the robot stack.
-
-**Important:** if you used `polish.json` (T_B rotation fit), don't mentally compare the new `rpy` to the *old* URDF's `rpy` — the old value was a known artifact from a different calibration convention. Compare against the physical mount direction instead.
+**Important:** if you used `polish.json` (T_B rotation fit), don't mentally compare the new `rpy` to the *old* file's `rpy` — the old value was a known artifact from a different calibration convention. Compare against the physical mount direction instead.
 
 #### Forward-camera invariant
 
-For a forward-facing head camera (the only configuration we ship), the body-frame yaw of `camera_mount_joint`'s `rpy` must be within ±π/2 of zero. The patcher and the chain/polish solvers all enforce this invariant by default. A fitted yaw near ±π is the smoking-gun signature of an upstream optical→body convention bug — typically a missed conversion in the Phase-1 hand-eye result that propagated through `warm_start_t_b_rotation` into the chain seed — and the URDF will **not** be patched until you investigate the root cause.
+For a forward-facing head camera (the only configuration we ship), the body-frame yaw of the camera-mount `rpy` must be within ±π/2 of zero. The apply and the chain/polish solvers all enforce this invariant by default. A fitted yaw near ±π is the smoking-gun signature of an upstream optical→body convention bug — typically a missed conversion in the Phase-1 hand-eye result that propagated through `warm_start_t_b_rotation` into the chain seed — and the per-robot files will **not** be written until you investigate the root cause.
 
 If you encounter this refusal:
 
 ```
-ERROR: Refusing to patch URDF: camera_mount_joint fitted yaw = 3.0935 rad (177.2°).
+ERROR: Refusing to write calibration: camera_mount fitted yaw = 3.0935 rad (177.2°).
 Forward-facing cameras must have |yaw| < π/2 (90°). This usually means the
 optical→body convention was missed in the Phase-1 hand-eye warm start.
 To override (e.g. you genuinely mounted the camera backward), pass
---allow-flipped-camera. The existing URDF rpy is preserved.
+--allow-flipped-camera. The existing per-robot files are untouched.
 ```
 
 …it means **don't ship this calibration as-is.** The most common cause is a stale or convention-mismatched Phase-1 dataset feeding `warm_start_t_b_rotation`; re-run the hand-eye solve and confirm `t_base_cam_ref` is in body-frame coordinates (camera +X = forward in `base_link`) before retrying.
@@ -308,45 +306,24 @@ For genuinely backward-mounted hardware, opt in explicitly:
 # Solver side (chain or polish)
 ros2 run pan_tilt run_calibration chain ... --allow-flipped-camera
 
-# Patcher side (apply_to_urdf must also be told)
+# Apply side (apply_to_urdf must also be told)
 python -m pan_tilt.calibration.apply_to_urdf \
     --results chain.json \
-    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro \
-    --out /tmp/patched.urdf.xacro \
     --allow-flipped-camera
 ```
 
-`warm_start_t_b_rotation` also surfaces a `UserWarning` whenever the back-solved yaw exceeds ±π/4, well before the patcher refusal — watch the calibration log for that warning even on runs that ultimately succeed; it's the earliest signal that something upstream is drifting.
+`warm_start_t_b_rotation` also surfaces a `UserWarning` whenever the back-solved yaw exceeds ±π/4, well before the apply refusal — watch the calibration log for that warning even on runs that ultimately succeed; it's the earliest signal that something upstream is drifting.
 
-#### Runtime joint offsets — patched in lockstep with the URDF
+#### Runtime joint offsets — applied in lockstep with the geometry
 
-`apply_to_urdf` patches both halves of the calibration in one shot:
+`apply_to_urdf` writes both halves of the calibration in one shot:
 
-1. **URDF static geometry** — `pan_joint` xyz, `camera_mount_joint` xyz/rpy.
-2. **Runtime offsets in `pan_tilt.yaml`** — `pan_offset_rad` / `tilt_offset_rad` under `pan_tilt_state_publisher.ros__parameters`. The state publisher adds these to firmware feedback before publishing `/joint_states`, so the URDF's `R_z(-pan_joint)` and `R_y(+tilt_joint)` end up matching the calibration FK exactly.
+1. **Mount geometry** — the four `pan_tilt_*` properties in the per-robot `pan_tilt_overrides.xacro`.
+2. **Runtime offsets in the per-robot `offsets.yaml`** — `pan_offset_rad` / `tilt_offset_rad` under `pan_tilt.offsets`. The state publisher adds these to firmware feedback before publishing `/joint_states`, so the URDF's `R_z(-pan_joint)` and `R_y(+tilt_joint)` end up matching the calibration FK exactly.
 
-The patcher auto-discovers `pan_tilt.yaml` via `ament_index_python` and writes both files atomically, leaving `.old-<timestamp>` backups for each. The "Apply patch" button in the calib_web UI runs the same in-process orchestrator and surfaces both backups in its success message. **No manual YAML edit is required.**
+Both files land atomically with `.old-<timestamp>` backups, both-or-neither (a failure mid-write rolls the first file back). The "Apply patch" button in the calib_web UI runs the same in-process code and surfaces both backups in its success message. **No manual YAML edit is required**, and there is no partial-apply flag — the pair always travels together, because a half-applied pair is exactly the 2026-04-30 incident.
 
-CLI:
-
-```bash
-python -m pan_tilt.calibration.apply_to_urdf \
-    --results polish.json \
-    --xacro src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro
-# Patched URDF: .../pan_tilt.urdf.xacro
-#   backup:    .../pan_tilt.urdf.xacro.old-20260501_103000
-# Patched YAML: .../config/pan_tilt.yaml
-#   backup:    .../config/pan_tilt.yaml.old-20260501_103000
-#   pan_offset_rad:  3.1449572018
-#   tilt_offset_rad: -1.8735170869
-```
-
-Flags:
-- `--yaml <path>` — override the auto-discovered YAML (e.g. for a per-robot overlay).
-- `--no-yaml` — patch the URDF only. Use only for dry runs; without the YAML offsets the URDF chain mis-represents the camera's pose by up to ~45° (the parked-tilt angle) and vision points project below ground.
-- `--out <path>` — write the patched URDF to a side file instead of replacing in place. Falls back to the legacy "paste these into YAML" hint since the in-place orchestrator doesn't run in `--out` mode.
-
-Idempotent: if a file already matches the calibration, no backup for that file is written. Restart the pan_tilt launch after the URDF rebuild — the YAML edit is loaded automatically when the state publisher restarts.
+Idempotent: if a file already matches the calibration, no backup for that file is written. `config/pan_tilt.yaml`'s `pan_offset_rad`/`tilt_offset_rad` params remain only as a dev-machine fallback for when the per-robot profile is unavailable — the apply never touches that file.
 
 #### Tinker 2026 is in basin-π — `--allow-flipped-camera` is the normal path here
 
@@ -363,7 +340,7 @@ python -m pan_tilt.calibration.run_calibration polish ... --allow-flipped-camera
 python -m pan_tilt.calibration.apply_to_urdf  ... --allow-flipped-camera
 ```
 
-The state-publisher offsets in `pan_tilt.yaml` and the URDF's `camera_mount_joint` rpy together encode the basin choice; they MUST be applied as a pair from the same `polish.json`. Mixing a basin-π URDF with basin-0 offsets (or vice versa) breaks the TF chain by 180° — that's the 2026-04-30 incident root cause documented at the top of this section.
+The state-publisher offsets in the per-robot `offsets.yaml` and the per-robot `pan_tilt_camera_mount_rpy` together encode the basin choice; they MUST come from the same `polish.json` — which the per-robot apply now enforces structurally (the two files land atomically or not at all). Mixing a basin-π geometry with basin-0 offsets (or vice versa) breaks the TF chain by 180° — that's the 2026-04-30 incident root cause documented at the top of this section.
 
 ### 9. Verify
 
@@ -427,7 +404,7 @@ cd src/tk26_vision/src/pan_tilt
 python -m pytest test/test_calibration.py -v
 ```
 
-These 6 tests fabricate samples from known ground-truth parameter blocks (including one with a 90° T_B mount) and assert that the solvers recover the truth inside tolerance. A separate regression test guards the URDF patcher against both the standalone and macro xacro forms. If any test fails after an edit, the fit will fail on real data too.
+These 6 tests fabricate samples from known ground-truth parameter blocks (including one with a 90° T_B mount) and assert that the solvers recover the truth inside tolerance. Separate suites (`test_apply_per_robot.py`, `test_apply_source_tree.py`, `test_apply_lockstep.py`) guard the per-robot apply (refusal without `ROBOT_NAME`, rpy preservation, atomic both-or-neither writes). If any test fails after an edit, the fit will fail on real data too.
 
 ## File layout
 
@@ -439,7 +416,7 @@ src/pan_tilt/
 │   ├── calibrate_collect.py        # ROS2 node: drives pan-tilt + xArm, writes JSON
 │   └── calibration/
 │       ├── aruco_detect.py         # ChArUco detection + MAD averaging (no ROS)
-│       ├── apply_to_urdf.py        # emits a unified diff from fitted params
+│       ├── apply_to_urdf.py        # per-robot apply: writes robots/$ROBOT_NAME/pan_tilt/{overrides.xacro,offsets.yaml}
 │       ├── charuco_generate.py     # PDF/PNG generator (no external deps)
 │       ├── optimize.py             # fit_chain / fit_joint / solve_handeye / warm_start
 │       ├── pan_tilt_model.py       # forward_kinematics + PanTiltParams

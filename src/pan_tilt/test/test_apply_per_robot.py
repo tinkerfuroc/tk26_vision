@@ -87,6 +87,12 @@ def test_apply_error_alias():
     assert ap.ApplyError is ap.CalibrationApplyError
 
 
+def test_refuses_robot_name_with_path_traversal(tmp_path, monkeypatch):
+    monkeypatch.setenv('ROBOT_NAME', '../tinker1')
+    with pytest.raises(ap.CalibrationApplyError, match='path separator'):
+        ap.apply_calibration(_fake_params(), basic_root=tmp_path)
+
+
 def test_refuses_unknown_robot_profile(tmp_path, monkeypatch):
     monkeypatch.setenv('ROBOT_NAME', 'tinker9')
     _seed_tree(tmp_path, 'tinker1')      # only tinker1 exists

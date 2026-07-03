@@ -254,8 +254,14 @@ the dedup test, not a defect.
    (through the static TF: `x ≈ distance`, `z ≈` chest height).
 3. Two people ≥1 m apart, both waving → exactly two entries;
    `test_scan_waving_closest_person` is the nearer one.
-4. Crop files exist and contain the correct person (spot-check the PNGs
-   against the rqt debug overlay).
+4. **Crop files — currently EXPECTED TO FAIL:** `waving_person_server.py`
+   never populates the `DetectWaving` response's `rgb_image`/`depth_image`/
+   `segments` fields, so `_crop_and_save` receives a default-empty `Image`,
+   `cv_bridge` decode fails (caught → warning), and no crop PNGs are written.
+   This is a pre-existing server gap (see §7), not something introduced by
+   this bench; the criterion becomes a real regression gate once that
+   follow-up lands, and until then a failure here should be recorded, not
+   treated as a bench defect.
 5. Positions where nobody waves log the scan FAILURE but the sweep advances
    (FailureIsSuccess) — the tree never wedges on an empty position.
 6. Known limitation to record, not fix: a person who moves >0.3 m between
@@ -304,3 +310,12 @@ Tier 0 ships with zero new code. Builds: #1–4 via
 - `test_scan.py` sweeps pans including ±180/±120° — meaningless but harmless
   with a fixed camera; do not "fix" the angle list for the bench, it keeps
   the script identical to the pan-tilt-equipped use.
+- **Referee-crop path is broken today, pre-existing:** `waving_person_server.py`
+  never fills `rgb_image`/`depth_image`/`segments` on its `DetectWaving`
+  response, so both §5.3 criterion 4 here *and* the production Restaurant
+  referee-crop path (`bb_key_pictures` → `BtNode_ShowImage`) silently produce
+  no crops. Candidate fixes: populate those fields at response-assembly time
+  in `waving_person_server.py` (the server has the RGB frame and per-person
+  masks in hand), or switch `BtNode_ScanForWavingPerson`'s `_crop_and_save`
+  to crop from `waving_boxes` client-side. Open follow-up, deliberately out
+  of scope for this bench work.

@@ -15,13 +15,19 @@ Recommended: add the export to ~/.bashrc or ~/.zshrc so every shell inherits it.
 
 See src/tk26_vision/DEV_NOTES.md §"2026-04-22 — Camera bringup performance fix"
 for the full diagnosis.
+
+segment_size raised 20MB -> 64MB on 2026-07-03 to carry the HRI task's
+1920x1080 Orbbec color frames (~6.2MB raw uncompressed, vs ~1.2MB at
+720p) with headroom for several in-flight frames across multiple
+subscribers. See
+src/tk26_vision/docs/superpowers/specs/2026-07-03-orbbec-hri-resolution-bump-design.md.
 -->
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
     <transport_descriptors>
         <transport_descriptor>
             <transport_id>shm_transport</transport_id>
             <type>SHM</type>
-            <segment_size>20971520</segment_size>
+            <segment_size>67108864</segment_size>
             <port_queue_capacity>512</port_queue_capacity>
             <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
         </transport_descriptor>

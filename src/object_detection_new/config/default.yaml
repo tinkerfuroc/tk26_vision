@@ -10,7 +10,7 @@
     
     # Orbbec camera topics
     orbbec_image_topic: '/camera/color/image_raw'
-    orbbec_depth_topic: '/camera/depth_registered/points'
+    orbbec_depth_topic: '/camera/depth/image_raw'
     orbbec_camera_info_topic: '/camera/color/camera_info'
     
     # Model settings

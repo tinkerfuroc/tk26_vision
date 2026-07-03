@@ -125,7 +125,7 @@
 
     <div class="controls" style="margin-top:14px">
       <label class="f">batch_size<input id="batch" type="number" min="1" max="32" value="8"></label>
-      <label class="f">max_workers<input id="workers" type="number" min="1" max="16" value="4"></label>
+      <label class="f" title="0 = one worker per batch: every batch VLM call fires in parallel. >0 caps concurrency for rate limits.">max_workers<input id="workers" type="number" min="0" max="32" value="0"></label>
       <label class="f">qwen fallback
         <select id="qwen"><option value="1">on</option><option value="0">off</option></select></label>
       <button id="run" class="primary">Run test</button>

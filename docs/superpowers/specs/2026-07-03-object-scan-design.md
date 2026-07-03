@@ -145,9 +145,12 @@ requirement as `object_match_all_server` / `generalist_node`).
 2. `cv_bridge` → BGR → `_image_utils.encode_to_data_url`.
 3. if `vocabulary` empty → `status=1, error_msg="empty vocabulary"`.
 4. split `vocabulary` into batches of `batch_size` (preserve order).
-5. `ThreadPoolExecutor(max_workers)` — one `request_scan_labels_chain(image_url, batch, …)`
-   per batch. A batch that raises `ScanVlmError` is logged and contributes no labels
-   (does not fail the whole scan) — tracked in a `batches_fail` counter.
+5. `ThreadPoolExecutor` — one `request_scan_labels_chain(image_url, batch, …)` per batch,
+   **all batches in parallel by default** (`max_workers=0` → one worker per batch, so total
+   latency is ~one VLM call regardless of batch count; a positive `max_workers` only caps
+   concurrency against provider rate limits). A batch that raises `ScanVlmError` is logged
+   and contributes no labels (does not fail the whole scan) — tracked in a `batches_fail`
+   counter.
 6. union all batch labels, dedup, order by first appearance in `vocabulary`.
 7. `status = 0` if **at least one batch succeeded** (even with zero labels found);
    `status = 1, error_msg="all N VLM batches failed: …"` if **every** batch raised.
@@ -164,7 +167,7 @@ requirement as `object_match_all_server` / `generalist_node`).
 | `scan_model_qwen` | `''` | `''` → DashScope default `qwen3-vl-plus` via `resolve_qwen_target` |
 | `qwen_api_backend` | `dashscope` | |
 | `batch_size` | `8` | **tune later** per operator note; controls classes-per-VLM-call |
-| `max_workers` | `4` | concurrent batches |
+| `max_workers` | `0` | `0` = one worker per batch (every batch VLM call in parallel); `>0` caps concurrency for rate limits |
 | `vlm_timeout_s` | `20.0` | per provider call |
 | `vlm_max_retries` | `3` | per provider |
 | `orbbec_image_topic` | `/camera/color/image_raw` | |

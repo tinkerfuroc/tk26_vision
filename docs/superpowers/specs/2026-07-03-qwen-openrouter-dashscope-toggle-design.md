@@ -41,52 +41,45 @@ doesn't "fix" them inconsistently.
 ## Mechanism
 
 New ROS parameter `qwen_api_backend` (`'dashscope'` | `'openrouter'`,
-default `'dashscope'`) declared on every node at the 11 call sites. Its
-declared default is sourced from a `QWEN_API_BACKEND` env var:
+**hardcoded default `'dashscope'`, no environment variable involved**)
+declared on every node at the 11 call sites:
 
 ```python
-self.declare_parameter(
-    'qwen_api_backend',
-    os.environ.get('QWEN_API_BACKEND', 'dashscope'),
-)
+self.declare_parameter('qwen_api_backend', 'dashscope')
 ```
 
-**Durable home for the env var:** the workspace-root `.env` file. Every
-affected node already calls `load_env()` (python-dotenv, CWD-upward) at
-startup before declaring parameters — this ordering is a hard requirement of
-this design and must be preserved (`load_env()` before
-`declare_parameter('qwen_api_backend', ...)`). Putting `QWEN_API_BACKEND=
-openrouter` in the root `.env` makes the setting durable, discoverable, and
-reachable identically whether a node is started via `vision_bringup`'s
-launch file, a tmux script, or a future systemd unit — because the *node*
-resolves it, not the launcher.
+**No env var, no `.env`, no shell/robot-profile involvement.** An earlier
+draft tried to source the default from a `QWEN_API_BACKEND` env var so one
+export would flip a whole robot. Two rounds of review found this
+unworkable: `ros2 launch` never loads `.env` (only each node's own
+`load_dotenv()` call does), so a launch-time default sourced from `.env`
+silently diverges from a node-time default sourced the same way, and the
+fix for that (shell-exporting the var instead, e.g. via
+`tinker_robot_config`/`robot-env.sh`) was rejected. Per explicit direction:
+`qwen_api_backend` is a **plain launch/ROS parameter with no smart
+default** — the operator (or whatever per-robot script invokes
+`ros2 launch` / `ros2 run`) passes `qwen_api_backend:=openrouter` (or
+`-p qwen_api_backend:=openrouter` for a bare `ros2 run`) explicitly, every
+time, for the robot that needs it. Consistency across a robot's 11 call
+sites is the responsibility of whatever wraps the launch commands for that
+robot (e.g. hardcoded in that robot's launch invocation), not this design's
+mechanism — it deliberately owns nothing beyond "one ROS parameter per
+node, no magic default source."
 
 **Launch-file wiring for the 5 nodes `vision_bringup.launch.py` manages**
 (`generalist_node`, `waving_person_server`, `feature_recognition`,
-`feature_matching`, `seat_recommend_bbox`): a matching
-`DeclareLaunchArgument('qwen_api_backend', ...)` whose default is the env
-substitution, **not a literal string**:
-
-```python
-DeclareLaunchArgument(
-    'qwen_api_backend',
-    default_value=EnvironmentVariable('QWEN_API_BACKEND', default_value='dashscope'),
-),
-```
-
-This is load-bearing: an explicitly-passed launch parameter overrides a
-node's env-sourced `declare_parameter` default. If the launch arg defaulted
-to the literal `'dashscope'`, it would silently override
-`QWEN_API_BACKEND=openrouter` for exactly the 5 nodes that have launch-file
-coverage — the opposite of intent.
+`feature_matching`, `seat_recommend_bbox`): a plain
+`DeclareLaunchArgument('qwen_api_backend', default_value='dashscope')`,
+passed straight through as a `-p` override — no substitution logic, no env
+lookup, nothing to get subtly wrong.
 
 **Known gap:** the other 4 node executables (`grocery_categorize`,
 `object_match_server`, `object_match_all_server`, `placing_location_server`)
 have no launch file at all today (only bare `ros2 run`, considered obsolete
-generally but out of scope to fix here). They still honor
-`QWEN_API_BACKEND` via their own `declare_parameter` default, so the toggle
-works for them today; giving them proper launch-file coverage is a separate
-follow-up, not silently bundled into this change.
+generally but out of scope to fix here). They get the same
+`declare_parameter('qwen_api_backend', 'dashscope')` and must be flipped via
+an explicit `-p` override on their own `ros2 run` invocation; giving them
+proper launch-file coverage is a separate follow-up, not bundled here.
 
 ## No credential changes
 
@@ -118,23 +111,48 @@ the OpenRouter-default-model constant drifting out of sync — the same bug
 class as the existing `DASHSCOPE_API_KEY`/`DASHCOPE_API_KEY` order split
 that's already tech debt in this codebase.
 
+**Note — this overrides a documented convention.** `_waving_vlm.py` (and,
+per `tk26_vision/CLAUDE.md`, `qwen_match_vlm.py`/`vlm_match_client.py` by
+the same convention) explicitly document staying `kimi_api`-free as an
+intentional decoupling choice. This design knowingly overrides that
+convention for one shared function, for the reason above. The
+implementation must update those modules' docstrings and the CLAUDE.md
+line that describes the convention — leaving stale docs claiming
+decoupling that no longer holds would confuse the next person touching
+these files.
+
 `generalist_node.py` / `vlm_bbox.py` do **not** use the shared resolver —
 they keep their existing `dashscope/model`-prefix convention
-(`_split_provider`). The toggle must rewrite **both** of that node's
-DashScope-pointing defaults, not just one:
+(`_split_provider`). Two DashScope-pointing defaults are involved:
 
-- `dashscope_qwen_model` (consulted only when `prefer_dashscope_qwen=True`)
+- `dashscope_qwen_model` (default `'dashscope/qwen3-vl-plus'`, consulted
+  only when `prefer_dashscope_qwen=True`)
 - `vlm_fallback_models` (default `['dashscope/qwen3-vl-plus']` — this is the
-  **actual default-path** fallback; the earlier draft of this design missed
+  **actual default-path** fallback; an earlier draft of this design missed
   it entirely, which would have left the default path pinned to DashScope
   even with the toggle flipped)
 
-Both must flip their `dashscope/`-prefixed entries to bare OpenRouter model
-strings when `qwen_api_backend='openrouter'`. `prefer_dashscope_qwen` as a
-param name becomes slightly misleading under this toggle (it now means
-"prefer the qwen leg over gemini", independent of which backend serves that
-leg) — rename is optional, not required; flag for the implementation plan to
-decide.
+**No auto-flip for either.** An earlier draft proposed automatically
+rewriting `dashscope/`-prefixed entries to OpenRouter model strings when
+`qwen_api_backend='openrouter'`. Review rejected this: detecting "this list
+is still at its unmodified default" by comparing it against the known
+default value is the exact same string(list)-comparison ambiguity already
+rejected for the scalar model params below (an operator who explicitly sets
+`vlm_fallback_models: ['dashscope/qwen3-vl-plus']` on purpose would get it
+silently rewritten). Applying that already-rejected pattern to a list
+doesn't make it safer. Instead: **fail fast at node `__init__`** if
+`qwen_api_backend='openrouter'` and either `dashscope_qwen_model` (when
+`prefer_dashscope_qwen=True`) or any entry in `vlm_fallback_models`
+(when it's false) still contains a `dashscope/`-prefixed entry — with an
+error telling the operator to pass an explicit OpenRouter-pointing value
+for whichever param is active. This costs the operator one extra explicit
+override on this one node when flipping the toggle; the alternative is
+reintroducing a silent-rewrite bug on a list.
+
+`prefer_dashscope_qwen` as a param name becomes slightly misleading under
+this toggle (it now means "prefer the qwen leg over gemini", independent of
+which backend serves that leg) — rename is optional, not required; flag for
+the implementation plan to decide.
 
 ## Model substitution — sentinel default, not string comparison
 
@@ -144,12 +162,20 @@ string (`'qwen3-vl-plus'`). This breaks when an operator explicitly sets the
 param to that same value on purpose (e.g. for config clarity) — it would be
 silently rewritten to a different model with no error.
 
-**Fix:** each of the 9 per-node qwen-model params (`feature_model_qwen`,
-`match_model_qwen`, `categorize_model_qwen`, `bbox_model_qwen`,
-`vlm_model_qwen`, etc.) changes its default to an **empty-string sentinel**
-(`''`). `resolve_qwen_target` treats `''` as "use the backend's own
-default model" and honors any non-empty value verbatim, on either backend.
-This removes the ambiguity class entirely instead of working around it.
+**Fix:** 7 of the per-node qwen-model params currently default to
+`'qwen3-vl-plus'` (`feature_model_qwen`, `match_model_qwen`,
+`categorize_model_qwen`, `bbox_model_qwen`, `placing_model_qwen`,
+`vlm_model_qwen` on `waving_person_server`/`object_match_server`) and need
+their default changed to an **empty-string sentinel** (`''`).
+`object_match_all_server.py`'s `vlm_model`/`judge_model` already default to
+`''` — no change needed there, already sentinel-shaped. `resolve_qwen_target`
+treats `''` as "use the backend's own default model" and honors any
+non-empty value verbatim, on either backend. This removes the ambiguity
+class entirely instead of working around it.
+
+Two docs currently describe the old `'qwen3-vl-plus'` default and must be
+updated in the same change: `tk26_vision/CLAUDE.md`'s per-node param table,
+and `kimi_api/.env.example`'s comments if it references a model default.
 
 **Init-time validation:** `resolve_qwen_target` (or its caller) checks the
 model-id shape against the selected backend — OpenRouter ids contain `/`
@@ -157,6 +183,15 @@ model-id shape against the selected backend — OpenRouter ids contain `/`
 mismatch (e.g. a bare DashScope id explicitly set while
 `backend='openrouter'`), rather than letting it reach a live API call and
 fail with an opaque 404 mid-task.
+
+**Interim behavior before the benchmark task (below) lands a real
+default:** `resolve_qwen_target` must raise at `__init__` if
+`backend='openrouter'` and the resolved OpenRouter default-model constant
+is unset/empty — not silently proceed with a blank model string. In
+practice the implementation plan should sequence the benchmark task before
+any node ships with `qwen_api_backend='openrouter'` reachable in
+production, but this is a defensive backstop, not a substitute for that
+ordering.
 
 ## Default OpenRouter model — deferred, not picked yet
 
@@ -170,13 +205,21 @@ benchmark/verification task before any default is locked in**, checking:
 2. **Bounding-box coordinate format** — `vlm_bbox.py` already has an
    empirically-calibrated decoder for `qwen3-vl`-family output (0-1000
    normalized xyxy, matched by a `'qwen3'` substring in the model name,
-   verified against a known-position target per `vlm_bbox.py:70-76`). Any
-   candidate model must be verified against that same
-   known-position-target methodology before it's trusted for
-   `seat_recommend_bbox`, `object_match_server`, `object_match_all_server`,
-   `waving_person_server`, `placing_location_server`, or
-   `generalist_node`'s bbox path — a wrong-format decode fails silently
-   (wrong coordinates, not an error).
+   verified against a known-position target per `vlm_bbox.py:70-76`).
+   **Only `vlm_bbox.py` switches decoders by model family** — the other
+   five bbox-producing modules (`_seat_bbox_vlm.py`, `qwen_match_vlm.py`,
+   `vlm_match_client.py`, `vlm_judge_client.py`, and whatever
+   `waving_person_server`/`placing_location_server` use) hardcode a
+   0-1000-normalized decode unconditionally, with no model check at all.
+   Picking an OpenRouter model whose output format doesn't match produces
+   **silently wrong coordinates on those five, not an error** — there is
+   no format-mismatch detection to catch it. The benchmark task must
+   either (a) confirm the chosen model matches the calibrated format on
+   all six consumers before it ships, or (b) if a chosen model needs a
+   different decode, extend the remaining five modules with the same
+   family-aware branching `vlm_bbox.py` already has — this is real
+   implementation work the benchmark task's results determine the size of,
+   not a guaranteed drop-in.
 3. **Regional latency** — a timed round-trip check from (or toward) each
    deployment region, against DashScope-cn, DashScope-intl, and 2-3
    OpenRouter candidates. This is the feature's entire stated motivation;
@@ -196,14 +239,22 @@ tier).
 - Invalid `qwen_api_backend` string (not `'dashscope'`/`'openrouter'`) →
   fail fast at init, never silently default.
 - Model-id-shape-vs-backend mismatch (see above) → fail fast at init.
-- **Fail-fast applies to the key required by the chain's primary leg.**
-  Where Qwen is a *fallback* leg (most chains — Gemini primary), a missing
-  key for the selected Qwen backend preserves today's graceful-disable
-  behavior (skip the fallback, log a warning) rather than crashing the node
-  — this matches existing behavior for the OpenRouter/Gemini key today.
-  Where Qwen is the *primary* leg (`seat_recommend_bbox`'s `bbox_select`
-  strategy, `vlm_provider='qwen'` default), a missing key for the selected
-  backend fails fast, since there's no primary to fall back to.
+- **Fail-fast applies only where the VLM call is the sole serving path —
+  not merely wherever Qwen is nominally "primary."** The earlier draft's
+  rule ("Qwen primary → fail fast") is wrong for `waving_person_server`:
+  it defaults `vlm_provider='qwen'` (primary within its *VLM-only* chain),
+  but the node's actual documented contract is graceful-disable — a
+  missing key today does not crash it, because MediaPipe still serves
+  waving detection without any VLM at all. The earlier rule would turn
+  that into an init crash and break an existing no-key-startup guarantee
+  (part of the T1 test tier). Corrected rule: fail fast only where there
+  is no non-VLM fallback at all for that feature (e.g.
+  `seat_recommend_bbox`'s `bbox_select` strategy has no non-VLM seat
+  detector). Where a non-VLM fallback exists — `waving_person_server`
+  (MediaPipe) and, if it has an equivalent, `object_match_all_server` —
+  preserve today's graceful-disable regardless of which leg is "primary"
+  within the VLM-only chain. This must be checked per node during
+  implementation, not assumed from the `vlm_provider` default alone.
 - **Fallback-arming checks become backend-aware.** Several chains today
   arm their Qwen fallback only if `DASHSCOPE_API_KEY` is present. Under
   `backend='openrouter'`, that check must test for the key the *selected*
@@ -215,6 +266,28 @@ tier).
   consequence of the toggle, not part of the out-of-scope chain
   consolidation.
 - No live-swap: backend is fixed for the node's process lifetime.
+
+## Other noted items
+
+- **`object_match_all_server.py` has an existing `vlm_base_url` param**
+  that overlaps with the new toggle's base-URL selection. Precedence
+  between an explicit `vlm_base_url` override and the resolver's
+  backend-derived URL is undecided — recommend explicit `vlm_base_url`
+  wins (consistent with "explicit values are always honored verbatim"
+  elsewhere in this design), but this needs a one-line decision in the
+  implementation plan, not left implicit.
+- **Match/judge backend consistency in `object_match_all_server` holds
+  only by construction** — both `vlm_match_client.py` and
+  `vlm_judge_client.py` are fed the same single node-level
+  `qwen_api_backend` param, so they can't diverge. Stating this
+  explicitly so it isn't accidentally broken by a future per-call
+  override.
+- **Accepted tradeoff, not a defect:** setting `qwen_api_backend=
+  'openrouter'` collapses both chain legs (Gemini and Qwen) onto one
+  gateway, losing the host-independence `vlm_bbox.py` currently
+  documents as deliberate (`vlm_bbox.py:296-300`). This is the intended
+  effect of a per-robot backend choice driven by regional latency, not an
+  oversight — noted so it isn't rediscovered as a "bug" later.
 
 ## Testing
 
@@ -238,13 +311,33 @@ tier).
 
 ## Review history
 
-Design was adversarially reviewed by an independent subagent
-(model: `claude-fable-5`) against the actual codebase before this version.
-That review found and this version incorporates fixes for: sentinel-default
+Two rounds of adversarial review by an independent subagent
+(model: `claude-fable-5`), each verifying claims against the live codebase
+rather than reasoning about the design in the abstract.
+
+**Round 1** found and this version incorporates fixes for: sentinel-default
 model detection (was string-comparison), the `vlm_fallback_models` gap in
 `generalist_node` (original draft only touched `dashscope_qwen_model`), the
-launch-arg-vs-env-default precedence bug, the factually-incorrect
-"new coupling" rationale for a separate `tk_vision_specialized` resolver,
-backend-aware fallback-arming, and the model-choice methodology (deferred
-to a benchmark task instead of picking `qwen3.7-plus` on cost/recency
-alone).
+factually-incorrect "new coupling" rationale for a separate
+`tk_vision_specialized` resolver, backend-aware fallback-arming, and the
+model-choice methodology (deferred to a benchmark task instead of picking
+`qwen3.7-plus` on cost/recency alone).
+
+**Round 2** re-verified round 1's fixes against the code and found: the
+round-1 launch-arg-vs-env-default fix didn't actually work (`ros2 launch`
+never loads `.env`, so the env-sourced launch default silently diverged
+from the node-time default) — resolved by dropping the env-var mechanism
+entirely per explicit direction, `qwen_api_backend` is now a plain
+parameter with a hardcoded default and no smart source; the fail-fast rule
+would have regressed `waving_person_server`'s existing no-key
+graceful-disable behavior — corrected to key on "no non-VLM fallback
+exists" rather than "Qwen is nominally primary"; the `generalist_node`
+list-flip was underspecified in a way that could silently rewrite explicit
+operator config — corrected to fail-fast instead of auto-flip, for
+consistency with the sentinel-default principle; only `vlm_bbox.py` has
+model-family-aware bbox decoding, the other five bbox-producing modules
+hardcode the format with no mismatch detection — now called out as
+real implementation work the benchmark task's results size, not a
+guaranteed drop-in; plus a sentinel-count correction (7 params, not 9;
+`object_match_all_server` was already sentinel-shaped) and several minor
+doc/precedence items.

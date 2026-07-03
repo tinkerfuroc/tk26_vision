@@ -23,6 +23,7 @@ from ament_index_python.packages import (
 )
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 
 from tinker_vision_msgs_26.srv import DetectWaving
 
@@ -37,6 +38,10 @@ from tk_vision_specialized._waving_bench_eval import (
 
 DEFAULT_SERVICE = '/detect_waving_persons'
 SERVICE_WAIT_TIMEOUT_SEC = 5.0
+# Per-call ceiling. Must exceed the server's 20 s VLM-fallback budget so a
+# slow-but-alive keyed run is never misread as a dead/stalled server.
+CALL_TIMEOUT_SEC = 30.0
+NO_RESPONSE_REASON = 'no response from service (timeout or server death)'
 
 
 def record_from_response(resp) -> CallRecord:
@@ -119,13 +124,36 @@ def _run_case(node, client, scenario_name: str, case, jsonl) -> tuple:
             min_waving_persons=int(case.request['min_waving_persons']),
         )
         future = client.call_async(request)
-        rclpy.spin_until_future_complete(node, future)
-        record = record_from_response(future.result())
-        calls.append(record)
+        rclpy.spin_until_future_complete(node, future, timeout_sec=CALL_TIMEOUT_SEC)
 
-        verdict = evaluate_call(case, record)
-        distances = [distance_of(pt, case.request['target_frame']) for pt in record.points]
-        print(_format_call_line(call_index, case.calls_per_case, record, distances, verdict))
+        response, call_error = None, None
+        if not future.done():
+            future.cancel()
+            call_error = NO_RESPONSE_REASON
+        else:
+            try:
+                response = future.result()
+            except Exception as exc:  # server died/restarted mid-call
+                call_error = f'{NO_RESPONSE_REASON}: {exc}'
+        if response is None and call_error is None:
+            call_error = NO_RESPONSE_REASON
+
+        if call_error is not None:
+            # Sentinel record mirrors the server's own status=-1 error
+            # convention; empty points make evaluate_case count this as a
+            # failed call for every count/status expectation.
+            record = CallRecord(status=-1, points=[], frame_ids=[], error_msg=call_error)
+            passed, reasons = False, [call_error]
+            print(f'    call {call_index + 1}/{case.calls_per_case}: ✗ {call_error}')
+        else:
+            record = record_from_response(response)
+            verdict = evaluate_call(case, record)
+            passed, reasons = verdict.passed, verdict.reasons
+            distances = [distance_of(pt, case.request['target_frame'])
+                         for pt in record.points]
+            print(_format_call_line(call_index, case.calls_per_case, record,
+                                    distances, verdict))
+        calls.append(record)
 
         _write_json(jsonl, {
             'ts': datetime.now().astimezone().isoformat(),
@@ -139,8 +167,8 @@ def _run_case(node, client, scenario_name: str, case, jsonl) -> tuple:
                 {'x': p[0], 'y': p[1], 'z': p[2], 'frame_id': fid}
                 for p, fid in zip(record.points, record.frame_ids)
             ],
-            'passed': verdict.passed,
-            'reasons': verdict.reasons,
+            'passed': passed,
+            'reasons': reasons,
         })
 
         if call_index < case.calls_per_case - 1:
@@ -151,7 +179,9 @@ def _run_case(node, client, scenario_name: str, case, jsonl) -> tuple:
 
 def run(ns: argparse.Namespace, suite: dict, selected_names: list,
         results_path: Path) -> int:
-    rclpy.init()
+    # Keep Python's default SIGINT handling: rclpy's own handler would swallow
+    # Ctrl-C at the input() prompt (no KeyboardInterrupt -> unkillable prompt).
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = Node('waving_bench')
     client = node.create_client(DetectWaving, ns.service)
     try:
@@ -168,58 +198,64 @@ def run(ns: argparse.Namespace, suite: dict, selected_names: list,
         cases_run = 0
         cases_skipped = 0
         quit_requested = False
+        aborted = False
 
         with results_path.open('w', buffering=1) as jsonl:
-            for scenario_name in selected_names:
-                for case in suite[scenario_name]:
-                    if ns.calls is not None:
-                        case = replace(case, calls_per_case=ns.calls)
+            try:
+                for scenario_name in selected_names:
+                    for case in suite[scenario_name]:
+                        if ns.calls is not None:
+                            case = replace(case, calls_per_case=ns.calls)
 
-                    print(f'[{scenario_name}/{case.index}] {case.prompt}')
+                        print(f'[{scenario_name}/{case.index}] {case.prompt}')
 
-                    if not ns.yes:
-                        answer = input(
-                            'Position the scene, then press Enter '
-                            '(s=skip, q=quit): ').strip().lower()
-                        if answer == 's':
-                            cases_skipped += 1
-                            print('  skipped')
-                            _write_json(jsonl, {
-                                'type': 'case_summary',
-                                'scenario': scenario_name,
-                                'case_index': case.index,
-                                'n_passed': 0,
-                                'n_calls': 0,
-                                'passed': False,
-                                'best_effort': case.best_effort,
-                                'skipped': True,
-                            })
-                            continue
-                        if answer == 'q':
-                            quit_requested = True
-                            break
+                        if not ns.yes:
+                            answer = input(
+                                'Position the scene, then press Enter '
+                                '(s=skip, q=quit): ').strip().lower()
+                            if answer == 's':
+                                cases_skipped += 1
+                                print('  skipped')
+                                _write_json(jsonl, {
+                                    'type': 'case_summary',
+                                    'scenario': scenario_name,
+                                    'case_index': case.index,
+                                    'n_passed': 0,
+                                    'n_calls': 0,
+                                    'passed': False,
+                                    'best_effort': case.best_effort,
+                                    'skipped': True,
+                                })
+                                continue
+                            if answer == 'q':
+                                quit_requested = True
+                                break
 
-                    calls = _run_case(node, client, scenario_name, case, jsonl)
-                    result = evaluate_case(case, calls)
-                    cases_run += 1
-                    case_results.append(result)
+                        calls = _run_case(node, client, scenario_name, case, jsonl)
+                        result = evaluate_case(case, calls)
+                        cases_run += 1
+                        case_results.append(result)
 
-                    print(f'  case summary: {result.n_passed}/{result.n_calls} passed '
-                          f"-> {'PASS' if result.passed else 'FAIL'}"
-                          f"{' (best-effort)' if case.best_effort else ''}")
-                    _write_json(jsonl, {
-                        'type': 'case_summary',
-                        'scenario': scenario_name,
-                        'case_index': case.index,
-                        'n_passed': result.n_passed,
-                        'n_calls': result.n_calls,
-                        'passed': result.passed,
-                        'best_effort': case.best_effort,
-                        'skipped': False,
-                    })
+                        print(f'  case summary: {result.n_passed}/{result.n_calls} passed '
+                              f"-> {'PASS' if result.passed else 'FAIL'}"
+                              f"{' (best-effort)' if case.best_effort else ''}")
+                        _write_json(jsonl, {
+                            'type': 'case_summary',
+                            'scenario': scenario_name,
+                            'case_index': case.index,
+                            'n_passed': result.n_passed,
+                            'n_calls': result.n_calls,
+                            'passed': result.passed,
+                            'best_effort': case.best_effort,
+                            'skipped': False,
+                        })
 
-                if quit_requested:
-                    break
+                    if quit_requested:
+                        break
+            except (KeyboardInterrupt, EOFError):
+                # Ctrl-C anywhere, or stdin closing at the operator prompt.
+                aborted = True
+                print('\naborted by operator')
 
             overall_passed = suite_passed(case_results)
             _write_json(jsonl, {
@@ -229,12 +265,16 @@ def run(ns: argparse.Namespace, suite: dict, selected_names: list,
                 'cases_skipped': cases_skipped,
             })
 
-        print(f"\nSuite {'PASSED' if overall_passed else 'FAILED'} "
+        outcome = 'ABORTED' if aborted else ('PASSED' if overall_passed else 'FAILED')
+        print(f'\nSuite {outcome} '
               f'({cases_run} run, {cases_skipped} skipped). Results: {results_path}')
+        if aborted:
+            return 1
         return 0 if overall_passed else 1
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def main(args=None) -> None:
@@ -248,6 +288,11 @@ def main(args=None) -> None:
     except OSError as exc:
         print(f'error: could not read suite config {config_path}: {exc}', file=sys.stderr)
         sys.exit(1)
+    except yaml.YAMLError as exc:
+        one_line = ' '.join(str(exc).split())
+        print(f'error: could not parse suite config {config_path}: {one_line}',
+              file=sys.stderr)
+        sys.exit(1)
 
     try:
         suite = load_suite(raw_config)
@@ -255,6 +300,8 @@ def main(args=None) -> None:
         print(f'error: invalid suite config {config_path}: {exc}', file=sys.stderr)
         sys.exit(1)
 
+    # Exit-code split: 2 = usage/selection error (no/unknown scenario),
+    # 1 = runtime/environment failure (bad config, service down, failed suite).
     if not ns.scenario and not ns.all:
         print('No scenario selected. Pass --scenario NAME (repeatable) or --all.')
         print('Available scenarios:')
@@ -278,7 +325,13 @@ def main(args=None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / 'results.jsonl'
 
-    sys.exit(run(ns, suite, selected_names, results_path))
+    try:
+        sys.exit(run(ns, suite, selected_names, results_path))
+    except (KeyboardInterrupt, EOFError):
+        # Backstop for interrupts outside the case loop (e.g. during the
+        # initial wait_for_service); the in-loop handler writes the summary.
+        print('\naborted by operator', file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -108,15 +108,37 @@ ros2 topic pub --once /pan_tilt_controller/cmd \
   The geometry lives in `tinker_urdf` so the robot-description package does
   not gain a runtime dependency on `pan_tilt`; `pan_tilt` depends on
   `tinker_urdf` instead.
-- Per-robot URDF overrides come from
-  `tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml`
-  (`attach_xyz`/`attach_rpy`/`camera_mount_xyz`/`camera_mount_rpy`).
-  `pan_tilt.launch.py` includes `tinker_robot_config`'s
-  `robot_description.launch.py` wrapper, which flattens that sub-tree
-  into xacro `--mappings`. The macro defaults still apply for manual
-  `xacro …` invocations or `tracer_mini_manipulator`. (P6.2)
 - `config/specs.json` is retained as historical calibration/reference data only.
   The runtime stack does not load it anymore.
+- **Pan/tilt joint offsets (calibration-derived, per-robot).**
+  `pan_tilt_state_publisher` reads `pan_tilt.offsets.pan_offset_rad` /
+  `pan_tilt.offsets.tilt_offset_rad` from the active `$ROBOT_NAME` profile
+  via `tinker_robot_config` (`robots/<ROBOT_NAME>/pan_tilt/offsets.yaml`) —
+  see `_load_profile` / `_load_per_robot_offsets` in
+  `pan_tilt_state_publisher.py`. When the profile is unavailable
+  (`ROBOT_NAME` unset, `tinker_robot_config` not installed, or the profile
+  has no `pan_tilt.offsets.*` keys) the node logs a WARN and falls back to
+  the `pan_offset_rad` / `tilt_offset_rad` ROS params in
+  [config/pan_tilt.yaml](./config/pan_tilt.yaml) — those values are a dev-
+  machine fallback only, **not** per-robot, and are stamped as such in the
+  yaml's comment. Sourcing values are still `polish.json`'s
+  `theta_p_offset_rad` / `theta_t_offset_rad` after each calibration; write
+  them into the per-robot `offsets.yaml`, not just the package yaml.
+- **Per-robot URDF overrides (dropped from this launch).** Earlier
+  revisions of `pan_tilt.launch.py` threaded
+  `robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml`
+  (`attach_xyz`/`attach_rpy`/`camera_mount_xyz`/`camera_mount_rpy`) through
+  `tinker_robot_config`'s `robot_description.launch.py` wrapper via an
+  `overrides_key='pan_tilt.urdf_overrides'` launch argument. That wiring is
+  removed as of this change — `pan_tilt.launch.py` now includes the wrapper
+  with only `xacro_path` + the private-topic `remappings`, so it renders the
+  xacro macro's hardcoded attach/camera_mount defaults. `urdf_overrides.yaml`
+  itself and the resolver's generic `overrides_key` mechanism still exist in
+  `tinker_robot_config` (other callers may use them); this package simply no
+  longer consumes that sub-tree at launch time. Note this is a distinct
+  profile sub-tree from the joint offsets above (`pan_tilt.urdf_overrides.*`
+  = URDF mount geometry; `pan_tilt.offsets.*` = joint-state calibration
+  offsets, now read directly by the runtime node instead of at launch time).
 
 ## Calibration
 

@@ -5,6 +5,21 @@ All notable changes to this package land here, newest first.
 ## [Unreleased]
 
 ### Changed
+- `pan_tilt_state_publisher` now reads its calibration-derived pan/tilt
+  joint offsets from the per-robot `tinker_robot_config` profile
+  (`robots/<ROBOT_NAME>/pan_tilt/offsets.yaml`, keys
+  `pan_tilt.offsets.{pan,tilt}_offset_rad`) instead of only the
+  `config/pan_tilt.yaml` ROS params. Adds `_load_profile()` /
+  `_load_per_robot_offsets(logger)` module-level helpers (isolated for test
+  monkeypatching); any resolver failure (package absent, `ROBOT_NAME`
+  unset, profile missing the keys) degrades to a logged WARN and falls back
+  to the existing `pan_offset_rad`/`tilt_offset_rad` params, which
+  `config/pan_tilt.yaml` now documents as a dev-machine fallback only (NOT
+  per-robot). `pan_tilt.launch.py`'s deprecated
+  `overrides_key='pan_tilt.urdf_overrides'` mapping (unrelated URDF-mount
+  geometry sub-tree, not the joint offsets) is dropped in the same change —
+  see README "Runtime Configuration" for the split between the two profile
+  sub-trees. (Task 2 / Phase 1b)
 - `pan_tilt.launch.py` publishes the URDF via the new
   `tinker_robot_config/robot_description.launch.py` wrapper, with
   `overrides_key='pan_tilt.urdf_overrides'` and the existing private-topic

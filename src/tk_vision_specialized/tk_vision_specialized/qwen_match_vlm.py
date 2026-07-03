@@ -1,4 +1,4 @@
-"""DashScope Qwen3-VL grounding client for the object_match service.
+"""Qwen3-VL grounding client for the object_match service.
 
 Sister of ``object_detection_generalist.vlm_bbox`` but tuned for *visual*
 grounding rather than text grounding: the user sends two images (a SCENE
@@ -13,51 +13,34 @@ Reasons for picking Qwen3-VL specifically (over Qwen2.5-VL or qwen-vl-max):
 * Multi-image input is officially supported on the OpenAI-compatible
   endpoint — ``[image, image, text]`` parts in one user turn.
 
-The OpenAI-compatible base URL defaults to the CN region
-(``dashscope.aliyuncs.com``); intl users can override via the
-``base_url`` argument with ``https://dashscope-intl.aliyuncs.com/compatible-mode/v1``.
-
-API key resolution intentionally tries ``DASHCOPE_API_KEY`` first because
-that is the (typo'd) name the workspace ``.env`` carries. ``DASHSCOPE_API_KEY``
-is the official name and is checked as a fallback so an external operator
-who fixes the typo locally still works without code edits.
+Qwen-only, no provider chain: unlike kimi_api's Gemini-primary/Qwen-fallback
+nodes, this client is called unconditionally by ``object_match_server.py``.
+The ``qwen_api_backend`` argument selects DashScope (default) or OpenRouter
+as the Qwen host; base URL, API key, and model resolution for both is
+centralized in ``kimi_api._env.resolve_qwen_target`` (see that module for
+the exact env-var / model-id rules per backend). The ``base_url`` argument
+here, when non-empty, always overrides the backend's own default URL.
 """
 
 from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 import time
 from typing import List, Tuple
 
 import cv2
 import numpy as np
-from dotenv import load_dotenv
+
+from kimi_api._env import load_env, resolve_qwen_target
 
 
 Bbox = Tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixel coords
 
 
-_DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-
-_KEY_NAMES = ('DASHCOPE_API_KEY', 'DASHSCOPE_API_KEY')
-
-
 class QwenMatchError(RuntimeError):
     """Raised on non-recoverable Qwen call failures (e.g. missing API key)."""
-
-
-def _resolve_api_key() -> str:
-    load_dotenv()
-    for name in _KEY_NAMES:
-        val = os.environ.get(name)
-        if val:
-            return val
-    raise QwenMatchError(
-        f'DashScope API key not found in env (looked for {_KEY_NAMES})'
-    )
 
 
 def _system_prompt(top_k: int) -> str:
@@ -162,8 +145,9 @@ def request_match_bboxes(
     *,
     item_name: str,
     top_k: int = 3,
-    model: str = 'qwen3-vl-plus',
-    base_url: str = _DEFAULT_BASE_URL,
+    model: str = '',
+    base_url: str = '',
+    qwen_api_backend: str = 'dashscope',
     max_retries: int = 1,
     timeout_s: float = 12.0,
     logger=None,
@@ -173,9 +157,18 @@ def request_match_bboxes(
     Returns ``(boxes, confidences, labels, elapsed_s)`` — parallel lists in
     the order Qwen returned them (already best-to-worst per the prompt
     contract). Empty lists on parse exhaustion or "no instance visible"
-    responses. Raises ``QwenMatchError`` only for missing credentials.
+    responses. Raises ``QwenMatchError`` for missing credentials, an
+    invalid ``qwen_api_backend``, or a model-id shape mismatch (see
+    ``kimi_api._env.resolve_qwen_target``) -- these are the only failure
+    modes that reach the caller as an exception; everything else degrades
+    to an empty result.
     """
-    api_key = _resolve_api_key()  # raises QwenMatchError if missing
+    load_env()
+    try:
+        base_url, api_key, model = resolve_qwen_target(
+            qwen_api_backend, model, base_url)
+    except RuntimeError as exc:
+        raise QwenMatchError(str(exc)) from exc
 
     from openai import OpenAI
 

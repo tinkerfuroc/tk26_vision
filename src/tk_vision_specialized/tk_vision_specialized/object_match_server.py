@@ -88,11 +88,9 @@ class ObjectMatchServer(YOLOSegmentationNode):
 
     def _declare_parameters(self):
         super()._declare_parameters()
-        self.declare_parameter('vlm_model', 'qwen3-vl-plus')
-        self.declare_parameter(
-            'vlm_base_url',
-            'https://dashscope.aliyuncs.com/compatible-mode/v1',
-        )
+        self.declare_parameter('vlm_model', '')
+        self.declare_parameter('vlm_base_url', '')
+        self.declare_parameter('qwen_api_backend', 'dashscope')
         self.declare_parameter('vlm_timeout_s', 12.0)
         self.declare_parameter('vlm_max_retries', 1)
         self.declare_parameter('top_k_candidates', 3)
@@ -105,6 +103,7 @@ class ObjectMatchServer(YOLOSegmentationNode):
         super()._load_parameters()
         self.vlm_model = self.get_parameter('vlm_model').value
         self.vlm_base_url = self.get_parameter('vlm_base_url').value
+        self.qwen_api_backend = self.get_parameter('qwen_api_backend').value
         self.vlm_timeout_s = float(self.get_parameter('vlm_timeout_s').value)
         self.vlm_max_retries = int(
             self.get_parameter('vlm_max_retries').value
@@ -267,6 +266,7 @@ class ObjectMatchServer(YOLOSegmentationNode):
                 top_k=self.top_k_candidates,
                 model=self.vlm_model,
                 base_url=self.vlm_base_url,
+                qwen_api_backend=self.qwen_api_backend,
                 max_retries=self.vlm_max_retries,
                 timeout_s=self.vlm_timeout_s,
                 logger=self.get_logger(),

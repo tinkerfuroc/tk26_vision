@@ -61,6 +61,13 @@ shell sources.
 
 ## Changelog
 
+### 0.3.0 — 2026-07-03
+- `vision_driver.launch.py`: new `color_width` / `color_height` launch args for
+  the Orbbec color stream (defaults `1280`/`720` — behavior unchanged unless
+  overridden; the HRI task overrides to 1920×1080).
+- Repo-root `config/fastdds_shm.xml`: SHM segment size raised 20 MB → 64 MB to
+  carry the larger 1080p Orbbec color frames.
+
 ### 0.2.0 — 2026-06-23
 - Rewrote both launches around a BT-driven node selection (tasks HRI+Follow,
   GPSR, Restaurant, PickAndPlace).

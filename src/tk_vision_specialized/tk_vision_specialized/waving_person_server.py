@@ -1,4 +1,5 @@
 import rclpy
+import rclpy.time
 from rclpy.node import Node
 from tinker_vision_msgs_26.srv import DetectWaving
 from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest
@@ -223,6 +224,7 @@ class DetectWavingPersonsNode(Node):
         window_name = 'Waving Detection'
         try:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 960, 540)
         except Exception as exc:  # noqa: BLE001 -- no GUI backend available
             self.get_logger().error(
                 f'show_window=true but cv2 has no GUI backend available '
@@ -231,6 +233,18 @@ class DetectWavingPersonsNode(Node):
                 f'published on /detect_waving_debug_image.'
             )
             return
+        # Paint something immediately instead of waiting for the first real
+        # detection frame -- a namedWindow with nothing shown yet can sit
+        # unmapped/unpainted on some window managers until the first imshow,
+        # which made the window appear not to "pop up" at all until the
+        # first service call landed. This also proves the window is alive
+        # independent of whether a detection has happened yet.
+        placeholder = np.zeros((540, 960, 3), dtype=np.uint8)
+        cv2.putText(
+            placeholder, 'Waiting for detect_waving_persons calls...',
+            (20, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2,
+        )
+        self._show_frame(window_name, placeholder)
         self.get_logger().info(
             f'cv2 popup window ready (DISPLAY={os.environ.get("DISPLAY")!r}).'
         )
@@ -241,8 +255,7 @@ class DetectWavingPersonsNode(Node):
                 cv2.waitKey(1)
                 continue
             try:
-                cv2.imshow(window_name, frame)
-                cv2.waitKey(1)
+                self._show_frame(window_name, frame)
             except Exception as exc:  # noqa: BLE001 -- keep the node alive
                 self.get_logger().error(
                     f'cv2 imshow/waitKey failed ({exc}); disabling the '
@@ -255,6 +268,20 @@ class DetectWavingPersonsNode(Node):
         # non-fatal) "QObject::killTimer: Timers cannot be stopped from
         # another thread" warning in testing -- the OS/window manager
         # reclaims the window on process exit regardless.
+
+    @staticmethod
+    def _show_frame(window_name: str, frame) -> None:
+        """imshow + repeated waitKey pumps.
+
+        A single waitKey(1) right after imshow is the textbook pattern, but
+        proved unreliable for actually materializing/repainting the window
+        promptly on some window managers -- a few short pumps in quick
+        succession (still ~a few ms total, no meaningful latency added) are
+        far more consistent at forcing the frame to actually paint.
+        """
+        cv2.imshow(window_name, frame)
+        for _ in range(3):
+            cv2.waitKey(1)
 
     def destroy_node(self):
         self._vlm_executor.shutdown(wait=False)
@@ -629,6 +656,40 @@ class DetectWavingPersonsNode(Node):
             camera_k = self.camera_k
         finally:
             self.img_lock.release()
+
+        # Freshness barrier: reject a frame cached from before this request
+        # arrived. Without this, a caller that just moved the pan-tilt (e.g.
+        # BtNode_TurnPanTilt + a settle wait) and immediately calls this
+        # service can silently get scored against whatever frame was cached
+        # from BEFORE the move -- image_callback updates self.rgb_image
+        # asynchronously and there's no guarantee a post-move frame has
+        # landed by the time the request arrives (observed live: the first
+        # call after startup used the pre-move frame). Poll for a fresher
+        # frame up to POLL_TIMEOUT_NS, then proceed with a warning rather
+        # than block forever on a stalled camera.
+        STALE_BUDGET_NS = int(1.0 * 1e9)
+        POLL_TIMEOUT_NS = int(2.0 * 1e9)
+        poll_start_ns = self.get_clock().now().nanoseconds
+        frame_ns = rclpy.time.Time.from_msg(header.stamp).nanoseconds
+        while poll_start_ns - frame_ns > STALE_BUDGET_NS:
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - poll_start_ns > POLL_TIMEOUT_NS:
+                self.get_logger().warn(
+                    f'Frame is stale (age {(poll_start_ns - frame_ns) / 1e9:.2f}s '
+                    f'at request time) and no fresher frame arrived within '
+                    f'{POLL_TIMEOUT_NS / 1e9:.1f}s; proceeding anyway.'
+                )
+                break
+            time.sleep(0.05)
+            self.img_lock.acquire()
+            try:
+                rgb_image = self.rgb_image.copy()
+                depth_image = self.depth_image
+                header = self.header
+                camera_k = self.camera_k
+            finally:
+                self.img_lock.release()
+            frame_ns = rclpy.time.Time.from_msg(header.stamp).nanoseconds
 
         # Launch the VLM fallback now, in parallel with the depth conversion +
         # YOLO + MediaPipe pass below -- it only needs rgb_image, which is

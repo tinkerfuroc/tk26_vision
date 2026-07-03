@@ -5,6 +5,7 @@ from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 import cv2
+import os
 import time
 import queue
 import numpy as np
@@ -212,16 +213,27 @@ class DetectWavingPersonsNode(Node):
         frame has arrived, so the window stays responsive/movable between
         detections instead of freezing.
         """
+        # Match the operator's real X display. Only sets it if the process
+        # doesn't already have one -- never clobber an explicit launch-time
+        # DISPLAY. Verified live (2026-07-03): a bare cv2.namedWindow +
+        # imshow + waitKey round-trip against DISPLAY=:0 succeeds in this
+        # venv (Qt5 GUI backend), including from a background thread fed by
+        # a producer/consumer queue exactly like the one below.
+        os.environ.setdefault('DISPLAY', ':0')
         window_name = 'Waving Detection'
         try:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         except Exception as exc:  # noqa: BLE001 -- no GUI backend available
             self.get_logger().error(
                 f'show_window=true but cv2 has no GUI backend available '
-                f'({exc}); no popup window will appear. The debug image is '
-                f'still published on /detect_waving_debug_image.'
+                f'(DISPLAY={os.environ.get("DISPLAY")!r}, error: {exc}); no '
+                f'popup window will appear. The debug image is still '
+                f'published on /detect_waving_debug_image.'
             )
             return
+        self.get_logger().info(
+            f'cv2 popup window ready (DISPLAY={os.environ.get("DISPLAY")!r}).'
+        )
         while not self._window_shutdown.is_set():
             try:
                 frame = self._frame_queue.get(timeout=0.1)
@@ -237,10 +249,12 @@ class DetectWavingPersonsNode(Node):
                     f'popup window for the rest of this run.'
                 )
                 return
-        try:
-            cv2.destroyWindow(window_name)
-        except Exception:  # noqa: BLE001 -- best-effort cleanup
-            pass
+        # No explicit cv2.destroyWindow() here: the process is exiting
+        # anyway (this only runs from destroy_node's shutdown path), and
+        # destroying a Qt-backed window from here produced a real (if
+        # non-fatal) "QObject::killTimer: Timers cannot be stopped from
+        # another thread" warning in testing -- the OS/window manager
+        # reclaims the window on process exit regardless.
 
     def destroy_node(self):
         self._vlm_executor.shutdown(wait=False)

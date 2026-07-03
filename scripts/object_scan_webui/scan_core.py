@@ -282,6 +282,7 @@ def scan_image(
     batch_size: int = 8,
     max_workers: int = 0,
     use_qwen_fallback: bool = True,
+    providers: tuple | None = None,
     timeout_s: float = 20.0,
     max_retries: int = 2,
     log=None,
@@ -292,8 +293,13 @@ def scan_image(
     batch, so total latency is ~one VLM call regardless of batch count. Set a
     positive `max_workers` only to cap concurrency (e.g. against provider rate
     limits).
+
+    `providers` overrides the chain for A/B testing a single provider, e.g.
+    `("gemini",)` or `("qwen",)`. When None, the chain is derived from
+    `use_qwen_fallback` (gemini -> qwen, or gemini-only).
     """
-    chain = ("gemini", "qwen") if use_qwen_fallback else ("gemini",)
+    chain = providers if providers else (
+        ("gemini", "qwen") if use_qwen_fallback else ("gemini",))
     groups = batches(vocabulary, batch_size)
     # 0 / negative -> one worker per batch (every batch call in parallel).
     workers = len(groups) if max_workers <= 0 else min(max_workers, len(groups))

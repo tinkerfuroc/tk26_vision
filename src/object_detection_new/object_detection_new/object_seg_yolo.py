@@ -14,7 +14,7 @@ import time
 from typing import Optional, Tuple
 
 # ROS2 messages
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Header
 import geometry_msgs.msg
 from tinker_vision_msgs_26.msg import Object, Objects
@@ -35,6 +35,7 @@ from cv_bridge import CvBridge
 from vision_util.vision_logging import VisionLogger
 from vision_util.mask_utils import largest_connected_component_in_bbox
 from vision_util.weights_cache import resolve_weights
+from vision_util.depth_reproject import decode_depth_metres, depth_image_to_points
 
 
 class YOLOSegmentationNode(Node):
@@ -124,7 +125,7 @@ class YOLOSegmentationNode(Node):
         self.declare_parameter(
             'orbbec_image_topic', '/camera/color/image_raw')
         self.declare_parameter(
-            'orbbec_depth_topic', '/camera/depth_registered/points')
+            'orbbec_depth_topic', '/camera/depth/image_raw')
         self.declare_parameter(
             'orbbec_camera_info_topic', '/camera/color/camera_info')        
         # Hz, 0 = no continuous publishing
@@ -290,7 +291,7 @@ class YOLOSegmentationNode(Node):
                 self, Image, orbbec_image_topic, qos_profile=qos_profile
             )
             depth_sub_orbbec = Subscriber(
-                self, PointCloud2, orbbec_depth_topic, qos_profile=qos_profile
+                self, Image, orbbec_depth_topic, qos_profile=qos_profile
             )
 
             sync_orbbec = ApproximateTimeSynchronizer(
@@ -352,7 +353,7 @@ class YOLOSegmentationNode(Node):
         self.recent_publish_time['realsense'] = self.get_clock().now()
         self.lock_msg.release()
 
-    def _orbbec_callback(self, rgb_msg: Image, depth_msg: PointCloud2):
+    def _orbbec_callback(self, rgb_msg: Image, depth_msg: Image):
         """Process synchronized orbbec RGB and depth messages."""
         self.lock_msg.acquire()
         self.recent_sync_msg['orbbec'] = (rgb_msg, depth_msg)
@@ -396,39 +397,21 @@ class YOLOSegmentationNode(Node):
 
         return points, valid_mask
 
-    def _pointcloud_to_array(self, pc_msg: PointCloud2, intrinsic: CameraInfo) -> tuple:
+    def _orbbec_depth_to_array(self, depth_msg: Image, intrinsic: CameraInfo) -> tuple:
+        """Reproject the Orbbec's registered depth Image to a points array.
+
+        Depth is registered to color (depth_registration:=true), so its
+        shape and frame always match the live color stream -- at whatever
+        resolution the driver is launched with, never a fixed size.
         """
-        Convert PointCloud2 to point array (Orbbec format).
+        depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        depth_m = decode_depth_metres(depth_raw)
+        points = depth_image_to_points(depth_m, intrinsic.k)
 
-        Orbbec outputs unordered point cloud, need to reproject to image grid.
-        """
-        h, w = 720, 1280
-        K = np.array(intrinsic.k).reshape((3, 3))
+        valid_mask = (points[:, :, 2] > self.min_depth) & \
+                     (points[:, :, 2] < self.max_depth)
 
-        # Parse point cloud. Derive floats/point from point_step so both the 4-float
-        # xyz layout (Femto Bolt default) and the 5-float xyzrgb layout
-        # (enable_colored_point_cloud:=true) work — point_step is bytes/point, /4 = floats/point.
-        floats_per_point = pc_msg.point_step // 4
-        arr = np.frombuffer(pc_msg.data, dtype='<f4')
-        N = len(arr) // floats_per_point
-        points = arr.reshape((N, floats_per_point))[:, [0, 1, 2]]
-
-        # Project to image coordinates
-        points_homo = points / np.repeat(points[:, 2:3], 3, axis=1)
-        coor_homo = (K @ points_homo.T).T
-        coor = np.rint(coor_homo[:, :2]).astype(int)
-
-        # Create depth image
-        depth_img = np.zeros((h, w, 3))
-        valid_coords = (coor[:, 0] >= 0) & (coor[:, 0] < w) & \
-                       (coor[:, 1] >= 0) & (coor[:, 1] < h)
-        depth_img[coor[valid_coords, 1], coor[valid_coords, 0], :] = points[valid_coords]
-
-        # Valid mask
-        valid_mask = (depth_img[:, :, 2] > self.min_depth) & \
-                     (depth_img[:, :, 2] < self.max_depth)
-
-        return depth_img, valid_mask
+        return points, valid_mask
 
     def _warn_fallback_throttled(self) -> None:
         """Emit the "FFS unavailable, falling back to native depth" warning at
@@ -572,11 +555,11 @@ class YOLOSegmentationNode(Node):
 
         # return rgb_img, points, valid_mask, depth_msg.header
 
-    def _process_orbbec_data(self, rgb_msg: Image, depth_msg: PointCloud2,
+    def _process_orbbec_data(self, rgb_msg: Image, depth_msg: Image,
                              intrinsic: CameraInfo) -> tuple:
         """Process orbbec RGB-D data into usable format."""
         rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-        points, valid_mask = self._pointcloud_to_array(depth_msg, intrinsic)
+        points, valid_mask = self._orbbec_depth_to_array(depth_msg, intrinsic)
 
         return rgb_img, points, valid_mask, depth_msg.header
 

@@ -124,21 +124,25 @@ ros2 topic pub --once /pan_tilt_controller/cmd \
   yaml's comment. Sourcing values are still `polish.json`'s
   `theta_p_offset_rad` / `theta_t_offset_rad` after each calibration; write
   them into the per-robot `offsets.yaml`, not just the package yaml.
-- **Per-robot URDF overrides (dropped from this launch).** Earlier
-  revisions of `pan_tilt.launch.py` threaded
+- **Per-robot URDF mount geometry (now sourced by the xacro, not launch
+  args).** Earlier revisions of `pan_tilt.launch.py` threaded
   `robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml`
   (`attach_xyz`/`attach_rpy`/`camera_mount_xyz`/`camera_mount_rpy`) through
   `tinker_robot_config`'s `robot_description.launch.py` wrapper via an
-  `overrides_key='pan_tilt.urdf_overrides'` launch argument. That wiring is
-  removed as of this change — `pan_tilt.launch.py` now includes the wrapper
-  with only `xacro_path` + the private-topic `remappings`, so it renders the
-  xacro macro's hardcoded attach/camera_mount defaults. `urdf_overrides.yaml`
-  itself and the resolver's generic `overrides_key` mechanism still exist in
-  `tinker_robot_config` (other callers may use them); this package simply no
-  longer consumes that sub-tree at launch time. Note this is a distinct
-  profile sub-tree from the joint offsets above (`pan_tilt.urdf_overrides.*`
-  = URDF mount geometry; `pan_tilt.offsets.*` = joint-state calibration
-  offsets, now read directly by the runtime node instead of at launch time).
+  `overrides_key='pan_tilt.urdf_overrides'` launch argument. That launch-arg
+  plumbing is removed — since tk25_basic `db1524a`, `pan_tilt.urdf.xacro`
+  itself sources per-robot mount geometry via a `ROBOT_NAME`-guarded
+  `<xacro:include>` of
+  `robots/$ROBOT_NAME/pan_tilt/pan_tilt_overrides.xacro` at xacro-parse
+  time, independent of launch arguments. Per-robot geometry is therefore
+  preserved whenever `ROBOT_NAME` is set (any render path, including manual
+  `xacro …`); the macro's nominal defaults apply only when `ROBOT_NAME` is
+  unset. Note the two per-robot concerns are distinct and always were:
+  `pan_tilt.urdf_overrides.*` / `pan_tilt_overrides.xacro` = URDF mount
+  geometry (never carried the joint offsets); `pan_tilt.offsets.*` =
+  joint-state calibration offsets, which were always ROS params read by
+  `pan_tilt_state_publisher` and are now resolved from the per-robot
+  profile per the bullet above.
 
 ## Calibration
 

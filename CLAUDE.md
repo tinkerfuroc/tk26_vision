@@ -63,6 +63,19 @@ then `pip install --ignore-installed numpy==1.23.4 scipy==1.12.0
 opencv-contrib-python==4.10.0.84 PyYAML fastapi 'uvicorn[standard]' aiofiles
 pyserial`. Diff-target: `.venv-calib/freeze.lock.txt`.
 
+**Fresh-`.venv-calib` gotcha — missing `easy-install.pth`** (same class as
+the `.venv-fs`/foundation_stereo one): after provisioning a new
+`.venv-calib` and building, `ros2 run pan_tilt <entry point>` fails with
+`importlib.metadata.PackageNotFoundError: No package metadata was found for
+pan-tilt` — colcon's develop install leaves only a bare `pan-tilt.egg-link`
+in `install/pan_tilt/.../site-packages` without an `easy-install.pth`, so
+the venv interpreter can't locate the distribution metadata under
+`build/pan_tilt`. Fix: create
+`.venv-calib/lib/python3.10/site-packages/pan_tilt.pth` containing the
+single line `/home/tinker/tk25_ws/build/pan_tilt`. Survives subsequent
+`colcon build`s; lost only when `.venv-calib` itself is rebuilt (reapply
+then).
+
 ## Environment
 
 ### Python deps

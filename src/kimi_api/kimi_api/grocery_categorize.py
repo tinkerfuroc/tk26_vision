@@ -32,7 +32,7 @@ from tinker_vision_msgs_26.action import Categorize
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
 from ._categorize_vlm import ShelfVlmError, request_shelf_layer_chain
-from ._env import default_model, load_env, require_api_key, require_dashscope_api_key
+from ._env import default_model, load_env, require_api_key, resolve_qwen_target
 from ._image_utils import encode_to_data_url
 
 USE_SHELF_HEIGHT = False
@@ -63,7 +63,8 @@ class GroceryCategorizeAction(Node):
         self.declare_parameter('vlm_timeout_s', 60.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
-        self.declare_parameter('categorize_model_qwen', 'qwen3-vl-plus')
+        self.declare_parameter('categorize_model_qwen', '')
+        self.declare_parameter('qwen_api_backend', 'dashscope')
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
         self.vlm_timeout_s = self.get_parameter('vlm_timeout_s').get_parameter_value().double_value
@@ -76,6 +77,7 @@ class GroceryCategorizeAction(Node):
         self.categorize_model_qwen = (
             self.get_parameter('categorize_model_qwen').get_parameter_value().string_value
         )
+        self.qwen_api_backend = self.get_parameter('qwen_api_backend').value
 
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
@@ -132,8 +134,9 @@ class GroceryCategorizeAction(Node):
                 self.get_logger().warn(f'Unknown fallback provider {fb!r}; ignoring.')
             else:
                 try:
-                    require_dashscope_api_key()
-                    chain.append(('qwen', self.categorize_model_qwen))
+                    _, _, resolved_model = resolve_qwen_target(
+                        self.qwen_api_backend, self.categorize_model_qwen)
+                    chain.append(('qwen', resolved_model))
                 except RuntimeError:
                     self.get_logger().warn(
                         f'Fallback provider {fb!r} key missing; fallback disabled.'
@@ -287,6 +290,7 @@ class GroceryCategorizeAction(Node):
             shelf_res = request_shelf_layer_chain(
                 sys_prompt, shelf_img_url, obj_seg_url,
                 provider_models=self._categorize_provider_chain,
+                qwen_api_backend=self.qwen_api_backend,
                 timeout_s=self.vlm_timeout_s,
                 max_retries=self.vlm_max_retries,
                 logger=self.get_logger(),

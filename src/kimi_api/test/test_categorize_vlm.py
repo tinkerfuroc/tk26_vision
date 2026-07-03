@@ -90,6 +90,28 @@ def test_request_shelf_layer_qwen_uses_dashscope(monkeypatch):
         'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
 
+def test_request_shelf_layer_qwen_openrouter_backend(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'or-key')
+    fake = _make_fake_openai(lambda kw: _VALID_PAYLOAD)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    res = request_shelf_layer(
+        'sys', 'shelf-url', 'obj-url', provider='qwen', model='',
+        qwen_api_backend='openrouter')
+
+    assert res.provider == 'qwen'
+    assert fake.last_init['base_url'] == 'https://openrouter.ai/api/v1'
+    assert fake.last_init['api_key'] == 'or-key'
+
+
+def test_request_shelf_layer_qwen_openrouter_missing_key_raises(monkeypatch):
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    with pytest.raises(ShelfVlmError, match='OPENROUTER_API_KEY'):
+        request_shelf_layer(
+            'sys', 'shelf-url', 'obj-url', provider='qwen', model='',
+            qwen_api_backend='openrouter')
+
+
 def test_request_shelf_layer_missing_key_raises(monkeypatch):
     monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
     with pytest.raises(ShelfVlmError, match='OPENROUTER_API_KEY'):

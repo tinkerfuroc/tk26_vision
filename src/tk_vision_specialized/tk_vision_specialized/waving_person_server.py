@@ -5,9 +5,6 @@ from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 import cv2
-import os
-import shutil
-import subprocess
 import time
 import queue
 import numpy as np
@@ -114,12 +111,11 @@ class DetectWavingPersonsNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # show_window=true spawns rqt_image_view as a subprocess subscribed to
-        # /detect_waving_debug_image. cv2.imshow is unreliable here because the
-        # system has opencv-python-headless installed alongside opencv-python,
-        # and the headless wheel wins import resolution -> cv2.waitKey raises
-        # "not implemented. Rebuild the library with GTK+ 2.x". rqt_image_view
-        # uses Qt directly and works regardless of the cv2 wheel.
+        # show_window=true pops up a real cv2.imshow window with per-person
+        # bounding boxes, fed from a bounded queue by a dedicated background
+        # thread (_cv2_window_loop) so imshow/waitKey are always called from
+        # the same thread, not from whichever ROS callback-group thread
+        # happens to process a given request.
         self.declare_parameter('show_window', True)
         self.show_window = (
             self.get_parameter('show_window').get_parameter_value().bool_value)
@@ -191,48 +187,66 @@ class DetectWavingPersonsNode(Node):
             self.get_parameter('vision_log_folder').get_parameter_value().string_value,
         )
 
-        self._viewer_proc = None
+        self._frame_queue = queue.Queue(maxsize=2)
+        self._window_shutdown = threading.Event()
+        self._window_thread = None
         if self.show_window:
-            self._spawn_image_viewer()
+            self._window_thread = threading.Thread(
+                target=self._cv2_window_loop, name='waving_cv2_window',
+                daemon=True,
+            )
+            self._window_thread.start()
 
         self.get_logger().info(
             f'Detect Waving Persons node started (show_window={self.show_window})')
 
-    def _spawn_image_viewer(self):
-        """Launch rqt_image_view subscribed to the debug_image topic.
+    def _cv2_window_loop(self):
+        """Own a single cv2.imshow window for the life of the node.
 
-        Falls back to a warning if rqt_image_view isn't installed -- the
-        debug_image topic is still published, so the operator can run any
-        viewer manually."""
-        topic = '/detect_waving_debug_image'
-        if shutil.which('ros2') is None:
-            self.get_logger().warn(
-                'show_window=true but `ros2` not on PATH; skipping viewer spawn.')
-            return
-        env = os.environ.copy()
-        env.setdefault('DISPLAY', ':0')
+        Runs on a dedicated thread so imshow/waitKey are always called from
+        the same thread -- required for the Qt/GTK backend to behave, and
+        not guaranteed if called directly from a ROS callback-group thread
+        (detect_waving_callback may run on a different worker each call).
+        Pulls the latest annotated frame from _frame_queue; a get() timeout
+        keeps waitKey() pumping the window's event loop even when no new
+        frame has arrived, so the window stays responsive/movable between
+        detections instead of freezing.
+        """
+        window_name = 'Waving Detection'
         try:
-            self._viewer_proc = subprocess.Popen(
-                ['ros2', 'run', 'rqt_image_view', 'rqt_image_view', topic],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        except Exception as exc:  # noqa: BLE001 -- no GUI backend available
+            self.get_logger().error(
+                f'show_window=true but cv2 has no GUI backend available '
+                f'({exc}); no popup window will appear. The debug image is '
+                f'still published on /detect_waving_debug_image.'
             )
-            self.get_logger().info(
-                f'Spawned rqt_image_view (pid={self._viewer_proc.pid}) on {topic}'
-            )
-        except FileNotFoundError as exc:
-            self.get_logger().warn(f'Failed to spawn rqt_image_view: {exc}')
+            return
+        while not self._window_shutdown.is_set():
+            try:
+                frame = self._frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                cv2.waitKey(1)
+                continue
+            try:
+                cv2.imshow(window_name, frame)
+                cv2.waitKey(1)
+            except Exception as exc:  # noqa: BLE001 -- keep the node alive
+                self.get_logger().error(
+                    f'cv2 imshow/waitKey failed ({exc}); disabling the '
+                    f'popup window for the rest of this run.'
+                )
+                return
+        try:
+            cv2.destroyWindow(window_name)
+        except Exception:  # noqa: BLE001 -- best-effort cleanup
+            pass
 
     def destroy_node(self):
         self._vlm_executor.shutdown(wait=False)
-        if self._viewer_proc is not None and self._viewer_proc.poll() is None:
-            try:
-                self._viewer_proc.terminate()
-                self._viewer_proc.wait(timeout=2.0)
-            except Exception:  # noqa: BLE001
-                self._viewer_proc.kill()
+        self._window_shutdown.set()
+        if self._window_thread is not None:
+            self._window_thread.join(timeout=2.0)
         return super().destroy_node()
 
     def _annotate_frame(self, rgb_bgr, waving_annotations, waving_centroids):
@@ -838,11 +852,20 @@ class DetectWavingPersonsNode(Node):
             waving=len(waving_persons_centroids),
             already_annotated=True,
         )
-        if self.show_window and getattr(self, '_frame_queue', None) is not None:
+        if self.show_window:
             try:
                 self._frame_queue.put_nowait(annotated)
             except queue.Full:
-                pass
+                # Drop the stale frame, keep the newest -- the window loop
+                # would rather show the latest detection than fall behind.
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._frame_queue.put_nowait(annotated)
+                except queue.Full:
+                    pass
 
         if self._vision_logger.enabled:
             detections = []

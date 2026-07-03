@@ -162,6 +162,11 @@ def _require_robot_name() -> str:
             "that robot's per-robot files and cannot overwrite another "
             "robot's."
         )
+    if "/" in robot or ".." in robot:
+        raise CalibrationApplyError(
+            f"ROBOT_NAME {robot!r} contains a path separator or '..' — "
+            f"refusing (it is used as a directory name under robots/)."
+        )
     return robot
 
 

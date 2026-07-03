@@ -5,6 +5,12 @@ All notable changes to this package land here, newest first.
 ## [Unreleased]
 
 ### Changed
+- Task-3 review follow-up: `calibration/readme.md` §8 rewritten to the
+  per-robot apply flow (the shared-xacro `cp` + `--xacro`/`--no-yaml`
+  instructions it still documented are gone); orphaned
+  `calibration/yaml_targets.py` deleted (no importers left);
+  `_require_robot_name` now rejects a `ROBOT_NAME` containing `/` or `..`
+  (path-traversal hardening). (Task 3 / Phase 1c)
 - **Calibration Preview/Apply is per-robot only** (Task 3 / Phase 1c).
   `apply_to_urdf` was rewritten around a single public entry
   `apply_calibration(params, basic_root=None, allow_flipped_camera=False)`

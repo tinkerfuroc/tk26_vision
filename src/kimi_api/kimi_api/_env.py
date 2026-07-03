@@ -83,3 +83,73 @@ def require_dashscope_api_key() -> str:
             'root (or export it) before using a dashscope/ VLM model.'
         )
     return key
+
+
+_VALID_QWEN_BACKENDS = ('dashscope', 'openrouter')
+
+# Provisional default for qwen_api_backend='openrouter' — OpenRouter does not
+# carry the exact 'qwen3-vl-plus' slug this codebase defaults to on DashScope.
+# This is the SAFER open-weight starting bet (same Qwen3-VL family as the
+# calibrated bbox decoder in object_detection_generalist/vlm_bbox.py), NOT a
+# verified final choice. Do not rely on this for a competition run until the
+# benchmark task in docs/superpowers/specs/2026-07-03-qwen-openrouter-
+# dashscope-toggle-design.md §"Default OpenRouter model" has actually run
+# (image modality + known-position bbox format + regional latency) and this
+# constant has been updated accordingly.
+_OPENROUTER_QWEN_DEFAULT_MODEL = 'qwen/qwen3-vl-32b-instruct'
+
+_DASHSCOPE_DEFAULT_MODEL = 'qwen3-vl-plus'
+
+
+def resolve_qwen_target(
+    backend: str,
+    model_param_value: str,
+    base_url_override: str = '',
+) -> tuple[str, str, str]:
+    """Return (base_url, api_key, model) for a Qwen call on the given backend.
+
+    `backend` is 'dashscope' or 'openrouter' — the caller's qwen_api_backend
+    ROS param. `model_param_value` is the caller's own qwen-model ROS param:
+    '' means "use this backend's default model"; any non-empty value is
+    honored verbatim on either backend (never silently rewritten — an
+    explicit value the operator set for the "wrong" backend raises instead
+    of being swapped, since OpenRouter ids contain '/' and DashScope ids
+    don't, and mixing them up is very likely a config mistake worth
+    surfacing loudly). `base_url_override`, if non-empty, always wins over
+    the backend's own base URL — it does not change which API key is
+    required.
+
+    Raises RuntimeError on: invalid backend, missing required key for the
+    selected backend, or a model-id shape mismatch (see above).
+    """
+    if backend not in _VALID_QWEN_BACKENDS:
+        raise RuntimeError(
+            f'Invalid qwen_api_backend {backend!r}; expected one of '
+            f'{_VALID_QWEN_BACKENDS}.'
+        )
+
+    model = model_param_value or ''
+
+    if backend == 'dashscope':
+        resolved_model = model or _DASHSCOPE_DEFAULT_MODEL
+        if '/' in resolved_model:
+            raise RuntimeError(
+                f"qwen_api_backend='dashscope' but model {resolved_model!r} "
+                "looks like an OpenRouter id (contains '/'). Pass a bare "
+                "DashScope model id, or set qwen_api_backend='openrouter'."
+            )
+        api_key = require_dashscope_api_key()
+        resolved_base_url = base_url_override or dashscope_base_url()
+        return resolved_base_url, api_key, resolved_model
+
+    # openrouter
+    resolved_model = model or _OPENROUTER_QWEN_DEFAULT_MODEL
+    if '/' not in resolved_model:
+        raise RuntimeError(
+            f"qwen_api_backend='openrouter' but model {resolved_model!r} "
+            "looks like a bare DashScope id (no '/'). Pass an OpenRouter "
+            "'org/name' id, or set qwen_api_backend='dashscope'."
+        )
+    api_key = require_api_key()
+    resolved_base_url = base_url_override or base_url()
+    return resolved_base_url, api_key, resolved_model

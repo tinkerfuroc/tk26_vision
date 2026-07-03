@@ -70,7 +70,7 @@ def test_request_feature_description_returns_text_on_success(monkeypatch):
 
     res = request_feature_description(
         _img_url(), 'sys prompt', 'user prompt',
-        provider='qwen', model='qwen3-vl-plus')
+        provider='qwen', model='qwen3-vl-plus', qwen_api_backend='dashscope')
 
     assert isinstance(res, FeatureVlmResult)
     assert res.text == 'a description'
@@ -78,6 +78,27 @@ def test_request_feature_description_returns_text_on_success(monkeypatch):
     assert fake.last_init['base_url'] == \
         'https://dashscope.aliyuncs.com/compatible-mode/v1'
     assert fake.last_init['api_key'] == 'k'
+
+
+def test_request_feature_description_qwen_openrouter_backend(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'or-key')
+    fake = _make_fake_openai(lambda kw: 'a description')
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    request_feature_description(
+        'data:url', 'sys', 'user',
+        provider='qwen', model='', qwen_api_backend='openrouter')
+
+    assert fake.last_init['base_url'] == 'https://openrouter.ai/api/v1'
+    assert fake.last_init['api_key'] == 'or-key'
+
+
+def test_request_feature_description_qwen_openrouter_missing_key_raises(monkeypatch):
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    with pytest.raises(FeatureVlmError, match='OPENROUTER_API_KEY'):
+        request_feature_description(
+            'data:url', 'sys', 'user',
+            provider='qwen', model='', qwen_api_backend='openrouter')
 
 
 def test_request_feature_description_gemini_uses_openrouter(monkeypatch):

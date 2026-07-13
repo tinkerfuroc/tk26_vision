@@ -379,7 +379,36 @@ Follows the tk26_vision tier conventions (`scripts/tests/`):
   (kimi_api, tk_vision_specialized). This effort adds only new files + one
   guarded block in `vision_driver.launch.py`; commit-new-only, no amends.
 
+## 13. Coordination with the vision intake/action refactor (concurrent spec)
+
+`docs/superpowers/specs/2026-07-13-vision-actions-and-intake-decoupling-design.md`
+(committed 2026-07-13 by the concurrent session) refactors the consumer side:
+service→action conversion for VLM-backed nodes, plus shared
+`CameraIntake` / `TransformHelper` helpers in `vision_util` replacing each
+node's private subscription + TF machinery. That spec explicitly evaluated a
+"central camera-relay node that owns all subscriptions" as its option (c),
+deferred it, and called `CameraIntake` "the stepping stone to it" — **this
+design is that option (c)**. The two efforts compose:
+
+- Once consumers adopt `CameraIntake`/`TransformHelper`, migration to these
+  servers becomes a **backend swap inside those two helpers**
+  (subscription-backed → `get_snapshot`/`get_transform`-client-backed) rather
+  than ~16 per-node edits. Appendix A's per-node rows mostly collapse into
+  that single change.
+- Interface alignment: `CameraIntake.wait_fresh` maps to
+  `captured_after`/`wait_timeout_sec`; `TransformHelper` (default 180 s cache)
+  maps to `get_transform` against this server's 180 s buffer. Any semantics
+  `CameraIntake` grows during Waves 1–3 should be reflected in
+  `GetCameraSnapshot` before the swap.
+- Continuous consumers (`person_track`, `follow_head`) adopt `CameraIntake`
+  in streaming mode and **keep** subscriptions — the helper needs both
+  backends; only the on-demand mode is re-backed by these servers.
+
 ## Appendix A — deferred consumer migration map
+
+Most rows below collapse into the `CameraIntake`/`TransformHelper` backend
+swap (§13) once the intake refactor's waves land; the table remains the
+per-node ground truth of what is consumed today.
 
 | Consumer (node) | Today | Future call |
 |---|---|---|

@@ -472,8 +472,21 @@ steps.
 `vision_intake` package — cleaner nominally, but adds a package + rebuild
 churn for no isolation gain; (c) a central camera-relay node that owns all
 subscriptions (kills the triple-subscription follow-up #3 for real) —
-attractive later, but a runtime-topology change with its own failure modes;
-explicitly out of scope, and `CameraIntake` is the stepping stone to it.
+out of scope here, and `CameraIntake` is the stepping stone to it.
+**Option (c) is now a concurrent, separate effort**:
+`docs/specs/2026-07-13-camera-server-design.md` (per-camera C++
+snapshot/PC/TF servers, committed 2026-07-13 by a concurrent session). Its
+§13 records the composition contract: once nodes here adopt
+`CameraIntake`/`TransformHelper`, migrating them to the camera servers is a
+backend swap *inside* the two helpers. Alignment obligations on this spec:
+any semantics `CameraIntake` grows during Waves 1–3 must be reflectable in
+`GetCameraSnapshot` — as of rev 2 that means `on_timeout` (both modes map
+onto its `WAIT_TIMEOUT`-returns-newest) and `age_source`, where
+`'stamp'` maps to the server's pair-stamp freshness but **`'recv'`
+(local receive-clock) has no remote equivalent** — nodes needing exact
+recv-clock semantics keep the subscription backend after the swap.
+Continuous consumers (person_track, follow_head) keep subscriptions
+regardless (both specs agree).
 
 ## 6. Testing
 

@@ -1,0 +1,12 @@
+string camera
+string[] names
+string[] features
+---
+int32 status
+string error_msg
+string recommendation
+---
+int32 status
+float32 delay_limit
+string stage
+string message

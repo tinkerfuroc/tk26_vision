@@ -1,0 +1,14 @@
+string camera
+string[] features
+sensor_msgs/Image[] comparison_images
+float32 max_distance
+string target_frame
+---
+int32 status
+string error_msg
+geometry_msgs/PointStamped[] centroids
+---
+int32 status
+float32 delay_limit
+string stage
+string message

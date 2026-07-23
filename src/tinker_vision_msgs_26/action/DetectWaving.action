@@ -1,0 +1,17 @@
+float32 threshold_meters
+string target_frame
+int32 min_waving_persons
+---
+int32 status
+string error_msg
+geometry_msgs/PointStamped[] waving_persons
+sensor_msgs/RegionOfInterest[] waving_boxes  # 1:1 with waving_persons; image-space boxes for re-seed
+
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image
+sensor_msgs/Image[] segments
+---
+int32 status
+float32 delay_limit
+string stage
+string message

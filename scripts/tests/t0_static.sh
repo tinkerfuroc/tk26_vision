@@ -58,6 +58,15 @@ ifaces=(
     tinker_vision_msgs_26/srv/FeatureExtraction
     tinker_vision_msgs_26/srv/FeatureMatching
     tinker_vision_msgs_26/srv/SeatRecommendation
+    tinker_vision_msgs_26/srv/SeatRecommendBbox
+    tinker_vision_msgs_26/srv/ObjectScan
+    tinker_vision_msgs_26/srv/DetectWaving
+    tinker_vision_msgs_26/action/FeatureExtraction
+    tinker_vision_msgs_26/action/FeatureMatching
+    tinker_vision_msgs_26/action/SeatRecommendation
+    tinker_vision_msgs_26/action/SeatRecommendBbox
+    tinker_vision_msgs_26/action/ObjectScan
+    tinker_vision_msgs_26/action/DetectWaving
     tinker_vision_msgs_26/srv/FollowHead
     tinker_vision_msgs_26/action/FollowHeadAction
     tinker_vision_msgs_26/action/Categorize

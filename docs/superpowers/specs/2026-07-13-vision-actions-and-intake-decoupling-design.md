@@ -153,7 +153,10 @@ The pattern:
   `Retry(scan, 5)` (`egpsr.py:97`) exhausts in ~2.5 s against a 20 s VLM
   call, and Restaurant's 14-position scan sequence
   (`wire_with_navigation.py:300-333`) hard-fails on one zombie goal. A
-  cancelled-while-queued goal returns CANCELED without executing.
+  cancelled-while-queued goal returns CANCELED without running user/VLM work.
+  Its rclpy execute callback still runs once at its FIFO turn so the action
+  server resolves the client's result future; skipping `goal_handle.execute()`
+  leaves that future pending indefinitely on ROS 2 Humble.
   **The queue is per-node, not per-server**: `feature_recognition`'s two
   action servers share one worker (they contend for one VLM quota, one
   detection client, one camera cache — parallel execution buys nothing and

@@ -36,6 +36,13 @@ CameraInfo make_info(uint32_t width = 4, uint32_t height = 4,
   return info;
 }
 
+CameraInfo with_distortion(CameraInfo info, const std::string& model,
+                           std::vector<double> coefficients) {
+  info.distortion_model = model;
+  info.d = std::move(coefficients);
+  return info;
+}
+
 void write_u16(std::vector<uint8_t>& data, size_t offset, uint16_t value,
                bool big_endian) {
   if (big_endian) {
@@ -295,6 +302,101 @@ TEST(Deprojector, InvalidatesXyCacheWhenIntrinsicsOrDimensionsChange) {
   EXPECT_NEAR(read_f32_le(out.data, 4), -0.01F, 1e-6F);
 }
 
+TEST(Deprojector, UndistortsRawPlumbBobAndInvalidatesCacheOnDChange) {
+  Deprojector deprojector;
+  const Image depth = make_depth_u16(3, 1);
+  PointCloud2 out;
+  std::string error;
+  const CameraInfo positive = with_distortion(
+      make_info(3, 1, 1.0, 1.0, 0.0, 0.0), "plumb_bob",
+      {0.1, 0.0, 0.0, 0.0, 0.0});
+  const CameraInfo negative = with_distortion(
+      make_info(3, 1, 1.0, 1.0, 0.0, 0.0), "plumb_bob",
+      {-0.1, 0.0, 0.0, 0.0, 0.0});
+
+  ASSERT_TRUE(deproject(deprojector, depth, positive, out, error)) << error;
+  const float positive_ray = read_f32_le(out.data, 2U * 12U);
+  EXPECT_LT(positive_ray, 2.0F);
+
+  ASSERT_TRUE(deproject(deprojector, depth, negative, out, error)) << error;
+  const float negative_ray = read_f32_le(out.data, 2U * 12U);
+  EXPECT_GT(negative_ray, positive_ray);
+}
+
+TEST(Deprojector, SupportsRationalPolynomialAndEquidistantModels) {
+  Deprojector deprojector;
+  const Image depth = make_depth_u16(2, 1);
+  PointCloud2 out;
+  std::string error;
+
+  ASSERT_TRUE(deproject(
+      deprojector, depth,
+      with_distortion(make_info(2, 1, 2.0, 2.0, 0.0, 0.0),
+                      "rational_polynomial",
+                      {0.01, 0.0, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0}),
+      out, error))
+      << error;
+  EXPECT_EQ(out.width, 2U);
+
+  ASSERT_TRUE(deproject(
+      deprojector, depth,
+      with_distortion(make_info(2, 1, 2.0, 2.0, 0.0, 0.0),
+                      "equidistant", {0.01, 0.0, 0.0, 0.0}),
+      out, error))
+      << error;
+  EXPECT_EQ(out.width, 2U);
+}
+
+TEST(Deprojector, TreatsUnnamedAllZeroDistortionAsRectifiedPinhole) {
+  Deprojector deprojector;
+  CameraInfo info = make_info(2, 1, 100.0, 100.0, 0.0, 0.0);
+  info.d = {0.0};
+  PointCloud2 out;
+  std::string error;
+  ASSERT_TRUE(
+      deproject(deprojector, make_depth_u16(2, 1), info, out, error))
+      << error;
+  EXPECT_NEAR(read_f32_le(out.data, 12U), 0.01F, 1e-6F);
+}
+
+TEST(Deprojector, AcceptsValidPaddedRows) {
+  Deprojector deprojector;
+  Image depth = make_depth_u16(2, 2);
+  depth.step = 8;
+  depth.data.assign(16, 0xaa);
+  write_u16(depth.data, 0, 1000, false);
+  write_u16(depth.data, 2, 2000, false);
+  write_u16(depth.data, 8, 3000, false);
+  write_u16(depth.data, 10, 4000, false);
+
+  Image color = make_color(2, 2);
+  color.step = 8;
+  color.data.assign(16, 0xee);
+  color.data[0] = 1;
+  color.data[1] = 2;
+  color.data[2] = 3;
+  color.data[3] = 4;
+  color.data[4] = 5;
+  color.data[5] = 6;
+  color.data[8] = 7;
+  color.data[9] = 8;
+  color.data[10] = 9;
+  color.data[11] = 10;
+  color.data[12] = 11;
+  color.data[13] = 12;
+
+  PointCloud2 out;
+  std::string error;
+  ASSERT_TRUE(deproject(
+      deprojector, depth,
+      make_info(2, 2, 10.0, 10.0, 0.0, 0.0), out, error, &color))
+      << error;
+  ASSERT_EQ(out.width, 4U);
+  EXPECT_NEAR(read_f32_le(out.data, 2U * 16U + 8U), 3.0F, 1e-6F);
+  EXPECT_EQ(out.data[2U * 16U + 12U], 9U);
+  EXPECT_EQ(out.data[2U * 16U + 14U], 7U);
+}
+
 TEST(Deprojector, DropsNonfiniteNonpositiveAndAllInvalidDepth) {
   Deprojector deprojector;
   Image depth = make_depth_f32(5, 1);
@@ -386,6 +488,21 @@ TEST(Deprojector, RejectsMalformedCameraInfoAndIntrinsics) {
       deprojector, depth,
       make_info(4, 4, 100.0, 100.0,
                 std::numeric_limits<double>::quiet_NaN(), 2.0));
+
+  expect_failure_and_empty(
+      deprojector, depth,
+      with_distortion(make_info(), "", {0.1}));
+  expect_failure_and_empty(
+      deprojector, depth,
+      with_distortion(make_info(), "plumb_bob", {0.1, 0.0}));
+  expect_failure_and_empty(
+      deprojector, depth,
+      with_distortion(make_info(), "unsupported_model", {}));
+  expect_failure_and_empty(
+      deprojector, depth,
+      with_distortion(
+          make_info(), "plumb_bob",
+          {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0, 0.0, 0.0}));
 }
 
 TEST(Deprojector, RejectsMalformedOrUnregisteredColor) {
@@ -407,6 +524,26 @@ TEST(Deprojector, RejectsMalformedOrUnregisteredColor) {
   color = make_color();
   color.data.pop_back();
   expect_failure_and_empty(deprojector, depth, info, &color);
+}
+
+TEST(Deprojector, RejectsIncompatibleNonemptyFrameIds) {
+  Deprojector deprojector;
+  Image depth = make_depth_u16();
+  depth.header.frame_id = "depth_optical";
+  CameraInfo info = make_info();
+  info.header.frame_id = "other_optical";
+  expect_failure_and_empty(deprojector, depth, info);
+
+  info.header.frame_id = "depth_optical";
+  Image color = make_color();
+  color.header.frame_id = "color_optical";
+  expect_failure_and_empty(deprojector, depth, info, &color);
+
+  color.header.frame_id.clear();
+  PointCloud2 out;
+  std::string error;
+  EXPECT_TRUE(deproject(deprojector, depth, info, out, error, &color))
+      << error;
 }
 
 TEST(Deprojector, RejectsNonfiniteTransformAndClearsPriorOutput) {

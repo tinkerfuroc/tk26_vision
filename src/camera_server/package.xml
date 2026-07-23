@@ -22,6 +22,8 @@
   <depend>tf2_eigen</depend>
   <depend>eigen3_cmake_module</depend>
   <depend>eigen</depend>
+  <build_depend>libopencv-dev</build_depend>
+  <exec_depend>libopencv-dev</exec_depend>
   <depend>tinker_vision_msgs_26</depend>
 
   <exec_depend>ros2launch</exec_depend>

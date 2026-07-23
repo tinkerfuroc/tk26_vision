@@ -1,7 +1,7 @@
 # Camera Server Design — per-camera C++ snapshot/point-cloud/TF servers
 
 - **Date:** 2026-07-13
-- **Status:** Draft — pending user review
+- **Status:** Implementation in progress — interfaces and Tasks 2–4 landed
 - **Scope of this effort:** servers only. Consumer migration is deferred (consumer
   packages are under active refactor) and documented as a map in Appendix A.
 
@@ -95,10 +95,13 @@ legacy callers (BT, pick_and_place) ─▶ camera_compat_bridge ──client─�
 | `color_topic` | `/camera/xarm_camera/color/image_raw` | `/camera/color/image_raw` |
 | `depth_topic` | `/camera/xarm_camera/aligned_depth_to_color/image_raw` | `/camera/depth/image_raw` (registered to color) |
 | `color_info_topic` | `/camera/xarm_camera/color/camera_info` | `/camera/color/camera_info` |
-| `depth_info_topic` | `/camera/xarm_camera/aligned_depth_to_color/camera_info` | `/camera/depth/camera_info` |
+| `depth_info_topic` | `/camera/xarm_camera/aligned_depth_to_color/camera_info` | `/camera/color/camera_info` |
 
 Both cameras therefore serve **color-aligned depth**; deprojection uses
 `depth_info` intrinsics and packs RGB from the synced color frame (same frame).
+For the head camera, the registered `/camera/depth/image_raw` path is
+deprojected with `/camera/color/camera_info`, matching the existing validated
+Orbbec consumers.
 
 ## 4. New interfaces (`tinker_vision_msgs_26`)
 
@@ -119,7 +122,7 @@ string[] target_frames
 
 # Freshness. All zero => newest cached pair, no waiting.
 float32 max_age_sec        # >0: fail with STALE if cached pair older than this
-builtin_interfaces/Time captured_after   # non-zero: wait for pair stamped >= this
+builtin_interfaces/Time captured_after   # non-zero: wait until both image stamps >= this
 float32 wait_timeout_sec   # bound on the captured_after wait (default 0 => server default)
 ---
 int32 STATUS_OK=0
@@ -130,8 +133,8 @@ int32 STATUS_BAD_REQUEST=5
 
 int32 status               # 0 OK; 1 NO_DATA; 2 STALE; 3 WAIT_TIMEOUT; 5 BAD_REQUEST
 string error_msg
-builtin_interfaces/Time stamp   # stamp of the synced (color, depth) pair
-string frame_id                 # optical frame of the returned data
+builtin_interfaces/Time stamp   # min(color stamp, depth stamp)
+string frame_id                 # common aligned optical frame
 sensor_msgs/Image color
 sensor_msgs/Image depth
 sensor_msgs/CameraInfo color_info
@@ -144,6 +147,8 @@ Semantics:
 
 - `WAIT_TIMEOUT` still populates the newest available pair (stamped in
   `stamp`) so the caller can decide; `error_msg` states the shortfall.
+- The pair/freshness stamp is `min(color.header.stamp, depth.header.stamp)`.
+  Thus `captured_after` and `max_age_sec` conservatively apply to both images.
 - TF failure never fails the snapshot: frames are returned,
   `transforms_ok[i]=false` for the failed pair(s).
 - `captured_after` + `wait_timeout_sec` replaces today's ad-hoc
@@ -230,8 +235,9 @@ the 0.05 s variants are documented to stop firing below ~10 Hz camera rate).
 
 ### 5.2 Latest-frame store
 
-- Stores `ConstSharedPtr`s: last synced `(color, depth)` pair + pair stamp +
-  monotonic `pair_seq`, plus latest `color_info`/`depth_info`.
+- Stores `ConstSharedPtr`s: last synced `(color, depth)` pair, both original
+  image stamps, conservative pair stamp `min(color, depth)`, monotonic
+  `pair_seq`, plus latest `color_info`/`depth_info`.
 - Single mutex; readers copy the shared_ptrs out under the lock (no image
   copies until response serialization).
 - A `condition_variable` signaled on every synced pair implements the
@@ -239,14 +245,16 @@ the 0.05 s variants are documented to stop firing below ~10 Hz camera rate).
 
 ### 5.3 Threading model
 
-- `MultiThreadedExecutor`, `num_threads` param default **4**.
-- Subscription + sync callbacks: one `MutuallyExclusive` callback group
-  (cheap store-only work, keeps ordering).
-- Each service: `Reentrant` group, so a handler blocked in a
-  `captured_after` wait cannot starve the subscription callbacks or other
-  service calls. Waiting handlers occupy an executor thread; with 4 threads
-  and the tk26_vision compute-budget pattern (few concurrent callers) this is
-  ample. `wait_timeout_sec` is capped by param (`max_wait_sec`, default 2.0).
+- Standalone service execution uses a `MultiThreadedExecutor`;
+  `num_executor_threads` defaults to **4** and is validated at **>=2**.
+- All image/filter and CameraInfo callbacks live in one `MutuallyExclusive`,
+  `auto_add=false` callback group spun by a dedicated node-owned internal
+  executor/thread. The destructor cancels and joins that thread. Consequently,
+  blocked freshness services cannot starve ingestion in either standalone or
+  component mode, even when waits meet or exceed the service thread count.
+- Snapshot/transform services are `Reentrant`; the future cloud service has a
+  separate `MutuallyExclusive` group. `wait_timeout_sec` is capped by
+  `max_wait_sec` (default 2.0).
 
 ### 5.4 TF
 
@@ -261,17 +269,23 @@ the 0.05 s variants are documented to stop firing below ~10 Hz camera rate).
 
 ### 5.5 Deprojection
 
-- Precondition: input depth is already registered and rectified to color, and
-  optional color has exactly the same width/height. The server does not apply
-  OpenCV distortion correction or cross-camera/resolution registration.
+- Precondition: input depth is already registered to color, and optional color
+  has exactly the same width/height. Cross-camera/resolution registration is
+  out of scope, but raw registered images are supported: cached rays use
+  OpenCV `undistortPoints` for `plumb_bob`/`rational_polynomial` and
+  `fisheye::undistortPoints` for `equidistant`.
 - CPU, single pass over the depth image: `z = depth(u,v)` (`16UC1`/`mono16`
   mm → m, or `32FC1` m; little- and big-endian input are handled),
-  `x = (u-cx)/fx * z`, `y = (v-cy)/fy * z` via the cached xy-table; optional
+  `x = ray_x(u,v) * z`, `y = ray_y(u,v) * z` via the cached, distortion-aware
+  xy-table; optional
   RGB pack from the synced color image; optional stride; optional in-pass
   transform by the frame-stamped Eigen isometry.
-- Dimensions, row strides, backing buffers, intrinsics, and allocation/count
-  arithmetic are validated before access. Non-finite/non-positive depths are
-  dropped.
+- The cache key includes dimensions, K, distortion model, and D. Unsupported,
+  non-finite, or coefficient-count-inconsistent models are rejected rather
+  than silently falling back to raw K.
+- Dimensions, padded row strides, backing buffers, intrinsics, compatible
+  nonempty depth/depth-info/color frame IDs, and allocation/count arithmetic
+  are validated before access. Non-finite/non-positive depths are dropped.
 - Output: unorganized, deterministic little-endian `PointCloud2`,
   `x,y,z[,rgb]` float32 fields with exact 12/16-byte point steps and
   `is_dense=true` — matching `get_orbbec_pc` output shape; parity verified in
@@ -318,11 +332,17 @@ surface a clean deletion story.
 - Intrinsics not yet received but frames present: `NO_DATA` for point cloud,
   snapshot succeeds with `want_camera_info` honored best-effort (empty info +
   note in `error_msg`).
+- Request durations must be finite/nonnegative and ROS times canonical
+  (`sec>=0`, `nanosec<1e9`). Snapshot target lists are bounded (default 16),
+  preserve result index alignment, reject blank frames/all-empty requests,
+  and degrade only the failed TF entries. Runtime timing/cache parameters are
+  finite and positive; sync queue is >=2 and executor threads are >=2.
 
 ## 8. Observability
 
-- 1 Hz `~/status` publisher (`CameraServerStatus`): stream ages, synced-pair
-  rate, seq. Cheap, and gives T2 and ops a one-topic health view.
+- 1 Hz `~/status` publisher (`CameraServerStatus`): header-stamp stream ages,
+  conservative pair age, seq, and sync rate calculated from actual
+  steady-clock elapsed time.
 - Throttled (10 s) WARN logs on stream starvation (no synced pair for >2 s
   while at least one input stream is alive) and on sync-partner skew.
 
@@ -356,6 +376,11 @@ Follows the tk26_vision tier conventions (`scripts/tests/`):
 - **T1 (node startup, no cameras):** both instances start and stay alive;
   `get_snapshot`/`get_point_cloud` return `NO_DATA` (not hang/crash);
   `get_transform` answers from `/tf_static`; `~/status` publishes.
+- **Automated focused integration:** synthetic BEST_EFFORT synchronized input,
+  response flag suppression, missing-info diagnostics, stale/timeout
+  semantics, static and partial TF results, malformed-request survival,
+  status calculations, and concurrent waits at/above the service executor
+  thread count while ingestion continues.
 - **T2 (live cameras):**
   - snapshot freshness: `pair_age` bounded; color/depth stamp skew ≤ slop;
   - `captured_after` semantics: request stamped "now" returns a strictly

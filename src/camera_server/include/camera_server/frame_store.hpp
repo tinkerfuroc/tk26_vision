@@ -14,8 +14,12 @@ namespace camera_server {
 struct FramePair {
   sensor_msgs::msg::Image::ConstSharedPtr color;
   sensor_msgs::msg::Image::ConstSharedPtr depth;
-  int64_t stamp_ns = 0;  // Pair stamp (color header) in nanoseconds.
-  uint64_t seq = 0;      // Monotonic valid synced-pair counter.
+  int64_t color_stamp_ns = 0;
+  int64_t depth_stamp_ns = 0;
+  // Conservative freshness/snapshot stamp: min(color_stamp, depth_stamp), so
+  // a pair satisfies captured_after only when both images do.
+  int64_t stamp_ns = 0;
+  uint64_t seq = 0;  // Monotonic valid synced-pair counter.
 };
 
 /// Thread-safe latest-frame store shared between the sync callback (writer)
@@ -33,10 +37,10 @@ class FrameStore {
   sensor_msgs::msg::CameraInfo::ConstSharedPtr color_info() const;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr depth_info() const;
 
-  /// Blocks until a complete stored pair is stamped >= after_ns, or timeout
-  /// elapses. Always returns the newest available pair; the caller checks
-  /// both pointers and pair.stamp_ns >= after_ns to distinguish success from
-  /// timeout/no data.
+  /// Blocks until a complete stored pair has both image stamps >= after_ns, or
+  /// timeout elapses. Always returns the newest available pair; the caller
+  /// checks both pointers and pair.stamp_ns >= after_ns to distinguish success
+  /// from timeout/no data.
   FramePair wait_for_pair_after(int64_t after_ns,
                                 std::chrono::nanoseconds timeout);
 

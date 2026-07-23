@@ -19,6 +19,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS calib3d core)
 find_package(tinker_vision_msgs_26 REQUIRED)
 
 # Core logic (no rclcpp node): unit-testable pieces. PIC allows the static
@@ -32,10 +33,34 @@ target_include_directories(camera_server_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${sensor_msgs_INCLUDE_DIRS})
-target_link_libraries(camera_server_core PUBLIC Eigen3::Eigen)
+target_link_libraries(camera_server_core PUBLIC Eigen3::Eigen ${OpenCV_LIBS})
 
-install(TARGETS camera_server_core
+add_library(camera_server_component SHARED
+  src/camera_server_node.cpp
+)
+target_link_libraries(camera_server_component camera_server_core)
+ament_target_dependencies(camera_server_component
+  rclcpp
+  rclcpp_components
+  sensor_msgs
+  geometry_msgs
+  builtin_interfaces
+  message_filters
+  tf2
+  tf2_ros
+  tf2_eigen
+  tinker_vision_msgs_26
+)
+rclcpp_components_register_nodes(camera_server_component
+  "camera_server::CameraServerNode")
+
+add_executable(camera_server_node src/camera_server_main.cpp)
+target_link_libraries(camera_server_node camera_server_component)
+ament_target_dependencies(camera_server_node rclcpp)
+
+install(TARGETS camera_server_core camera_server_component
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+install(TARGETS camera_server_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 
 if(BUILD_TESTING)
@@ -45,6 +70,11 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_deprojector test/test_deprojector.cpp)
   target_link_libraries(test_deprojector camera_server_core)
+
+  ament_add_gtest(test_camera_server_node test/test_camera_server_node.cpp)
+  target_link_libraries(test_camera_server_node camera_server_component)
+  ament_target_dependencies(test_camera_server_node
+    rclcpp sensor_msgs geometry_msgs tf2_ros tinker_vision_msgs_26)
 endif()
 
 ament_package()

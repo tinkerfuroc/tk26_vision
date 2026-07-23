@@ -94,7 +94,7 @@ string[] target_frames
 
 # Freshness. All zero => newest cached pair, no waiting.
 float32 max_age_sec                      # >0: STALE if cached pair older
-builtin_interfaces/Time captured_after   # non-zero: wait for pair stamped >= this
+builtin_interfaces/Time captured_after   # non-zero: wait until both image stamps >= this
 float32 wait_timeout_sec                 # bound on the wait; 0 => server default
 ---
 int32 STATUS_OK=0
@@ -105,8 +105,8 @@ int32 STATUS_BAD_REQUEST=5
 
 int32 status
 string error_msg
-builtin_interfaces/Time stamp            # stamp of the synced (color, depth) pair
-string frame_id                          # optical frame of the returned data
+builtin_interfaces/Time stamp            # min(color stamp, depth stamp)
+string frame_id                          # common aligned optical frame
 sensor_msgs/Image color
 sensor_msgs/Image depth
 sensor_msgs/CameraInfo color_info
@@ -137,7 +137,7 @@ int32 STATUS_BAD_REQUEST=5
 
 int32 status
 string error_msg
-builtin_interfaces/Time stamp
+builtin_interfaces/Time stamp            # depth image stamp; also points.header
 sensor_msgs/PointCloud2 points
 ```
 
@@ -315,6 +315,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS calib3d core)
 find_package(tinker_vision_msgs_26 REQUIRED)
 
 # Core logic (no rclcpp node): unit-testable pieces.
@@ -553,7 +554,9 @@ namespace camera_server {
 struct FramePair {
   sensor_msgs::msg::Image::ConstSharedPtr color;
   sensor_msgs::msg::Image::ConstSharedPtr depth;
-  int64_t stamp_ns = 0;  // pair stamp (color header) in nanoseconds
+  int64_t color_stamp_ns = 0;
+  int64_t depth_stamp_ns = 0;
+  int64_t stamp_ns = 0;  // min(color_stamp_ns, depth_stamp_ns)
   uint64_t seq = 0;      // monotonic synced-pair counter
 };
 
@@ -572,10 +575,8 @@ class FrameStore {
   sensor_msgs::msg::CameraInfo::ConstSharedPtr color_info() const;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr depth_info() const;
 
-  /// Blocks until a complete stored pair is stamped >= after_ns, or timeout
-  /// elapses. Always returns the newest available pair; the caller checks both
-  /// pointers and pair.stamp_ns >= after_ns to distinguish success from
-  /// timeout/no data.
+  /// Blocks until both images in a complete pair are stamped >= after_ns, or
+  /// timeout elapses. Always returns the newest available pair.
   FramePair wait_for_pair_after(int64_t after_ns,
                                 std::chrono::nanoseconds timeout);
 
@@ -626,7 +627,10 @@ void FrameStore::set_pair(sensor_msgs::msg::Image::ConstSharedPtr color,
     std::lock_guard<std::mutex> lock(mutex_);
     pair_.color = std::move(color);
     pair_.depth = std::move(depth);
-    pair_.stamp_ns = stamp_ns_of(*pair_.color);
+    pair_.color_stamp_ns = stamp_ns_of(*pair_.color);
+    pair_.depth_stamp_ns = stamp_ns_of(*pair_.depth);
+    pair_.stamp_ns =
+        std::min(pair_.color_stamp_ns, pair_.depth_stamp_ns);
     pair_.seq += 1;
   }
   cv_.notify_all();
@@ -709,12 +713,18 @@ git commit -m "feat(camera_server): package scaffold + thread-safe FrameStore wi
 - Consumes: nothing from other tasks (pure function of msgs).
 - Produces (used by Task 5): `camera_server::Deprojector::deproject(depth, depth_info, color_or_null, stride, optional<Eigen::Isometry3f>, out_cloud, error_msg) -> bool`. Output cloud: unorganized, `height=1`, fields `x,y,z` FLOAT32 (+ packed `rgb` FLOAT32 when color given), invalid (z<=0/NaN) pixels dropped, `is_dense=true`. Caller sets `out.header`. Not thread-safe (internal xy-table cache) — callers serialize with a mutex.
 
-**Final Phase 3 hardening contract (authoritative over the initial TDD
+**Final Phase 3/4 hardening contract (authoritative over the initial TDD
 sketches below):**
 
-- Depth must be registered/rectified to color before this API; when color is
-  requested its dimensions must exactly match depth. No ratio mapping,
-  distortion correction, or OpenCV registration is performed here.
+- Depth must be registered to color before this API; when color is requested
+  its dimensions must exactly match depth. No ratio mapping or cross-camera
+  registration is performed. Raw registered images are valid: build rays with
+  OpenCV `undistortPoints` for plumb_bob/rational_polynomial and
+  `fisheye::undistortPoints` for equidistant.
+- The ray cache key includes dimensions, K, distortion model, and every D
+  coefficient. Reject unsupported models, non-finite coefficients, incorrect
+  coefficient counts, and conflicting nonempty depth/depth-info/color frame
+  IDs instead of silently falling back to raw K.
 - Accept `16UC1`, `mono16` (millimetres), and `32FC1` (metres), correctly
   decoding both ROS input byte orders. Emit a deterministic little-endian
   cloud with exact `x@0,y@4,z@8[,rgb@12]` FLOAT32 fields and 12/16-byte point
@@ -729,8 +739,10 @@ sketches below):**
 - Clear `out` and `error_msg` on entry. Every failure leaves `out` empty with
   a deterministic nonempty error; success leaves `error_msg` empty.
 - Tests cover exact fields/layout/data sizing, XYZ and RGB/BGR channels,
-  rotation plus translation, cache invalidation, malformed buffers and
-  dimensions, endian cases, invalid/all-invalid depth, and extreme strides.
+  rotation plus translation, K/model/D cache invalidation, plumb-bob/rational/
+  equidistant rays, valid padded rows, frame-ID compatibility, malformed
+  buffers/dimensions, endian cases, invalid/all-invalid depth, and extreme
+  strides.
 
 - [ ] **Step 1: Write the failing gtest**
 
@@ -903,7 +915,8 @@ namespace camera_server {
 
 /// CPU depth-image deprojection with a cached per-intrinsics xy-table.
 /// Handles 16UC1/mono16 (mm) and 32FC1 (m) depth, rgb8/bgr8 color.
-/// Depth must already be registered/rectified to same-sized color.
+/// Depth must already be registered to same-sized color. Cached rays account
+/// for supported CameraInfo distortion models.
 /// NOT thread-safe (table cache): callers serialize access externally.
 class Deprojector {
  public:
@@ -922,9 +935,13 @@ class Deprojector {
   struct TableKey {
     uint32_t w = 0, h = 0;
     double fx = 0, fy = 0, cx = 0, cy = 0;
+    std::string distortion_model;
+    std::vector<double> distortion;
     bool operator==(const TableKey& o) const {
       return w == o.w && h == o.h && fx == o.fx && fy == o.fy &&
-             cx == o.cx && cy == o.cy;
+             cx == o.cx && cy == o.cy &&
+             distortion_model == o.distortion_model &&
+             distortion == o.distortion;
     }
   };
   void rebuild_table(const TableKey& key);
@@ -949,7 +966,7 @@ target_include_directories(camera_server_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${sensor_msgs_INCLUDE_DIRS})
-target_link_libraries(camera_server_core PUBLIC Eigen3::Eigen)
+target_link_libraries(camera_server_core PUBLIC Eigen3::Eigen ${OpenCV_LIBS})
 ```
 
 and inside `if(BUILD_TESTING)`:
@@ -1099,7 +1116,11 @@ tkbuild tk26_vision --packages-select camera_server
 /home/tinker/tk25_ws/build/camera_server/test_frame_store
 ```
 
-Expected: `[  PASSED  ] 7 tests.` and `[  PASSED  ] 5 tests.` If the rgb byte-order assertion fails (iterator maps r↔b), fix the write order in deprojector.cpp — the authority is: existing consumers unpack with `struct.unpack` little-endian where byte 0 = b (PCL convention).
+Expected after the Phase 4 audit: `[  PASSED  ] 17 tests.` for Deprojector
+and `[  PASSED  ] 11 tests.` for FrameStore. If the rgb byte-order assertion
+fails (iterator maps r↔b), fix the write order in deprojector.cpp — the
+authority is: existing consumers unpack with `struct.unpack` little-endian
+where byte 0 = b (PCL convention).
 
 - [ ] **Step 6: Append changelog line to README.md**
 
@@ -1123,6 +1144,35 @@ git commit -m "feat(camera_server): CPU deprojector (depth->XYZ[RGB] cloud, xy-t
 
 ### Task 4: CameraServerNode — subscriptions, TF, status, `get_snapshot`, `get_transform`
 
+**Landed Phase 4 audit contract (authoritative over the original draft
+snippets below):**
+
+- Streaming image/filter and CameraInfo callbacks use an `auto_add=false`
+  callback group spun by a node-owned single-thread executor. Destruction
+  cancels/joins it. This prevents blocking freshness services from starving
+  ingestion in both standalone and component use.
+- `num_executor_threads` defaults to 4 and must be >=2. Queue size must be
+  >=2; slop is finite/nonnegative; TF cache/lookup/cap, max wait, status
+  period, and starvation interval are finite/positive.
+- `FramePair` preserves color/depth stamps and uses their minimum for snapshot
+  response, TF, freshness, and captured-after. Task 5 uses the depth stamp for
+  cloud TF/response.
+- Requests validate finite/nonnegative durations and canonical ROS times.
+  Snapshot targets are bounded by `max_target_frames` (default 16), blank
+  targets and all-empty requests are rejected, and TF arrays remain
+  index-aligned on partial failure. Service boundaries catch
+  `std::exception` and use response-side status constants.
+- Registered color/depth must have compatible nonempty frame IDs; the response
+  uses the common aligned frame (depth ID preferred when present). CameraInfo
+  remains best-effort with diagnostics. The head default depth intrinsics are
+  `/camera/color/camera_info`, matching registered `/camera/depth/image_raw`.
+- Status FPS uses actual steady-clock elapsed time; ages use stream header
+  stamps; starvation and partner-skew warnings are throttled; `NO_DATA`
+  includes available stream ages.
+- Automated ROS tests cover no-data/malformed survival, synchronized QoS
+  ingestion, payload flags, missing info, stale/timeout behavior, static and
+  partial TF, status, and three waits against a two-thread service executor.
+
 **Files:**
 - Create: `src/tk26_vision/src/camera_server/include/camera_server/camera_server_node.hpp`
 - Create: `src/tk26_vision/src/camera_server/src/camera_server_node.cpp`
@@ -1141,7 +1191,7 @@ Parameters (all declared in the constructor):
 | `color_topic` | `/camera/color/image_raw` | head defaults; wrist overrides via launch |
 | `depth_topic` | `/camera/depth/image_raw` | |
 | `color_info_topic` | `/camera/color/camera_info` | |
-| `depth_info_topic` | `/camera/depth/camera_info` | |
+| `depth_info_topic` | `/camera/color/camera_info` | registered head depth uses color intrinsics |
 | `sync_queue_size` | 10 | |
 | `sync_slop_sec` | 0.1 | ApproximateTime max interval |
 | `tf_cache_sec` | 180.0 | |
@@ -1149,7 +1199,9 @@ Parameters (all declared in the constructor):
 | `transform_timeout_cap_sec` | 2.0 | GetTransform request cap |
 | `max_wait_sec` | 2.0 | captured_after wait cap / default |
 | `status_period_sec` | 1.0 | |
-| `num_threads` | 4 | read by main for the executor |
+| `starvation_warn_sec` | 2.0 | throttled sync-starvation threshold |
+| `max_target_frames` | 16 | bound snapshot TF work |
+| `num_executor_threads` | 4 | standalone service executor; minimum 2 |
 
 - [ ] **Step 1: Write camera_server_node.hpp**
 
@@ -1280,7 +1332,7 @@ CameraServerNode::CameraServerNode(const rclcpp::NodeOptions& options)
   const auto color_info_topic = declare_parameter<std::string>(
       "color_info_topic", "/camera/color/camera_info");
   const auto depth_info_topic = declare_parameter<std::string>(
-      "depth_info_topic", "/camera/depth/camera_info");
+      "depth_info_topic", "/camera/color/camera_info");
   const int sync_queue = declare_parameter<int>("sync_queue_size", 10);
   const double slop = declare_parameter<double>("sync_slop_sec", 0.1);
   const double tf_cache = declare_parameter<double>("tf_cache_sec", 180.0);
@@ -1290,7 +1342,7 @@ CameraServerNode::CameraServerNode(const rclcpp::NodeOptions& options)
       declare_parameter<double>("transform_timeout_cap_sec", 2.0);
   max_wait_sec_ = declare_parameter<double>("max_wait_sec", 2.0);
   status_period_sec_ = declare_parameter<double>("status_period_sec", 1.0);
-  declare_parameter<int>("num_threads", 4);  // read by main()
+  declare_parameter<int>("num_executor_threads", 4);  // read by main()
 
   sub_group_ =
       create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1538,7 +1590,8 @@ int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<camera_server::CameraServerNode>();
   const int threads =
-      static_cast<int>(node->get_parameter("num_threads").as_int());
+      static_cast<int>(
+          node->get_parameter("num_executor_threads").as_int());
   rclcpp::executors::MultiThreadedExecutor executor(
       rclcpp::ExecutorOptions(), static_cast<size_t>(threads));
   executor.add_node(node);
@@ -1998,7 +2051,7 @@ HEAD_PARAMS = {
     'color_topic': '/camera/color/image_raw',
     'depth_topic': '/camera/depth/image_raw',
     'color_info_topic': '/camera/color/camera_info',
-    'depth_info_topic': '/camera/depth/camera_info',
+    'depth_info_topic': '/camera/color/camera_info',
 }
 
 
@@ -2069,7 +2122,7 @@ Read the file first. Two edits, following its existing gated-Node pattern (`enab
             'color_topic': '/camera/color/image_raw',
             'depth_topic': '/camera/depth/image_raw',
             'color_info_topic': '/camera/color/camera_info',
-            'depth_info_topic': '/camera/depth/camera_info',
+            'depth_info_topic': '/camera/color/camera_info',
         }],
         condition=IfCondition(LaunchConfiguration('enable_camera_server')),
     )

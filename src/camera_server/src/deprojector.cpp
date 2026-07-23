@@ -1,5 +1,6 @@
 #include "camera_server/deprojector.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +13,8 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
 
 namespace camera_server {
@@ -143,6 +146,67 @@ bool validate_intrinsics(const sensor_msgs::msg::Image& depth,
     error_msg = "camera_info principal point must be finite";
     return false;
   }
+
+  for (const double coefficient : info.d) {
+    if (!std::isfinite(coefficient)) {
+      error_msg = "camera_info distortion coefficients must be finite";
+      return false;
+    }
+  }
+  const bool nonzero_distortion =
+      std::any_of(info.d.begin(), info.d.end(),
+                  [](double value) { return value != 0.0; });
+  if (info.distortion_model.empty()) {
+    if (nonzero_distortion) {
+      error_msg =
+          "camera_info has nonzero distortion but no distortion_model";
+      return false;
+    }
+  } else if (info.distortion_model == "plumb_bob") {
+    if (info.d.size() != 5) {
+      error_msg = "plumb_bob camera_info must contain exactly 5 coefficients";
+      return false;
+    }
+  } else if (info.distortion_model == "rational_polynomial") {
+    if (info.d.size() != 8) {
+      error_msg =
+          "rational_polynomial camera_info must contain exactly 8 coefficients";
+      return false;
+    }
+  } else if (info.distortion_model == "equidistant") {
+    if (info.d.size() != 4) {
+      error_msg = "equidistant camera_info must contain exactly 4 coefficients";
+      return false;
+    }
+  } else {
+    error_msg = "unsupported camera_info distortion_model: " +
+                info.distortion_model;
+    return false;
+  }
+  return true;
+}
+
+bool frame_ids_compatible(const std::string& lhs, const std::string& rhs) {
+  return lhs.empty() || rhs.empty() || lhs == rhs;
+}
+
+bool validate_frame_ids(const sensor_msgs::msg::Image& depth,
+                        const sensor_msgs::msg::CameraInfo& info,
+                        const sensor_msgs::msg::Image* color,
+                        std::string& error_msg) {
+  if (!frame_ids_compatible(depth.header.frame_id,
+                            info.header.frame_id)) {
+    error_msg =
+        "depth image and depth camera_info frame_id values do not match";
+    return false;
+  }
+  if (color != nullptr &&
+      !frame_ids_compatible(depth.header.frame_id,
+                            color->header.frame_id)) {
+    error_msg =
+        "registered color and depth image frame_id values do not match";
+    return false;
+  }
   return true;
 }
 
@@ -171,22 +235,54 @@ bool Deprojector::rebuild_table(const TableKey& key,
     return false;
   }
 
-  size_t index = 0;
+  std::vector<cv::Point2f> pixels;
+  std::vector<cv::Point2f> rays;
+  try {
+    pixels.resize(pixel_count);
+    rays.resize(pixel_count);
+  } catch (const std::length_error&) {
+    error_msg = "ray-table dimensions exceed container capacity";
+    return false;
+  } catch (const std::bad_alloc&) {
+    error_msg = "unable to allocate distortion ray table";
+    return false;
+  }
+  size_t pixel_index = 0;
   for (uint32_t v = 0; v < key.height; ++v) {
     for (uint32_t u = 0; u < key.width; ++u) {
-      const double normalized_x =
-          (static_cast<double>(u) - key.cx) / key.fx;
-      const double normalized_y =
-          (static_cast<double>(v) - key.cy) / key.fy;
-      const float x = static_cast<float>(normalized_x);
-      const float y = static_cast<float>(normalized_y);
+      pixels[pixel_index++] =
+          cv::Point2f(static_cast<float>(u), static_cast<float>(v));
+    }
+  }
+
+  const cv::Matx33d camera_matrix(
+      key.fx, 0.0, key.cx, 0.0, key.fy, key.cy, 0.0, 0.0, 1.0);
+  try {
+    if (key.distortion_model == "equidistant") {
+      cv::fisheye::undistortPoints(pixels, rays, camera_matrix,
+                                   cv::Mat(key.distortion));
+    } else if (key.distortion_model.empty()) {
+      cv::undistortPoints(pixels, rays, camera_matrix, cv::noArray());
+    } else {
+      cv::undistortPoints(pixels, rays, camera_matrix,
+                          cv::Mat(key.distortion));
+    }
+  } catch (const cv::Exception& exception) {
+    error_msg = "OpenCV could not undistort camera rays: " +
+                std::string(exception.what());
+    return false;
+  }
+
+  size_t index = 0;
+  for (const auto& ray : rays) {
+      const float x = ray.x;
+      const float y = ray.y;
       if (!std::isfinite(x) || !std::isfinite(y)) {
         error_msg = "camera intrinsics produce non-finite deprojection rays";
         return false;
       }
       table[index++] = x;
       table[index++] = y;
-    }
   }
 
   key_ = key;
@@ -215,7 +311,8 @@ bool Deprojector::deproject(
   const size_t depth_bytes_per_pixel = is_u16 ? size_t{2} : size_t{4};
   if (!validate_image_buffer(depth, depth_bytes_per_pixel, "depth",
                              error_msg) ||
-      !validate_intrinsics(depth, depth_info, error_msg)) {
+      !validate_intrinsics(depth, depth_info, error_msg) ||
+      !validate_frame_ids(depth, depth_info, color, error_msg)) {
     return false;
   }
 
@@ -241,7 +338,9 @@ bool Deprojector::deproject(
 
   const TableKey requested_key{depth.width, depth.height, depth_info.k[0],
                                depth_info.k[4], depth_info.k[2],
-                               depth_info.k[5]};
+                               depth_info.k[5],
+                               depth_info.distortion_model,
+                               depth_info.d};
   if (!(requested_key == key_) || xy_table_.empty()) {
     if (!rebuild_table(requested_key, error_msg)) {
       return false;

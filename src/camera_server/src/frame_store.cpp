@@ -1,5 +1,6 @@
 #include "camera_server/frame_store.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace camera_server {
@@ -24,7 +25,10 @@ void FrameStore::set_pair(sensor_msgs::msg::Image::ConstSharedPtr color,
     std::lock_guard<std::mutex> lock(mutex_);
     pair_.color = std::move(color);
     pair_.depth = std::move(depth);
-    pair_.stamp_ns = stamp_ns_of(*pair_.color);
+    pair_.color_stamp_ns = stamp_ns_of(*pair_.color);
+    pair_.depth_stamp_ns = stamp_ns_of(*pair_.depth);
+    pair_.stamp_ns =
+        std::min(pair_.color_stamp_ns, pair_.depth_stamp_ns);
     pair_.seq += 1;
   }
   cv_.notify_all();

@@ -1,0 +1,21 @@
+# On-demand deprojected point cloud from the latest synced pair.
+# Spec: docs/specs/2026-07-13-camera-server-design.md §4.2
+
+uint32 stride              # pixel stride; 0 or 1 = full resolution
+bool include_color         # true => XYZRGB, false => XYZ
+string target_frame        # empty => native optical frame; else transformed at pair stamp
+float32 max_age_sec
+builtin_interfaces/Time captured_after
+float32 wait_timeout_sec
+---
+int32 STATUS_OK=0
+int32 STATUS_NO_DATA=1
+int32 STATUS_STALE=2
+int32 STATUS_WAIT_TIMEOUT=3
+int32 STATUS_TF_FAIL=4
+int32 STATUS_BAD_REQUEST=5
+
+int32 status
+string error_msg
+builtin_interfaces/Time stamp
+sensor_msgs/PointCloud2 points

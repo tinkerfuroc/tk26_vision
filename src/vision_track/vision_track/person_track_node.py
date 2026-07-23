@@ -13,9 +13,9 @@ Date: 2025
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
-from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.duration import Duration
 
 import numpy as np
@@ -31,7 +31,7 @@ from pathlib import Path
 import os
 
 # ROS2 messages
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image
 from geometry_msgs.msg import PointStamped, Point
 from std_msgs.msg import Header, String, UInt8
 from tf2_ros import Buffer, TransformListener
@@ -46,9 +46,6 @@ from tinker_vision_msgs_26.srv import ReseedTarget
 # Pan-tilt head-follow messages (optional, default-off feature)
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 
-# Message filters for synchronization
-from message_filters import Subscriber, ApproximateTimeSynchronizer
-
 # CV Bridge
 from cv_bridge import CvBridge
 
@@ -58,9 +55,14 @@ from vision_track.track_yolo import YOLOTracker, TrackerState, TrackingResult
 # Shared logger
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    NO_NEW_FRAME,
+    StreamSpec,
+)
 
 from vision_track.core.centroid import reduce_centroid
-from vision_track.core.color_decode import decode_color_msg
 from vision_track.core.depth_roi import roi_window
 from vision_track.core.frame_diag import compute_frame_diag
 from vision_track.core.reacq_state import reacq_state
@@ -286,7 +288,7 @@ class PersonTrackNode(Node):
         # when the debug params are on. The tick reads the frame cache WITHOUT
         # consuming it (never touches last_processed_seq) so it cannot race
         # the tracking loop.
-        self._idle_last_seq = -1
+        self._idle_last_seq = None
         if self.debug_state_enabled or self.debug_image_enabled:
             self.idle_debug_timer = self.create_timer(0.1, self._idle_debug_tick)
 
@@ -294,19 +296,14 @@ class PersonTrackNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # Thread locks
-        self.lock_msg = threading.Lock()
-        self.lock_info = threading.Lock()
         self.lock_tracker = threading.Lock()
         # Guards tracking_active + goal_handle so goal_callback can atomically
         # test-and-set without two concurrent ACCEPTs under MultiThreadedExecutor.
         self.lock_lifecycle = threading.Lock()
         
-        # Camera data storage
-        self.camera_intrinsic: CameraInfo = None
-        self.recent_sync_msg = None  # (rgb_msg, depth_msg)
-        self.recent_msg_time = None
-        self.frame_seq = 0  # Frame sequence counter
-        self.last_processed_seq = -1  # Last processed frame sequence
+        # Sequence token consumed only by the tracking loop. Reseed and idle
+        # telemetry use non-consuming reads or their own token.
+        self.last_processed_seq = None
         
         # Depth limits
         self.max_depth = 10.0  # meters
@@ -389,12 +386,12 @@ class PersonTrackNode(Node):
         self.declare_parameter('active_help_timeout_sec', 0.0)
         # Frame-starvation watchdog. The loop's only frame source is the
         # ApproximateTimeSynchronizer (RGB+depth); if it stops emitting matched
-        # pairs (e.g. RGB/depth desync) frame_seq freezes and the loop would
-        # otherwise busy-wait forever — frozen dashboard, no loss handling, no
-        # diagnostics. After warn_sec of no new frame: log + keep the dashboard
-        # alive. After lost_sec: engage the loss/recovery FSM (forever-hold +
-        # wave/reseed). Both must sit well above the camera inter-frame gap
-        # (~33 ms @ 30 Hz) to avoid false positives.
+        # pairs (e.g. RGB/depth desync) the intake sequence freezes and the loop
+        # would otherwise busy-wait forever — frozen dashboard, no loss
+        # handling, no diagnostics. After warn_sec of no new frame: log + keep
+        # the dashboard alive. After lost_sec: engage the loss/recovery FSM
+        # (forever-hold + wave/reseed). Both must sit well above the camera
+        # inter-frame gap (~33 ms @ 30 Hz) to avoid false positives.
         self.declare_parameter('frame_stall_warn_sec', 0.5)
         self.declare_parameter('frame_stall_lost_sec', 1.5)
         # track_web dashboard telemetry (all default OFF; byte-identical to
@@ -694,39 +691,30 @@ class PersonTrackNode(Node):
         # small buffer absorbs that jitter. BEST_EFFORT is kept deliberately —
         # the camera publishes BEST_EFFORT, and a RELIABLE reader would fail to
         # match it and receive nothing.
-        qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5
-        )
-
-        cb_group = MutuallyExclusiveCallbackGroup()
         # Dedicated reentrant group for the two synchronized image streams so RGB
         # and depth can be DELIVERED concurrently by the MultiThreadedExecutor.
         # On the node default (mutually-exclusive) group they serialize, widening
         # the window in which a history overwrite drops one half of a pair.
         sync_group = ReentrantCallbackGroup()
-
-        # Synchronized RGB and depth subscribers
-        image_sub = Subscriber(self, Image, self.image_topic,
-                               qos_profile=qos_profile, callback_group=sync_group)
-        depth_sub = Subscriber(self, Image, self.depth_topic,
-                               qos_profile=qos_profile, callback_group=sync_group)
-        
-        sync = ApproximateTimeSynchronizer(
-            [image_sub, depth_sub],
-            queue_size=10,
-            slop=0.1
-        )
-        sync.registerCallback(self._camera_callback)
-        
-        # Camera info subscriber
-        self.camera_info_sub = self.create_subscription(
-            CameraInfo,
-            self.camera_info_topic,
-            self._camera_info_callback,
-            qos_profile=10,
-            callback_group=cb_group
+        self.camera_intake = CameraIntake(
+            self,
+            IntakeConfig(
+                camera='orbbec',
+                color=StreamSpec(
+                    self.image_topic, best_effort=True, qos_depth=5),
+                depth=StreamSpec(
+                    self.depth_topic, best_effort=True, qos_depth=5),
+                camera_info=StreamSpec(
+                    self.camera_info_topic,
+                    best_effort=False,
+                    qos_depth=10,
+                ),
+                sync_queue=10,
+                sync_slop_s=0.1,
+                age_source='recv',
+            ),
+            callback_group=sync_group,
+            bridge=self.bridge,
         )
         
         self.get_logger().info(f'Subscribed to camera topics:')
@@ -811,22 +799,7 @@ class PersonTrackNode(Node):
             f'track_id={response.target_track_id} ({response.message})')
         return response
 
-    def _camera_info_callback(self, msg: CameraInfo):
-        """Store camera intrinsic parameters."""
-        with self.lock_info:
-            # Log resolution on first camera info received
-            if self.camera_intrinsic is None:
-                self.get_logger().info(f'Camera info received: resolution {msg.width}x{msg.height}')
-            self.camera_intrinsic = msg
-
-    def _camera_callback(self, rgb_msg: Image, depth_msg: Image):
-        """Process synchronized RGB and depth messages."""
-        with self.lock_msg:
-            self.recent_sync_msg = (rgb_msg, depth_msg)
-            self.recent_msg_time = self.get_clock().now()
-            self.frame_seq += 1
-
-    def _depth_image_to_points(self, depth_msg: Image, intrinsic: CameraInfo, bbox: tuple = None) -> tuple:
+    def _depth_image_to_points(self, depth_msg: Image, intrinsic, bbox: tuple = None) -> tuple:
         """
         Unproject a registered depth image (encoding 16UC1, mm) to per-pixel XYZ.
 
@@ -838,8 +811,9 @@ class PersonTrackNode(Node):
             valid_mask: np.ndarray of shape (H, W) with valid depth mask
         """
         h, w = depth_msg.height, depth_msg.width
-        fx, fy = intrinsic.k[0], intrinsic.k[4]
-        cx, cy = intrinsic.k[2], intrinsic.k[5]
+        k = intrinsic.k if hasattr(intrinsic, 'k') else intrinsic
+        fx, fy = k[0], k[4]
+        cx, cy = k[2], k[5]
 
         # Orbbec Femto Bolt default: 16UC1 depth in millimeters.
         depth = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(h, w).astype(np.float32) * 0.001
@@ -1030,11 +1004,8 @@ class PersonTrackNode(Node):
         self.get_logger().info('Received track_person goal request')
         
         # Check if camera data is available
-        with self.lock_msg:
-            has_data = self.recent_sync_msg is not None
-        
-        with self.lock_info:
-            has_intrinsic = self.camera_intrinsic is not None
+        has_data = self.camera_intake.latest() is not None
+        has_intrinsic = self.camera_intake.intrinsics() is not None
         
         if not has_data or not has_intrinsic:
             self.get_logger().warn('No camera data available, rejecting goal')
@@ -1277,32 +1248,34 @@ class PersonTrackNode(Node):
         it NEVER returns False. This mirrors the idle telemetry tick's
         non-consuming read.
         """
-        with self.lock_msg:
-            if self.recent_sync_msg is None:
-                return None
-            current_seq = self.frame_seq
-            if consume:
-                if current_seq == self.last_processed_seq:
-                    return False
-                self.last_processed_seq = current_seq
-            rgb_msg, depth_msg = self.recent_sync_msg
+        bundle = (
+            self.camera_intake.latest_new(self.last_processed_seq)
+            if consume
+            else self.camera_intake.latest()
+        )
+        if bundle is None:
+            return None
+        if bundle is NO_NEW_FRAME:
+            return False
+        if consume:
+            # Preserve the legacy consume point: a synchronized pair is consumed
+            # before checking intrinsics or decoding color.
+            self.last_processed_seq = bundle.seq
 
-        with self.lock_info:
-            intrinsic = self.camera_intrinsic
+        intrinsic = self.camera_intake.intrinsics()
         if intrinsic is None:
             return None
 
-        # Normalize the wire format (Orbbec = rgb8, others = bgr8) to BGR once,
-        # here — every downstream consumer (tracker feed via BGR2RGB, debug
-        # draw/publish, vision logger) assumes BGR. Zero-copy for bgr8 (the
-        # returned view is read-only; all writers copy first).
-        rgb_img, err = decode_color_msg(rgb_msg)
-        if rgb_img is None:
-            self.get_logger().warn(f'color frame dropped: {err}',
+        # CameraIntake normalizes rgb8/bgr8 to a memoized read-only BGR array.
+        # Every writer below already copies first.
+        try:
+            rgb_img = bundle.color_bgr()
+        except Exception as exc:
+            self.get_logger().warn(f'color frame dropped: {exc}',
                                    throttle_duration_sec=5.0)
             return None
 
-        return rgb_img, rgb_msg, depth_msg, intrinsic
+        return rgb_img, bundle.color_msg, bundle.depth_msg, intrinsic
 
     def _refresh_candidate_depths(self, depth_msg):
         """Median-depth per visible person bbox, for the crosser gate.
@@ -1738,8 +1711,8 @@ class PersonTrackNode(Node):
         """React to a camera-frame stall (synchronizer stopped emitting pairs).
 
         The diagnosed root cause of "stopped getting new camera frames": when
-        frame_seq freezes the loop would otherwise busy-wait forever with a
-        frozen dashboard, no loss handling, and no diagnostics.
+        the intake sequence freezes the loop would otherwise busy-wait forever
+        with a frozen dashboard, no loss handling, and no diagnostics.
 
         - 'warn': log (throttled) + keep the dashboard alive (distinct
           ``camera_stalled`` phase + re-emit the last good frame) instead of a
@@ -1837,17 +1810,16 @@ class PersonTrackNode(Node):
         if not (self.debug_image_enabled
                 and self.debug_image_pub.get_subscription_count() > 0):
             return
-        with self.lock_msg:
-            pair = self.recent_sync_msg
-            seq = self.frame_seq
-        if pair is None or seq == self._idle_last_seq:
+        bundle = self.camera_intake.latest_new(self._idle_last_seq)
+        if bundle is None or bundle is NO_NEW_FRAME:
             return
-        rgb_img, err = decode_color_msg(pair[0])
-        if rgb_img is None:
-            self.get_logger().warn(f'idle frame dropped: {err}',
+        try:
+            rgb_img = bundle.color_bgr()
+        except Exception as exc:
+            self.get_logger().warn(f'idle frame dropped: {exc}',
                                    throttle_duration_sec=5.0)
             return
-        self._idle_last_seq = seq
+        self._idle_last_seq = bundle.seq
         self._publish_raw_debug_image(rgb_img)
 
     def _publish_debug_outputs(self, rgb_img, track_result, feedback, last_seen_time):
@@ -2024,9 +1996,10 @@ class PersonTrackNode(Node):
             self._pan_tilt_initialized = True
             return
         target = None
-        if self._last_target_u is not None and self.camera_intrinsic is not None:
-            fx = float(self.camera_intrinsic.k[0])
-            cx = float(self.camera_intrinsic.k[2])
+        intrinsic = self.camera_intake.intrinsics()
+        if self._last_target_u is not None and intrinsic is not None:
+            fx = float(intrinsic[0])
+            cx = float(intrinsic[2])
             target = self._pan_follower.center(
                 self._last_target_u, cx, fx, current_pan, now)   # CENTER
         # No bbox -> HOLD: issue no command, so the servo keeps pointing where the

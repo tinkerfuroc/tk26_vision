@@ -44,9 +44,10 @@ tf2_geometry_msgs, pytest, `tkbuild` (`/home/tinker/tk25_ws/tkbuild`).
   and not concurrent VLM execution. ActionServer callback group does not
   serialize execute callbacks; the queue does.
 - Every ActionServer must set `result_timeout=0`.
-- Cancellation rule: `CancelResponse.ACCEPT`; queued goals cancel without
-  executing; active goals check cancellation at every stage boundary and inside
-  provider retry/provider loops via `should_abort`.
+- Cancellation rule: `CancelResponse.ACCEPT`; queued goals skip user/VLM work
+  but still run their rclpy execute callback once to resolve the result future;
+  active goals check cancellation at every stage boundary and inside provider
+  retry/provider loops via `should_abort`.
 - OpenAI SDK rule: every in-repo provider-chain helper touched by this work
   must construct OpenAI clients with `max_retries=0`; the chain already owns
   retry policy.
@@ -303,8 +304,11 @@ Implement a minimal `QueuedActionGate` that can be used as an ActionServer
   handle by calling `goal_handle.execute()`.
 - `notify_finished(goal_handle)`: called in each execute callback `finally`
   block; clears the active goal and starts the next non-canceled queued handle.
-- `cancel_queued(goal_handle) -> bool`: marks queued goals canceled before
-  execution when cancel is accepted.
+- `cancel_queued(goal_handle) -> bool`: marks queued goals so their eventual
+  execute callback returns CANCELED without running user work.
+- `should_cancel(goal_handle) -> bool`: combines queued cancellation intent
+  with rclpy's `is_cancel_requested` state. Intent remains visible until
+  `notify_finished`.
 - The helper must not reject goals and must not start more than one goal at a
   time.
 
@@ -317,8 +321,9 @@ Cover:
 - first accepted handle executes immediately;
 - second/third accepted handles do not execute until prior `notify_finished`;
 - order is FIFO;
-- cancel-before-execute skips execution and allows the next queued handle to
-  run;
+- cancel-before-execute still schedules exactly one lifecycle execute call,
+  exposes cancellation intent, and allows the next queued handle to run after
+  the canceled callback finishes;
 - double `notify_finished` is harmless and logged or ignored.
 
 - [ ] **Step 3: Run tests**

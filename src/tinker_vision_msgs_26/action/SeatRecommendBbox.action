@@ -1,0 +1,23 @@
+# Recommend where a new guest should sit. Returns the human-readable
+# sentence (same semantics as SeatRecommendation.srv) plus the 2D
+# bounding box and 3D centroid of the recommended empty seat.
+string camera
+string[] names
+string[] features
+string target_frame
+# Optional pre-known seat labels. When non-empty, the VLM is instructed
+# to choose `recommendation` from this list (or return "none"); the
+# server rejects out-of-catalog labels with status=1. Empty preserves
+# open-vocabulary behavior.
+string[] known_seats
+---
+int32 status
+string error_msg
+string recommendation
+tinker_vision_msgs_26/BoundingBox bbox
+geometry_msgs/PointStamped centroid
+---
+int32 status
+float32 delay_limit
+string stage
+string message

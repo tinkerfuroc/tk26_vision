@@ -1571,3 +1571,17 @@ Executed the plan at `plans/plan-for-the-follow-keen-platypus.md`. Closed follow
 - Live T2/T3 regression pass and T4 operator scenarios (person-in-frame specialist positive case, servo motion, person ReID, shelf categorization with populated scene) — unchanged from the prior entry; still waiting on operator.
 - `BtNode_TrackPerson` + `BtNode_ScanForWavingPerson` semantic rearchitect (generalist doesn't populate `person_id` or `being_pointed`). Mechanical migration landed; proper fix needs routing TrackPerson at `/track_person` (person_track_server action) and replacing ScanForWavingPerson with the sibling `ScanForWavingPersonNew` that uses `DetectWaving`.
 
+## 2026-07-23 camera_server landing
+
+- Added the `camera_server` package: synced snapshot, point-cloud, and
+  time-correct TF services for wrist/head cameras, plus an opt-in legacy bridge.
+- Added gated standalone and `vision_driver` launch wiring; the head server is
+  enabled by default in `vision_driver` while the bridge remains opt-in.
+- Workstation verification: camera-server gtests pass (FrameStore 11,
+  Deprojector 17, CameraServerNode 7); camera_server/vision_bringup build and
+  launch argument checks pass; bridge startup smoke passes with a writable
+  `ROS_LOG_DIR`.
+- T1: `scripts/tests/manual/camera_server_t1.sh` is a no-camera startup and
+  bounded-wait check; it passed all 8 checks on this workstation on 2026-07-23.
+- T2: `scripts/tests/manual/camera_server_t2_parity.py` is pending an operator
+  run with live cameras (freshness, TF-at-stamp, legacy and driver-cloud parity).

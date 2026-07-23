@@ -2223,7 +2223,7 @@ git commit -m "feat(camera_server): launch wiring — dev launch + head instance
 - Consumes: everything from Tasks 1–7.
 - Produces: repeatable T1 (no-camera) check script and T2 (live-camera) parity/freshness harness for operator runs.
 
-- [ ] **Step 1: Write camera_server_t1.sh**
+- [x] **Step 1: Write camera_server_t1.sh**
 
 ```bash
 #!/usr/bin/env bash
@@ -2278,7 +2278,7 @@ Then: `chmod +x src/tk26_vision/scripts/tests/manual/camera_server_t1.sh`
 
 Note: `ros2 service call` prints responses like `response:\n...status=1...` — if the actual formatting differs (`status: 1`), adjust the `check` expectations to match observed output on first run; the invariant being tested is the status value, not the formatting.
 
-- [ ] **Step 2: Write camera_server_t2_parity.py**
+- [x] **Step 2: Write camera_server_t2_parity.py**
 
 ```python
 #!/usr/bin/env python3
@@ -2436,18 +2436,19 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 3: Run T1 (no hardware needed) and record**
+- [x] **Step 3: Run T1 (no hardware needed) and record**
 
 ```bash
 source /home/tinker/tk25_ws/install/setup.bash
 bash src/tk26_vision/scripts/tests/manual/camera_server_t1.sh
 ```
 
-Expected: all PASS lines, exit 0. Fix `check` expectations against observed `ros2 service call` output formatting on the first run if needed (see Step 1 note).
+Observed: all 8 checks passed on this workstation on 2026-07-23. The script
+accepts both `status: 1` and generated Python-style `status=1` response output.
 
 T2 requires live cameras — do NOT attempt to start drivers; leave T2 for an operator run and note it as pending.
 
-- [ ] **Step 4: Append DEV_NOTES.md entry**
+- [x] **Step 4: Append DEV_NOTES.md entry**
 
 Append at the end of `src/tk26_vision/DEV_NOTES.md`:
 
@@ -2457,7 +2458,8 @@ Append at the end of `src/tk26_vision/DEV_NOTES.md`:
 - New pkg `camera_server` (spec docs/specs/2026-07-13-camera-server-design.md):
   wrist/head snapshot+point-cloud+TF servers, compat bridge (gated OFF).
 - gtests: frame_store (5), deprojector (7) — PASS.
-- T1 (`scripts/tests/manual/camera_server_t1.sh`): PASS <fill actual date/host>.
+- T1 (`scripts/tests/manual/camera_server_t1.sh`): PASS (2026-07-23,
+  this workstation).
 - T2 (`scripts/tests/manual/camera_server_t2_parity.py`): PENDING operator run
   with live cameras — head: parity vs get_orbbec_pc + driver cloud; wrist:
   freshness/TF only. Consumers NOT migrated (spec Appendix A).
@@ -2465,7 +2467,7 @@ Append at the end of `src/tk26_vision/DEV_NOTES.md`:
 
 (Replace `<fill actual date/host>` with the real values from the run.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd /home/tinker/tk25_ws/src/tk26_vision

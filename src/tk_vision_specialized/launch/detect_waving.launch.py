@@ -31,6 +31,7 @@ def generate_launch_description():
     camera_info_topic = LaunchConfiguration('camera_info_topic')
     sync_slop_sec = LaunchConfiguration('sync_slop_sec')
     vision_logging_enabled = LaunchConfiguration('vision_logging_enabled')
+    waving_detector = LaunchConfiguration('waving_detector')
 
     args = [
         DeclareLaunchArgument(
@@ -53,6 +54,12 @@ def generate_launch_description():
             'sync_slop_sec', default_value='0.1'),
         DeclareLaunchArgument(
             'vision_logging_enabled', default_value='true'),
+        DeclareLaunchArgument(
+            'waving_detector', default_value='vlm',
+            description="Waving detector: 'vlm' (VLM sole source, default), "
+                        "'hybrid' (MediaPipe + VLM augment), or 'mediapipe' "
+                        "(CV only). 'vlm'/'hybrid' auto-degrade to MediaPipe "
+                        'when no provider key is configured.'),
     ]
 
     waving_node = Node(
@@ -73,6 +80,7 @@ def generate_launch_description():
             'camera_info_topic': camera_info_topic,
             'sync_slop_sec': sync_slop_sec,
             'vision_logging_enabled': vision_logging_enabled,
+            'waving_detector': waving_detector,
         }],
     )
 

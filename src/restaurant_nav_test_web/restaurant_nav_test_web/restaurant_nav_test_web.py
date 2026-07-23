@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import rclpy
 import tf2_ros
+from rclpy.action import get_action_names_and_types
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -103,13 +104,14 @@ class RestaurantNavTestWebNode(Node):
     def _readiness(self) -> dict:
         topics = dict(self.get_topic_names_and_types())
         services = dict(self.get_service_names_and_types())
+        actions = dict(get_action_names_and_types(self))
         cam = str(self.get_parameter("camera_topic").value)
         with self._lock:
             cam_fresh = self._jpeg is not None
         return {
             "camera": cam in topics and cam_fresh,
             "pan_tilt": "/pan_tilt_controller/state" in topics,
-            "waving": "/detect_waving_persons" in services,
+            "waving": "/detect_waving_persons" in actions,
             "goto": "/go_to_approach/_action/send_goal" in services,
         }
 

@@ -173,6 +173,7 @@ def test_request_waving_persons_returns_boxes(monkeypatch):
     assert fake.last_init['base_url'] == \
         'https://dashscope.aliyuncs.com/compatible-mode/v1'
     assert fake.last_init['api_key'] == 'k'
+    assert fake.last_init['max_retries'] == 0
 
 
 def test_request_waving_persons_missing_key_raises(monkeypatch):
@@ -255,6 +256,56 @@ def test_chain_all_fail_raises(monkeypatch):
             _img(), provider_models=[('qwen', 'q'), ('gemini', 'g')])
 
 
+def test_request_abort_stops_retry(monkeypatch):
+    monkeypatch.delenv('DASHCOPE_API_KEY', raising=False)
+    monkeypatch.setenv('DASHSCOPE_API_KEY', 'k')
+    aborted = {'value': False}
+
+    def script(_kwargs):
+        aborted['value'] = True
+        raise RuntimeError('provider failed')
+
+    fake = _make_fake_openai(script)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    with pytest.raises(WavingVlmError, match='aborted'):
+        request_waving_persons(
+            _img(),
+            provider='qwen',
+            model='q',
+            max_retries=3,
+            should_abort=lambda: aborted['value'],
+        )
+
+    assert len(fake.calls) == 1
+
+
+def test_chain_abort_stops_provider_fallback(monkeypatch):
+    aborted = {'value': False}
+    calls = []
+
+    def fake(rgb, *, provider, model, **kwargs):
+        calls.append(provider)
+        assert kwargs['should_abort'] is should_abort
+        aborted['value'] = True
+        raise WavingVlmError('provider failed')
+
+    def should_abort():
+        return aborted['value']
+
+    monkeypatch.setattr(
+        'tk_vision_specialized._waving_vlm.request_waving_persons', fake)
+
+    with pytest.raises(WavingVlmError, match='aborted'):
+        request_waving_persons_chain(
+            _img(),
+            provider_models=[('qwen', 'q'), ('gemini', 'g')],
+            should_abort=should_abort,
+        )
+
+    assert calls == ['qwen']
+
+
 from tk_vision_specialized._waving_vlm import should_wait_for_vlm  # noqa: E402
 
 
@@ -271,3 +322,49 @@ def test_should_wait_for_vlm_skips_at_or_above_threshold():
 def test_should_wait_for_vlm_never_skips_when_threshold_non_positive():
     assert should_wait_for_vlm(5, 0) is True
     assert should_wait_for_vlm(5, -1) is True
+
+
+from tk_vision_specialized._waving_vlm import _SYSTEM_PROMPT  # noqa: E402
+
+
+def test_system_prompt_requires_live_person():
+    p = _SYSTEM_PROMPT.lower()
+    # The live-person clause must name the concrete distractors (printed
+    # figures on a wall mural / advertisement) so the model rejects them.
+    assert 'live' in p
+    assert 'printed' in p
+    assert 'wall mural' in p
+    assert 'advertisement' in p
+
+
+from tk_vision_specialized._waving_vlm import resolve_effective_mode  # noqa: E402
+
+
+def test_resolve_effective_mode_vlm_with_key():
+    assert resolve_effective_mode('vlm', True, True) == ('vlm', None)
+
+
+def test_resolve_effective_mode_hybrid_with_key():
+    assert resolve_effective_mode('hybrid', True, True) == ('hybrid', None)
+
+
+def test_resolve_effective_mode_vlm_no_key_degrades():
+    assert resolve_effective_mode('vlm', True, False) == ('mediapipe', 'vlm')
+
+
+def test_resolve_effective_mode_hybrid_no_key_degrades():
+    assert resolve_effective_mode('hybrid', True, False) == ('mediapipe', 'hybrid')
+
+
+def test_resolve_effective_mode_kill_switch_degrades_even_with_key():
+    assert resolve_effective_mode('vlm', False, True) == ('mediapipe', 'vlm')
+
+
+def test_resolve_effective_mode_mediapipe_never_degrades_flag():
+    # Explicit mediapipe is not a degrade, so degraded_from stays None.
+    assert resolve_effective_mode('mediapipe', True, True) == ('mediapipe', None)
+    assert resolve_effective_mode('mediapipe', True, False) == ('mediapipe', None)
+
+
+def test_resolve_effective_mode_unknown_coerces_to_mediapipe():
+    assert resolve_effective_mode('bogus', True, True) == ('mediapipe', None)

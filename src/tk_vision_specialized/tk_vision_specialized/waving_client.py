@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
 
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
-from tinker_vision_msgs_26.srv import DetectWaving
+from tinker_vision_msgs_26.action import DetectWaving
 import time
 
 
 class WavingDetectionClient(Node):
     def __init__(self):
         super().__init__('waving_detection_client')
-        self.client = self.create_client(DetectWaving, '/detect_waving_persons')
+        self.client = ActionClient(
+            self, DetectWaving, '/detect_waving_persons')
         self.detecting = True
 
-        # 等待服务可用
-        while not self.client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Service not available, waiting...')
-        self.get_logger().info('Service available! Starting continuous detection...')
+        # 等待 action 可用
+        while not self.client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info('Action not available, waiting...')
+        self.get_logger().info('Action available! Starting continuous detection...')
 
     def send_request(self, threshold_meters=5.0, target_frame=""):
-        request = DetectWaving.Request()
-        request.threshold_meters = threshold_meters
-        request.target_frame = target_frame
+        goal = DetectWaving.Goal()
+        goal.threshold_meters = threshold_meters
+        goal.target_frame = target_frame
 
-        future = self.client.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
+        send_future = self.client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future)
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error('✗ Waving detection goal rejected')
+            return None
 
-        response = future.result()
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        response = result_future.result().result
 
         if response.status == 0:
             self.get_logger().info(f'✓ {response.error_msg}')

@@ -1,9 +1,8 @@
 import rclpy
-import rclpy.time
 from rclpy.node import Node
-from tinker_vision_msgs_26.srv import DetectWaving
-from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest
-from message_filters import Subscriber, ApproximateTimeSynchronizer
+from rclpy.action import ActionServer, CancelResponse
+from tinker_vision_msgs_26.action import DetectWaving
+from sensor_msgs.msg import Image, RegionOfInterest
 from cv_bridge import CvBridge
 import cv2
 import os
@@ -17,10 +16,12 @@ from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError as Futur
 from geometry_msgs.msg import PointStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-import tf2_ros
-import tf2_geometry_msgs
 
 # Shared logger
+from vision_util.action_queue import QueuedActionGate
+from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.depth_reproject import waving_optical_points
+from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
 from ._waving_vlm import (
@@ -28,43 +29,25 @@ from ._waving_vlm import (
     build_provider_models,
     has_provider_key,
     should_wait_for_vlm,
+    resolve_effective_mode,
     WavingVlmError,
 )
 from ._waving_geometry import is_duplicate_box, centroid_from_box
 
 
-def depth_image_to_points(
-    depth_msg: Image, cam_K: np.ndarray, bridge: CvBridge,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Back-project a registered depth Image to a (H, W, 3) XYZ grid in the
-    camera optical frame, plus a (H, W) bool valid mask. Mirrors the math in
-    `_process_realsense_data` (object_seg_yolo.py:407-431) but uses the
-    standard pinhole convention (u=col<->fx,cx; v=row<->fy,cy) so the output
-    matches the Orbbec depth_registered/points frame the rest of this node
-    expects."""
-    depth_img = bridge.imgmsg_to_cv2(depth_msg, 'passthrough').astype(float) / 1000.0
-    H, W = depth_img.shape
-    fx, fy, cx, cy = cam_K[0, 0], cam_K[1, 1], cam_K[0, 2], cam_K[1, 2]
+FRAME_MAX_AGE_S = 1.0
+FRAME_WAIT_TIMEOUT_S = 2.0
+CANCEL_STATE_TIMEOUT_S = 0.1
+CANCEL_STATE_POLL_S = 0.005
 
-    valid_mask = (depth_img > 1e-6) & (depth_img < 10.0)
-    depth_img = np.clip(depth_img, 0.0, 10.0)
 
-    u = np.arange(W, dtype=float)[None, :]  # column index -> x
-    v = np.arange(H, dtype=float)[:, None]  # row index    -> y
-    x = (u - cx) * depth_img / fx
-    y = (v - cy) * depth_img / fy
-
-    points = np.stack([x, y, depth_img], axis=2)
-    return points, valid_mask
+class _GoalCanceled(Exception):
+    """Internal control flow for cooperative action cancellation."""
 
 
 class DetectWavingPersonsNode(Node):
     def __init__(self):
         super().__init__('detect_waving_persons_node')
-        self.srv = self.create_service(
-            DetectWaving, 'detect_waving_persons',
-            self.detect_waving_callback,
-            callback_group=MutuallyExclusiveCallbackGroup())
 
         self.declare_parameter('color_topic', '/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
@@ -79,17 +62,16 @@ class DetectWavingPersonsNode(Node):
             .get_parameter_value().string_value)
         sync_slop_sec = float(self.get_parameter('sync_slop_sec').value)
 
-        image_sub = Subscriber(self, Image, color_topic)
-        depth_image_sub = Subscriber(self, Image, depth_topic)
-
-        self.ts = ApproximateTimeSynchronizer(
-            [image_sub, depth_image_sub], queue_size=10, slop=sync_slop_sec)
-        self.ts.registerCallback(self.image_callback)
-
-        self.create_subscription(
-            CameraInfo, camera_info_topic, self.camera_info_callback, 10)
-
         self.bridge = CvBridge()
+        self.action_cb_group = MutuallyExclusiveCallbackGroup()
+        self.intake_cb_group = MutuallyExclusiveCallbackGroup()
+        self.camera_intake = self._create_camera_intake(
+            color_topic,
+            depth_topic,
+            camera_info_topic,
+            sync_slop_sec,
+        )
+        self.transform_helper = TransformHelper(self)
         self.declare_parameter('model_path', 'yolo11m-seg.pt')
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.yolo = YOLO(str(resolve_weights(model_path)))
@@ -101,17 +83,6 @@ class DetectWavingPersonsNode(Node):
             static_image_mode=True,
             min_detection_confidence=0.5,
         )
-
-        self.img_lock = threading.Lock()
-        self.intrinsiscs_lock = threading.Lock()
-        self.rgb_image = None
-        self.depth_image = None
-        self.header = None
-        self.camera_k = None
-        self.received_intrinsics = False
-
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # show_window=true pops up a real cv2.imshow window with per-person
         # bounding boxes, fed from a bounded queue by a dedicated background
@@ -129,7 +100,7 @@ class DetectWavingPersonsNode(Node):
         # Mirror that profile here: the integer 10 means depth=10 with rcl
         # defaults -- exactly what the subscriber expects. depth=10 also
         # prevents the outbound queue from overflowing on back-to-back
-        # service calls (which is what dropped frames at depth=1).
+        # action goals (which is what dropped frames at depth=1).
         self.debug_image_pub = self.create_publisher(
             Image, '/detect_waving_debug_image', 10,
         )
@@ -155,6 +126,19 @@ class DetectWavingPersonsNode(Node):
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
 
+        # Which detector decides who is waving:
+        #   'vlm'       -> VLM is the sole waver source (MediaPipe skipped);
+        #                  YOLO still runs for person masks -> 3D centroid.
+        #   'hybrid'    -> MediaPipe wavers + VLM augmentation gated by the
+        #                  request's min_waving_persons (legacy 2026-07-03).
+        #   'mediapipe' -> MediaPipe only, VLM never called.
+        # 'vlm'/'hybrid' degrade to 'mediapipe' at call time when no provider
+        # key is configured (see resolve_effective_mode) so offline/no-key
+        # boxes keep working unchanged. enable_vlm_fallback=False forces
+        # 'mediapipe' regardless (hard kill-switch).
+        self.declare_parameter('waving_detector', 'vlm')
+        self.waving_detector = str(
+            self.get_parameter('waving_detector').value).lower()
         self.declare_parameter('enable_vlm_fallback', True)
         self.declare_parameter('vlm_provider', 'qwen')
         self.declare_parameter('vlm_fallback_provider', 'gemini')
@@ -176,7 +160,7 @@ class DetectWavingPersonsNode(Node):
         self._vlm_chain = self._resolve_provider_chain()
         # Dedicated pool for the concurrent VLM waving-fallback call. 2
         # workers, not 1: an abandoned call from an early-exited request (see
-        # _start_vlm_call / detect_waving_callback) can still be finishing in
+        # _start_vlm_call / _run_detect_waving) can still be finishing in
         # the background when the NEXT request submits its own call -- with
         # only 1 worker, that submission would queue behind the abandoned one
         # and silently reintroduce the wait this whole change exists to avoid.
@@ -199,8 +183,50 @@ class DetectWavingPersonsNode(Node):
             )
             self._window_thread.start()
 
+        self._action_gate = QueuedActionGate()
+        self.action_server = self._create_action_server()
+
         self.get_logger().info(
-            f'Detect Waving Persons node started (show_window={self.show_window})')
+            f'Detect Waving Persons node started (show_window={self.show_window}, '
+            f'waving_detector={self.waving_detector!r}, '
+            f'enable_vlm_fallback={self.enable_vlm_fallback})')
+
+    def _create_camera_intake(
+        self,
+        color_topic,
+        depth_topic,
+        camera_info_topic,
+        sync_slop_s,
+    ):
+        return CameraIntake(
+            self,
+            IntakeConfig(
+                camera='orbbec',
+                color=StreamSpec(
+                    color_topic, best_effort=False, qos_depth=10),
+                depth=StreamSpec(
+                    depth_topic, best_effort=False, qos_depth=10),
+                camera_info=StreamSpec(
+                    camera_info_topic, best_effort=False, qos_depth=10),
+                sync_queue=10,
+                sync_slop_s=sync_slop_s,
+                age_source='stamp',
+            ),
+            callback_group=self.intake_cb_group,
+            bridge=self.bridge,
+        )
+
+    def _create_action_server(self):
+        return ActionServer(
+            self,
+            DetectWaving,
+            'detect_waving_persons',
+            execute_callback=self.detect_waving_execute_callback,
+            cancel_callback=self.detect_waving_cancel_callback,
+            handle_accepted_callback=self.detect_waving_handle_accepted_callback,
+            callback_group=self.action_cb_group,
+            result_timeout=0,
+        )
 
     def _cv2_window_loop(self):
         """Own a single cv2.imshow window for the life of the node.
@@ -208,7 +234,7 @@ class DetectWavingPersonsNode(Node):
         Runs on a dedicated thread so imshow/waitKey are always called from
         the same thread -- required for the Qt/GTK backend to behave, and
         not guaranteed if called directly from a ROS callback-group thread
-        (detect_waving_callback may run on a different worker each call).
+        (_run_detect_waving may run on a different worker for each goal).
         Pulls the latest annotated frame from _frame_queue; a get() timeout
         keeps waitKey() pumping the window's event loop even when no new
         frame has arrived, so the window stays responsive/movable between
@@ -237,11 +263,11 @@ class DetectWavingPersonsNode(Node):
         # detection frame -- a namedWindow with nothing shown yet can sit
         # unmapped/unpainted on some window managers until the first imshow,
         # which made the window appear not to "pop up" at all until the
-        # first service call landed. This also proves the window is alive
+        # first action goal arrived. This also proves the window is alive
         # independent of whether a detection has happened yet.
         placeholder = np.zeros((540, 960, 3), dtype=np.uint8)
         cv2.putText(
-            placeholder, 'Waiting for detect_waving_persons calls...',
+            placeholder, 'Waiting for detect_waving_persons goals...',
             (20, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2,
         )
         self._show_frame(window_name, placeholder)
@@ -271,17 +297,36 @@ class DetectWavingPersonsNode(Node):
 
     @staticmethod
     def _show_frame(window_name: str, frame) -> None:
-        """imshow + repeated waitKey pumps.
+        """imshow + repeated waitKey pumps, raising the window on each update.
 
         A single waitKey(1) right after imshow is the textbook pattern, but
         proved unreliable for actually materializing/repainting the window
         promptly on some window managers -- a few short pumps in quick
         succession (still ~a few ms total, no meaningful latency added) are
         far more consistent at forcing the frame to actually paint.
+
+        Since this runs exactly once per new frame (plus the startup
+        placeholder), it's also the hook for bringing the window to the front
+        whenever the image updates: toggle WND_PROP_TOPMOST on before the
+        paint (raises the window) then back off after (releases the
+        always-on-top flag, so the operator can cover it again between
+        detections). Both setWindowProperty calls are guarded because
+        WND_PROP_TOPMOST needs a Qt/GTK highgui backend and isn't present on
+        every OpenCV build -- a missing constant/backend must only skip the
+        raise, never kill the window loop or block the paint.
         """
+        try:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1.0)
+        except Exception:  # noqa: BLE001 -- no Qt/GTK backend; paint anyway
+            pass
         cv2.imshow(window_name, frame)
         for _ in range(3):
             cv2.waitKey(1)
+        try:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 0.0)
+            cv2.waitKey(1)
+        except Exception:  # noqa: BLE001 -- raise is best-effort only
+            pass
 
     def destroy_node(self):
         self._vlm_executor.shutdown(wait=False)
@@ -289,6 +334,88 @@ class DetectWavingPersonsNode(Node):
         if self._window_thread is not None:
             self._window_thread.join(timeout=2.0)
         return super().destroy_node()
+
+    def detect_waving_handle_accepted_callback(self, goal_handle) -> None:
+        """Queue an accepted action goal for serialized execution."""
+        self._action_gate.accept(goal_handle)
+
+    def detect_waving_cancel_callback(self, goal_handle):
+        """Accept cancellation and retain intent for a queued goal."""
+        self._action_gate.cancel_queued(goal_handle)
+        return CancelResponse.ACCEPT
+
+    def _should_cancel(self, goal_handle) -> bool:
+        return self._action_gate.should_cancel(goal_handle)
+
+    def _raise_if_canceled(self, goal_handle) -> None:
+        if self._should_cancel(goal_handle):
+            raise _GoalCanceled
+
+    def _publish_feedback(
+        self,
+        goal_handle,
+        *,
+        stage: str,
+        message: str,
+        delay_limit: float,
+    ) -> None:
+        self._raise_if_canceled(goal_handle)
+        feedback = DetectWaving.Feedback()
+        feedback.status = 0
+        feedback.delay_limit = float(delay_limit)
+        feedback.stage = stage
+        feedback.message = message
+        goal_handle.publish_feedback(feedback)
+
+    def _vlm_delay_limit(self) -> float:
+        retries = max(0, int(self.vlm_max_retries))
+        per_provider_s = retries * max(0.0, float(self.vlm_timeout_s))
+        return max(1.0, len(self._vlm_chain) * per_provider_s + 5.0)
+
+    def _canceled_result(self, goal_handle):
+        result = DetectWaving.Result()
+        result.status = 1
+        result.error_msg = 'Waving detection canceled.'
+
+        deadline = time.monotonic() + CANCEL_STATE_TIMEOUT_S
+        while not bool(getattr(goal_handle, 'is_cancel_requested', False)):
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                result.status = -1
+                result.error_msg = (
+                    'Waving detection cancellation-state error: cancel '
+                    'request did not become visible.'
+                )
+                self.get_logger().error(result.error_msg)
+                goal_handle.abort()
+                return result
+            time.sleep(min(CANCEL_STATE_POLL_S, remaining_s))
+
+        goal_handle.canceled()
+        return result
+
+    def detect_waving_execute_callback(self, goal_handle):
+        """Execute one queued waving-detection goal."""
+        try:
+            self._raise_if_canceled(goal_handle)
+            result = self._run_detect_waving(goal_handle)
+            self._raise_if_canceled(goal_handle)
+        except _GoalCanceled:
+            return self._canceled_result(goal_handle)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'Unhandled waving detection failure: {exc}'
+            )
+            result = DetectWaving.Result()
+            result.status = -1
+            result.error_msg = f'Waving detection failed: {exc}.'
+            goal_handle.abort()
+            return result
+        else:
+            goal_handle.succeed()
+            return result
+        finally:
+            self._action_gate.notify_finished(goal_handle)
 
     def _annotate_frame(self, rgb_bgr, waving_annotations, waving_centroids):
         frame = rgb_bgr.copy()
@@ -309,23 +436,24 @@ class DetectWavingPersonsNode(Node):
         return frame
 
     def _annotate_all_persons(self, rgb_bgr, person_annotations):
-        """Draw every detected person, color-coded by waving verdict.
+        """Draw only the persons judged to be waving, boxed in red.
 
-        Red bbox = waving, green bbox = still. Renders on every service call
-        so the debug window/image is populated even when no wave fires."""
+        Non-waving persons are intentionally left unboxed so the debug
+        window/image highlights just the wavers. Empty/still scenes still
+        emit the raw RGB (via the empty/failure paths) so operators can
+        confirm the pipeline ran."""
         frame = rgb_bgr.copy()
+        red = (0, 0, 255)
         wave_idx = 0
         for x1, y1, x2, y2, landmarks, is_wave in person_annotations:
-            color = (0, 0, 255) if is_wave else (0, 255, 0)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            if is_wave:
-                wave_idx += 1
-                label = f'waving #{wave_idx}'
-            else:
-                label = 'still'
+            if not is_wave:
+                continue
+            cv2.rectangle(frame, (x1, y1), (x2, y2), red, 2)
+            wave_idx += 1
+            label = f'waving #{wave_idx}'
             cv2.putText(
                 frame, label, (x1, max(0, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, red, 2,
             )
             if landmarks is not None:
                 roi = frame[y1:y2, x1:x2]
@@ -334,73 +462,20 @@ class DetectWavingPersonsNode(Node):
                         roi, landmarks, self.mp_pose.POSE_CONNECTIONS)
         return frame
 
-    def camera_info_callback(self, msg):
-        if self.received_intrinsics:
-            return
-        self.intrinsiscs_lock.acquire()
-        try:
-            self.camera_k = np.array(msg.k).reshape((3, 3))
-            self.get_logger().info('Camera info received.')
-            self.received_intrinsics = True
-        finally:
-            self.intrinsiscs_lock.release()
-
-    def _snapshot_latest_transform(self, target_frame, source_frame,
-                                   wait_seconds=1.0, poll_period=0.02):
-        """Snapshot the latest available TF for (target<-source) at call time.
-
-        Called once at the *start* of the service callback so that all per-
-        centroid transforms later in the callback use the same fixed pose --
-        this both removes the "TF moved between centroid #1 and centroid #N"
-        race and sidesteps the "Lookup would require extrapolation into the
-        future" error you get when the image stamp is a few ms newer than
-        the most recent TF (the camera+TF pipeline lag a tick behind images).
-        We pass `rclpy.time.Time()` (a default-constructed Time = epoch 0,
-        which tf2 interprets as "give me the latest"), so no extrapolation
-        ever happens -- we always read what's already in the buffer.
-
-        For slow-changing chains like base_link<->camera_color_optical_frame
-        on the pan-tilt this is sub-mm accurate. If the chain is empty
-        (TF listener hasn't received any frames yet on first request),
-        poll up to `wait_seconds` for one to arrive. Returns TransformStamped
-        or None on total failure."""
-        deadline = self.get_clock().now() + rclpy.duration.Duration(seconds=wait_seconds)
-        latest = rclpy.time.Time()  # tf2 magic value for "latest"
-        while True:
-            if self.tf_buffer.can_transform(target_frame, source_frame, latest):
-                try:
-                    return self.tf_buffer.lookup_transform(
-                        target_frame, source_frame, latest,
-                    )
-                except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                        tf2_ros.ExtrapolationException) as exc:
-                    self.get_logger().error(
-                        f'TF lookup raced after can_transform passed '
-                        f'({target_frame}<-{source_frame}): {exc}'
-                    )
-                    return None
-            if self.get_clock().now() >= deadline:
-                self.get_logger().error(
-                    f'TF for {target_frame}<-{source_frame} not available '
-                    f'within {wait_seconds:.2f}s'
-                )
-                return None
-            time.sleep(poll_period)
-
     def _publish_debug_image(self, image, header, *,
                              persons, waving, status_text=None,
                              already_annotated=False):
         """Publish an annotated debug frame to /detect_waving_debug_image.
 
-        Called from every service-callback exit path that has an `rgb_image`
+        Called from every action exit path that has an `rgb_image`
         in hand (success, TF failure, depth failure, post-success transform
         failure). Publishing on failure is what lets the operator see *what
         the camera was looking at when the request was rejected* -- without
-        it, debugging "why did my service call fail" requires re-running
+        it, debugging "why did my action fail" requires re-running
         the camera capture.
 
         `already_annotated=True` skips re-drawing (used by the success path,
-        which has already drawn red/green person bboxes via
+        which has already drawn the red waver bboxes via
         `_annotate_all_persons`). For failure paths we just stamp a status
         banner on the raw frame."""
         if not already_annotated:
@@ -449,23 +524,6 @@ class DetectWavingPersonsNode(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().debug(f'debug_image republish failed: {exc}')
 
-    def image_callback(self, rgb_msg, depth_image_msg):
-        # Convert outside the lock -- CvBridge can raise on a malformed image
-        # message, and a leaked img_lock would deadlock every subsequent
-        # image callback and service request under MultiThreadedExecutor.
-        try:
-            cv_img = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
-        except Exception as exc:  # noqa: BLE001 -- drop bad frame, keep node alive
-            self.get_logger().warn(f'imgmsg_to_cv2 failed: {exc}; dropping frame')
-            return
-        self.img_lock.acquire()
-        try:
-            self.rgb_image = cv_img
-            self.depth_image = depth_image_msg
-            self.header = rgb_msg.header
-        finally:
-            self.img_lock.release()
-
     MIN_VISIBILITY = 0.5
     ELBOW_TOL_NORM = 0.1
 
@@ -496,27 +554,36 @@ class DetectWavingPersonsNode(Node):
                 f'Waving VLM chain: {[p for p, _ in chain]}')
         return chain
 
-    def _start_vlm_call(self, rgb_image, min_waving_persons: int):
+    def _start_vlm_call(
+        self,
+        rgb_image,
+        min_waving_persons: int,
+        *,
+        force: bool = False,
+        should_abort=None,
+    ):
         """Launch the VLM waving-fallback call on the dedicated executor.
 
-        Returns None immediately if the fallback is disabled, no provider
-        has a key configured, or the caller didn't opt in
-        (min_waving_persons <= 0 -- the request-level default, so GPSR/EGPSR
-        and any other caller that never sets this field keep today's
-        fast-only behavior with no changes on their end). Otherwise returns
-        a Future whose .result() is a WavingVlmResult, or raises
-        WavingVlmError on hard failure (matching
+        Returns None immediately if the fallback is disabled or no provider
+        has a key configured. Otherwise, when `force` is False, also returns
+        None unless the caller opted in (min_waving_persons > 0 -- the
+        request-level default, so GPSR/EGPSR and any other caller that never
+        sets this field keep today's fast-only behavior in 'hybrid' mode).
+        `force=True` (VLM-only mode) bypasses the min_waving_persons gate so
+        the VLM always runs. Returns a Future whose .result() is a
+        WavingVlmResult, or raises WavingVlmError on hard failure (matching
         request_waving_persons_chain's own contract).
         """
         if not self.enable_vlm_fallback or not self._vlm_chain:
             return None
-        if min_waving_persons <= 0:
+        if not force and min_waving_persons <= 0:
             return None
         return self._vlm_executor.submit(
             request_waving_persons_chain, rgb_image,
             provider_models=self._vlm_chain,
             timeout_s=self.vlm_timeout_s, max_retries=self.vlm_max_retries,
             logger=self.get_logger(),
+            should_abort=should_abort,
         )
 
     def _log_discarded_vlm_result(self, future: Future):
@@ -633,72 +700,82 @@ class DetectWavingPersonsNode(Node):
             )
         return gesture
 
-    def detect_waving_callback(self, request, response):
+    def _run_detect_waving(self, goal_handle):
         _t0 = time.perf_counter()
+        request = goal_handle.request
+        response = DetectWaving.Result()
         self.get_logger().info('Detect waving request received. Detecting persons now...')
 
-        self.img_lock.acquire()
+        self._publish_feedback(
+            goal_handle,
+            stage='acquiring_frame',
+            message='Acquiring a fresh synchronized color and depth frame.',
+            delay_limit=FRAME_WAIT_TIMEOUT_S,
+        )
+        frame = self.camera_intake.wait_fresh(
+            max_age_s=FRAME_MAX_AGE_S,
+            timeout_s=FRAME_WAIT_TIMEOUT_S,
+            poll_s=0.05,
+            on_timeout='stale',
+        )
+        if frame is None:
+            response.status = -1
+            response.error_msg = 'No image, depth data received yet'
+            self.get_logger().error(response.error_msg)
+            return response
+        if frame.K is None:
+            response.status = -1
+            response.error_msg = 'No camera info received yet'
+            self.get_logger().error(response.error_msg)
+            return response
+
         try:
-            if self.rgb_image is None or self.depth_image is None:
-                response.status = -1
-                response.error_msg = 'No image, depth data received yet'
-                self.get_logger().error(response.error_msg)
-                return response
-            if self.camera_k is None:
-                response.status = -1
-                response.error_msg = 'No camera info received yet'
-                self.get_logger().error(response.error_msg)
-                return response
+            rgb_image = frame.color_bgr().copy()
+            depth_m = frame.depth_m()
+        except Exception as exc:  # noqa: BLE001
+            response.status = -1
+            response.error_msg = f'camera frame decode failed: {exc}'
+            self.get_logger().error(response.error_msg)
+            return response
+        header = frame.header
+        camera_k = frame.K
+        self._raise_if_canceled(goal_handle)
 
-            rgb_image = self.rgb_image.copy()
-            depth_image = self.depth_image
-            header = self.header
-            camera_k = self.camera_k
-        finally:
-            self.img_lock.release()
+        # Resolve which detector this call uses. 'vlm'/'hybrid' fall back to
+        # 'mediapipe' when the VLM chain is unavailable (no key / kill-switch)
+        # so offline boxes keep working; only key-present boxes are truly
+        # VLM-only.
+        effective_mode, degraded_from = resolve_effective_mode(
+            self.waving_detector, self.enable_vlm_fallback,
+            bool(self._vlm_chain))
+        if degraded_from is not None:
+            self.get_logger().warn(
+                f'waving_detector={degraded_from!r} requested but VLM '
+                f'unavailable (enable_vlm_fallback={self.enable_vlm_fallback}, '
+                f'chain={[p for p, _ in self._vlm_chain]}); using MediaPipe '
+                f'for this call.')
+        run_mediapipe = effective_mode in ('mediapipe', 'hybrid')
 
-        # Freshness barrier: reject a frame cached from before this request
-        # arrived. Without this, a caller that just moved the pan-tilt (e.g.
-        # BtNode_TurnPanTilt + a settle wait) and immediately calls this
-        # service can silently get scored against whatever frame was cached
-        # from BEFORE the move -- image_callback updates self.rgb_image
-        # asynchronously and there's no guarantee a post-move frame has
-        # landed by the time the request arrives (observed live: the first
-        # call after startup used the pre-move frame). Poll for a fresher
-        # frame up to POLL_TIMEOUT_NS, then proceed with a warning rather
-        # than block forever on a stalled camera.
-        STALE_BUDGET_NS = int(1.0 * 1e9)
-        POLL_TIMEOUT_NS = int(2.0 * 1e9)
-        poll_start_ns = self.get_clock().now().nanoseconds
-        frame_ns = rclpy.time.Time.from_msg(header.stamp).nanoseconds
-        while poll_start_ns - frame_ns > STALE_BUDGET_NS:
-            now_ns = self.get_clock().now().nanoseconds
-            if now_ns - poll_start_ns > POLL_TIMEOUT_NS:
-                self.get_logger().warn(
-                    f'Frame is stale (age {(poll_start_ns - frame_ns) / 1e9:.2f}s '
-                    f'at request time) and no fresher frame arrived within '
-                    f'{POLL_TIMEOUT_NS / 1e9:.1f}s; proceeding anyway.'
-                )
-                break
-            time.sleep(0.05)
-            self.img_lock.acquire()
-            try:
-                rgb_image = self.rgb_image.copy()
-                depth_image = self.depth_image
-                header = self.header
-                camera_k = self.camera_k
-            finally:
-                self.img_lock.release()
-            frame_ns = rclpy.time.Time.from_msg(header.stamp).nanoseconds
-
-        # Launch the VLM fallback now, in parallel with the depth conversion +
-        # YOLO + MediaPipe pass below -- it only needs rgb_image, which is
-        # already available. Gated on request.min_waving_persons > 0: an
-        # explicit per-caller opt-in, not a node-wide default, so GPSR/EGPSR
-        # and any other caller that never sets this field (it defaults to 0)
-        # get today's fast-only behavior unchanged. See _start_vlm_call /
+        # Launch the VLM now, in parallel with the depth conversion + YOLO +
+        # (optional) MediaPipe pass below -- it only needs rgb_image, which is
+        # already available. In 'vlm' mode it always runs (force=True bypasses
+        # the min_waving_persons gate); in 'hybrid' mode the request's
+        # min_waving_persons > 0 opt-in still gates it. See _start_vlm_call /
         # the merge-or-discard logic after the CV loop.
-        vlm_future = self._start_vlm_call(rgb_image, request.min_waving_persons)
+        if effective_mode in ('vlm', 'hybrid'):
+            self._publish_feedback(
+                goal_handle,
+                stage='vlm_call',
+                message='Starting VLM waving detection.',
+                delay_limit=self._vlm_delay_limit(),
+            )
+            vlm_future = self._start_vlm_call(
+                rgb_image, request.min_waving_persons,
+                force=(effective_mode == 'vlm'),
+                should_abort=lambda: self._should_cancel(goal_handle),
+            )
+        else:
+            vlm_future = None
 
         self.get_logger().info('Data copied for processing. Starting detection...')
         transform = None
@@ -707,10 +784,20 @@ class DetectWavingPersonsNode(Node):
             # TF, generous 5 s budget -- the pan-tilt + base chain is fixed
             # while the service runs, so a one-time snapshot is correct
             # for every centroid below.
-            transform = self._snapshot_latest_transform(
-                request.target_frame, header.frame_id,
-                wait_seconds=5.0,
+            self._publish_feedback(
+                goal_handle,
+                stage='transforming',
+                message='Snapshotting the latest target transform.',
+                delay_limit=5.0,
             )
+            transform = self.transform_helper.wait_lookup(
+                request.target_frame,
+                header.frame_id,
+                deadline_s=5.0,
+                latest=True,
+                poll_s=0.02,
+            )
+            self._raise_if_canceled(goal_handle)
             if transform is None:
                 response.status = -1
                 response.error_msg = (
@@ -731,9 +818,15 @@ class DetectWavingPersonsNode(Node):
             'Transform lookup successful (if needed). '
             'Processing depth image and running YOLO...')
 
+        self._publish_feedback(
+            goal_handle,
+            stage='detecting',
+            message='Running person segmentation and waving detection.',
+            delay_limit=max(5.0, self._vlm_delay_limit()),
+        )
         try:
-            points, validmask_points = depth_image_to_points(
-                depth_image, camera_k, self.bridge)
+            points, validmask_points = waving_optical_points(
+                depth_m, camera_k)
         except Exception as exc:  # noqa: BLE001 -- bad frame shouldn't kill the executor
             response.status = -1
             response.error_msg = f'depth conversion failed: {exc}'
@@ -745,7 +838,9 @@ class DetectWavingPersonsNode(Node):
             if vlm_future is not None:
                 vlm_future.add_done_callback(self._log_discarded_vlm_result)
             return response
+        self._raise_if_canceled(goal_handle)
         yolo_results = self.yolo(rgb_image, conf=self.min_person_conf, verbose=False)
+        self._raise_if_canceled(goal_handle)
 
         boxes = yolo_results[0].boxes
         masks = yolo_results[0].masks  # None if model has no seg head or no instances
@@ -762,6 +857,7 @@ class DetectWavingPersonsNode(Node):
         person_candidates = 0
         if boxes is not None:
             for i, box in enumerate(boxes):
+                self._raise_if_canceled(goal_handle)
                 if self.yolo.names[int(box.cls[0])] == 'person':
                     person_candidates += 1
                     x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
@@ -775,11 +871,19 @@ class DetectWavingPersonsNode(Node):
                             f'Person candidate #{person_candidates} skipped: empty ROI')
                         continue
 
-                    pose_results = self.pose.process(
-                        cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB))
-                    is_wave = self.is_waving(pose_results.pose_landmarks, person_roi)
+                    # In 'vlm' mode the VLM is the sole waver source, so skip
+                    # the MediaPipe pose pass entirely (saves the per-ROI
+                    # inference); YOLO masks below still feed VLM centroids.
+                    if run_mediapipe:
+                        pose_results = self.pose.process(
+                            cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB))
+                        landmarks = pose_results.pose_landmarks
+                        is_wave = self.is_waving(landmarks, person_roi)
+                    else:
+                        landmarks = None
+                        is_wave = False
                     all_person_annotations.append(
-                        (x1, y1, x2, y2, pose_results.pose_landmarks, is_wave)
+                        (x1, y1, x2, y2, landmarks, is_wave)
                     )
                     rec_mask = None
                     if masks is not None and i < len(masks.data):
@@ -856,8 +960,7 @@ class DetectWavingPersonsNode(Node):
                                 point_stamped.point.z = float(centroid[2])
                                 waving_persons_centroids.append(point_stamped)
                                 waving_annotations.append(
-                                    (x1, y1, x2, y2,
-                                     pose_results.pose_landmarks))
+                                    (x1, y1, x2, y2, landmarks))
                                 waving_masks.append(person_mask)
                                 waving_sources.append('mp')
                                 self.get_logger().info(
@@ -872,16 +975,20 @@ class DetectWavingPersonsNode(Node):
         n_vlm_added = 0
         vlm_provider_used = ''
         if vlm_future is not None:
-            if should_wait_for_vlm(
+            # 'vlm' mode always waits (the VLM is the only waver source);
+            # 'hybrid' mode keeps the CV-found-enough short-circuit.
+            if effective_mode == 'vlm' or should_wait_for_vlm(
                     len(waving_persons_centroids), request.min_waving_persons):
                 try:
                     vlm_result = vlm_future.result(timeout=self.vlm_timeout_s)
                 except (WavingVlmError, FutureTimeoutError) as exc:
+                    self._raise_if_canceled(goal_handle)
                     self.get_logger().warn(
                         f'VLM waving fallback unavailable: {exc}')
                     vlm_result = None
                     vlm_future.add_done_callback(self._log_discarded_vlm_result)
                 if vlm_result is not None:
+                    self._raise_if_canceled(goal_handle)
                     n_vlm_added, vlm_provider_used = self._merge_vlm_result(
                         vlm_result, points, validmask_points, header, request,
                         person_records, waving_persons_centroids,
@@ -890,6 +997,7 @@ class DetectWavingPersonsNode(Node):
                     self.get_logger().info(
                         f'VLM fallback added {n_vlm_added} waver(s) '
                         f'(provider={vlm_provider_used or "none"}).')
+                    self._raise_if_canceled(goal_handle)
             else:
                 vlm_future.add_done_callback(self._log_discarded_vlm_result)
                 self.get_logger().info(
@@ -898,6 +1006,13 @@ class DetectWavingPersonsNode(Node):
                     f'{request.min_waving_persons}); discarding VLM call '
                     f'without waiting.'
                 )
+
+        self._publish_feedback(
+            goal_handle,
+            stage='judging',
+            message='Finalizing waving detections and centroids.',
+            delay_limit=3.0,
+        )
 
         # sort waving person centroids from closest to farthest (keep annotations + masks aligned)
         if waving_persons_centroids:
@@ -911,16 +1026,16 @@ class DetectWavingPersonsNode(Node):
             waving_masks = [m for _, _, m, _ in quads]
             waving_sources = [s for _, _, _, s in quads]
 
-        # Always render an annotated frame -- every person candidate is drawn
-        # (red=waving, green=still). Empty scenes still emit the raw RGB so
-        # operators can confirm the pipeline ran.
+        # Always render an annotated frame -- only wavers are boxed (red).
+        # Non-waving persons are left unboxed; empty scenes still emit the raw
+        # RGB so operators can confirm the pipeline ran.
         annotated = self._annotate_all_persons(rgb_image, all_person_annotations)
         for (x1, y1, x2, y2, _lm), src in zip(waving_annotations, waving_sources):
             if src != 'vlm':
                 continue
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 165, 255), 2)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(annotated, 'waving (vlm)', (x1, max(0, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
         self._publish_debug_image(
             annotated, header,
             persons=person_candidates,
@@ -992,20 +1107,23 @@ class DetectWavingPersonsNode(Node):
                 try:
                     transformed_points = []
                     for point in waving_persons_centroids:
-                        transformed_points.append(
-                            tf2_geometry_msgs.do_transform_point(point, transform))
+                        self._raise_if_canceled(goal_handle)
+                        transformed = self.transform_helper.transform_point(
+                            point, transform)
+                        if transformed is None:
+                            raise RuntimeError('point transform failed')
+                        transformed_points.append(transformed)
                     response.waving_persons = transformed_points
                     response.waving_boxes = waving_boxes
-                except (tf2_ros.LookupException,
-                        tf2_ros.ConnectivityException,
-                        tf2_ros.ExtrapolationException) as e:
+                except Exception as e:  # noqa: BLE001
+                    self._raise_if_canceled(goal_handle)
                     response.status = -1
                     response.error_msg = (
                         f'Failed to transform point from {header.frame_id} '
                         f'to {request.target_frame}: {e}')
                     self.get_logger().error(response.error_msg)
                     # Detection actually ran on this path -- preserve the
-                    # red/green person overlay rather than overwriting the
+                    # red waver overlay rather than overwriting the
                     # cached frame with the raw rgb_image.
                     self._publish_debug_image(
                         annotated, header, persons=person_candidates,

@@ -4,7 +4,7 @@
 Walks an operator through the waving_bench scenario suite (see
 config/waving_bench.yaml), fires the configured DetectWaving calls per case,
 and judges the responses via `_waving_bench_eval` — no evaluation logic
-lives in this file, only argument parsing, service I/O, printing, and
+lives in this file, only argument parsing, action I/O, printing, and
 JSONL writing.
 """
 import argparse
@@ -22,10 +22,11 @@ from ament_index_python.packages import (
     PackageNotFoundError,
 )
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 
-from tinker_vision_msgs_26.srv import DetectWaving
+from tinker_vision_msgs_26.action import DetectWaving
 
 from tk_vision_specialized._waving_bench_eval import (
     CallRecord,
@@ -41,7 +42,7 @@ SERVICE_WAIT_TIMEOUT_SEC = 5.0
 # Per-call ceiling. Must exceed the server's 20 s VLM-fallback budget so a
 # slow-but-alive keyed run is never misread as a dead/stalled server.
 CALL_TIMEOUT_SEC = 30.0
-NO_RESPONSE_REASON = 'no response from service (timeout or server death)'
+NO_RESPONSE_REASON = 'no action result (timeout or server death)'
 
 
 def record_from_response(resp) -> CallRecord:
@@ -82,7 +83,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog='waving_bench',
         description=(
             'Interactive scenario bench for /detect_waving_persons '
-            '(tinker_vision_msgs_26/srv/DetectWaving).'
+            '(tinker_vision_msgs_26/action/DetectWaving).'
         ),
     )
     parser.add_argument(
@@ -100,7 +101,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help='Output directory (default: /tmp/waving_bench_<YYYYmmdd_HHMMSS>).')
     parser.add_argument(
         '--service', default=DEFAULT_SERVICE,
-        help="DetectWaving service name (default: '%(default)s').")
+        help="DetectWaving action name (default: '%(default)s').")
     parser.add_argument(
         '--calls', type=_positive_int, default=None, metavar='N',
         help='Override calls_per_case for every case (quick smoke). Must be >= 1.')
@@ -129,21 +130,35 @@ def _run_case(node, client, scenario_name: str, case, jsonl) -> tuple:
     """Fire calls for one case, print + log per-call lines, return CallRecords."""
     calls = []
     for call_index in range(case.calls_per_case):
-        request = DetectWaving.Request(
+        goal = DetectWaving.Goal(
             threshold_meters=float(case.request['threshold_meters']),
             target_frame=str(case.request['target_frame']),
             min_waving_persons=int(case.request['min_waving_persons']),
         )
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(node, future, timeout_sec=CALL_TIMEOUT_SEC)
-
         response, call_error = None, None
-        if not future.done():
-            future.cancel()
+        send_future = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(
+            node, send_future, timeout_sec=CALL_TIMEOUT_SEC)
+        if not send_future.done():
+            send_future.cancel()
             call_error = NO_RESPONSE_REASON
         else:
             try:
-                response = future.result()
+                goal_handle = send_future.result()
+                if goal_handle is None or not goal_handle.accepted:
+                    call_error = 'waving action goal rejected'
+                else:
+                    result_future = goal_handle.get_result_async()
+                    rclpy.spin_until_future_complete(
+                        node,
+                        result_future,
+                        timeout_sec=CALL_TIMEOUT_SEC,
+                    )
+                    if not result_future.done():
+                        goal_handle.cancel_goal_async()
+                        call_error = NO_RESPONSE_REASON
+                    else:
+                        response = result_future.result().result
             except Exception as exc:  # server died/restarted mid-call
                 call_error = f'{NO_RESPONSE_REASON}: {exc}'
         if response is None and call_error is None:
@@ -194,11 +209,11 @@ def run(ns: argparse.Namespace, suite: dict, selected_names: list,
     # Ctrl-C at the input() prompt (no KeyboardInterrupt -> unkillable prompt).
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = Node('waving_bench')
-    client = node.create_client(DetectWaving, ns.service)
+    client = ActionClient(node, DetectWaving, ns.service)
     try:
-        if not client.wait_for_service(timeout_sec=SERVICE_WAIT_TIMEOUT_SEC):
+        if not client.wait_for_server(timeout_sec=SERVICE_WAIT_TIMEOUT_SEC):
             print(
-                f"error: service '{ns.service}' not available after "
+                f"error: action '{ns.service}' not available after "
                 f"{SERVICE_WAIT_TIMEOUT_SEC:.1f}s wait "
                 "(is waving_person_server running?)",
                 file=sys.stderr,
@@ -319,7 +334,7 @@ def main(args=None) -> None:
         sys.exit(1)
 
     # Exit-code split: 2 = usage/selection error (no/unknown scenario),
-    # 1 = runtime/environment failure (bad config, service down, failed suite).
+    # 1 = runtime/environment failure (bad config, action down, failed suite).
     if not ns.scenario and not ns.all:
         print('No scenario selected. Pass --scenario NAME (repeatable) or --all.')
         print('Available scenarios:')
@@ -347,7 +362,7 @@ def main(args=None) -> None:
         sys.exit(run(ns, suite, selected_names, results_path))
     except (KeyboardInterrupt, EOFError):
         # Backstop for interrupts outside the case loop (e.g. during the
-        # initial wait_for_service); the in-loop handler writes the summary.
+        # initial wait_for_server); the in-loop handler writes the summary.
         print('\naborted by operator', file=sys.stderr)
         sys.exit(1)
 

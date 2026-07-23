@@ -31,8 +31,8 @@ def _node(resp, reseed_ret, on_reseed=None):
             on_reseed(box)
         return reseed_ret
     return SimpleNamespace(
-        _wave_cli=None,
-        _call=lambda cli, req, timeout=0, name="": (resp, None),
+        _wave_action=None,
+        _call_action=lambda client, goal, timeout=0, name="": (resp, None),
         reseed=_reseed,
     )
 
@@ -90,11 +90,12 @@ def test_no_waver_no_reseed():
     assert out["boxes"] == []
 
 
-def test_service_error_surfaces():
+def test_action_error_surfaces():
     node = SimpleNamespace(
-        _wave_cli=None,
-        _call=lambda cli, req, timeout=0, name="": (None, "service unavailable"),
-        reseed=lambda b: pytest.fail("must not reseed on service error"))
+        _wave_action=None,
+        _call_action=lambda client, goal, timeout=0, name="": (
+            None, "action unavailable"),
+        reseed=lambda b: pytest.fail("must not reseed on action error"))
     out = wave(node)
     assert out["status"] == -1
     assert "error" in out

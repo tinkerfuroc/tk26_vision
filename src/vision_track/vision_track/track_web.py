@@ -4,7 +4,7 @@ Run:
     ros2 run vision_track track_web --ros-args -p bind:=0.0.0.0 -p port:=8766
 
 Bridges the person tracker's debug topics + TrackPerson action +
-ReseedTarget/DetectWaving services to the FastAPI app in track_web_app.py.
+ReseedTarget service and DetectWaving action to the FastAPI app.
 Threading: rclpy.spin in the main thread, uvicorn in a daemon thread, all
 shared state behind self._lock (the calib_web model). HTTP handlers run on
 uvicorn worker threads and may block politely (wait_for_*/future polls) —
@@ -31,8 +31,8 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-from tinker_vision_msgs_26.action import TrackPerson
-from tinker_vision_msgs_26.srv import DetectWaving, ReseedTarget
+from tinker_vision_msgs_26.action import DetectWaving, TrackPerson
+from tinker_vision_msgs_26.srv import ReseedTarget
 
 from vision_track.process_manager import ProcessManager
 from vision_track.track_web_app import create_app
@@ -123,8 +123,8 @@ class TrackWebNode(Node):
                                     callback_group=cb)
         self._reseed_cli = self.create_client(
             ReseedTarget, f"/{tracker}/reseed_target", callback_group=cb)
-        self._wave_cli = self.create_client(DetectWaving, waving,
-                                            callback_group=cb)
+        self._wave_action = ActionClient(
+            self, DetectWaving, waving, callback_group=cb)
         self.get_logger().info(
             f"track_web bridging tracker '{tracker}', waving '{waving}'")
 
@@ -246,6 +246,28 @@ class TrackWebNode(Node):
             return None, f"{name} timed out after {timeout:.0f}s"
         return future.result(), None
 
+    def _call_action(self, client, goal, timeout=30.0, name="action"):
+        if not client.wait_for_server(timeout_sec=2.0):
+            return None, f"{name} unavailable"
+        send_future = client.send_goal_async(goal)
+        deadline = time.time() + timeout
+        while not send_future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not send_future.done():
+            send_future.cancel()
+            return None, f"{name} timed out after {timeout:.0f}s"
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            return None, f"{name} goal rejected"
+        result_future = goal_handle.get_result_async()
+        while not result_future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not result_future.done():
+            goal_handle.cancel_goal_async()
+            return None, f"{name} timed out after {timeout:.0f}s"
+        wrapped = result_future.result()
+        return wrapped.result, None
+
     def reseed(self, bbox):
         req = ReseedTarget.Request()
         req.bbox.x_offset = max(0, int(bbox[0]))
@@ -261,11 +283,13 @@ class TrackWebNode(Node):
                 "message": str(resp.message)}
 
     def wave(self):
-        # Default request (min_waving_persons=0) deliberately runs the fast
-        # MediaPipe heuristic only — the VLM fallback is a server-side knob the
-        # bench doesn't need; 30s timeout still covers it if enabled there.
-        resp, err = self._call(self._wave_cli, DetectWaving.Request(),
-                               timeout=30.0, name="detect_waving_persons")
+        goal = DetectWaving.Goal()
+        resp, err = self._call_action(
+            self._wave_action,
+            goal,
+            timeout=30.0,
+            name="detect_waving_persons",
+        )
         if err:
             return {"status": -1, "boxes": [], "points": [], "error": err}
         boxes = [[int(b.x_offset), int(b.y_offset),

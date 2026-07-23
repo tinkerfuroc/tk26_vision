@@ -17,7 +17,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import openai
@@ -38,11 +38,19 @@ _SYSTEM_PROMPT = (
     'You watch a scene for a service robot and find people who are WAVING. '
     'A person is waving if a hand or arm is raised at or above shoulder/head '
     'height to get attention (an open raised hand counts). Do NOT count arms '
-    'resting down, crossed, or held at the waist. Return JSON {"persons": '
+    'resting down, crossed, or held at the waist. '
+    'Only count REAL, LIVE people who are physically present in the scene. Do '
+    'NOT count any person who is printed, drawn, or displayed on a poster, '
+    'advertisement, banner, wall mural, painting, photograph, magazine, '
+    'product packaging, television, monitor, phone, tablet, or any other '
+    'screen or flat surface -- even if their pose looks exactly like a wave. '
+    'A climber, model, or figure that is part of a picture on the wall is NOT '
+    'a waving person. Return JSON {"persons": '
     '[{"box_2d": [x1,y1,x2,y2], "waving": true}, ...]}. box_2d is the tight '
     'box around the WHOLE PERSON (head to feet if visible), normalized 0-1000 '
     'over the image where (0,0) is top-left and (1000,1000) is bottom-right. '
-    'Only include people who are actually waving; return an empty list if none.'
+    'Only include people who are actually waving AND live; return an empty '
+    'list if none.'
 )
 
 _SCHEMA = {
@@ -66,6 +74,13 @@ _SCHEMA = {
 
 class WavingVlmError(RuntimeError):
     """Hard failure: missing key, exhausted retries, or unparseable response."""
+
+
+def _raise_if_aborted(
+    should_abort: Optional[Callable[[], bool]],
+) -> None:
+    if should_abort is not None and should_abort():
+        raise WavingVlmError('waving VLM request aborted')
 
 
 @dataclass
@@ -145,6 +160,25 @@ def should_wait_for_vlm(cv_waver_count: int, skip_min_wavers: int) -> bool:
     return cv_waver_count < skip_min_wavers
 
 
+def resolve_effective_mode(waving_detector: str, enable_vlm_fallback: bool,
+                           chain_nonempty: bool):
+    """Resolve the waving detector actually used for a request.
+
+    'vlm'/'hybrid' degrade to 'mediapipe' when the VLM is unavailable -- the
+    kill-switch is off (enable_vlm_fallback False) or the provider chain is
+    empty (no API key). Unknown values coerce to 'mediapipe'. Returns
+    (effective_mode, degraded_from): degraded_from is the originally-requested
+    mode when a degrade happened (for a warning log), else None.
+    """
+    requested = (waving_detector
+                 if waving_detector in ('vlm', 'hybrid', 'mediapipe')
+                 else 'mediapipe')
+    if not enable_vlm_fallback or not chain_nonempty:
+        degraded_from = requested if requested in ('vlm', 'hybrid') else None
+        return 'mediapipe', degraded_from
+    return requested, None
+
+
 def _resolve_key(provider: str) -> Optional[str]:
     """Resolve a provider's API key from os.environ only, or None."""
     if provider == 'qwen':
@@ -191,7 +225,9 @@ def _strip_fences(text: str) -> str:
 
 def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
                            timeout_s: float = 20.0, max_retries: int = 3,
-                           logger=None) -> WavingVlmResult:
+                           logger=None,
+                           should_abort: Optional[Callable[[], bool]] = None,
+                           ) -> WavingVlmResult:
     """Single-provider waving detection.
 
     Raises WavingVlmError on hard failure (missing key, exhausted retries).
@@ -209,7 +245,7 @@ def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
     else:
         raise WavingVlmError(f'unknown provider {provider!r} (expected qwen|gemini)')
 
-    client = openai.OpenAI(api_key=key, base_url=b_url)
+    client = openai.OpenAI(api_key=key, base_url=b_url, max_retries=0)
     h, w = rgb_bgr.shape[:2]
     messages = [
         {'role': 'system', 'content': _SYSTEM_PROMPT},
@@ -230,6 +266,7 @@ def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
     last_error: Optional[Exception] = None
     try:
         for attempt in range(1, max_retries + 1):
+            _raise_if_aborted(should_abort)
             rf = rf_strict if use_strict else rf_loose
             try:
                 kwargs = dict(model=model, messages=messages,
@@ -253,6 +290,7 @@ def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
                 if logger is not None:
                     logger.warning(f'[{provider}] parse failed '
                                    f'(attempt {attempt}/{max_retries}): {exc}')
+                _raise_if_aborted(should_abort)
             except Exception as exc:  # noqa: BLE001
                 txt = str(exc).lower()
                 if use_strict and any(k in txt for k in
@@ -265,6 +303,7 @@ def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
                 if logger is not None:
                     logger.warning(f'[{provider}] call failed '
                                    f'(attempt {attempt}/{max_retries}): {exc}')
+                _raise_if_aborted(should_abort)
         raise WavingVlmError(
             f'[{provider}] exhausted {max_retries} retries; last={last_error}')
     finally:
@@ -277,7 +316,9 @@ def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
 def request_waving_persons_chain(rgb_bgr: np.ndarray, *,
                                  provider_models: Sequence[tuple],
                                  timeout_s: float = 20.0, max_retries: int = 3,
-                                 logger=None) -> WavingVlmResult:
+                                 logger=None,
+                                 should_abort: Optional[Callable[[], bool]] = None,
+                                 ) -> WavingVlmResult:
     """Try (provider, model) pairs in order; return the first CLEAN result.
 
     Errors-only fallthrough: a hard WavingVlmError or a soft .error falls
@@ -287,17 +328,21 @@ def request_waving_persons_chain(rgb_bgr: np.ndarray, *,
     """
     errors = []
     for provider, model in provider_models:
+        _raise_if_aborted(should_abort)
         try:
             res = request_waving_persons(
                 rgb_bgr, provider=provider, model=model,
-                timeout_s=timeout_s, max_retries=max_retries, logger=logger)
+                timeout_s=timeout_s, max_retries=max_retries, logger=logger,
+                should_abort=should_abort)
         except WavingVlmError as exc:
+            _raise_if_aborted(should_abort)
             errors.append(f'{provider}: {exc}')
             if logger is not None:
                 logger.warning(f'waving VLM provider {provider} failed: {exc}; '
                                f'trying next.')
             continue
         if res.error:
+            _raise_if_aborted(should_abort)
             errors.append(f'{provider}: {res.error}')
             if logger is not None:
                 logger.warning(f'waving VLM provider {provider} soft-failed: '

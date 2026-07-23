@@ -7,8 +7,8 @@ Task-specific vision servers. Each node wraps a narrow detection task and expose
 | Executable | Type | Interface | Description |
 |---|---|---|---|
 | `spot_on_shelf_server` | action | `tinker_vision_msgs_26/action/SpotOnShelf` | Detect objects on a shelf and bucket them into vertical layers + horizontal grids. Delegates detection to `object_detection_yolo`. |
-| `waving_person_server` | service | `tinker_vision_msgs_26/srv/DetectWaving` | Find all persons raising a hand / waving in the current Orbbec frame. YOLOv8 person boxes + MediaPipe Pose on each ROI. |
-| `waving_client` | — | — | Example client: calls `/detect_waving_persons` once per second, prints results. Useful for camera-alignment sanity before demos. |
+| `waving_person_server` | action | `tinker_vision_msgs_26/action/DetectWaving` | Find all persons raising a hand / waving in the current Orbbec frame. |
+| `waving_client` | — | — | Example client: sends `/detect_waving_persons` goals once per second and prints results. Useful for camera-alignment sanity before demos. |
 | `check_waving_inference` | — | — | Offline tester. Subscribes to `/camera/color/image_raw`, runs N YOLO + MediaPipe passes on a timer, dumps `XX_raw.jpg`, `XX_annotated.jpg`, `XX_result.json` into a timestamped folder. Has no ROS service dependency. |
 | `placing_location_server` | service | `tinker_vision_msgs_26/srv/PlacingLocation` | VLM-only tabletop placing-location finder. Asks Gemini 2.5 Pro for ranked empty regions on the visible desktop, projects each region's bbox centroid to 3D via the active camera's depth, optionally TF-transforms to a target frame. Subclasses `YOLOSegmentationNode` to reuse camera sync + intrinsics + depth-to-3D projection. |
 
@@ -25,12 +25,12 @@ ros2 run tk_vision_specialized spot_on_shelf_server
 
 ## DetectWaving
 
-Request: `threshold_meters` (float, ≤0 = no limit), `target_frame` (string, e.g. `"map"` or `"base_link"`), `min_waving_persons` (int32, default 0). Response: `status` (0=found, 1=none, -1=error), `error_msg`, `waving_persons[]` (PointStamped, sorted closest-first). `rgb_image`, `depth_image`, `segments[]` are declared but not populated by the current server.
+Goal: `threshold_meters` (float, ≤0 = no limit), `target_frame` (string, e.g. `"map"` or `"base_link"`), `min_waving_persons` (int32, default 0). Result: `status` (0=found, 1=none, -1=error), `error_msg`, `waving_persons[]` (PointStamped, sorted closest-first). `rgb_image`, `depth_image`, `segments[]` are declared but not populated by the current server. Goals execute FIFO and can be canceled while queued or during camera, TF, inference, and VLM stages.
 
 `min_waving_persons` is an explicit per-caller opt-in to a concurrent VLM (Gemini/Qwen) fallback: if `> 0`, the server launches the VLM call on a background thread as soon as the frame is available (parallel with the YOLO+MediaPipe pass above) and blocks on it only if the CV pass alone found fewer than `min_waving_persons` wavers — otherwise the VLM call is abandoned (left running, result discarded) without adding latency. Leaving it at the default `0` (every caller except Restaurant's `BtNode_ScanForWavingPerson`) keeps the fast, VLM-free path unchanged. `enable_vlm_fallback` (node param, default `true`) is the master kill-switch; `vlm_timeout_s` (default 20.0) bounds the wait.
 
 Pipeline:
-1. Grab latest synchronized RGB + `PointCloud2` + `CameraInfo`.
+1. Wait for a fresh synchronized RGB + registered depth frame and `CameraInfo`.
 2. YOLOv8 (`yolov8s.pt`) → person boxes.
 3. For each person ROI, MediaPipe Pose keypoints.
 4. Single-frame heuristic on landmark y-coords (hand above shoulder, or hand above elbow with elbow above shoulder). No temporal motion tracking — a raised static hand counts.
@@ -44,13 +44,9 @@ ros2 run tk_vision_specialized waving_person_server
 # separate shell:
 ros2 run tk_vision_specialized waving_client
 # or a single-shot call:
-ros2 service call /detect_waving_persons tinker_vision_msgs_26/srv/DetectWaving \
+ros2 action send_goal /detect_waving_persons tinker_vision_msgs_26/action/DetectWaving \
   "{threshold_meters: 3.0, target_frame: 'map'}"
 ```
-
-### Known issues (filed for follow-up, not fixed during migration)
-
-- `waving_person_server.py:99` — `right_elbow.y <= right_shoulder.y + int(img_h + 0.1)` almost certainly meant `img_h * 0.1` (mirroring line 100). The right-arm branch is effectively always true.
 
 ## check_waving_inference
 
@@ -95,5 +91,6 @@ Python (via `requirements.txt`, pip-installed): `ultralytics>=8.0.0`, `mediapipe
 
 ## Changelog
 
+- **2026-07-04** — Waving detection is now **VLM-only by default**. New `waving_detector` param (`'vlm'` default | `'hybrid'` | `'mediapipe'`): in `'vlm'` mode the VLM is the sole waver source and MediaPipe pose is skipped (YOLO still runs for the person mask → 3D centroid). `'hybrid'` reproduces the 2026-07-03 MediaPipe+VLM-augment behavior; `'mediapipe'` is CV-only. `'vlm'`/`'hybrid'` **auto-degrade to MediaPipe** at call time when no provider key is configured (or `enable_vlm_fallback=false`), so offline/no-key boxes are unchanged. The VLM prompt gained a **live-person clause**: a waver must be a real, physically-present human — figures printed/displayed on a wall mural, advertisement, poster, screen, photo, etc. are rejected even when their pose looks like a wave. Prompt-only enforcement (no schema change). Tradeoff: every call in `'vlm'` mode waits ~5–20 s for the VLM (vs ~100–300 ms MediaPipe); set `waving_detector:=hybrid`/`mediapipe` for a fast path. Design: `docs/superpowers/specs/2026-07-04-waving-vlm-only-live-person-design.md`.
 - **2026-07-03** — `DetectWaving.min_waving_persons` now gates a concurrent VLM waving-detection fallback (was previously declared but unused — the trigger condition it fed was never satisfied by any real caller). VLM call launches on a background thread as soon as the frame is available, in parallel with the YOLO+MediaPipe pass; abandoned without waiting if CV alone already found enough wavers. Restaurant's BT node is the only caller that opts in (`min_waving_persons=2`); GPSR/EGPSR and the `track_web` bench tool never set it, so they keep the pre-existing fast-only behavior unchanged.
 - **2026-04-30** — Add `placing_location_server` (VLM-only tabletop placing-location service) + `tinker_vision_msgs_26/srv/PlacingLocation`. Subclasses `YOLOSegmentationNode` for camera I/O reuse; calls Gemini 2.5 Pro via `kimi_api._env`; returns `PointStamped[]` ranked best→worst. No automated tests added — VLM round-trip is non-deterministic.

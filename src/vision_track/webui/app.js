@@ -218,23 +218,29 @@ $("btn-start").onclick = async () => log("start → " + (await post("/api/goal/s
 $("btn-stop").onclick = async () => log("stop → " + (await post("/api/goal/stop")).message);
 $("btn-clear").onclick = clearOverlays;
 $("btn-wave").onclick = async () => {
-  log("DetectWaving…");
-  const r = await post("/api/wave");
-  // waving server convention: 0 = wavers found, 1 = ran but none waving,
-  // -1 (or transport error) = genuine failure.
-  if (r.error || r.status === -1) { log(`wave FAIL (${r.error || "status " + r.status})`); return; }
-  if (r.status === 1 || !r.boxes.length) { log("wave → no wavers detected"); return; }
-  if (r.auto_reseeded !== undefined) {
-    // single waver → auto-reseed (wave-to-resume), no click needed
-    const rs = r.reseed || {};
-    log(`wave → single waver, auto-reseed ${r.auto_reseeded
-        ? "OK id=" + rs.target_track_id : "FAILED (" + (rs.message || "?") + ")"}`);
-    clearOverlays();
-    return;
+  const button = $("btn-wave");
+  button.disabled = true;
+  try {
+    log("DetectWaving…");
+    const r = await post("/api/wave");
+    // waving action payload: 0 = wavers found, 1 = ran but none waving,
+    // -1 (or transport error) = genuine failure.
+    if (r.error || r.status === -1) { log(`wave FAIL (${r.error || "status " + r.status})`); return; }
+    if (r.status === 1 || !r.boxes.length) { log("wave → no wavers detected"); return; }
+    if (r.auto_reseeded !== undefined) {
+      // single waver → auto-reseed (wave-to-resume), no click needed
+      const rs = r.reseed || {};
+      log(`wave → single waver, auto-reseed ${r.auto_reseeded
+          ? "OK id=" + rs.target_track_id : "FAILED (" + (rs.message || "?") + ")"}`);
+      clearOverlays();
+      return;
+    }
+    waveBoxes = r.boxes;
+    log(`wave → ${r.boxes.length} box(es); click one to re-seed`);
+    renderWaveBoxes();
+  } finally {
+    button.disabled = false;
   }
-  waveBoxes = r.boxes;
-  log(`wave → ${r.boxes.length} box(es); click one to re-seed`);
-  renderWaveBoxes();
 };
 
 $("btn-record").onclick = async () => {

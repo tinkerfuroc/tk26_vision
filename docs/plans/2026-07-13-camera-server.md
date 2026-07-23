@@ -248,7 +248,7 @@ git commit -m "feat(tinker_vision_msgs_26): camera server interfaces (snapshot/p
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
-- Produces (used by Tasks 4–5): `camera_server::FramePair {color, depth : sensor_msgs::msg::Image::ConstSharedPtr; stamp_ns : int64_t; seq : uint64_t}`; `camera_server::FrameStore` with `set_pair(color, depth)`, `set_color_info(info)`, `set_depth_info(info)`, `latest_pair()`, `color_info()`, `depth_info()`, `wait_for_pair_after(after_ns, timeout) -> FramePair`. Stamps are int64 nanoseconds (from `rclcpp::Time(header.stamp).nanoseconds()`), avoiding rclcpp clock-type comparison throws.
+- Produces (used by Tasks 4–5): `camera_server::FramePair {color, depth : sensor_msgs::msg::Image::ConstSharedPtr; stamp_ns : int64_t; seq : uint64_t}`; `camera_server::FrameStore` with `set_pair(color, depth)`, `set_color_info(info)`, `set_depth_info(info)`, `latest_pair()`, `color_info()`, `depth_info()`, `wait_for_pair_after(after_ns, timeout) -> FramePair`. Stamps are int64 nanoseconds computed directly from `header.stamp`, avoiding rclcpp clock-type comparison throws. A pair is valid only when both color and depth are non-null; incomplete `set_pair` calls are ignored without replacing state, advancing `seq`, or notifying waiters. Freshness uses an inclusive `stamp_ns >= after_ns` boundary.
 
 - [ ] **Step 1: Write package.xml and CMakeLists.txt**
 
@@ -321,10 +321,11 @@ find_package(tinker_vision_msgs_26 REQUIRED)
 add_library(camera_server_core
   src/frame_store.cpp
 )
+set_target_properties(camera_server_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(camera_server_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(camera_server_core rclcpp sensor_msgs Eigen3)
+ament_target_dependencies(camera_server_core sensor_msgs)
 
 install(TARGETS camera_server_core
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
@@ -387,7 +388,10 @@ spec maps the deferred migration).
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
+#include <memory>
 #include <thread>
+#include <utility>
 
 #include "camera_server/frame_store.hpp"
 
@@ -437,6 +441,72 @@ TEST(FrameStore, InfosStoredIndependently) {
   EXPECT_EQ(store.depth_info(), nullptr);
 }
 
+// Also cover depth_info storage, shared-pointer identity for frames and infos,
+// already-fresh immediate return, the inclusive >= captured_after boundary,
+// an empty-store timeout, and rejected null color/depth inputs. Null inputs
+// must preserve the prior pair/seq and must not wake a freshness waiter.
+
+TEST(FrameStore, DepthInfoAndPointersArePreserved) {
+  FrameStore store;
+  const auto color = make_image(100);
+  const auto depth = make_image(100);
+  auto info = std::make_shared<sensor_msgs::msg::CameraInfo>();
+  store.set_pair(color, depth);
+  store.set_depth_info(info);
+  EXPECT_EQ(store.latest_pair().color, color);
+  EXPECT_EQ(store.latest_pair().depth, depth);
+  EXPECT_EQ(store.depth_info(), info);
+}
+
+TEST(FrameStore, AlreadyFreshAndExactBoundaryReturnImmediately) {
+  FrameStore store;
+  store.set_pair(make_image(500), make_image(500));
+  EXPECT_EQ(store.wait_for_pair_after(
+                400, std::chrono::seconds(1)).stamp_ns, 500);
+  EXPECT_EQ(store.wait_for_pair_after(
+                500, std::chrono::seconds(1)).stamp_ns, 500);
+}
+
+TEST(FrameStore, EmptyStoreWaitTimesOut) {
+  FrameStore store;
+  auto t0 = std::chrono::steady_clock::now();
+  FramePair p = store.wait_for_pair_after(
+      0, std::chrono::milliseconds(60));
+  auto elapsed = std::chrono::steady_clock::now() - t0;
+  EXPECT_GE(elapsed, std::chrono::milliseconds(45));
+  EXPECT_EQ(p.color, nullptr);
+  EXPECT_EQ(p.depth, nullptr);
+}
+
+TEST(FrameStore, NullPairInputsAreIgnored) {
+  FrameStore store;
+  const auto color = make_image(100);
+  const auto depth = make_image(100);
+  store.set_pair(color, depth);
+  store.set_pair(nullptr, make_image(200));
+  store.set_pair(make_image(300), nullptr);
+  FramePair p = store.latest_pair();
+  EXPECT_EQ(p.color, color);
+  EXPECT_EQ(p.depth, depth);
+  EXPECT_EQ(p.stamp_ns, 100);
+  EXPECT_EQ(p.seq, 1u);
+}
+
+TEST(FrameStore, IncompletePairDoesNotSatisfyFreshnessWait) {
+  FrameStore store;
+  std::thread feeder([&store] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    store.set_pair(make_image(600), nullptr);
+  });
+  auto t0 = std::chrono::steady_clock::now();
+  FramePair p = store.wait_for_pair_after(
+      500, std::chrono::milliseconds(80));
+  auto elapsed = std::chrono::steady_clock::now() - t0;
+  feeder.join();
+  EXPECT_GE(elapsed, std::chrono::milliseconds(65));
+  EXPECT_EQ(p.seq, 0u);
+}
+
 TEST(FrameStore, WaitTimesOutReturningNewest) {
   FrameStore store;
   store.set_pair(make_image(100), make_image(100));
@@ -471,6 +541,7 @@ TEST(FrameStore, WaitUnblocksOnFreshPair) {
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -489,6 +560,8 @@ struct FramePair {
 /// and service handlers (readers). Stores ConstSharedPtrs — no image copies.
 class FrameStore {
  public:
+  /// Incomplete pairs are ignored: state/seq are unchanged and waiters are
+  /// not notified.
   void set_pair(sensor_msgs::msg::Image::ConstSharedPtr color,
                 sensor_msgs::msg::Image::ConstSharedPtr depth);
   void set_color_info(sensor_msgs::msg::CameraInfo::ConstSharedPtr info);
@@ -498,9 +571,10 @@ class FrameStore {
   sensor_msgs::msg::CameraInfo::ConstSharedPtr color_info() const;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr depth_info() const;
 
-  /// Blocks until the stored pair is stamped >= after_ns, or timeout elapses.
-  /// Always returns the newest available pair; the caller checks
-  /// pair.stamp_ns >= after_ns to distinguish success from timeout.
+  /// Blocks until a complete stored pair is stamped >= after_ns, or timeout
+  /// elapses. Always returns the newest available pair; the caller checks both
+  /// pointers and pair.stamp_ns >= after_ns to distinguish success from
+  /// timeout/no data.
   FramePair wait_for_pair_after(int64_t after_ns,
                                 std::chrono::nanoseconds timeout);
 
@@ -530,7 +604,7 @@ Expected: FAIL at link time — undefined references to `camera_server::FrameSto
 ```cpp
 #include "camera_server/frame_store.hpp"
 
-#include <rclcpp/time.hpp>
+#include <utility>
 
 namespace camera_server {
 
@@ -543,11 +617,15 @@ int64_t stamp_ns_of(const sensor_msgs::msg::Image& img) {
 
 void FrameStore::set_pair(sensor_msgs::msg::Image::ConstSharedPtr color,
                           sensor_msgs::msg::Image::ConstSharedPtr depth) {
+  if (!color || !depth) {
+    return;
+  }
+
   {
     std::lock_guard<std::mutex> lock(mutex_);
     pair_.color = std::move(color);
     pair_.depth = std::move(depth);
-    pair_.stamp_ns = pair_.color ? stamp_ns_of(*pair_.color) : 0;
+    pair_.stamp_ns = stamp_ns_of(*pair_.color);
     pair_.seq += 1;
   }
   cv_.notify_all();
@@ -584,7 +662,8 @@ FramePair FrameStore::wait_for_pair_after(int64_t after_ns,
                                           std::chrono::nanoseconds timeout) {
   std::unique_lock<std::mutex> lock(mutex_);
   cv_.wait_for(lock, timeout, [this, after_ns] {
-    return pair_.color != nullptr && pair_.stamp_ns >= after_ns;
+    return pair_.color != nullptr && pair_.depth != nullptr &&
+           pair_.stamp_ns >= after_ns;
   });
   return pair_;
 }
@@ -599,7 +678,9 @@ tkbuild tk26_vision --packages-select camera_server
 /home/tinker/tk25_ws/build/camera_server/test_frame_store
 ```
 
-Expected: build succeeds; gtest prints `[  PASSED  ] 5 tests.`
+Expected: build succeeds; gtest covers empty/latest storage, camera-info and
+frame pointer preservation, already-fresh and exact-boundary returns, empty and
+stale timeouts, asynchronous wakeup, and rejected null pair inputs.
 
 - [ ] **Step 8: Commit**
 

@@ -14,10 +14,10 @@ namespace camera_server {
 
 /// CPU depth-image deprojection with a cached per-intrinsics xy table.
 ///
-/// Depth must already be registered/rectified to the color optical frame.
-/// Consequently, an optional color image must have exactly the same dimensions
-/// as depth; this class deliberately does not perform distortion correction or
-/// cross-camera registration.
+/// Depth must already be registered to the color optical frame. Raw registered
+/// images are supported: deprojection rays are distortion-aware for ROS
+/// plumb_bob, rational_polynomial, and equidistant camera models. This class
+/// does not perform cross-camera registration.
 ///
 /// Handles 16UC1/mono16 depth in millimetres and 32FC1 depth in metres, for
 /// either input byte order. Color may be rgb8 or bgr8. The output is always an
@@ -48,11 +48,15 @@ class Deprojector {
     double fy = 0.0;
     double cx = 0.0;
     double cy = 0.0;
+    std::string distortion_model;
+    std::vector<double> distortion;
 
     bool operator==(const TableKey& other) const {
       return width == other.width && height == other.height &&
              fx == other.fx && fy == other.fy && cx == other.cx &&
-             cy == other.cy;
+             cy == other.cy &&
+             distortion_model == other.distortion_model &&
+             distortion == other.distortion;
     }
   };
 

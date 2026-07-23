@@ -3,7 +3,7 @@
 
 uint32 stride              # pixel stride; 0 or 1 = full resolution
 bool include_color         # true => XYZRGB, false => XYZ
-string target_frame        # empty => native optical frame; else transformed at pair stamp
+string target_frame        # empty => native optical frame; else transformed at depth stamp
 float32 max_age_sec
 builtin_interfaces/Time captured_after
 float32 wait_timeout_sec
@@ -17,5 +17,5 @@ int32 STATUS_BAD_REQUEST=5
 
 int32 status
 string error_msg
-builtin_interfaces/Time stamp
+builtin_interfaces/Time stamp  # depth image stamp; also used by points.header
 sensor_msgs/PointCloud2 points

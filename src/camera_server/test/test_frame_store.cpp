@@ -30,6 +30,8 @@ TEST(FrameStore, EmptyStoreReturnsNullPair) {
   const FramePair pair = store.latest_pair();
   EXPECT_EQ(pair.color, nullptr);
   EXPECT_EQ(pair.depth, nullptr);
+  EXPECT_EQ(pair.color_stamp_ns, 0);
+  EXPECT_EQ(pair.depth_stamp_ns, 0);
   EXPECT_EQ(pair.stamp_ns, 0);
   EXPECT_EQ(pair.seq, 0u);
 }
@@ -43,12 +45,16 @@ TEST(FrameStore, SetPairStoresPointersAndBumpsSeq) {
   const FramePair first = store.latest_pair();
   EXPECT_EQ(first.color, color);
   EXPECT_EQ(first.depth, depth);
-  EXPECT_EQ(first.stamp_ns, 100);
+  EXPECT_EQ(first.color_stamp_ns, 100);
+  EXPECT_EQ(first.depth_stamp_ns, 99);
+  EXPECT_EQ(first.stamp_ns, 99);
   EXPECT_EQ(first.seq, 1u);
 
   store.set_pair(make_image(200), make_image(199));
   const FramePair second = store.latest_pair();
-  EXPECT_EQ(second.stamp_ns, 200);
+  EXPECT_EQ(second.color_stamp_ns, 200);
+  EXPECT_EQ(second.depth_stamp_ns, 199);
+  EXPECT_EQ(second.stamp_ns, 199);
   EXPECT_EQ(second.seq, 2u);
 }
 
@@ -99,6 +105,21 @@ TEST(FrameStore, ExactFreshnessBoundaryIsAccepted) {
 
   EXPECT_EQ(pair.stamp_ns, 500);
   EXPECT_LT(elapsed, std::chrono::milliseconds(100));
+}
+
+TEST(FrameStore, FreshnessBoundaryRequiresBothImages) {
+  FrameStore store;
+  store.set_pair(make_image(600), make_image(499));
+
+  const auto start = std::chrono::steady_clock::now();
+  const FramePair pair =
+      store.wait_for_pair_after(500, std::chrono::milliseconds(60));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  EXPECT_GE(elapsed, std::chrono::milliseconds(45));
+  EXPECT_EQ(pair.color_stamp_ns, 600);
+  EXPECT_EQ(pair.depth_stamp_ns, 499);
+  EXPECT_EQ(pair.stamp_ns, 499);
 }
 
 TEST(FrameStore, EmptyStoreWaitTimesOutReturningNullPair) {

@@ -57,3 +57,6 @@ unsupported or internally inconsistent models fail closed.
 - 2026-07-23: added starvation-proof CameraServerNode ingestion, conservative
   two-image freshness, bounded snapshot/TF services, accurate status telemetry,
   distortion-aware raw-image rays, and focused ROS integration coverage.
+- 2026-07-23: implemented `~/get_point_cloud` with depth-stamp TF/header
+  semantics, stride/XYZ[RGB] deprojection, fail-closed TF and camera-data
+  validation, plus bounded no-data/stale/timeout responses.

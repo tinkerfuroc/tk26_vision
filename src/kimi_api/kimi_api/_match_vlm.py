@@ -1,4 +1,4 @@
-"""Gemini/Qwen JSON-list VLM client for feature_matching_service.
+"""Gemini/Qwen JSON-list VLM client for the feature-matching action.
 
 Mirrors the provider-chain conventions of _feature_vlm.py / _seat_bbox_vlm.py,
 but the payload here is a JSON list of candidate indices (one per reference/
@@ -14,7 +14,7 @@ from __future__ import annotations
 import ast
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import openai
 
@@ -29,6 +29,11 @@ from ._vlm_text import strip_fences
 class MatchVlmError(RuntimeError):
     """Hard failure: missing API key, unknown provider, or every attempt
     (API call, parse, or validation) failed for a provider."""
+
+
+def _raise_if_aborted(should_abort: Optional[Callable[[], bool]]) -> None:
+    if should_abort is not None and should_abort():
+        raise MatchVlmError('match VLM request aborted')
 
 
 @dataclass
@@ -106,6 +111,7 @@ def request_match_indices(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> MatchVlmResult:
     """Single-provider match-index call with parse/validate retry.
 
@@ -129,7 +135,7 @@ def request_match_indices(
     else:
         raise MatchVlmError(f"unknown provider {provider!r} (expected qwen|gemini)")
 
-    client = openai.OpenAI(api_key=api_key, base_url=b_url)
+    client = openai.OpenAI(api_key=api_key, base_url=b_url, max_retries=0)
     messages = [
         {'role': 'system', 'content': sys_prompt},
         {'role': 'user', 'content': user_content},
@@ -139,6 +145,7 @@ def request_match_indices(
     last_error: Optional[str] = None
     try:
         for attempt in range(1, max_retries + 1):
+            _raise_if_aborted(should_abort)
             try:
                 completion = client.with_options(
                     timeout=timeout_s).chat.completions.create(
@@ -149,6 +156,7 @@ def request_match_indices(
                     logger.warning(
                         f'[{provider}] VLM call failed '
                         f'(attempt {attempt}/{max_retries}): {exc}')
+                _raise_if_aborted(should_abort)
                 if attempt < max_retries:
                     time.sleep(0.5 * (2 ** (attempt - 1)))
                 continue
@@ -164,6 +172,7 @@ def request_match_indices(
                     logger.info(
                         f'[{provider}] parse failed '
                         f'(attempt {attempt}/{max_retries}): {exc}')
+                _raise_if_aborted(should_abort)
                 continue
 
             patched, msg = patch_result(parsed, n_feats, n_cand)
@@ -184,6 +193,7 @@ def request_match_indices(
                 logger.info(
                     f'[{provider}] validate failed '
                     f'(attempt {attempt}/{max_retries}): {msg}')
+            _raise_if_aborted(should_abort)
         raise MatchVlmError(
             f'[{provider}] exhausted {max_retries} attempts; last={last_error}')
     finally:
@@ -204,6 +214,7 @@ def request_match_indices_chain(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> MatchVlmResult:
     """Try (provider, model) pairs in order; return the first success.
 
@@ -213,6 +224,7 @@ def request_match_indices_chain(
     """
     errors = []
     for provider, model in provider_models:
+        _raise_if_aborted(should_abort)
         try:
             return request_match_indices(
                 sys_prompt, user_content,
@@ -220,8 +232,10 @@ def request_match_indices_chain(
                 provider=provider, model=model,
                 qwen_api_backend=qwen_api_backend,
                 timeout_s=timeout_s, max_retries=max_retries, logger=logger,
+                should_abort=should_abort,
             )
         except MatchVlmError as exc:
+            _raise_if_aborted(should_abort)
             errors.append(f'{provider}: {exc}')
             if logger is not None:
                 logger.warning(

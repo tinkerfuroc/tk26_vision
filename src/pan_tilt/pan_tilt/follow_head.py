@@ -13,21 +13,22 @@ import cv2
 import numpy as np
 import rclpy
 import rclpy.executors
-import rclpy.time
-from cv_bridge import CvBridge
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image
 from tinker_vision_msgs_26.action import FollowHeadAction
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 from tinker_vision_msgs_26.srv import FollowHead
 from ultralytics import YOLO
 
 from pan_tilt.head_tracking_helpers import PersonTracker, WorldTargetEMA
+from vision_util.camera_intake import (
+    NO_NEW_FRAME,
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+)
+from vision_util.depth_reproject import follow_head_optical_points
 # Shared logger
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
@@ -246,44 +247,16 @@ class FollowHeadNode(Node):
             ttl_sec=self.target_ttl_sec,
         )
 
-        # Mirror person_track_node.py:229-246 — BEST_EFFORT on the high-rate
-        # color+depth streams and subscribe to the aligned depth image, not
-        # the (heavier, reprojected) PointCloud2.
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5,
-        )
         # ReentrantCallbackGroup for the high-rate sensor + state
         # subscribers so they don't serialize on the node default group
         # (which is MutuallyExclusive in Humble). Sharing the default
         # group with all other subs starves the executor of free
         # threads under load — the cancel-service handler ends up
         # queueing for a thread instead of running. Locks
-        # (lock_msg/lock_state/lock_info) already enforce data
-        # correctness inside the callbacks, so concurrent dispatch on
-        # different threads is safe.
+        # inside CameraIntake and lock_state enforce data correctness, so
+        # concurrent dispatch on different threads is safe.
         self._sensor_cb_group = ReentrantCallbackGroup()
-        image_sub = Subscriber(
-            self, Image, '/camera/color/image_raw', qos_profile=sensor_qos,
-            callback_group=self._sensor_cb_group,
-        )
-        depth_sub = Subscriber(
-            self, Image, '/camera/depth/image_raw', qos_profile=sensor_qos,
-            callback_group=self._sensor_cb_group,
-        )
-        image_sync_sub = ApproximateTimeSynchronizer(
-            [image_sub, depth_sub], queue_size=10, slop=0.1,
-        )
-        image_sync_sub.registerCallback(self.img_orbbec_callback)
-
-        self.camera_info_sub = self.create_subscription(
-            CameraInfo,
-            '/camera/color/camera_info',
-            self.camera_info_orbbec_callback,
-            qos_profile=10,
-            callback_group=self._sensor_cb_group,
-        )
+        self.camera_intake = self._create_camera_intake()
 
         # ReentrantCallbackGroup so the action server's internal cancel
         # service handler (and our user-level cancel_callback, which it
@@ -313,17 +286,9 @@ class FollowHeadNode(Node):
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
         self.is_canceled = False
-        self.recent_img = None
-        self.recent_depth_msg = None
-        self.recent_header = None
-        self.last_used_header = None
-        # Cached (u, v) meshgrid for depth unprojection — keyed on (h, w).
-        self._uv_cache = None
-        self.lock_msg = threading.Lock()
-        self.lock_info = threading.Lock()
+        self.last_used_seq = None
         self.lock_state = threading.Lock()
 
-        self.orbbec_K = None
         self.current_pan_deg = None
         self.current_tilt_deg = None
         # Phase B — ring buffer of (monotonic_time, pan_rad, tilt_rad, feedback_ok)
@@ -336,6 +301,7 @@ class FollowHeadNode(Node):
         self._perf_window_start = time.monotonic()
         self._perf_window_sec = 2.0
         self._perf_sync_count = 0
+        self._perf_last_sync_seq = 0
         self._perf_logic_count = 0
         self._perf_yolo_count = 0
         self._perf_sum = {
@@ -351,7 +317,6 @@ class FollowHeadNode(Node):
         }
 
         self.model = YOLO(str(resolve_weights(yolo_model)))
-        self.bridge = CvBridge()
 
         # Warmup: move the model onto GPU (if available) and run a single
         # dummy inference so the first real action goal doesn't eat the
@@ -400,6 +365,33 @@ class FollowHeadNode(Node):
             flush=True,
         )
 
+    def _create_camera_intake(self):
+        """Create the synchronized Orbbec intake with legacy endpoint QoS."""
+        return CameraIntake(
+            self,
+            IntakeConfig(
+                camera='orbbec',
+                color=StreamSpec(
+                    '/camera/color/image_raw',
+                    best_effort=True,
+                    qos_depth=5,
+                ),
+                depth=StreamSpec(
+                    '/camera/depth/image_raw',
+                    best_effort=True,
+                    qos_depth=5,
+                ),
+                camera_info=StreamSpec(
+                    '/camera/color/camera_info',
+                    best_effort=False,
+                    qos_depth=10,
+                ),
+                sync_queue=10,
+                sync_slop_s=0.1,
+            ),
+            callback_group=self._sensor_cb_group,
+        )
+
     def _resolve_model_path(self, model_path: str) -> str:
         if os.path.isabs(model_path) and os.path.exists(model_path):
             return model_path
@@ -424,13 +416,6 @@ class FollowHeadNode(Node):
         )
         return model_path
 
-    def camera_info_orbbec_callback(self, info):
-        if self.orbbec_K is not None:
-            return
-        with self.lock_info:
-            self.orbbec_K = np.array(info.k).reshape((3, 3))
-        self.get_logger().info('Orbbec camera intrinsic matrix has been set.')
-
     def pan_tilt_state_callback(self, msg: PanTiltState):
         with self.lock_state:
             self.current_pan_deg = float(np.rad2deg(msg.pan_rad))
@@ -444,17 +429,6 @@ class FollowHeadNode(Node):
                 ),
             )
 
-    def img_orbbec_callback(self, image_msg, depth_msg):
-        while not self.lock_msg.acquire(timeout=0.1):
-            self.get_logger().debug(
-                'Waiting for lock to process new image/depth messages...',
-            )
-        self.recent_img = image_msg
-        self.recent_depth_msg = depth_msg
-        self.recent_header = image_msg.header
-        self._perf_sync_count += 1
-        self.lock_msg.release()
-
     def follow_head_logic(self):
         self.get_logger().debug('Follow Head logic initiated.')
         self._perf_logic_count += 1
@@ -462,24 +436,20 @@ class FollowHeadNode(Node):
 
         _total_t0 = time.perf_counter()
 
-        while not self.lock_msg.acquire(timeout=0.1):
-            self.get_logger().debug('Waiting for lock to process follow head logic...')
-        if self.recent_img is None or self.recent_depth_msg is None:
-            self.lock_msg.release()
+        bundle = self.camera_intake.latest_new(self.last_used_seq)
+        if bundle is None:
             self._perf_early['no_msg'] += 1
             self.get_logger().warn('No image or depth received yet.')
             return None, 'No image or depth received yet.'
+        if bundle is NO_NEW_FRAME:
+            self._perf_early['already_used'] += 1
+            return None, f'image already used (seq: {self.last_used_seq})'
 
-        recent_img = self.recent_img
-        recent_depth_msg = self.recent_depth_msg
-        recent_header = self.recent_header
-        self.lock_msg.release()
-
-        if self.last_used_header:
-            if self.last_used_header == recent_header:
-                self._perf_early['already_used'] += 1
-                return None, f'image already used (header: {self.last_used_header})'
-            self.get_logger().debug(f'Using new image with header: {recent_header}')
+        self._perf_sync_count += max(
+            0, bundle.seq - self._perf_last_sync_seq
+        )
+        self._perf_last_sync_seq = bundle.seq
+        self.get_logger().debug(f'Using new image with seq: {bundle.seq}')
 
         # Enforce a minimum detection interval (5 Hz cap) so YOLO does not
         # saturate the CPU/GPU at the image-sync rate. Detection runs even
@@ -492,7 +462,7 @@ class FollowHeadNode(Node):
             and (now_mono - self._last_detection_time)
             < self.min_detection_interval_sec
         ):
-            self.last_used_header = recent_header
+            self.last_used_seq = bundle.seq
             remaining = (
                 self.min_detection_interval_sec
                 - (now_mono - self._last_detection_time)
@@ -500,15 +470,18 @@ class FollowHeadNode(Node):
             self._perf_early['min_interval'] += 1
             return None, f'Waiting {remaining:.2f}s for min detection interval.'
 
-        self.last_used_header = recent_header
+        self.last_used_seq = bundle.seq
 
-        color_img = self.bridge.imgmsg_to_cv2(recent_img, desired_encoding='bgr8')
+        color_img = bundle.color_bgr()
         # Blur gate removed — Orbbec frames are clean enough that a Laplacian
         # variance threshold drops more good frames than bad. YOLO handles
         # mild blur on its own.
         self._last_detection_time = now_mono
         _pc_t0 = time.perf_counter()
-        points, validmask_points = self._depth_image_to_points(recent_depth_msg)
+        points, validmask_points = follow_head_optical_points(
+            bundle.depth_m(),
+            bundle.K,
+        )
         self._perf_sum['pc_parse'] += time.perf_counter() - _pc_t0
 
         h, w, _ = color_img.shape
@@ -1119,45 +1092,6 @@ class FollowHeadNode(Node):
         gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
         return variance < self.blur_threshold
-
-    def _depth_image_to_points(self, depth_msg: Image):
-        """Unproject a 16UC1 aligned depth image to (H, W, 3) xyz + valid mask.
-
-        Mirrors ``person_track_node._depth_image_to_points`` — depth is
-        registered to color (Orbbec ``depth_registration:=true``), so the
-        color intrinsics (``self.orbbec_K``) apply directly. Cached meshgrid
-        keeps the per-tick cost ~1-3 ms versus 30-80 ms for the old
-        PointCloud2 reproject-and-scatter path.
-        """
-        h, w = int(depth_msg.height), int(depth_msg.width)
-        # Orbbec Femto Bolt default: 16UC1, millimeters.
-        depth = (
-            np.frombuffer(depth_msg.data, dtype=np.uint16)
-            .reshape(h, w)
-            .astype(np.float32)
-            * 0.001
-        )
-        # Valid-depth band: reuse the same "any positive depth" semantics the
-        # old path used (> 1e-3 m). Also cap at a generous upper bound so
-        # stray max-range values don't poison the median.
-        valid_mask = (depth > 1e-3) & (depth < 10.0)
-
-        if self._uv_cache is None or self._uv_cache[0] != (h, w):
-            u, v = np.meshgrid(
-                np.arange(w, dtype=np.float32),
-                np.arange(h, dtype=np.float32),
-            )
-            self._uv_cache = ((h, w), u, v)
-        _, u, v = self._uv_cache
-
-        K = self.orbbec_K
-        fx, fy = float(K[0, 0]), float(K[1, 1])
-        cx, cy = float(K[0, 2]), float(K[1, 2])
-        z = depth
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-        points = np.stack([x, y, z], axis=-1)
-        return points, valid_mask
 
     def _depth_in_mask_median(self, points, region_mask_bool):
         """Median (x, y, z) of valid-depth pixels under a boolean (H, W) mask.

@@ -58,9 +58,14 @@ add_executable(camera_server_node src/camera_server_main.cpp)
 target_link_libraries(camera_server_node camera_server_component)
 ament_target_dependencies(camera_server_node rclcpp)
 
+add_executable(camera_compat_bridge src/compat_bridge_node.cpp)
+ament_target_dependencies(camera_compat_bridge
+  rclcpp sensor_msgs tinker_vision_msgs_26)
+
 install(TARGETS camera_server_core camera_server_component
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 install(TARGETS camera_server_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS camera_compat_bridge DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 
 if(BUILD_TESTING)

@@ -18,7 +18,7 @@ import ast
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import openai
 
@@ -26,23 +26,40 @@ from ._env import base_url, require_api_key, resolve_qwen_target
 from ._vlm_text import strip_fences
 
 _SYS_PROMPT = (
-    "You are a precise, conservative visual object detector. You are given ONE "
-    "photo of a scene and a list of candidate object names. Return a JSON array "
-    "containing only the candidate names -- copied verbatim from the list -- "
+    "You are a precise, conservative visual object detector. You are "
+    "given ONE photo of a scene and a list of candidate object names. Return "
+    "a JSON array containing only the candidate names -- copied verbatim "
+    "from the list -- "
     "that are UNMISTAKABLY present and clearly visible in the photo. "
+    "SCOPE: only report objects that are placed ON TOP OF THE CIRCLE "
+    "TABLE -- the round (circular) table in the scene. Completely ignore "
+    "any object that is not resting on the surface of that circular table: "
+    "objects on the "
+    "floor, on other tables, shelves, chairs or counters, held by a person, "
+    "or anywhere in the background must NOT be included, even if they "
+    "clearly match a candidate name. If no circular table is visible, "
+    "return []. "
     "Bias strongly toward precision over recall: a missed object (false "
-    "negative) is much better than a wrong one (false positive). If you are not "
-    "certain an object is actually there -- it is ambiguous, heavily occluded, "
-    "blurry, only partially visible, or you would be guessing from context -- "
+    "negative) is much better than a wrong one (false positive). If you "
+    "are not certain an object is actually there -- it is ambiguous, "
+    "heavily occluded, blurry, only partially visible, or you would be "
+    "guessing from context -- "
     "DO NOT include it. Report only what you can actually see, never what is "
     "merely plausible or expected. Never include a name that is not in the "
-    "list. If none are clearly present, return []. Output ONLY the JSON array, "
-    "nothing else."
+    "list. If none are clearly present, return []. Output ONLY the JSON "
+    "array, nothing else."
 )
 
 
 class ScanVlmError(RuntimeError):
     """Hard failure: missing key, unknown provider, or every attempt failed."""
+
+
+def _raise_if_aborted(
+    should_abort: Optional[Callable[[], bool]],
+) -> None:
+    if should_abort is not None and should_abort():
+        raise ScanVlmError('scan VLM request aborted')
 
 
 @dataclass
@@ -88,16 +105,21 @@ def request_scan_labels(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> ScanVlmResult:
     """Single-provider labels-scan call with parse retry.
 
     An API exception or unparseable (non-list) response consumes one of
-    max_retries attempts. Raises ScanVlmError on missing key, unknown provider,
-    or exhausting every attempt. An empty (but valid) list is a success.
+    max_retries attempts. Raises ScanVlmError on missing key, unknown
+    provider, or exhausting every attempt. An empty (but valid) list is a
+    success.
     """
     if provider == 'qwen':
         try:
-            b_url, api_key, model = resolve_qwen_target(qwen_api_backend, model)
+            b_url, api_key, model = resolve_qwen_target(
+                qwen_api_backend,
+                model,
+            )
         except RuntimeError as exc:
             raise ScanVlmError(str(exc)) from exc
     elif provider == 'gemini':
@@ -107,9 +129,15 @@ def request_scan_labels(
             raise ScanVlmError(str(exc)) from exc
         b_url = base_url()
     else:
-        raise ScanVlmError(f"unknown provider {provider!r} (expected qwen|gemini)")
+        raise ScanVlmError(
+            f"unknown provider {provider!r} (expected qwen|gemini)"
+        )
 
-    client = openai.OpenAI(api_key=api_key, base_url=b_url)
+    client = openai.OpenAI(
+        api_key=api_key,
+        base_url=b_url,
+        max_retries=0,
+    )
     messages = [
         {'role': 'system', 'content': _SYS_PROMPT},
         {'role': 'user', 'content': [
@@ -124,6 +152,7 @@ def request_scan_labels(
     last_error: Optional[str] = None
     try:
         for attempt in range(1, max_retries + 1):
+            _raise_if_aborted(should_abort)
             try:
                 completion = client.with_options(
                     timeout=timeout_s).chat.completions.create(
@@ -134,6 +163,7 @@ def request_scan_labels(
                     logger.warning(
                         f'[{provider}] scan VLM call failed '
                         f'(attempt {attempt}/{max_retries}): {exc}')
+                _raise_if_aborted(should_abort)
                 if attempt < max_retries:
                     time.sleep(0.5 * (2 ** (attempt - 1)))
                 continue
@@ -149,12 +179,15 @@ def request_scan_labels(
                     logger.info(
                         f'[{provider}] parse failed '
                         f'(attempt {attempt}/{max_retries}): {exc}')
+                _raise_if_aborted(should_abort)
                 continue
             return ScanVlmResult(
                 labels=labels, provider=provider,
                 elapsed_s=time.perf_counter() - t0)
         raise ScanVlmError(
-            f'[{provider}] exhausted {max_retries} attempts; last={last_error}')
+            f'[{provider}] exhausted {max_retries} attempts; '
+            f'last={last_error}'
+        )
     finally:
         try:
             client.close()
@@ -171,26 +204,32 @@ def request_scan_labels_chain(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> ScanVlmResult:
     """Try (provider, model) pairs in order; return the first success.
 
-    Errors-only fallthrough: a ScanVlmError (exhausted attempts / missing key)
-    falls through to the next provider. Raises ScanVlmError if every provider
-    fails, or if provider_models is empty.
+    Errors-only fallthrough: a ScanVlmError (exhausted attempts / missing
+    key) falls through to the next provider. Raises ScanVlmError if every
+    provider fails, or if provider_models is empty.
     """
     errors = []
     for provider, model in provider_models:
+        _raise_if_aborted(should_abort)
         try:
             return request_scan_labels(
                 image_url, candidates, provider=provider, model=model,
                 qwen_api_backend=qwen_api_backend, timeout_s=timeout_s,
                 max_retries=max_retries, logger=logger,
+                should_abort=should_abort,
             )
         except ScanVlmError as exc:
+            _raise_if_aborted(should_abort)
             errors.append(f'{provider}: {exc}')
             if logger is not None:
                 logger.warning(
-                    f'scan VLM provider {provider} failed: {exc}; trying next.')
+                    f'scan VLM provider {provider} failed: {exc}; '
+                    f'trying next.'
+                )
     raise ScanVlmError(
         'all providers failed: '
         + (' | '.join(errors) or 'no providers configured'))

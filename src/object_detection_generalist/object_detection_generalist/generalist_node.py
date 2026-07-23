@@ -43,7 +43,6 @@ import time
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.parameter import Parameter
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header
@@ -52,6 +51,7 @@ from tinker_vision_msgs_26.msg import Object
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist
 
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
+from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
 from vision_util.weights_cache import resolve_weights
 
 from .sam_mask import SamPredictor
@@ -104,32 +104,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # thread-safe; serialize segmentation calls.
         self._sam_lock = threading.Lock()
 
-        # Latest raw orbbec depth Image (native camera resolution). The
-        # parent class only subscribes to the registered PointCloud2, so to
-        # answer `return_depth_image=True` for orbbec at raw size we keep a
-        # separate sub on the camera's depth-Image topic. No sync with the
-        # rgb/pc pair — we just hand back whatever arrived most recently.
-        self._orbbec_depth_image_lock = threading.Lock()
-        self._latest_orbbec_depth_image: Image | None = None
-        if 'orbbec' in self.camera_types:
-            depth_image_topic = (
-                self.get_parameter('orbbec_depth_image_topic').value
-            )
-            qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1,
-            )
-            self._orbbec_depth_image_sub = self.create_subscription(
-                Image,
-                depth_image_topic,
-                self._orbbec_depth_image_callback,
-                qos_profile=qos,
-                callback_group=MutuallyExclusiveCallbackGroup(),
-            )
-            self.get_logger().info(
-                f'Subscribed to orbbec depth Image on {depth_image_topic}'
-            )
+        # Keep the response depth stream independent of the inherited RGB-D
+        # ATS. It intentionally returns the latest depth message regardless
+        # of which pair was used for detection.
+        self._orbbec_response_depth_intake: CameraIntake | None = None
+        self._init_orbbec_response_depth_intake()
 
         # Cache the pretrained YOLO class-name set for O(1) prompt lookup
         # in the service callback. Names map is fixed once the model is
@@ -428,13 +407,21 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         if request.return_depth_image:
             # Raw depth Image at native resolution — no resize/processing.
             # Realsense: pulled from the synced rgb+depth pair.
-            # Orbbec: synced sub is PointCloud2, so we use the most recent
-            # message from the separate raw-depth-Image sub instead.
+            # Orbbec: use the most recent message from the independent
+            # depth-only response intake, without synchronizing it to RGB.
             if camera == 'realsense':
                 response.depth_image = rec_msg[1]
             else:
-                with self._orbbec_depth_image_lock:
-                    latest = self._latest_orbbec_depth_image
+                depth_bundle = (
+                    self._orbbec_response_depth_intake.latest()
+                    if self._orbbec_response_depth_intake is not None
+                    else None
+                )
+                latest = (
+                    depth_bundle.depth_msg
+                    if depth_bundle is not None
+                    else None
+                )
                 if latest is not None:
                     response.depth_image = copy.deepcopy(latest)
                 else:
@@ -941,9 +928,37 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
     # --- helpers ---------------------------------------------------------
 
+    def _init_orbbec_response_depth_intake(self) -> None:
+        if 'orbbec' not in self.camera_types:
+            return
+        depth_image_topic = self.get_parameter(
+            'orbbec_depth_image_topic'
+        ).value
+        self._orbbec_response_depth_intake = CameraIntake(
+            self,
+            IntakeConfig(
+                camera='orbbec_response_depth',
+                depth=StreamSpec(
+                    depth_image_topic,
+                    best_effort=True,
+                    qos_depth=1,
+                ),
+                age_source='recv',
+            ),
+            callback_group=MutuallyExclusiveCallbackGroup(),
+            bridge=self.bridge,
+        )
+        self._orbbec_depth_image_sub = (
+            self._orbbec_response_depth_intake._subscriptions[0]
+        )
+        self.get_logger().info(
+            f'Subscribed to orbbec depth Image on {depth_image_topic}'
+        )
+
     def _orbbec_depth_image_callback(self, msg: Image) -> None:
-        with self._orbbec_depth_image_lock:
-            self._latest_orbbec_depth_image = msg
+        """Compatibility callback forwarding to the response-depth intake."""
+        if self._orbbec_response_depth_intake is not None:
+            self._orbbec_response_depth_intake._depth_callback(msg)
 
     def _warn_if_depth_mismatch(self, rgb_h: int, rgb_w: int,
                                  response, camera: str) -> None:
@@ -980,20 +995,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         return 'orbbec'
 
     def _wait_for_recent_frame(self, camera: str):
-        call_time = self.get_clock().now()
-        for _ in range(self.sync_wait_time_limit):
-            with self.lock_msg:
-                recent_time = self.recent_publish_time[camera]
-                rec_msg_ref = self.recent_sync_msg.get(camera)
-            if recent_time is None or (
-                (call_time - recent_time).nanoseconds / 1e9
-                > self.img_sync_thres
-            ):
-                time.sleep(0.1)
-                continue
-            with self.lock_msg:
-                return copy.deepcopy(self.recent_sync_msg.get(camera))
-        return None
+        return super()._wait_for_recent_frame(camera)
 
     def _get_intrinsic(self, camera: str):
         with self.lock_info:

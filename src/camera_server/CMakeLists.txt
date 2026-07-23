@@ -25,12 +25,14 @@ find_package(tinker_vision_msgs_26 REQUIRED)
 # archive to be linked into the shared component added in a later task.
 add_library(camera_server_core
   src/frame_store.cpp
+  src/deprojector.cpp
 )
 set_target_properties(camera_server_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(camera_server_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(camera_server_core sensor_msgs)
+  $<INSTALL_INTERFACE:include>
+  ${sensor_msgs_INCLUDE_DIRS})
+target_link_libraries(camera_server_core PUBLIC Eigen3::Eigen)
 
 install(TARGETS camera_server_core
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
@@ -40,6 +42,9 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_frame_store test/test_frame_store.cpp)
   target_link_libraries(test_frame_store camera_server_core)
+
+  ament_add_gtest(test_deprojector test/test_deprojector.cpp)
+  target_link_libraries(test_deprojector camera_server_core)
 endif()
 
 ament_package()

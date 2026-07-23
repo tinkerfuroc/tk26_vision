@@ -155,7 +155,7 @@ Semantics:
 ```
 uint32 stride              # pixel stride; 0 or 1 = full resolution
 bool include_color         # true => XYZRGB, false => XYZ
-string target_frame        # empty => native optical frame; else transformed at pair stamp
+string target_frame        # empty => native optical frame; else transformed at depth stamp
 float32 max_age_sec
 builtin_interfaces/Time captured_after
 float32 wait_timeout_sec
@@ -176,9 +176,11 @@ sensor_msgs/PointCloud2 points
 Deprojected **in C++, on demand** from the cached depth + intrinsics
 (precomputed per-intrinsics xy-table, invalidated on intrinsics change) —
 this absorbs `get_orbbec_pc` (CUDA Python) and `get_point_cloud` (Python).
-`target_frame` transforms during packing with the frame-stamped transform —
-fixing, for future migrated callers, the latest-time cloud transforms in
-`pick_and_place::pc_proc`. If TF at stamp fails: `TF_FAIL`, no cloud.
+`target_frame` transforms during packing with the transform at the returned
+**depth image's header stamp**; the response and cloud headers use that same
+depth stamp. This fixes, for future migrated callers, the latest-time cloud
+transforms in `pick_and_place::pc_proc`. If TF at the depth stamp fails:
+`TF_FAIL`, no cloud.
 
 ### 4.3 `srv/GetTransform.srv`
 
@@ -252,19 +254,28 @@ the 0.05 s variants are documented to stop firing below ~10 Hz camera rate).
   largest existing consumer need: `seat_recommend_bbox`'s VLM round-trip),
   `tf2_ros::TransformListener` on its own dedicated thread/node so TF
   ingestion never competes with service load.
-- Snapshot/cloud lookups happen at the **pair stamp** with per-lookup timeout
-  param (`tf_lookup_timeout_sec`, default 0.1).
+- Snapshot lookups happen at the returned pair stamp. Point-cloud lookups
+  happen specifically at `depth.header.stamp`, which is also the point-cloud
+  response/header stamp. Each uses the per-lookup timeout param
+  (`tf_lookup_timeout_sec`, default 0.1).
 
 ### 5.5 Deprojection
 
-- CPU, single pass over the depth image: `z = depth(u,v)` (`16UC1` mm → m, or
-  `32FC1` m — both encodings handled, as anygrasp does today),
+- Precondition: input depth is already registered and rectified to color, and
+  optional color has exactly the same width/height. The server does not apply
+  OpenCV distortion correction or cross-camera/resolution registration.
+- CPU, single pass over the depth image: `z = depth(u,v)` (`16UC1`/`mono16`
+  mm → m, or `32FC1` m; little- and big-endian input are handled),
   `x = (u-cx)/fx * z`, `y = (v-cy)/fy * z` via the cached xy-table; optional
   RGB pack from the synced color image; optional stride; optional in-pass
   transform by the frame-stamped Eigen isometry.
-- Output: unorganized `PointCloud2`, `x,y,z[,rgb]` float32 fields, invalid
-  (z==0/NaN) pixels dropped — matching `get_orbbec_pc` output shape; parity
-  verified in T2.
+- Dimensions, row strides, backing buffers, intrinsics, and allocation/count
+  arithmetic are validated before access. Non-finite/non-positive depths are
+  dropped.
+- Output: unorganized, deterministic little-endian `PointCloud2`,
+  `x,y,z[,rgb]` float32 fields with exact 12/16-byte point steps and
+  `is_dense=true` — matching `get_orbbec_pc` output shape; parity verified in
+  T2.
 - Estimated cost: head 640×576 ≈ 0.37 M px, single-digit ms; wrist 1280×720 ≈
   0.92 M px, ~10–25 ms. Well inside the 10 s vision-call budget.
 

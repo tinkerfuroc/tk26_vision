@@ -67,6 +67,7 @@ install(TARGETS camera_server_core camera_server_component
 install(TARGETS camera_server_node DESTINATION lib/${PROJECT_NAME})
 install(TARGETS camera_compat_bridge DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

@@ -3,6 +3,7 @@
 Brings up, in one command:
   - the pan-tilt head (controller + state_publisher + URDF RSP),
   - the Orbbec Femto Bolt (the tk26-tuned overrides), and
+  - the head camera server (on-demand snapshot / point-cloud / TF services),
   - FoundationStereo with its streaming depth publisher ENABLED.
 
 RealSense is deliberately NOT here — the manipulation launch (grasp_bringup /
@@ -46,6 +47,7 @@ from launch.actions import (
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -56,6 +58,14 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('enable_pan_tilt', default_value='true'),
         DeclareLaunchArgument('enable_orbbec', default_value='true'),
+        DeclareLaunchArgument(
+            'enable_camera_server', default_value='true',
+            description=(
+                'Launch the head camera server. This is additive and uses '
+                'new service names; disable it only when another launch owns '
+                'the head_camera_server node.'
+            ),
+        ),
         DeclareLaunchArgument(
             'enable_ffs', default_value='true',
             description=(
@@ -155,4 +165,20 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('enable_ffs')),
     )
 
-    return LaunchDescription(args + [set_dds, pan_tilt, orbbec, ffs])
+    head_camera_server = Node(
+        package='camera_server',
+        executable='camera_server_node',
+        name='head_camera_server',
+        output='screen',
+        parameters=[{
+            'color_topic': '/camera/color/image_raw',
+            'depth_topic': '/camera/depth/image_raw',
+            'color_info_topic': '/camera/color/camera_info',
+            'depth_info_topic': '/camera/color/camera_info',
+        }],
+        condition=IfCondition(LaunchConfiguration('enable_camera_server')),
+    )
+
+    return LaunchDescription(
+        args + [set_dds, pan_tilt, orbbec, head_camera_server, ffs]
+    )

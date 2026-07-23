@@ -18,6 +18,7 @@
   <exec_depend>pan_tilt</exec_depend>
   <exec_depend>orbbec_camera</exec_depend>
   <exec_depend>foundation_stereo</exec_depend>
+  <exec_depend>camera_server</exec_depend>
 
   <!-- Perception layer -->
   <exec_depend>object_detection_new</exec_depend>

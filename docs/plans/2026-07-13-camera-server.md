@@ -2058,6 +2058,14 @@ git commit -m "feat(camera_server): legacy compat bridge (get_image/get_point_cl
 - Consumes: executables `camera_server_node`, `camera_compat_bridge` (Tasks 4–6).
 - Produces: launchable instances `wrist_camera_server` / `head_camera_server`; `vision_driver.launch.py` arg `enable_camera_server` (default `'true'`) launching the head instance; `enable_legacy_services` (default `'false'`) gating the bridge in the package launch only.
 
+Launch correction: `vision_driver.launch.py` must import
+`launch_ros.actions.Node`, and `vision_bringup/package.xml` must declare
+`<exec_depend>camera_server</exec_depend>`. Both head launch paths use
+`/camera/color/camera_info` for registered Orbbec depth, matching the legacy
+deprojection path. The standalone launch and `vision_driver` launch are
+mutually exclusive when both enable the head server; the bridge must remain
+disabled while legacy Python services own the root names.
+
 - [ ] **Step 1: Write camera_server.launch.py**
 
 ```python

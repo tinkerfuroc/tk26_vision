@@ -1,0 +1,15 @@
+# Time-correct transform lookup against the server's warm long-cache buffer.
+# Spec: docs/specs/2026-07-13-camera-server-design.md §4.3
+
+string target_frame
+string source_frame
+builtin_interfaces/Time lookup_time     # zero => latest available
+float32 timeout_sec                     # capped by server param (default cap 2.0)
+---
+int32 STATUS_OK=0
+int32 STATUS_UNAVAILABLE=1
+int32 STATUS_BAD_REQUEST=5
+
+int32 status
+string error_msg
+geometry_msgs/TransformStamped transform

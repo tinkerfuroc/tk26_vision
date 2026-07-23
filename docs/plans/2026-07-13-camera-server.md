@@ -82,11 +82,6 @@ Note: the spec's `GetTransform` request field `time` is renamed `lookup_time` (b
 ```
 # On-demand synced camera frame pair + frame-stamped transforms.
 # Spec: docs/specs/2026-07-13-camera-server-design.md §4.1
-int32 STATUS_OK=0
-int32 STATUS_NO_DATA=1
-int32 STATUS_STALE=2
-int32 STATUS_WAIT_TIMEOUT=3
-int32 STATUS_BAD_REQUEST=5
 
 # Streams to include (payload control; server caches everything regardless).
 bool want_color true
@@ -102,6 +97,12 @@ float32 max_age_sec                      # >0: STALE if cached pair older
 builtin_interfaces/Time captured_after   # non-zero: wait for pair stamped >= this
 float32 wait_timeout_sec                 # bound on the wait; 0 => server default
 ---
+int32 STATUS_OK=0
+int32 STATUS_NO_DATA=1
+int32 STATUS_STALE=2
+int32 STATUS_WAIT_TIMEOUT=3
+int32 STATUS_BAD_REQUEST=5
+
 int32 status
 string error_msg
 builtin_interfaces/Time stamp            # stamp of the synced (color, depth) pair
@@ -119,12 +120,6 @@ bool[] transforms_ok
 ```
 # On-demand deprojected point cloud from the latest synced pair.
 # Spec: docs/specs/2026-07-13-camera-server-design.md §4.2
-int32 STATUS_OK=0
-int32 STATUS_NO_DATA=1
-int32 STATUS_STALE=2
-int32 STATUS_WAIT_TIMEOUT=3
-int32 STATUS_TF_FAIL=4
-int32 STATUS_BAD_REQUEST=5
 
 uint32 stride              # pixel stride; 0 or 1 = full resolution
 bool include_color         # true => XYZRGB, false => XYZ
@@ -133,6 +128,13 @@ float32 max_age_sec
 builtin_interfaces/Time captured_after
 float32 wait_timeout_sec
 ---
+int32 STATUS_OK=0
+int32 STATUS_NO_DATA=1
+int32 STATUS_STALE=2
+int32 STATUS_WAIT_TIMEOUT=3
+int32 STATUS_TF_FAIL=4
+int32 STATUS_BAD_REQUEST=5
+
 int32 status
 string error_msg
 builtin_interfaces/Time stamp
@@ -144,15 +146,16 @@ sensor_msgs/PointCloud2 points
 ```
 # Time-correct transform lookup against the server's warm long-cache buffer.
 # Spec: docs/specs/2026-07-13-camera-server-design.md §4.3
-int32 STATUS_OK=0
-int32 STATUS_UNAVAILABLE=1
-int32 STATUS_BAD_REQUEST=5
 
 string target_frame
 string source_frame
 builtin_interfaces/Time lookup_time     # zero => latest available
 float32 timeout_sec                     # capped by server param (default cap 2.0)
 ---
+int32 STATUS_OK=0
+int32 STATUS_UNAVAILABLE=1
+int32 STATUS_BAD_REQUEST=5
+
 int32 status
 string error_msg
 geometry_msgs/TransformStamped transform

@@ -122,6 +122,12 @@ float32 max_age_sec        # >0: fail with STALE if cached pair older than this
 builtin_interfaces/Time captured_after   # non-zero: wait for pair stamped >= this
 float32 wait_timeout_sec   # bound on the captured_after wait (default 0 => server default)
 ---
+int32 STATUS_OK=0
+int32 STATUS_NO_DATA=1
+int32 STATUS_STALE=2
+int32 STATUS_WAIT_TIMEOUT=3
+int32 STATUS_BAD_REQUEST=5
+
 int32 status               # 0 OK; 1 NO_DATA; 2 STALE; 3 WAIT_TIMEOUT; 5 BAD_REQUEST
 string error_msg
 builtin_interfaces/Time stamp   # stamp of the synced (color, depth) pair
@@ -154,6 +160,13 @@ float32 max_age_sec
 builtin_interfaces/Time captured_after
 float32 wait_timeout_sec
 ---
+int32 STATUS_OK=0
+int32 STATUS_NO_DATA=1
+int32 STATUS_STALE=2
+int32 STATUS_WAIT_TIMEOUT=3
+int32 STATUS_TF_FAIL=4
+int32 STATUS_BAD_REQUEST=5
+
 int32 status               # 0 OK; 1 NO_DATA; 2 STALE; 3 WAIT_TIMEOUT; 4 TF_FAIL; 5 BAD_REQUEST
 string error_msg
 builtin_interfaces/Time stamp
@@ -172,9 +185,13 @@ fixing, for future migrated callers, the latest-time cloud transforms in
 ```
 string target_frame
 string source_frame
-builtin_interfaces/Time time    # zero => latest available
+builtin_interfaces/Time lookup_time    # zero => latest available
 float32 timeout_sec             # capped by server param (default cap 2.0)
 ---
+int32 STATUS_OK=0
+int32 STATUS_UNAVAILABLE=1
+int32 STATUS_BAD_REQUEST=5
+
 int32 status               # 0 OK; 1 UNAVAILABLE; 5 BAD_REQUEST
 string error_msg
 geometry_msgs/TransformStamped transform

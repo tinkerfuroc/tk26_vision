@@ -11,6 +11,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -22,6 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Objects.msg"
   "msg/PanTiltCtrl.msg"
   "msg/PanTiltState.msg"
+  "msg/CameraServerStatus.msg"
   "srv/DetectWaving.srv"
   "srv/DoorDetection.srv"
   "srv/FaceRegister.srv"
@@ -29,6 +31,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/FeatureMatching.srv"
   "srv/FollowHead.srv"
   "srv/FoundationStereoDepth.srv"
+  "srv/GetCameraSnapshot.srv"
+  "srv/GetCameraPointCloud.srv"
+  "srv/GetTransform.srv"
   "srv/GetImage.srv"
   "srv/GetPointCloud.srv"
   "srv/GetOrbbecPC.srv"
@@ -52,7 +57,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MonocularDepthPC.action"
   "action/SpotOnShelf.action"
   "action/TrackPerson.action"
-  DEPENDENCIES geometry_msgs std_msgs sensor_msgs
+  DEPENDENCIES geometry_msgs std_msgs sensor_msgs builtin_interfaces
 )
 
 if(BUILD_TESTING)

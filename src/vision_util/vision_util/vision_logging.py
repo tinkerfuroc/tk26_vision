@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from typing import Iterable, Mapping
 
@@ -105,6 +106,7 @@ class VisionLogger:
         self._enabled = bool(enabled)
         self._base = base_folder or 'vision_log'
         self._run_dir: str | None = None
+        self._run_dir_lock = threading.Lock()
         derived_tag = tag
         if derived_tag is None and node is not None:
             try:
@@ -174,11 +176,12 @@ class VisionLogger:
         return run_ts
 
     def _ensure_run_dir(self) -> str:
-        if self._run_dir is None:
-            run_ts = self._resolve_run_ts()
-            self._run_dir = os.path.join(self._base, run_ts)
-            os.makedirs(self._run_dir, exist_ok=True)
-        return self._run_dir
+        with self._run_dir_lock:
+            if self._run_dir is None:
+                run_ts = self._resolve_run_ts()
+                self._run_dir = os.path.join(self._base, run_ts)
+                os.makedirs(self._run_dir, exist_ok=True)
+            return self._run_dir
 
     def _compose_path(self, run_dir: str, ts: str, kind: str, ext: str,
                       branch: str = '') -> str:

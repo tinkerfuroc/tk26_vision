@@ -28,18 +28,14 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PointStamped
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from tf2_geometry_msgs import do_transform_point
-from tf2_ros import (
-    Buffer,
-    ConnectivityException,
-    ExtrapolationException,
-    LookupException,
-    TransformListener,
-)
-from tinker_vision_msgs_26.srv import FeatureMatching
+from tinker_vision_msgs_26.action import FeatureMatching
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
+from vision_util.action_queue import QueuedActionGate
+from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
 
 from ._env import (
@@ -58,6 +54,14 @@ MATCH_EVIDENCE = (
     'hair color and length, gender, apparent age, glasses, and '
     'upper-body clothing color and type'
 )
+
+DETECTION_DELAY_LIMIT_S = 60.0
+CANCEL_STATE_TIMEOUT_S = 0.1
+CANCEL_STATE_POLL_S = 0.01
+
+
+class _GoalCanceled(Exception):
+    """Internal control flow for cooperative action cancellation."""
 
 
 def build_matching_sys_prompt(n_cand: int, n_feats: int, text_only: bool) -> str:
@@ -143,10 +147,7 @@ class FeatureMatchingService(Node):
         # — 2 providers x vlm_max_retries x vlm_timeout_s + backoff
         # (2 x 3 x 20 + 3 ≈ 125 s at defaults); 180 s keeps the successful-
         # Qwen-fallback path from falling off the back of the buffer.
-        self.tf_buffer = Buffer(
-            cache_time=rclpy.duration.Duration(seconds=180.0)
-        )
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._transform_helper = TransformHelper(self, cache_time_s=180.0)
 
         require_api_key()  # fail fast at init if the primary Gemini key is missing
         self._match_provider_chain = self._resolve_match_provider_chain()
@@ -155,16 +156,24 @@ class FeatureMatchingService(Node):
             ObjectDetection, detection_service, callback_group=self.client_cb_group,
         )
 
-        self.matching_srv = self.create_service(
-            FeatureMatching,
-            'feature_matching_service',
-            self.feature_matching_srv_callback,
-            callback_group=self.server_cb_group,
-        )
+        self._action_gate = QueuedActionGate()
+        self.matching_action = self._create_matching_action()
 
         self.get_logger().info(
-            f'Feature matching service initialized (model={self.llm_model}, '
+            f'Feature matching action initialized (model={self.llm_model}, '
             f'detection_service={detection_service}).'
+        )
+
+    def _create_matching_action(self):
+        return ActionServer(
+            self,
+            FeatureMatching,
+            'feature_matching_service',
+            execute_callback=self.feature_matching_execute_callback,
+            cancel_callback=self.feature_matching_cancel_callback,
+            handle_accepted_callback=self.feature_matching_handle_accepted_callback,
+            callback_group=self.server_cb_group,
+            result_timeout=0,
         )
 
     def _resolve_match_provider_chain(self) -> list:
@@ -209,28 +218,119 @@ class FeatureMatchingService(Node):
         src_frame = det_header.frame_id
         if not target_frame or target_frame == src_frame:
             return PointStamped(header=det_header, point=point)
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                target_frame, src_frame, det_header.stamp,
-                timeout=rclpy.duration.Duration(seconds=0.1),
-            )
-        except (LookupException, ConnectivityException,
-                ExtrapolationException) as e:
+        tf = self._transform_helper.try_lookup(
+            target_frame,
+            src_frame,
+            stamp=det_header.stamp,
+            timeout_s=0.1,
+        )
+        if tf is None:
             self.get_logger().warn(
-                f'TF {src_frame} -> {target_frame} failed: {e}; '
+                f'TF {src_frame} -> {target_frame} failed; '
                 'returning detection-frame point'
             )
             return PointStamped(header=det_header, point=point)
         ps = PointStamped(header=det_header, point=point)
-        ps_out = do_transform_point(ps, tf)
+        ps_out = self._transform_helper.transform_point(ps, tf)
+        if ps_out is None:
+            self.get_logger().warn(
+                f'TF {src_frame} -> {target_frame} failed while transforming; '
+                'returning detection-frame point'
+            )
+            return ps
         ps_out.header.frame_id = target_frame
         return ps_out
 
-    async def feature_matching_srv_callback(
+    def feature_matching_handle_accepted_callback(self, goal_handle) -> None:
+        """Queue an accepted goal for serialized execution."""
+        self._action_gate.accept(goal_handle)
+
+    def feature_matching_cancel_callback(self, goal_handle):
+        """Accept cancellation and preserve intent for queued goals."""
+        self._action_gate.cancel_queued(goal_handle)
+        return CancelResponse.ACCEPT
+
+    def _should_cancel(self, goal_handle) -> bool:
+        return self._action_gate.should_cancel(goal_handle)
+
+    def _raise_if_canceled(self, goal_handle) -> None:
+        if self._should_cancel(goal_handle):
+            raise _GoalCanceled
+
+    def _publish_feedback(
         self,
-        request: FeatureMatching.Request,
-        response: FeatureMatching.Response,
+        goal_handle,
+        *,
+        stage: str,
+        message: str,
+        delay_limit: float,
+    ) -> None:
+        self._raise_if_canceled(goal_handle)
+        feedback = FeatureMatching.Feedback()
+        feedback.status = 0
+        feedback.delay_limit = float(delay_limit)
+        feedback.stage = stage
+        feedback.message = message
+        goal_handle.publish_feedback(feedback)
+
+    def _vlm_delay_limit(self) -> float:
+        retries = max(0, int(self.vlm_max_retries))
+        retry_backoff_s = sum(0.5 * (2 ** i) for i in range(max(0, retries - 1)))
+        per_provider_s = retries * max(0.0, float(self.vlm_timeout_s)) + retry_backoff_s
+        return max(1.0, len(self._match_provider_chain) * per_provider_s + 5.0)
+
+    def _canceled_result(self, goal_handle):
+        result = FeatureMatching.Result()
+        result.status = 1
+        result.error_msg = 'Feature matching canceled.'
+        result.centroids = []
+
+        deadline = time.monotonic() + CANCEL_STATE_TIMEOUT_S
+        while not bool(goal_handle.is_cancel_requested):
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                result.error_msg = (
+                    'Feature matching cancellation-state error: cancel '
+                    'request did not become visible.'
+                )
+                self.get_logger().error(result.error_msg)
+                goal_handle.abort()
+                return result
+            time.sleep(min(CANCEL_STATE_POLL_S, remaining_s))
+
+        goal_handle.canceled()
+        return result
+
+    async def feature_matching_execute_callback(self, goal_handle):
+        """Execute one queued feature-matching goal."""
+        try:
+            self._raise_if_canceled(goal_handle)
+            result = await self._run_feature_matching(goal_handle)
+            self._raise_if_canceled(goal_handle)
+        except _GoalCanceled:
+            return self._canceled_result(goal_handle)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'Unhandled feature matching failure: {exc}'
+            )
+            result = FeatureMatching.Result()
+            result.status = 1
+            result.error_msg = f'Feature matching failed: {exc}.'
+            result.centroids = []
+            goal_handle.abort()
+            return result
+        else:
+            goal_handle.succeed()
+            return result
+        finally:
+            self._action_gate.notify_finished(goal_handle)
+
+    async def _run_feature_matching(
+        self,
+        goal_handle,
     ):
+        request = goal_handle.request
+        response = FeatureMatching.Result()
         n_refs = len(request.comparison_images)
         n_feats = len(request.features)
 
@@ -275,6 +375,12 @@ class FeatureMatchingService(Node):
 
         start_time = time.time_ns()
 
+        self._publish_feedback(
+            goal_handle,
+            stage='detecting',
+            message='Detecting person candidates.',
+            delay_limit=DETECTION_DELAY_LIMIT_S,
+        )
         self.get_logger().info('Calling detection service...')
         if not self.detection_cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('Detection service unavailable.')
@@ -294,6 +400,7 @@ class FeatureMatchingService(Node):
 
         detection_future = self.detection_cli.call_async(detection_req)
         await detection_future
+        self._raise_if_canceled(goal_handle)
         detection_res = detection_future.result()
 
         self.get_logger().info('Detection service responded, processing results...')
@@ -402,6 +509,12 @@ class FeatureMatchingService(Node):
         if self.log_prompts:
             self.get_logger().info(f'text_tail: {text_tail}')
 
+        self._publish_feedback(
+            goal_handle,
+            stage='vlm_call',
+            message='Matching features against person candidates.',
+            delay_limit=self._vlm_delay_limit(),
+        )
         self.get_logger().info('Sending request to VLM...')
         result = None
         provider_used = ''
@@ -415,7 +528,9 @@ class FeatureMatchingService(Node):
                 timeout_s=self.vlm_timeout_s,
                 max_retries=self.vlm_max_retries,
                 logger=self.get_logger(),
+                should_abort=lambda: self._should_cancel(goal_handle),
             )
+            self._raise_if_canceled(goal_handle)
             result = match_res.indices
             provider_used = match_res.provider
             self.get_logger().info(
@@ -423,6 +538,7 @@ class FeatureMatchingService(Node):
                 f'Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
             )
         except MatchVlmError as exc:
+            self._raise_if_canceled(goal_handle)
             last_error = str(exc)
             self.get_logger().warn(f'VLM match failed on every provider: {exc}')
 
@@ -517,6 +633,12 @@ class FeatureMatchingService(Node):
             _emit_vision_log(None, response.status, response.error_msg)
             return response
 
+        self._publish_feedback(
+            goal_handle,
+            stage='transforming',
+            message='Transforming matched centroids.',
+            delay_limit=2.0,
+        )
         # patch_result (in _match_vlm.py) guarantees every value is in
         # [0, n_cand) — build centroids directly without per-element
         # re-validation.
@@ -550,8 +672,14 @@ def main():
     load_env()
     rclpy.init()
     feature_matching_service = FeatureMatchingService()
-    rclpy.spin(feature_matching_service)
-    rclpy.shutdown()
+    executor = MultiThreadedExecutor()
+    executor.add_node(feature_matching_service)
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        feature_matching_service.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

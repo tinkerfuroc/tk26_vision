@@ -1,5 +1,5 @@
 """Unit tests for _match_vlm.py -- the Gemini/Qwen JSON-list provider chain
-backing feature_matching_service. No network: the OpenAI client is
+backing the feature-matching action. No network: the OpenAI client is
 monkeypatched per-test, mirroring test_feature_vlm.py's approach."""
 
 from __future__ import annotations
@@ -140,6 +140,7 @@ def test_request_match_indices_returns_patched_list(monkeypatch):
     assert res.indices == [0, 1]
     assert res.provider == 'gemini'
     assert fake.last_init['base_url'] == 'https://openrouter.ai/api/v1'
+    assert fake.last_init['max_retries'] == 0
 
 
 def test_request_match_indices_qwen_uses_dashscope(monkeypatch):
@@ -251,6 +252,30 @@ def test_request_match_indices_none_content_is_retried(monkeypatch):
     assert attempts['n'] == 2
 
 
+def test_request_match_indices_abort_stops_retries_and_sleep(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'k')
+    aborted = {'value': False}
+    sleeps = []
+
+    def script(kw):
+        aborted['value'] = True
+        raise RuntimeError('transient failure')
+
+    fake = _make_fake_openai(script)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+    monkeypatch.setattr(
+        'kimi_api._match_vlm.time.sleep', lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(MatchVlmError, match='aborted'):
+        request_match_indices(
+            'sys', [], n_feats=1, n_cand=1,
+            provider='gemini', model='g', max_retries=3,
+            should_abort=lambda: aborted['value'])
+
+    assert len(fake.calls) == 1
+    assert sleeps == []
+
+
 # --- request_match_indices_chain ---
 
 def _fake_chain(monkeypatch, by_provider):
@@ -294,6 +319,26 @@ def test_chain_all_fail_raises(monkeypatch):
         request_match_indices_chain(
             'sys', [], n_feats=2, n_cand=2,
             provider_models=[('gemini', 'g'), ('qwen', 'q')])
+
+
+def test_chain_abort_stops_provider_fallthrough(monkeypatch):
+    aborted = {'value': False}
+    providers = []
+
+    def fake(sys_prompt, user_content, *, provider, model, **kw):
+        providers.append(provider)
+        aborted['value'] = True
+        raise MatchVlmError('provider failed')
+
+    monkeypatch.setattr('kimi_api._match_vlm.request_match_indices', fake)
+
+    with pytest.raises(MatchVlmError, match='aborted'):
+        request_match_indices_chain(
+            'sys', [], n_feats=2, n_cand=2,
+            provider_models=[('gemini', 'g'), ('qwen', 'q')],
+            should_abort=lambda: aborted['value'])
+
+    assert providers == ['gemini']
 
 
 def test_chain_empty_provider_models_raises():

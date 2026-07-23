@@ -7,13 +7,10 @@ centre to 3D by unprojecting the synchronized depth image at that pixel
 (mirrors `vision_track.person_track_node._depth_image_to_points`).
 Optionally TF-transforms the centroid to a caller-chosen frame.
 
-Kept separate from `feature_recognition` so the old string-only service
-stays wire-compatible for BT callers that expect
-`SeatRecommendation.srv`.
+Kept separate from `feature_recognition` so the string-only seat action
+stays wire-compatible for callers that only need the recommendation text.
 """
 
-import copy
-import threading
 import time
 
 import numpy as np
@@ -21,20 +18,31 @@ import rclpy
 import rclpy.executors
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PointStamped
-from message_filters import ApproximateTimeSynchronizer, Subscriber
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image
-from tf2_ros import Buffer, TransformException, TransformListener
-from tf2_geometry_msgs import do_transform_point
+from tinker_vision_msgs_26.action import SeatRecommendBbox
 from tinker_vision_msgs_26.msg import BoundingBox
-from tinker_vision_msgs_26.srv import SeatRecommendBbox
+from vision_util.action_queue import QueuedActionGate
+from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
 
 from ._env import load_env, require_api_key, resolve_qwen_target
 from ._seat_bbox_vlm import request_seat_bbox_chain, VlmSeatBboxError
 from ._seat_fewshot import load_fewshots
 from ._seat_vlm import VlmSeatError, request_seat_chain
+
+
+ACQUIRING_FRAME_DELAY_LIMIT_S = 2.0
+TRANSFORM_DELAY_LIMIT_S = 2.0
+JUDGING_DELAY_LIMIT_S = 5.0
+CANCEL_STATE_TIMEOUT_S = 0.1
+CANCEL_STATE_POLL_S = 0.005
+
+
+class _GoalCanceled(Exception):
+    """Internal control flow for cooperative action cancellation."""
 
 
 class SeatRecommendBboxService(Node):
@@ -214,35 +222,14 @@ class SeatRecommendBboxService(Node):
             require_api_key()
             self._provider_models = self._resolve_point_provider_chain()
 
-        self.server_cb_group = MutuallyExclusiveCallbackGroup()
-        self.camera_cb_group = MutuallyExclusiveCallbackGroup()
+        self.action_cb_group = MutuallyExclusiveCallbackGroup()
+        self.intake_cb_group = MutuallyExclusiveCallbackGroup()
 
         self.bridge = CvBridge()
-
-        self.lock_img = threading.Lock()
-        self.recent_sync = {'orbbec': None}  # (color_msg, depth_msg)
-        self.lock_info = threading.Lock()
-        self.camera_intrinsic = {'orbbec': None}
-
-        color_sub = Subscriber(
-            self, Image, image_topic, callback_group=self.camera_cb_group,
-        )
-        depth_sub = Subscriber(
-            self, Image, depth_topic, callback_group=self.camera_cb_group,
-        )
-        self._sync = ApproximateTimeSynchronizer(
-            [color_sub, depth_sub], queue_size=3, slop=0.1,
-        )
-        self._sync.registerCallback(self.sync_orbbec_callback)
-        self._color_sub = color_sub  # keep alive
-        self._depth_sub = depth_sub
-
-        self.camera_info_sub_orbbec = self.create_subscription(
-            CameraInfo,
+        self._camera_intake = self._create_camera_intake(
+            image_topic,
+            depth_topic,
             camera_info_topic,
-            self.camera_info_orbbec_callback,
-            qos_profile=10,
-            callback_group=self.camera_cb_group,
         )
 
         # VLM seat calls take 10-25 s and the TF lookup uses the depth
@@ -251,23 +238,63 @@ class SeatRecommendBboxService(Node):
         # chain's worst case — 2 providers x vlm_max_retries x vlm_timeout_s
         # + backoff (2 x 3 x 25 + 3 ≈ 155 s at defaults) — without the
         # successful-fallback path falling off the back.
-        self.tf_buffer = Buffer(
-            cache_time=rclpy.duration.Duration(seconds=180.0)
-        )
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._transform_helper = TransformHelper(self, cache_time_s=180.0)
 
-        self.seat_srv = self.create_service(
-            SeatRecommendBbox,
-            'seat_recommend_bbox_service',
-            self.seat_recommend_bbox_callback,
-            callback_group=self.server_cb_group,
-        )
+        self._action_gate = QueuedActionGate()
+        self.seat_action = self._create_seat_action()
 
         self.get_logger().info(
-            f'Seat-recommend-bbox service initialized '
+            f'Seat-recommend-bbox action initialized '
             f'(model={self.llm_model}, image={image_topic}, depth={depth_topic}, '
             f'snap={"on" if self.snap_enabled else "off"} '
             f'r={self.snap_search_radius_px}px min|ny|={self.snap_min_horizontality:.2f}).'
+        )
+
+    def _create_camera_intake(
+        self,
+        image_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+    ):
+        return CameraIntake(
+            self,
+            IntakeConfig(
+                camera='orbbec',
+                color=StreamSpec(
+                    image_topic,
+                    best_effort=False,
+                    qos_depth=10,
+                ),
+                depth=StreamSpec(
+                    depth_topic,
+                    best_effort=False,
+                    qos_depth=10,
+                ),
+                camera_info=StreamSpec(
+                    camera_info_topic,
+                    best_effort=False,
+                    qos_depth=10,
+                ),
+                sync_queue=3,
+                sync_slop_s=0.1,
+                age_source='recv',
+            ),
+            callback_group=self.intake_cb_group,
+            bridge=self.bridge,
+        )
+
+    def _create_seat_action(self):
+        return ActionServer(
+            self,
+            SeatRecommendBbox,
+            'seat_recommend_bbox_service',
+            execute_callback=self.seat_recommend_bbox_execute_callback,
+            cancel_callback=self.seat_recommend_bbox_cancel_callback,
+            handle_accepted_callback=(
+                self.seat_recommend_bbox_handle_accepted_callback
+            ),
+            callback_group=self.action_cb_group,
+            result_timeout=0,
         )
 
     def _model_for(self, provider: str) -> str:
@@ -338,15 +365,96 @@ class SeatRecommendBboxService(Node):
         )
         return chain
 
-    def camera_info_orbbec_callback(self, info):
-        self.lock_info.acquire()
-        self.camera_intrinsic['orbbec'] = info
-        self.lock_info.release()
+    def seat_recommend_bbox_handle_accepted_callback(self, goal_handle) -> None:
+        """Queue an accepted goal for serialized execution."""
+        self._action_gate.accept(goal_handle)
 
-    def sync_orbbec_callback(self, color_msg, depth_msg):
-        self.lock_img.acquire()
-        self.recent_sync['orbbec'] = (color_msg, depth_msg)
-        self.lock_img.release()
+    def seat_recommend_bbox_cancel_callback(self, goal_handle):
+        """Accept cancellation and preserve intent for queued goals."""
+        self._action_gate.cancel_queued(goal_handle)
+        return CancelResponse.ACCEPT
+
+    def _should_cancel(self, goal_handle) -> bool:
+        return self._action_gate.should_cancel(goal_handle)
+
+    def _raise_if_canceled(self, goal_handle) -> None:
+        if self._should_cancel(goal_handle):
+            raise _GoalCanceled
+
+    def _publish_feedback(
+        self,
+        goal_handle,
+        *,
+        stage: str,
+        message: str,
+        delay_limit: float,
+    ) -> None:
+        self._raise_if_canceled(goal_handle)
+        feedback = SeatRecommendBbox.Feedback()
+        feedback.status = 0
+        feedback.delay_limit = float(delay_limit)
+        feedback.stage = stage
+        feedback.message = message
+        goal_handle.publish_feedback(feedback)
+
+    def _vlm_delay_limit(self) -> float:
+        retries = max(0, int(self.vlm_max_retries))
+        retry_backoff_s = sum(
+            0.5 * (2 ** i) for i in range(max(0, retries - 1))
+        )
+        per_provider_s = (
+            retries * max(0.0, float(self.vlm_timeout_s))
+            + retry_backoff_s
+        )
+        return max(
+            1.0,
+            len(self._provider_models) * per_provider_s + 5.0,
+        )
+
+    def _canceled_result(self, goal_handle):
+        result = SeatRecommendBbox.Result()
+        result.status = 1
+        result.error_msg = 'Seat recommendation canceled.'
+        result.recommendation = ''
+
+        deadline = time.monotonic() + CANCEL_STATE_TIMEOUT_S
+        while not bool(getattr(goal_handle, 'is_cancel_requested', False)):
+            if time.monotonic() >= deadline:
+                result.error_msg = (
+                    'Seat recommendation cancellation-state error: cancel '
+                    'request did not become visible.'
+                )
+                self.get_logger().error(result.error_msg)
+                goal_handle.abort()
+                return result
+            time.sleep(CANCEL_STATE_POLL_S)
+
+        goal_handle.canceled()
+        return result
+
+    def seat_recommend_bbox_execute_callback(self, goal_handle):
+        """Execute one queued seat-bbox recommendation goal."""
+        try:
+            self._raise_if_canceled(goal_handle)
+            result = self._run_seat_recommend_bbox(goal_handle)
+            self._raise_if_canceled(goal_handle)
+        except _GoalCanceled:
+            return self._canceled_result(goal_handle)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'Unhandled seat recommendation failure: {exc}'
+            )
+            result = SeatRecommendBbox.Result()
+            result.status = 1
+            result.error_msg = f'Seat recommendation failed: {exc}.'
+            result.recommendation = ''
+            goal_handle.abort()
+            return result
+        else:
+            goal_handle.succeed()
+            return result
+        finally:
+            self._action_gate.notify_finished(goal_handle)
 
     def _fail(self, response, msg: str, *, log: bool = True):
         if log:
@@ -553,30 +661,30 @@ class SeatRecommendBboxService(Node):
 
         return cx, cy, float(self.fallback_depth_m), 'fallback'
 
-    def seat_recommend_bbox_callback(
-        self,
-        request: SeatRecommendBbox.Request,
-        response: SeatRecommendBbox.Response,
-    ):
+    def _run_seat_recommend_bbox(self, goal_handle):
+        request = goal_handle.request
+        response = SeatRecommendBbox.Result()
         start_time = time.time_ns()
 
         # 1. Latest synced frame + intrinsics.
+        self._publish_feedback(
+            goal_handle,
+            stage='acquiring_frame',
+            message='Acquiring the latest synchronized color and depth frame.',
+            delay_limit=ACQUIRING_FRAME_DELAY_LIMIT_S,
+        )
         if not any(cam in request.camera for cam in self.camera_types):
             return self._fail(response, f'Unsupported camera: {request.camera}.')
 
-        with self.lock_img:
-            synced = copy.copy(self.recent_sync['orbbec'])
-        if synced is None:
+        frame = self._camera_intake.latest()
+        if frame is None:
             return self._fail(response, f'No camera data for {request.camera}.')
-        img_msg, depth_msg = synced
-
-        with self.lock_info:
-            intrinsic = self.camera_intrinsic['orbbec']
-        if intrinsic is None:
+        if frame.K is None:
             return self._fail(response, 'No camera_info received yet.')
+        depth_msg = frame.depth_msg
 
         try:
-            color_img = self.bridge.imgmsg_to_cv2(img_msg, 'bgr8')
+            color_img = frame.color_bgr()
         except Exception as exc:  # noqa: BLE001
             return self._fail(response, f'cv_bridge conversion failed: {exc}')
 
@@ -586,31 +694,32 @@ class SeatRecommendBboxService(Node):
             f'(model={self.llm_model}, names={request.names}, features={request.features}, '
             f'target_frame={request.target_frame}, known_seats={known_seats}).'
         )
-        # if transform needed, record TF at this point for use after Gemini fishes processing
-        transform = None
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                request.target_frame,
-                depth_msg.header.frame_id,
-                depth_msg.header.stamp,
-                rclpy.duration.Duration(seconds=1.0),
-            )
-        except TransformException as exc:
+        # Snapshot the stamped transform before the long VLM call so the
+        # measurement cannot age out while providers retry or fall back.
+        self._publish_feedback(
+            goal_handle,
+            stage='transforming',
+            message='Looking up the frame-stamped target transform.',
+            delay_limit=TRANSFORM_DELAY_LIMIT_S,
+        )
+        transform = self._transform_helper.try_lookup(
+            request.target_frame,
+            depth_msg.header.frame_id,
+            stamp=depth_msg.header.stamp,
+            timeout_s=1.0,
+        )
+        if transform is None:
             self.get_logger().warn(
-                f'TF lookup failed for frame {request.target_frame}: {exc}'
+                f'TF lookup failed for frame {request.target_frame}.'
             )
             response.status = 1
-            response.error_msg = f'TF lookup failed for frame {request.target_frame}: {exc}'
+            response.error_msg = (
+                f'TF lookup failed for frame {request.target_frame}.'
+            )
             return response
 
         try:
-            # Orbbec Femto Bolt default: 16UC1 depth in millimeters.
-            depth_arr_m = (
-                np.frombuffer(depth_msg.data, dtype=np.uint16)
-                .reshape(depth_msg.height, depth_msg.width)
-                .astype(np.float32)
-                * 0.001
-            )
+            depth_arr_m = frame.depth_m()
         except Exception as exc:  # noqa: BLE001
             return self._fail(response, f'depth image decode failed: {exc}')
 
@@ -626,6 +735,12 @@ class SeatRecommendBboxService(Node):
         box_px = None
         provider_used = ''
         fewshots = None
+        self._publish_feedback(
+            goal_handle,
+            stage='vlm_call',
+            message='Selecting and localizing an empty seat.',
+            delay_limit=self._vlm_delay_limit(),
+        )
         if self.vlm_strategy == 'bbox_select':
             try:
                 sel = request_seat_bbox_chain(
@@ -638,9 +753,12 @@ class SeatRecommendBboxService(Node):
                     timeout_s=self.vlm_timeout_s,
                     max_retries=self.vlm_max_retries,
                     logger=self.get_logger(),
+                    should_abort=lambda: self._should_cancel(goal_handle),
                 )
             except VlmSeatBboxError as exc:
+                self._raise_if_canceled(goal_handle)
                 return self._fail(response, f'VLM bbox+select unavailable: {exc}')
+            self._raise_if_canceled(goal_handle)
             label = sel.label
             visible_seats = sel.seats
             vlm_elapsed = sel.elapsed_s
@@ -671,8 +789,17 @@ class SeatRecommendBboxService(Node):
                     )
                 )
             except VlmSeatError as exc:
+                self._raise_if_canceled(goal_handle)
                 return self._fail(response, f'VLM unavailable: {exc}')
+            self._raise_if_canceled(goal_handle)
             overridden_from = None
+
+        self._publish_feedback(
+            goal_handle,
+            stage='judging',
+            message='Validating the selected seat and computing its centroid.',
+            delay_limit=JUDGING_DELAY_LIMIT_S,
+        )
 
         if overridden_from:
             self.get_logger().info(
@@ -689,7 +816,7 @@ class SeatRecommendBboxService(Node):
             )
 
         # Populate the recommendation field with the short label so
-        # callers reading the srv still get a human-readable identifier.
+        # callers reading the action result still get a human-readable identifier.
         response.recommendation = label
 
         request_ctx = {
@@ -757,10 +884,10 @@ class SeatRecommendBboxService(Node):
             vlm_px = (int(point_xy[0]), int(point_xy[1]))
         log_extras['vlm_point'] = [vlm_px[0], vlm_px[1]]
 
-        fx = float(intrinsic.k[0])
-        fy = float(intrinsic.k[4])
-        px = float(intrinsic.k[2])
-        py = float(intrinsic.k[5])
+        fx = float(frame.K[0])
+        fy = float(frame.K[4])
+        px = float(frame.K[2])
+        py = float(frame.K[5])
         K = (fx, fy, px, py)
 
         # Snap the VLM point to the nearest horizontal (world-up) surface.
@@ -770,6 +897,7 @@ class SeatRecommendBboxService(Node):
         # is worse than telling the caller to retry.
         if self.snap_enabled:
             snap_res = self._snap_to_horizontal(depth_arr_m, K, vlm_px[0], vlm_px[1])
+            self._raise_if_canceled(goal_handle)
             if snap_res is None:
                 cx, cy = vlm_px
                 log_extras['snap'] = {'status': 'skipped_sparse_depth'}
@@ -854,6 +982,7 @@ class SeatRecommendBboxService(Node):
         uu, vv, z, depth_tier = self._resolve_depth_robust(
             depth_arr_m, cx, cy, bbox_xyxy,
         )
+        self._raise_if_canceled(goal_handle)
         log_extras['depth_tier'] = depth_tier
         log_extras['depth_frame'] = depth_msg.header.frame_id
         if depth_tier != 'point':
@@ -879,10 +1008,15 @@ class SeatRecommendBboxService(Node):
                 response.centroid = src
                 return response
             try:
-                transformed = do_transform_point(src, transform)
+                transformed = self._transform_helper.transform_point(
+                    src,
+                    transform,
+                )
+                if transformed is None:
+                    raise RuntimeError('point transform failed')
                 centroid_header = transformed.header
                 centroid_point = transformed.point
-            except (TransformException, Exception) as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 log_extras['event'] = 'tf_failed'
                 log_extras['centroid_3d_camera'] = [float(x), float(y), float(z)]
                 log_extras['depth_frame'] = depth_msg.header.frame_id
@@ -890,10 +1024,6 @@ class SeatRecommendBboxService(Node):
                 response.error_msg = f'TF {depth_msg.header.frame_id} -> {request.target_frame} failed: {exc}'
                 response.centroid = PointStamped(header=centroid_header, point=centroid_point)
                 return response
-                return _fail_with_log(
-                    f'TF {depth_msg.header.frame_id} -> {request.target_frame} failed: {exc}',
-                    [log_det] + extra_dets,
-                )
 
         response.centroid = PointStamped(header=centroid_header, point=centroid_point)
         response.status = 0

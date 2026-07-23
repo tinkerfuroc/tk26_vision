@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import openai
 
@@ -25,6 +25,11 @@ from ._env import (
 
 class FeatureVlmError(RuntimeError):
     """Hard failure: missing API key, unknown provider, or exhausted retries."""
+
+
+def _raise_if_aborted(should_abort: Optional[Callable[[], bool]]) -> None:
+    if should_abort is not None and should_abort():
+        raise FeatureVlmError('feature VLM request aborted')
 
 
 @dataclass
@@ -45,6 +50,7 @@ def request_feature_description(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> FeatureVlmResult:
     """Single-provider plain-text VLM call with exponential-backoff retries.
 
@@ -65,7 +71,11 @@ def request_feature_description(
     else:
         raise FeatureVlmError(f"unknown provider {provider!r} (expected qwen|gemini)")
 
-    client = openai.OpenAI(api_key=api_key, base_url=b_url)
+    client = openai.OpenAI(
+        api_key=api_key,
+        base_url=b_url,
+        max_retries=0,
+    )
     messages = [
         {'role': 'system', 'content': sys_prompt},
         {'role': 'user', 'content': [
@@ -78,6 +88,7 @@ def request_feature_description(
     last_error: Optional[Exception] = None
     try:
         for attempt in range(1, max_retries + 1):
+            _raise_if_aborted(should_abort)
             try:
                 completion = client.with_options(
                     timeout=timeout_s).chat.completions.create(
@@ -101,6 +112,7 @@ def request_feature_description(
                     logger.warning(
                         f'[{provider}] VLM call failed '
                         f'(attempt {attempt}/{max_retries}): {exc}')
+                _raise_if_aborted(should_abort)
                 if attempt < max_retries:
                     time.sleep(0.5 * (2 ** (attempt - 1)))
         raise FeatureVlmError(
@@ -122,6 +134,7 @@ def request_feature_description_chain(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> FeatureVlmResult:
     """Try (provider, model) pairs in order; return the first success.
 
@@ -131,14 +144,17 @@ def request_feature_description_chain(
     """
     errors = []
     for provider, model in provider_models:
+        _raise_if_aborted(should_abort)
         try:
             return request_feature_description(
                 image_url, sys_prompt, user_text,
                 provider=provider, model=model,
                 qwen_api_backend=qwen_api_backend,
                 timeout_s=timeout_s, max_retries=max_retries, logger=logger,
+                should_abort=should_abort,
             )
         except FeatureVlmError as exc:
+            _raise_if_aborted(should_abort)
             errors.append(f'{provider}: {exc}')
             if logger is not None:
                 logger.warning(

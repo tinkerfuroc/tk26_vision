@@ -1,6 +1,6 @@
 """LLM-backed person feature extraction and seat recommendation.
 
-Two services:
+Two actions:
 - `feature_extraction_service`: calls `object_detection_generalist`, picks
   the person most likely addressing the robot (see `select_best_person_idx`:
   size-gated, largest-first; centermost/closest only breaks near-size
@@ -18,15 +18,17 @@ import time
 import cv2
 import rclpy
 from cv_bridge import CvBridge
-from message_filters import Subscriber
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import Image
+from tinker_vision_msgs_26.action import FeatureExtraction, SeatRecommendation
 from tinker_vision_msgs_26.srv import (
-    FeatureExtraction,
     ObjectDetectionGeneralist as ObjectDetection,
-    SeatRecommendation,
 )
+from vision_util.action_queue import QueuedActionGate
+from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
 from vision_util.vision_logging import VisionLogger
 
 from ._env import (
@@ -37,6 +39,19 @@ from ._env import (
 )
 from ._feature_vlm import FeatureVlmError, request_feature_description_chain
 from ._image_utils import bbox_from_mask, encode_to_data_url
+
+
+DETECTION_DELAY_LIMIT_S = 60.0
+CANCEL_STATE_TIMEOUT_S = 0.1
+CANCEL_STATE_POLL_S = 0.005
+
+
+class _GoalCanceled(Exception):
+    """Internal control flow for confirmed action cancellation."""
+
+
+class _CancelStateError(RuntimeError):
+    """Gate cancellation intent did not reach the rclpy goal handle."""
 
 
 # Minimum person bbox height, as a fraction of frame height, to be considered
@@ -170,8 +185,6 @@ class FeatureService(Node):
     def __init__(self):
         super().__init__(f'feature_service_{int(time.time())}')
 
-        self.camera_types = ['orbbec']
-
         self.declare_parameter('log_prompts', True)
         self.declare_parameter('llm_model', default_flash_model())
         self.declare_parameter('detection_service', 'object_detection_generalist')
@@ -201,26 +214,13 @@ class FeatureService(Node):
             self.get_parameter('vision_log_folder').get_parameter_value().string_value,
         )
 
-        self.server_cb_group = MutuallyExclusiveCallbackGroup()
+        self.extraction_action_cb_group = MutuallyExclusiveCallbackGroup()
+        self.seat_action_cb_group = MutuallyExclusiveCallbackGroup()
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
-
-        # seat_recommend still uses the live frame from the camera topic.
-        self.image_subs = []
-        image_sub = Subscriber(self, Image, '/camera/color/image_raw')
-        image_sub.registerCallback(self.img_orbbec_callback)
-        self.image_subs.append(image_sub)
-
-        self.recent_msg = {'orbbec': None}
-
-        self.camera_info_sub_orbbec = self.create_subscription(
-            CameraInfo,
-            '/camera/color/camera_info',
-            self.camera_info_orbbec_callback,
-            qos_profile=10,
-        )
-        self.camera_intrinsic = {'orbbec': None}
+        self.intake_cb_group = MutuallyExclusiveCallbackGroup()
 
         self.bridge = CvBridge()
+        self._seat_color_intake = self._create_seat_color_intake()
 
         require_api_key()  # fail fast at init if the primary Gemini key is missing
         self._feature_provider_chain = self._resolve_feature_provider_chain()
@@ -229,18 +229,55 @@ class FeatureService(Node):
             ObjectDetection, detection_service, callback_group=self.client_cb_group,
         )
 
-        self.extraction_srv = self.create_service(
+        self._action_gate = QueuedActionGate()
+        self.extraction_action = self._create_extraction_action()
+        self.seat_recommend_action = self._create_seat_recommend_action()
+        self.get_logger().info(
+            f'Feature actions initialized (model={self.llm_model}, '
+            f'detection_service={detection_service}).'
+        )
+
+    def _create_seat_color_intake(self):
+        return CameraIntake(
+            self,
+            IntakeConfig(
+                camera='orbbec',
+                color=StreamSpec(
+                    '/camera/color/image_raw',
+                    best_effort=False,
+                    qos_depth=10,
+                ),
+            ),
+            callback_group=self.intake_cb_group,
+            bridge=self.bridge,
+        )
+
+    def _create_extraction_action(self):
+        return ActionServer(
+            self,
             FeatureExtraction,
             'feature_extraction_service',
-            self.feature_extraction_srv_callback,
-            callback_group=self.server_cb_group,
+            execute_callback=self.feature_extraction_execute_callback,
+            cancel_callback=self.feature_extraction_cancel_callback,
+            handle_accepted_callback=(
+                self.feature_extraction_handle_accepted_callback
+            ),
+            callback_group=self.extraction_action_cb_group,
+            result_timeout=0,
         )
-        self.seat_recommend_srv = self.create_service(
-            SeatRecommendation, 'seat_recommend_service', self.seat_recommend_srv_callback,
-        )
-        self.get_logger().info(
-            f'Feature services initialized (model={self.llm_model}, '
-            f'detection_service={detection_service}).'
+
+    def _create_seat_recommend_action(self):
+        return ActionServer(
+            self,
+            SeatRecommendation,
+            'seat_recommend_service',
+            execute_callback=self.seat_recommend_execute_callback,
+            cancel_callback=self.seat_recommend_cancel_callback,
+            handle_accepted_callback=(
+                self.seat_recommend_handle_accepted_callback
+            ),
+            callback_group=self.seat_action_cb_group,
+            result_timeout=0,
         )
 
     def _resolve_feature_provider_chain(self) -> list:
@@ -267,20 +304,153 @@ class FeatureService(Node):
         )
         return chain
 
-    def camera_info_orbbec_callback(self, info):
-        self.camera_intrinsic['orbbec'] = info
+    def feature_extraction_handle_accepted_callback(self, goal_handle) -> None:
+        """Queue an accepted extraction goal on the node-wide FIFO gate."""
+        self._action_gate.accept(goal_handle)
 
-    def img_orbbec_callback(self, color_msg):
-        self.recent_msg['orbbec'] = color_msg
+    def seat_recommend_handle_accepted_callback(self, goal_handle) -> None:
+        """Queue an accepted seat goal on the node-wide FIFO gate."""
+        self._action_gate.accept(goal_handle)
 
-    async def feature_extraction_srv_callback(
+    def feature_extraction_cancel_callback(self, goal_handle):
+        """Accept extraction cancellation and preserve queued intent."""
+        self._action_gate.cancel_queued(goal_handle)
+        return CancelResponse.ACCEPT
+
+    def seat_recommend_cancel_callback(self, goal_handle):
+        """Accept seat cancellation and preserve queued intent."""
+        self._action_gate.cancel_queued(goal_handle)
+        return CancelResponse.ACCEPT
+
+    def _should_cancel(self, goal_handle) -> bool:
+        return self._action_gate.should_cancel(goal_handle)
+
+    def _raise_if_canceled(self, goal_handle) -> None:
+        if not self._should_cancel(goal_handle):
+            return
+
+        deadline = time.monotonic() + CANCEL_STATE_TIMEOUT_S
+        while not bool(getattr(goal_handle, 'is_cancel_requested', False)):
+            if time.monotonic() >= deadline:
+                raise _CancelStateError(
+                    'Cancellation intent did not transition the goal '
+                    'to canceling within 0.1 seconds'
+                )
+            time.sleep(CANCEL_STATE_POLL_S)
+        raise _GoalCanceled
+
+    def _publish_feedback(
         self,
-        request: FeatureExtraction.Request,
-        response: FeatureExtraction.Response,
-    ):
+        goal_handle,
+        action_type,
+        *,
+        stage: str,
+        message: str,
+        delay_limit: float,
+    ) -> None:
+        self._raise_if_canceled(goal_handle)
+        feedback = action_type.Feedback()
+        feedback.status = 0
+        feedback.delay_limit = float(delay_limit)
+        feedback.stage = stage
+        feedback.message = message
+        goal_handle.publish_feedback(feedback)
+
+    def _vlm_delay_limit(self) -> float:
+        retries = max(0, int(self.vlm_max_retries))
+        retry_backoff_s = sum(
+            0.5 * (2 ** i) for i in range(max(0, retries - 1))
+        )
+        per_provider_s = (
+            retries * max(0.0, float(self.vlm_timeout_s))
+            + retry_backoff_s
+        )
+        return max(
+            1.0,
+            len(self._feature_provider_chain) * per_provider_s + 5.0,
+        )
+
+    @staticmethod
+    def _canceled_extraction_result(goal_handle):
+        result = FeatureExtraction.Result()
+        result.status = 1
+        result.error_msg = 'Feature extraction canceled.'
+        result.feature = ''
+        result.comparison_image = Image()
+        goal_handle.canceled()
+        return result
+
+    @staticmethod
+    def _canceled_seat_result(goal_handle):
+        result = SeatRecommendation.Result()
+        result.status = 1
+        result.error_msg = 'Seat recommendation canceled.'
+        result.recommendation = ''
+        goal_handle.canceled()
+        return result
+
+    async def feature_extraction_execute_callback(self, goal_handle):
+        """Execute one queued feature-extraction goal."""
+        try:
+            self._raise_if_canceled(goal_handle)
+            result = await self._run_feature_extraction(goal_handle)
+            self._raise_if_canceled(goal_handle)
+        except _GoalCanceled:
+            return self._canceled_extraction_result(goal_handle)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'Unhandled feature extraction failure: {exc}'
+            )
+            result = FeatureExtraction.Result()
+            result.status = 1
+            result.error_msg = f'Feature extraction failed: {exc}.'
+            result.feature = ''
+            result.comparison_image = Image()
+            goal_handle.abort()
+            return result
+        else:
+            goal_handle.succeed()
+            return result
+        finally:
+            self._action_gate.notify_finished(goal_handle)
+
+    def seat_recommend_execute_callback(self, goal_handle):
+        """Execute one queued seat-recommendation goal."""
+        try:
+            self._raise_if_canceled(goal_handle)
+            result = self._run_seat_recommend(goal_handle)
+            self._raise_if_canceled(goal_handle)
+        except _GoalCanceled:
+            return self._canceled_seat_result(goal_handle)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'Unhandled seat recommendation failure: {exc}'
+            )
+            result = SeatRecommendation.Result()
+            result.status = 1
+            result.error_msg = f'Seat recommendation failed: {exc}.'
+            result.recommendation = ''
+            goal_handle.abort()
+            return result
+        else:
+            goal_handle.succeed()
+            return result
+        finally:
+            self._action_gate.notify_finished(goal_handle)
+
+    async def _run_feature_extraction(self, goal_handle):
+        request = goal_handle.request
+        response = FeatureExtraction.Result()
         self.get_logger().info('Feature extraction request received.')
         start_time = time.time_ns()
 
+        self._publish_feedback(
+            goal_handle,
+            FeatureExtraction,
+            stage='detecting',
+            message='Detecting the person addressing the robot.',
+            delay_limit=DETECTION_DELAY_LIMIT_S,
+        )
         if not self.detection_cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('Detection service unavailable.')
             response.status = 1
@@ -299,6 +469,7 @@ class FeatureService(Node):
 
         detection_future = self.detection_cli.call_async(detection_req)
         await detection_future
+        self._raise_if_canceled(goal_handle)
         detection_res = detection_future.result()
 
         if detection_res is None or detection_res.status != 0:
@@ -420,6 +591,13 @@ class FeatureService(Node):
 
         sys_prompt = FEATURE_SYS_PROMPT
 
+        self._publish_feedback(
+            goal_handle,
+            FeatureExtraction,
+            stage='vlm_call',
+            message='Extracting the selected person features.',
+            delay_limit=self._vlm_delay_limit(),
+        )
         t_vlm_start = time.time_ns()
         try:
             vlm_result = request_feature_description_chain(
@@ -430,8 +608,10 @@ class FeatureService(Node):
                 timeout_s=self.vlm_timeout_s,
                 max_retries=self.vlm_max_retries,
                 logger=self.get_logger(),
+                should_abort=lambda: self._should_cancel(goal_handle),
             )
         except FeatureVlmError as exc:
+            self._raise_if_canceled(goal_handle)
             t_vlm_ms = (time.time_ns() - t_vlm_start) / 1e6
             self.get_logger().error(f'VLM call failed on every provider: {exc}')
             response.feature = ''
@@ -440,6 +620,7 @@ class FeatureService(Node):
             _emit_vision_log('', 1, str(exc), t_vlm_ms, '')
             return response
 
+        self._raise_if_canceled(goal_handle)
         t_vlm_ms = (time.time_ns() - t_vlm_start) / 1e6
         self.get_logger().info(
             f'LLM finished. Total time: {(time.time_ns() - start_time) / 1e9:.3f} s'
@@ -450,18 +631,22 @@ class FeatureService(Node):
         _emit_vision_log(response.feature, 0, '', t_vlm_ms, vlm_result.provider)
         return response
 
-    def seat_recommend_srv_callback(
-        self,
-        request: SeatRecommendation.Request,
-        response: SeatRecommendation.Response,
-    ):
+    def _run_seat_recommend(self, goal_handle):
+        request = goal_handle.request
+        response = SeatRecommendation.Result()
+        self._publish_feedback(
+            goal_handle,
+            SeatRecommendation,
+            stage='acquiring_frame',
+            message='Acquiring the latest color frame.',
+            delay_limit=2.0,
+        )
+
         color_img = None
-        for cam in self.camera_types:
-            if cam in request.camera:
-                rec_msg = self.recent_msg[cam]
-                if rec_msg is not None:
-                    color_img = self.bridge.imgmsg_to_cv2(rec_msg, 'bgr8')
-                    break
+        if 'orbbec' in request.camera:
+            frame = self._seat_color_intake.latest()
+            if frame is not None:
+                color_img = frame.color_bgr()
 
         if color_img is None:
             self.get_logger().warn('No camera data.')
@@ -509,6 +694,13 @@ class FeatureService(Node):
             )
 
         start_time = time.time_ns()
+        self._publish_feedback(
+            goal_handle,
+            SeatRecommendation,
+            stage='vlm_call',
+            message='Generating the seat recommendation.',
+            delay_limit=self._vlm_delay_limit(),
+        )
         try:
             vlm_result = request_feature_description_chain(
                 color_image_url, sys_prompt_recommend, text_prompt,
@@ -517,8 +709,10 @@ class FeatureService(Node):
                 timeout_s=self.vlm_timeout_s,
                 max_retries=self.vlm_max_retries,
                 logger=self.get_logger(),
+                should_abort=lambda: self._should_cancel(goal_handle),
             )
         except FeatureVlmError as exc:
+            self._raise_if_canceled(goal_handle)
             t_vlm_ms = (time.time_ns() - start_time) / 1e6
             self.get_logger().error(f'Seat recommend VLM call failed on every provider: {exc}')
             response.status = 1
@@ -527,6 +721,7 @@ class FeatureService(Node):
             _emit_vision_log('', 1, str(exc), t_vlm_ms, '')
             return response
 
+        self._raise_if_canceled(goal_handle)
         t_vlm_ms = (time.time_ns() - start_time) / 1e6
         self.get_logger().info(
             f'Finished, time = {(time.time_ns() - start_time) / 1e9:.3f} s'
@@ -544,8 +739,14 @@ def main():
     load_env()
     rclpy.init()
     feature_service = FeatureService()
-    rclpy.spin(feature_service)
-    rclpy.shutdown()
+    executor = MultiThreadedExecutor()
+    executor.add_node(feature_service)
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        feature_service.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

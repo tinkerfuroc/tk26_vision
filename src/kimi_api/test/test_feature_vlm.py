@@ -78,6 +78,7 @@ def test_request_feature_description_returns_text_on_success(monkeypatch):
     assert fake.last_init['base_url'] == \
         'https://dashscope.aliyuncs.com/compatible-mode/v1'
     assert fake.last_init['api_key'] == 'k'
+    assert fake.last_init['max_retries'] == 0
 
 
 def test_request_feature_description_qwen_openrouter_backend(monkeypatch):
@@ -202,6 +203,32 @@ def test_request_feature_description_exhausts_retries_raises(monkeypatch):
     assert len(fake.calls) == 3
 
 
+def test_request_feature_description_abort_stops_retries_and_sleep(
+    monkeypatch,
+):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'k')
+    aborted = {'value': False}
+    sleeps = []
+
+    def script(kw):
+        aborted['value'] = True
+        raise RuntimeError('transient failure')
+
+    fake = _make_fake_openai(script)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+    monkeypatch.setattr(
+        'kimi_api._feature_vlm.time.sleep',
+        lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(FeatureVlmError, match='aborted'):
+        request_feature_description(
+            _img_url(), 'sys', 'user', provider='gemini', model='g',
+            max_retries=3, should_abort=lambda: aborted['value'])
+
+    assert len(fake.calls) == 1
+    assert sleeps == []
+
+
 # --- request_feature_description_chain (monkeypatch the per-provider call) ---
 
 def _fake_chain(monkeypatch, by_provider):
@@ -248,6 +275,28 @@ def test_chain_all_fail_raises(monkeypatch):
         request_feature_description_chain(
             _img_url(), 'sys', 'user',
             provider_models=[('gemini', 'g'), ('qwen', 'q')])
+
+
+def test_chain_abort_stops_provider_fallthrough(monkeypatch):
+    aborted = {'value': False}
+    providers = []
+
+    def fake_request(
+            image_url, sys_prompt, user_text, *, provider, model, **kw):
+        providers.append(provider)
+        aborted['value'] = True
+        raise FeatureVlmError('provider failed')
+
+    monkeypatch.setattr(
+        'kimi_api._feature_vlm.request_feature_description', fake_request)
+
+    with pytest.raises(FeatureVlmError, match='aborted'):
+        request_feature_description_chain(
+            _img_url(), 'sys', 'user',
+            provider_models=[('gemini', 'g'), ('qwen', 'q')],
+            should_abort=lambda: aborted['value'])
+
+    assert providers == ['gemini']
 
 
 def test_chain_empty_provider_models_raises(monkeypatch):

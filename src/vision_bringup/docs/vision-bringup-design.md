@@ -106,6 +106,7 @@ FFS to fence). Two always-on core nodes + per-task groups.
 | `kimi_api/seat_recommend_bbox` | ✓ | | | |
 | `pan_tilt/follow_head` | ✓ | | ✓ | |
 | `vision_util/get_image` | | ✓ | | |
+| `kimi_api/object_scan` | | | | ✓ |
 
 ¹ `enable_hri` = HRI **+ Follow** (Follow is integrated into HRI as one task).
 
@@ -114,27 +115,30 @@ are set: `yolo_seg_node` ← hri∨gpsr; `person_track_server` ← hri∨gpsr;
 `waving_person_server` ← hri∨gpsr∨restaurant; `feature_recognition` ← hri∨gpsr;
 `follow_head` ← hri∨restaurant. OR via `IfCondition(PythonExpression(...))`.
 
-`enable_pick_place` gates **no** task-specific node — PickAndPlace's only vision
-deps (generalist + door) are already in the always-on core. The flag is kept for
-symmetry and future-proofing.
+`enable_pick_place` gates the labels-only `/object_scan` action server. The
+generalist and door services remain in the always-on core.
 
 ### Per-task vision usage (evidence summary)
 
-- **HRI+Follow** — `feature_extraction_service` + `feature_matching_service`
+- **HRI+Follow** — actions `feature_extraction_service` +
+  `feature_matching_service`
   (guest intake / two-way introduction, always), `seat_recommend_bbox_service`
-  (escort-and-seat, always), `follow_head_action` (eye contact, always);
+  action (escort-and-seat, always), `follow_head_action` (eye contact, always);
   Follow side: `track_person` + `/person_track_node/reseed_target`,
-  `detect_waving_persons` (recovery scan), `object_detection_yolo`
+  `detect_waving_persons` action (recovery scan), `object_detection_yolo`
   (help-me-carry pointed-luggage).
 - **GPSR** — `object_detection_generalist` (find_object/person/count),
   `object_detection_yolo` (grasp branch), `track_person` (follow plan),
-  `detect_waving_persons` (go-to-waving), `feature_extraction_service`
-  (describe_person), `get_image_service` (vlm_fallback).
-- **Restaurant** — `detect_waving_persons` (waving customers, both standard and
-  simplified trees), `object_detection_generalist` (tray + fallback customer
-  scan, always-on core), `follow_head_action` (eye contact, standard tree only).
-- **PickAndPlace** — `object_detection_generalist` (ScanForGeneralist),
-  `door_detection_srv` (enterArena). Both in the always-on core.
+  `detect_waving_persons` action (go-to-waving), the
+  `feature_extraction_service` action (describe_person), `get_image_service`
+  (vlm_fallback).
+- **Restaurant** — `detect_waving_persons` action (waving customers, both
+  standard and simplified trees), `object_detection_generalist` (tray +
+  fallback customer scan, always-on core), `follow_head_action` (eye contact,
+  standard tree only).
+- **PickAndPlace** — `object_scan` action (whole-table labels-only scan),
+  `object_detection_generalist` (ScanForGeneralist), and `door_detection_srv`
+  (enterArena).
 
 ### Dropped nodes (no reachable caller in the four tasks)
 
@@ -170,7 +174,7 @@ only), `get_orbbec_pc`, `monocular_depth_pc`. These remain runnable via
 ## 7. Caveats
 
 - **kimi_api nodes** (`feature_recognition`, `feature_matching`,
-  `seat_recommend_bbox`) raise at init without `OPENROUTER_API_KEY` /
+  `seat_recommend_bbox`, `object_scan`) raise at init without `OPENROUTER_API_KEY` /
   `DASHSCOPE_API_KEY`. Launch from the workspace root so `.env` is found, or
   leave `enable_hri`/`enable_gpsr` off.
 - **FFS standalone** (no manipulation RealSense) spins with no input — harmless

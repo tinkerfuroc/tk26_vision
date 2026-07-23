@@ -1,15 +1,16 @@
 # kimi_api
 
-LLM/VLM-backed person and scene services for Tinker (ROS2 Humble).
+LLM/VLM-backed person and scene action servers for Tinker (ROS2 Humble).
 
 ## Nodes
 
 | Node | Interface | Purpose |
 |---|---|---|
-| `feature_recognition` | `/feature_extraction_service`, `/seat_recommend_service` | Describe the person addressing the robot (five slots: hair color, gender, age, glasses, upper-body wear) + legacy seat recommendation |
-| `feature_matching` | `/feature_matching_service` | Locate previously described/photographed people among detected persons (image mode when one reference image per feature is supplied; text-only fallback when fewer reference images than features are supplied; more references than features is rejected) |
+| `feature_recognition` | actions `/feature_extraction_service`, `/seat_recommend_service` | Describe the person addressing the robot (five slots: hair color, gender, age, glasses, upper-body wear) + legacy seat recommendation |
+| `feature_matching` | action `/feature_matching_service` | Locate previously described/photographed people among detected persons (image mode when one reference image per feature is supplied; text-only fallback when fewer reference images than features are supplied; more references than features is rejected) |
 | `grocery_categorize` | action `/grocery_categorize` | Categorize grocery items |
-| `seat_recommend_bbox` | `/seat_recommend_bbox_service` | VLM seat recommendation (bbox_select strategy) |
+| `seat_recommend_bbox` | action `/seat_recommend_bbox_service` | VLM seat recommendation (bbox_select strategy) |
+| `object_scan` | action `/object_scan` | Return the visible subset of a caller-provided object vocabulary |
 | `seat_fewshot_annotator` | (no ROS interface — local web UI) | Dev tool: annotate seat few-shot examples |
 
 Providers/keys: Gemini via `OPENROUTER_API_KEY` (primary), Qwen via

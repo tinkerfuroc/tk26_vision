@@ -14,9 +14,9 @@ if have_api_key; then
     start_node yolo_default_t3 object_detection_new yolo_seg_default_node
     wait_for_service /object_detection 20 || fail "T3.1" "yolo default didn't advertise"
     start_node feature_matching_t3 kimi_api feature_matching
-    if wait_for_service /feature_matching_service 15; then
-        out="$LOG_DIR/T3.1.svcout"
-        timeout 45 ros2 service call /feature_matching_service tinker_vision_msgs_26/srv/FeatureMatching \
+    if wait_for_action /feature_matching_service 15; then
+        out="$LOG_DIR/T3.1.actout"
+        timeout 45 ros2 action send_goal /feature_matching_service tinker_vision_msgs_26/action/FeatureMatching \
             "{camera: 'orbbec', features: ['red bottle'], max_distance: 2.0, target_frame: 'base_link'}" 2>&1 | head -c 4000 >"$out" || true
         if grep -qE 'Traceback' "$out"; then
             fail "T3.1" "traceback in response"
@@ -27,7 +27,7 @@ if have_api_key; then
             fail "T3.1" "head: $(head -c 400 "$out")"
         fi
     else
-        fail "T3.1" "feature_matching service not advertised"
+        fail "T3.1" "feature_matching action not advertised"
     fi
     stop_all_nodes
 else
@@ -58,9 +58,9 @@ if have_api_key; then
     wait_for_service /object_detection_generalist 30 || fail "T3.4" "generalist did not advertise"
     # feature_matching's default detection_service is 'object_detection_generalist' post-migration.
     start_node feature_matching_t3.4 kimi_api feature_matching
-    if wait_for_service /feature_matching_service 15; then
-        out="$LOG_DIR/T3.4.svcout"
-        timeout 90 ros2 service call /feature_matching_service tinker_vision_msgs_26/srv/FeatureMatching \
+    if wait_for_action /feature_matching_service 15; then
+        out="$LOG_DIR/T3.4.actout"
+        timeout 90 ros2 action send_goal /feature_matching_service tinker_vision_msgs_26/action/FeatureMatching \
             "{camera: 'realsense', features: ['person'], max_distance: 3.0, target_frame: 'base_link'}" 2>&1 \
             | head -c 4000 >"$out" || true
         if grep -qE 'Traceback' "$out"; then
@@ -72,7 +72,7 @@ if have_api_key; then
             fail "T3.4" "head: $(head -c 400 "$out")"
         fi
     else
-        fail "T3.4" "feature_matching_service not advertised"
+        fail "T3.4" "feature_matching action not advertised"
     fi
     stop_all_nodes
 else

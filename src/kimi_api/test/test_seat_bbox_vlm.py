@@ -301,6 +301,7 @@ def test_request_seat_bbox_qwen_openrouter_backend(monkeypatch):
     assert res.label == 'none'
     assert fake.last_init['base_url'] == 'https://openrouter.ai/api/v1'
     assert fake.last_init['api_key'] == 'or-key'
+    assert fake.last_init['max_retries'] == 0
 
 
 def test_request_seat_bbox_qwen_openrouter_missing_key_raises(monkeypatch):
@@ -312,6 +313,25 @@ def test_request_seat_bbox_qwen_openrouter_missing_key_raises(monkeypatch):
     with pytest.raises(VlmSeatBboxError, match='OPENROUTER_API_KEY'):
         m.request_seat_bbox(
             _img(), [], [], provider='qwen', model='', qwen_api_backend='openrouter')
+
+
+def test_request_seat_bbox_abort_stops_retries(monkeypatch):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'k')
+    aborted = {'value': False}
+
+    def script(kw):
+        aborted['value'] = True
+        raise RuntimeError('transient failure')
+
+    fake = _make_fake_openai(script)
+    monkeypatch.setattr(openai, 'OpenAI', fake)
+
+    with pytest.raises(VlmSeatBboxError, match='aborted'):
+        m.request_seat_bbox(
+            _img(), [], [], provider='gemini', model='g',
+            max_retries=3, should_abort=lambda: aborted['value'])
+
+    assert len(fake.calls) == 1
 
 
 # --- request_seat_bbox_chain (monkeypatch the per-provider call) ---
@@ -357,6 +377,30 @@ def test_chain_legit_none_does_not_fall_back(monkeypatch):
     res = m.request_seat_bbox_chain(None, [], [],
                                     provider_models=[("qwen", "q"), ("gemini", "g")])
     assert res.label == "none" and res.box_xyxy is None and res.provider == "qwen"
+
+
+def test_chain_abort_stops_provider_fallback(monkeypatch):
+    aborted = {'value': False}
+    providers = []
+
+    def fake_request(rgb, names, features, *, provider, model, **kw):
+        providers.append(provider)
+        assert kw['should_abort'] is should_abort
+        aborted['value'] = True
+        raise VlmSeatBboxError('provider failed')
+
+    def should_abort():
+        return aborted['value']
+
+    monkeypatch.setattr(m, 'request_seat_bbox', fake_request)
+
+    with pytest.raises(VlmSeatBboxError, match='aborted'):
+        m.request_seat_bbox_chain(
+            None, [], [],
+            provider_models=[('qwen', 'q'), ('gemini', 'g')],
+            should_abort=should_abort)
+
+    assert providers == ['qwen']
 
 
 def test_chain_all_fail_raises(monkeypatch):

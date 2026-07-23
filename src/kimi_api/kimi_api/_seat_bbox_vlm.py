@@ -18,7 +18,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
@@ -35,6 +35,11 @@ Box = tuple[int, int, int, int]
 
 class VlmSeatBboxError(RuntimeError):
     """Hard failure: missing API key, exhausted retries, or unparseable response."""
+
+
+def _raise_if_aborted(should_abort: Optional[Callable[[], bool]]) -> None:
+    if should_abort is not None and should_abort():
+        raise VlmSeatBboxError("seat bbox VLM request aborted")
 
 
 @dataclass
@@ -341,6 +346,7 @@ def request_seat_bbox(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> SeatBboxResult:
     """Single-provider bbox+select. Raises VlmSeatBboxError on hard failure;
     returns a SeatBboxResult whose .error may be set on soft selection issues."""
@@ -362,7 +368,7 @@ def request_seat_bbox(
 
     from openai import OpenAI
 
-    client = OpenAI(api_key=api_key, base_url=b_url)
+    client = OpenAI(api_key=api_key, base_url=b_url, max_retries=0)
     h, w = rgb_bgr.shape[:2]
     messages = [
         {"role": "system", "content": _SYSTEM},
@@ -381,6 +387,7 @@ def request_seat_bbox(
     last_error: Optional[Exception] = None
     try:
         for attempt in range(1, max_retries + 1):
+            _raise_if_aborted(should_abort)
             rf = rf_strict if use_strict else rf_loose
             try:
                 kwargs = dict(model=model, messages=messages,
@@ -406,6 +413,7 @@ def request_seat_bbox(
                 if logger is not None:
                     logger.warning(f"[{provider}] parse failed "
                                    f"(attempt {attempt}/{max_retries}): {exc}")
+                _raise_if_aborted(should_abort)
             except Exception as exc:  # noqa: BLE001
                 txt = str(exc).lower()
                 if use_strict and any(k in txt for k in
@@ -418,6 +426,7 @@ def request_seat_bbox(
                 if logger is not None:
                     logger.warning(f"[{provider}] call failed "
                                    f"(attempt {attempt}/{max_retries}): {exc}")
+                _raise_if_aborted(should_abort)
         raise VlmSeatBboxError(
             f"[{provider}] exhausted {max_retries} retries; last={last_error}")
     finally:
@@ -438,6 +447,7 @@ def request_seat_bbox_chain(
     timeout_s: float = 20.0,
     max_retries: int = 3,
     logger=None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> SeatBboxResult:
     """Try (provider, model) pairs in order. Return the first CLEAN result —
     a decodable box, or a legitimate "none" (no error). Hard errors
@@ -445,19 +455,23 @@ def request_seat_bbox_chain(
     provider. Raises VlmSeatBboxError if every provider fails."""
     errors = []
     for provider, model in provider_models:
+        _raise_if_aborted(should_abort)
         try:
             res = request_seat_bbox(
                 rgb_bgr, names, features,
                 provider=provider, model=model,
                 qwen_api_backend=qwen_api_backend, known_seats=known_seats,
                 timeout_s=timeout_s, max_retries=max_retries, logger=logger,
+                should_abort=should_abort,
             )
         except VlmSeatBboxError as exc:
+            _raise_if_aborted(should_abort)
             errors.append(f"{provider}: {exc}")
             if logger is not None:
                 logger.warning(f"bbox+select provider {provider} failed: {exc}; trying next.")
             continue
         if res.error:
+            _raise_if_aborted(should_abort)
             errors.append(f"{provider}: {res.error}")
             if logger is not None:
                 logger.warning(f"bbox+select provider {provider} soft-failed: "

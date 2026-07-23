@@ -60,3 +60,6 @@ unsupported or internally inconsistent models fail closed.
 - 2026-07-23: implemented `~/get_point_cloud` with depth-stamp TF/header
   semantics, stride/XYZ[RGB] deprojection, fail-closed TF and camera-data
   validation, plus bounded no-data/stale/timeout responses.
+- 2026-07-23: added the opt-in zero-subscription legacy compatibility bridge
+  with a dedicated client executor, bounded forwarding deadlines, and cleanup
+  of timed-out requests.

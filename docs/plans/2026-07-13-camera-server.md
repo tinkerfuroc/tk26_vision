@@ -1798,6 +1798,17 @@ git commit -m "feat(camera_server): implement get_point_cloud (deprojection + fr
 - Consumes: `GetCameraSnapshot` / `GetCameraPointCloud` services (Tasks 4–5) as a client; legacy types `GetImage`, `GetPointCloud`, `GetOrbbecPC` (pre-existing).
 - Produces: executable `camera_compat_bridge` serving `get_image_service`, `get_point_cloud_service`, `get_orbbec_pc` with the exact legacy semantics (`status` 0/1, `error_msg` shapes `Unsupported camera: <x>.` / `No camera data for <x>.`). Parameters: `wrist_server` (default `/wrist_camera_server`), `head_server` (default `/head_camera_server`), `forward_timeout_sec` (default 5.0). **Never launched by default** (spec §6) — Task 7 wires it gated-off.
 
+Implementation correction: the landed bridge uses an auto-add=false client
+callback group on a node-owned `SingleThreadedExecutor` thread. This is
+required because legacy service callbacks synchronously wait for forwarded
+responses; a main executor (including a single-threaded component container)
+must never be responsible for servicing those client futures. Forwarding uses
+one steady-clock deadline covering discovery and response, removes timed-out
+pending requests, catches middleware exceptions, and maps every unavailable or
+non-OK upstream result to the exact legacy `No camera data for <camera>.`
+shape. The source file is authoritative for these details; the original code
+sketch below is retained only as a field-mapping reference.
+
 - [ ] **Step 1: Write compat_bridge_node.cpp**
 
 ```cpp

@@ -106,6 +106,7 @@ class CameraServerNode : public rclcpp::Node {
   std::atomic<int64_t> last_depth_stamp_ns_{-1};
   std::atomic<int64_t> last_color_arrival_steady_ns_{-1};
   std::atomic<int64_t> last_depth_arrival_steady_ns_{-1};
+  std::atomic<int64_t> last_pair_arrival_steady_ns_{-1};
 
   uint64_t status_last_seq_ = 0;
   std::chrono::steady_clock::time_point status_last_time_;

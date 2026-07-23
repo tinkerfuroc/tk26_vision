@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <limits>
@@ -37,6 +38,16 @@ using Transform = tinker_vision_msgs_26::srv::GetTransform;
 using Status = tinker_vision_msgs_26::msg::CameraServerStatus;
 using Image = sensor_msgs::msg::Image;
 using CameraInfo = sensor_msgs::msg::CameraInfo;
+
+float read_f32_le(const std::vector<uint8_t>& data, size_t offset) {
+  uint32_t bits = static_cast<uint32_t>(data[offset]) |
+                  (static_cast<uint32_t>(data[offset + 1]) << 8U) |
+                  (static_cast<uint32_t>(data[offset + 2]) << 16U) |
+                  (static_cast<uint32_t>(data[offset + 3]) << 24U);
+  float value = 0.0F;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
 
 bool wait_until(const std::function<bool()>& predicate,
                 std::chrono::milliseconds timeout = 2s) {
@@ -261,7 +272,7 @@ TEST_F(CameraServerNodeTest, NoDataMalformedRequestsAndStubSurvive) {
   auto cloud_request = std::make_shared<PointCloud::Request>();
   const auto cloud = call<PointCloud>(cloud_client_, cloud_request);
   ASSERT_NE(cloud, nullptr);
-  EXPECT_EQ(cloud->status, PointCloud::Response::STATUS_BAD_REQUEST);
+  EXPECT_EQ(cloud->status, PointCloud::Response::STATUS_NO_DATA);
 
   request = std::make_shared<Snapshot::Request>();
   request->want_color = true;
@@ -319,6 +330,79 @@ TEST_F(CameraServerNodeTest,
             nanoseconds(older));
   EXPECT_GT(last_status_.sync_fps, 0.0F);
   EXPECT_TRUE(std::isfinite(last_status_.pair_age_sec));
+}
+
+TEST_F(CameraServerNodeTest,
+       PointCloudUsesDepthStampAndSupportsStrideColorAndTargetTf) {
+  publish_info();
+  const auto depth_stamp = stamp_after(10ms);
+  publish_pair(depth_stamp, depth_stamp);
+
+  auto request = std::make_shared<PointCloud::Request>();
+  request->include_color = false;
+  PointCloud::Response::SharedPtr native;
+  ASSERT_TRUE(wait_until([&]() {
+    native = call<PointCloud>(cloud_client_, request, 500ms);
+    return native && native->status == PointCloud::Response::STATUS_OK;
+  })) << (native ? native->error_msg : "no response");
+  ASSERT_NE(native, nullptr);
+  EXPECT_EQ(nanoseconds(native->stamp), nanoseconds(depth_stamp));
+  EXPECT_EQ(nanoseconds(native->points.header.stamp),
+            nanoseconds(depth_stamp));
+  EXPECT_EQ(native->points.header.frame_id, "camera_optical");
+  EXPECT_EQ(native->points.width, 1U);
+  EXPECT_EQ(native->points.point_step, 12U);
+  ASSERT_EQ(native->points.fields.size(), 3U);
+
+  request->include_color = true;
+  request->stride = 1;
+  PointCloud::Response::SharedPtr colored;
+  ASSERT_TRUE(wait_until([&]() {
+    colored = call<PointCloud>(cloud_client_, request, 500ms);
+    return colored && colored->status == PointCloud::Response::STATUS_OK;
+  }));
+  ASSERT_NE(colored, nullptr);
+  EXPECT_EQ(colored->points.point_step, 16U);
+  ASSERT_EQ(colored->points.fields.size(), 4U);
+  EXPECT_EQ(colored->points.fields.back().name, "rgb");
+
+  tf2_ros::StaticTransformBroadcaster broadcaster(helper_);
+  geometry_msgs::msg::TransformStamped tf;
+  tf.header.stamp = helper_->now();
+  tf.header.frame_id = "base";
+  tf.child_frame_id = "camera_optical";
+  tf.transform.rotation.w = 1.0;
+  tf.transform.translation.x = 0.5;
+  broadcaster.sendTransform(tf);
+
+  request->include_color = false;
+  request->target_frame = "base";
+  PointCloud::Response::SharedPtr transformed;
+  ASSERT_TRUE(wait_until([&]() {
+    transformed = call<PointCloud>(cloud_client_, request, 500ms);
+    return transformed &&
+           transformed->status == PointCloud::Response::STATUS_OK;
+  }));
+  ASSERT_NE(transformed, nullptr);
+  EXPECT_EQ(transformed->points.header.frame_id, "base");
+  EXPECT_NEAR(read_f32_le(transformed->points.data, 0), 0.5F, 1e-5F);
+  EXPECT_EQ(nanoseconds(transformed->stamp), nanoseconds(depth_stamp));
+}
+
+TEST_F(CameraServerNodeTest, CloudFreshnessUsesOlderImageStamp) {
+  publish_info();
+  const auto boundary = stamp_after(100ms);
+  const auto old_stamp = stamp_after(50ms);
+  publish_pair(old_stamp, old_stamp);
+
+  auto request = std::make_shared<PointCloud::Request>();
+  request->captured_after = boundary;
+  request->wait_timeout_sec = 0.05F;
+  const auto response = call<PointCloud>(cloud_client_, request);
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status,
+            PointCloud::Response::STATUS_WAIT_TIMEOUT) << response->error_msg;
+  EXPECT_TRUE(response->points.data.empty());
 }
 
 TEST_F(CameraServerNodeTest, StaticTransformAndFreshnessFailuresAreStable) {

@@ -30,6 +30,7 @@ CameraInfo make_info(uint32_t width = 4, uint32_t height = 4,
                      double fx = 100.0, double fy = 100.0,
                      double cx = 2.0, double cy = 2.0) {
   CameraInfo info;
+  info.header.frame_id = "camera_optical";
   info.width = width;
   info.height = height;
   info.k = {fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0};
@@ -80,6 +81,7 @@ Image make_depth_u16(uint32_t width = 4, uint32_t height = 4,
                      const std::string& encoding = "16UC1",
                      bool big_endian = false) {
   Image image;
+  image.header.frame_id = "camera_optical";
   image.width = width;
   image.height = height;
   image.encoding = encoding;
@@ -98,6 +100,7 @@ Image make_depth_u16(uint32_t width = 4, uint32_t height = 4,
 Image make_depth_f32(uint32_t width = 4, uint32_t height = 4,
                      float metres = 1.0F, bool big_endian = false) {
   Image image;
+  image.header.frame_id = "camera_optical";
   image.width = width;
   image.height = height;
   image.encoding = "32FC1";
@@ -116,6 +119,7 @@ Image make_depth_f32(uint32_t width = 4, uint32_t height = 4,
 Image make_color(uint32_t width = 4, uint32_t height = 4,
                  const std::string& encoding = "rgb8") {
   Image image;
+  image.header.frame_id = "camera_optical";
   image.width = width;
   image.height = height;
   image.encoding = encoding;
@@ -540,10 +544,7 @@ TEST(Deprojector, RejectsIncompatibleNonemptyFrameIds) {
   expect_failure_and_empty(deprojector, depth, info, &color);
 
   color.header.frame_id.clear();
-  PointCloud2 out;
-  std::string error;
-  EXPECT_TRUE(deproject(deprojector, depth, info, out, error, &color))
-      << error;
+  expect_failure_and_empty(deprojector, depth, info, &color);
 }
 
 TEST(Deprojector, RejectsNonfiniteTransformAndClearsPriorOutput) {

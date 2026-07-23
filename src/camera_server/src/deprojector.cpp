@@ -187,7 +187,7 @@ bool validate_intrinsics(const sensor_msgs::msg::Image& depth,
 }
 
 bool frame_ids_compatible(const std::string& lhs, const std::string& rhs) {
-  return lhs.empty() || rhs.empty() || lhs == rhs;
+  return !lhs.empty() && !rhs.empty() && lhs == rhs;
 }
 
 bool validate_frame_ids(const sensor_msgs::msg::Image& depth,

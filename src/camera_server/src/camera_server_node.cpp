@@ -13,6 +13,7 @@
 #include <builtin_interfaces/msg/time.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <tf2/time.h>
+#include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/transform_listener.h>
 
 namespace camera_server {
@@ -61,7 +62,7 @@ bool blank(const std::string& value) {
 }
 
 bool compatible_frame_ids(const std::string& lhs, const std::string& rhs) {
-  return lhs.empty() || rhs.empty() || lhs == rhs;
+  return !lhs.empty() && !rhs.empty() && lhs == rhs;
 }
 
 void append_diagnostic(std::string& message, const std::string& detail) {
@@ -316,6 +317,7 @@ void CameraServerNode::on_synced(Image::ConstSharedPtr color,
     return;
   }
   store_.set_pair(std::move(color), std::move(depth));
+  last_pair_arrival_steady_ns_.store(steady_now_ns());
 }
 
 void CameraServerNode::on_color_info(CameraInfo::ConstSharedPtr info) {
@@ -376,17 +378,21 @@ void CameraServerNode::publish_status() {
       last_depth_arrival_steady_ns_.load() < 0
           ? std::numeric_limits<double>::infinity()
           : (steady_ns - last_depth_arrival_steady_ns_.load()) * 1e-9;
+  const double pair_arrival_age =
+      last_pair_arrival_steady_ns_.load() < 0
+          ? std::numeric_limits<double>::infinity()
+          : (steady_ns - last_pair_arrival_steady_ns_.load()) * 1e-9;
   const bool any_input_alive =
       color_arrival_age < starvation_warn_sec_ ||
       depth_arrival_age < starvation_warn_sec_;
   if (any_input_alive &&
-      (status.pair_age_sec < 0.0F ||
-       status.pair_age_sec > starvation_warn_sec_)) {
+      pair_arrival_age > starvation_warn_sec_) {
     RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 10000,
-        "sync starved: color_age=%.3fs depth_age=%.3fs pair_age=%.3fs; "
-        "check missing partner, QoS, frame IDs, and stamps",
-        status.color_age_sec, status.depth_age_sec, status.pair_age_sec);
+        "sync starved: color_age=%.3fs depth_age=%.3fs "
+        "pair_arrival_age=%.3fs; check missing partner, QoS, frame IDs, "
+        "and stamps",
+        status.color_age_sec, status.depth_age_sec, pair_arrival_age);
   }
   if (color_arrival_age < starvation_warn_sec_ &&
       depth_arrival_age < starvation_warn_sec_ && color_ns >= 0 &&
@@ -586,14 +592,118 @@ void CameraServerNode::handle_snapshot(
 }
 
 void CameraServerNode::handle_point_cloud(
-    GetCameraPointCloud::Request::ConstSharedPtr /*request*/,
+    GetCameraPointCloud::Request::ConstSharedPtr request,
     GetCameraPointCloud::Response::SharedPtr response) {
-  // Task 5 replaces this explicit stub with deprojection. Keeping the service
-  // available lets no-camera/startup checks prove the node is responsive.
-  response->status =
-      GetCameraPointCloud::Response::STATUS_BAD_REQUEST;
-  response->error_msg =
-      "get_point_cloud is not implemented until camera-server Task 5";
+  response->points = sensor_msgs::msg::PointCloud2{};
+  FramePair pair;
+  const AcquisitionStatus acquisition =
+      acquire_pair(request->max_age_sec, request->captured_after,
+                   request->wait_timeout_sec, pair,
+                   response->error_msg);
+  switch (acquisition) {
+    case AcquisitionStatus::kOk:
+      response->status = GetCameraPointCloud::Response::STATUS_OK;
+      break;
+    case AcquisitionStatus::kNoData:
+      response->status = GetCameraPointCloud::Response::STATUS_NO_DATA;
+      return;
+    case AcquisitionStatus::kStale:
+      response->status = GetCameraPointCloud::Response::STATUS_STALE;
+      return;
+    case AcquisitionStatus::kWaitTimeout:
+      response->status = GetCameraPointCloud::Response::STATUS_WAIT_TIMEOUT;
+      return;
+    case AcquisitionStatus::kBadRequest:
+      response->status = GetCameraPointCloud::Response::STATUS_BAD_REQUEST;
+      return;
+  }
+
+  if (!pair.depth) {
+    response->status = GetCameraPointCloud::Response::STATUS_NO_DATA;
+    response->error_msg = "no depth frame in synchronized pair";
+    return;
+  }
+  const auto depth_info = store_.depth_info();
+  if (!depth_info) {
+    response->status = GetCameraPointCloud::Response::STATUS_NO_DATA;
+    response->error_msg = "depth camera_info not received yet";
+    return;
+  }
+  if (request->include_color && !pair.color) {
+    response->status = GetCameraPointCloud::Response::STATUS_NO_DATA;
+    response->error_msg = "color requested but no color frame is available";
+    return;
+  }
+  if (!request->target_frame.empty() && blank(request->target_frame)) {
+    response->status = GetCameraPointCloud::Response::STATUS_BAD_REQUEST;
+    response->error_msg = "target_frame must not be blank";
+    return;
+  }
+
+  const std::string native_frame = pair.depth->header.frame_id;
+  if (native_frame.empty()) {
+    response->status = GetCameraPointCloud::Response::STATUS_NO_DATA;
+    response->error_msg = "depth frame_id is empty";
+    return;
+  }
+  const auto cloud_stamp = pair.depth->header.stamp;
+  std::optional<Eigen::Isometry3f> transform;
+  if (!request->target_frame.empty() && request->target_frame != native_frame) {
+    if (to_ns(cloud_stamp) == 0) {
+      response->status = GetCameraPointCloud::Response::STATUS_TF_FAIL;
+      response->error_msg =
+          "cannot perform time-correct target transform for zero depth stamp";
+      return;
+    }
+    try {
+      const auto tf_msg = tf_buffer_->lookupTransform(
+          request->target_frame, native_frame,
+          rclcpp::Time(cloud_stamp, RCL_ROS_TIME),
+          rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
+      const Eigen::Isometry3f candidate =
+          tf2::transformToEigen(tf_msg).cast<float>();
+      if (!candidate.matrix().allFinite()) {
+        throw std::runtime_error("TF transform contains non-finite values");
+      }
+      transform = candidate;
+    } catch (const tf2::TransformException& exception) {
+      response->status = GetCameraPointCloud::Response::STATUS_TF_FAIL;
+      response->error_msg =
+          "TF " + request->target_frame + "<-" + native_frame +
+          " at depth stamp: " + exception.what();
+      return;
+    } catch (const std::exception& exception) {
+      response->status = GetCameraPointCloud::Response::STATUS_TF_FAIL;
+      response->error_msg =
+          "TF conversion failed at depth stamp: " +
+          std::string(exception.what());
+      return;
+    }
+  }
+
+  const sensor_msgs::msg::Image* color =
+      request->include_color ? pair.color.get() : nullptr;
+  std::string deprojection_error;
+  {
+    std::lock_guard<std::mutex> lock(deproject_mutex_);
+    if (!deprojector_.deproject(*pair.depth, *depth_info, color,
+                                request->stride, transform,
+                                response->points, deprojection_error)) {
+      response->status = GetCameraPointCloud::Response::STATUS_NO_DATA;
+      response->error_msg = "camera data cannot be deprojected: " +
+                            deprojection_error;
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "get_point_cloud rejected camera data: %s",
+          deprojection_error.c_str());
+      return;
+    }
+  }
+  response->stamp = cloud_stamp;
+  response->points.header.stamp = cloud_stamp;
+  response->points.header.frame_id =
+      request->target_frame.empty() ? native_frame : request->target_frame;
+  response->status = GetCameraPointCloud::Response::STATUS_OK;
 }
 
 void CameraServerNode::handle_transform(

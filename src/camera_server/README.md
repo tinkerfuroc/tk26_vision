@@ -7,8 +7,9 @@ time-correct transforms **on demand**:
 - `~/get_snapshot` (`tinker_vision_msgs_26/srv/GetCameraSnapshot`) — latest
   synced color+depth pair + camera infos + transforms at the pair stamp, with
   `max_age` / `captured_after` freshness semantics.
-- `~/get_point_cloud` (`GetCameraPointCloud`) — CPU deprojection of the cached
-  pair (stride / XYZ or XYZRGB / optional target frame at pair stamp).
+- `~/get_point_cloud` (`GetCameraPointCloud`) — CPU deprojection of registered
+  depth from the cached pair (stride / XYZ or XYZRGB / optional target frame
+  at the depth image stamp).
 - `~/get_transform` (`GetTransform`) — lookup against the server's warm 180 s
   TF buffer, for on-demand consumers with cold local buffers.
 - `~/status` (`CameraServerStatus`, 1 Hz) — stream ages, sync fps, pair seq.
@@ -31,3 +32,6 @@ spec maps the deferred migration).
 ## Changelog
 
 - 2026-07-13: package scaffold + thread-safe FrameStore with captured_after wait.
+- 2026-07-23: hardened CPU Deprojector for registered depth — validated
+  16UC1/mono16/32FC1 input, deterministic little-endian XYZ[RGB], cached
+  xy-table, stride, and rigid-transform support.

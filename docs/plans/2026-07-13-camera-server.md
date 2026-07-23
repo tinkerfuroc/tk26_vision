@@ -123,7 +123,7 @@ bool[] transforms_ok
 
 uint32 stride              # pixel stride; 0 or 1 = full resolution
 bool include_color         # true => XYZRGB, false => XYZ
-string target_frame        # empty => native optical frame; else transformed at pair stamp
+string target_frame        # empty => native optical frame; else transformed at depth stamp
 float32 max_age_sec
 builtin_interfaces/Time captured_after
 float32 wait_timeout_sec
@@ -355,7 +355,8 @@ time-correct transforms **on demand**:
   synced color+depth pair + camera infos + transforms at the pair stamp, with
   `max_age` / `captured_after` freshness semantics.
 - `~/get_point_cloud` (`GetCameraPointCloud`) — CPU deprojection of the cached
-  pair (stride / XYZ or XYZRGB / optional target frame at pair stamp).
+  registered-depth pair (stride / XYZ or XYZRGB / optional target frame at
+  the depth image stamp).
 - `~/get_transform` (`GetTransform`) — lookup against the server's warm 180 s
   TF buffer, for on-demand consumers with cold local buffers.
 - `~/status` (`CameraServerStatus`, 1 Hz) — stream ages, sync fps, pair seq.
@@ -708,6 +709,29 @@ git commit -m "feat(camera_server): package scaffold + thread-safe FrameStore wi
 - Consumes: nothing from other tasks (pure function of msgs).
 - Produces (used by Task 5): `camera_server::Deprojector::deproject(depth, depth_info, color_or_null, stride, optional<Eigen::Isometry3f>, out_cloud, error_msg) -> bool`. Output cloud: unorganized, `height=1`, fields `x,y,z` FLOAT32 (+ packed `rgb` FLOAT32 when color given), invalid (z<=0/NaN) pixels dropped, `is_dense=true`. Caller sets `out.header`. Not thread-safe (internal xy-table cache) — callers serialize with a mutex.
 
+**Final Phase 3 hardening contract (authoritative over the initial TDD
+sketches below):**
+
+- Depth must be registered/rectified to color before this API; when color is
+  requested its dimensions must exactly match depth. No ratio mapping,
+  distortion correction, or OpenCV registration is performed here.
+- Accept `16UC1`, `mono16` (millimetres), and `32FC1` (metres), correctly
+  decoding both ROS input byte orders. Emit a deterministic little-endian
+  cloud with exact `x@0,y@4,z@8[,rgb@12]` FLOAT32 fields and 12/16-byte point
+  steps.
+- Validate nonzero image and CameraInfo dimensions, exact depth/CameraInfo
+  dimensions, finite positive focal lengths, finite principal point, encoding,
+  minimum row step, and `step * height` backing length before any access.
+  Arithmetic for table, sampled counts, point capacity, and row/data sizes is
+  overflow-safe.
+- Skip every non-finite or non-positive depth, including NaN, +/-Inf, zero,
+  and negative float depth. Reject non-finite transforms/output coordinates.
+- Clear `out` and `error_msg` on entry. Every failure leaves `out` empty with
+  a deterministic nonempty error; success leaves `error_msg` empty.
+- Tests cover exact fields/layout/data sizing, XYZ and RGB/BGR channels,
+  rotation plus translation, cache invalidation, malformed buffers and
+  dimensions, endian cases, invalid/all-invalid depth, and extreme strides.
+
 - [ ] **Step 1: Write the failing gtest**
 
 `test/test_deprojector.cpp`:
@@ -878,8 +902,8 @@ TEST(Deprojector, RejectsUnsupportedEncoding) {
 namespace camera_server {
 
 /// CPU depth-image deprojection with a cached per-intrinsics xy-table.
-/// Handles 16UC1 (mm) and 32FC1 (m) depth, rgb8/bgr8 color (color may be a
-/// different resolution than depth — pixel coordinates are ratio-mapped).
+/// Handles 16UC1/mono16 (mm) and 32FC1 (m) depth, rgb8/bgr8 color.
+/// Depth must already be registered/rectified to same-sized color.
 /// NOT thread-safe (table cache): callers serialize access externally.
 class Deprojector {
  public:
@@ -921,6 +945,11 @@ add_library(camera_server_core
   src/frame_store.cpp
   src/deprojector.cpp
 )
+target_include_directories(camera_server_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${sensor_msgs_INCLUDE_DIRS})
+target_link_libraries(camera_server_core PUBLIC Eigen3::Eigen)
 ```
 
 and inside `if(BUILD_TESTING)`:
@@ -1008,12 +1037,8 @@ bool Deprojector::deproject(const sensor_msgs::msg::Image& depth,
   std::optional<sensor_msgs::PointCloud2Iterator<uint8_t>> it_rgb;
   if (color) it_rgb.emplace(out, "rgb");
 
-  // color may be a different resolution than depth (e.g. raw-res streams):
-  // ratio-map pixel coordinates.
-  const float cu_ratio =
-      color ? static_cast<float>(color->width) / depth.width : 0.f;
-  const float cv_ratio =
-      color ? static_cast<float>(color->height) / depth.height : 0.f;
+  // The hardened contract requires depth already registered to color and
+  // validates identical dimensions before this loop.
   const bool bgr = color && color->encoding == "bgr8";
 
   size_t n = 0;
@@ -1038,10 +1063,8 @@ bool Deprojector::deproject(const sensor_msgs::msg::Image& depth,
       ++it_x; ++it_y; ++it_z;
 
       if (color) {
-        const uint32_t cu = std::min<uint32_t>(
-            static_cast<uint32_t>(u * cu_ratio), color->width - 1);
-        const uint32_t cv = std::min<uint32_t>(
-            static_cast<uint32_t>(v * cv_ratio), color->height - 1);
+        const uint32_t cu = u;
+        const uint32_t cv = v;
         const uint8_t* px =
             color->data.data() + static_cast<size_t>(cv) * color->step + cu * 3;
         // PointCloud2 packed rgb byte order: [b, g, r, _] via the
@@ -1081,7 +1104,7 @@ Expected: `[  PASSED  ] 7 tests.` and `[  PASSED  ] 5 tests.` If the rgb byte-or
 - [ ] **Step 6: Append changelog line to README.md**
 
 ```markdown
-- 2026-07-13: Deprojector — 16UC1/32FC1 depth -> XYZ[RGB] cloud, cached xy-table, stride + transform support.
+- 2026-07-23: Deprojector — hardened 16UC1/mono16/32FC1 registered depth -> deterministic little-endian XYZ[RGB] cloud, validated buffers/intrinsics, cached xy-table, stride + transform support.
 ```
 
 - [ ] **Step 7: Commit**
@@ -1592,7 +1615,7 @@ git commit -m "feat(camera_server): CameraServerNode — get_snapshot/get_transf
 
 **Interfaces:**
 - Consumes: `acquire_pair` + `Deprojector::deproject` + `tf_buffer_` (Tasks 2–4).
-- Produces: working `~/get_point_cloud` per spec §4.2 — non-OK statuses return no cloud (unlike snapshot; clouds are expensive), `target_frame` transform at pair stamp, TF failure fails closed with `STATUS_TF_FAIL`.
+- Produces: working `~/get_point_cloud` per spec §4.2 — non-OK statuses return no cloud (unlike snapshot; clouds are expensive), `target_frame` transform at `depth.header.stamp`, response/cloud stamps copied from that same depth stamp, TF failure fails closed with `STATUS_TF_FAIL`.
 
 - [ ] **Step 1: Replace the stub `handle_point_cloud` in camera_server_node.cpp**
 
@@ -1623,18 +1646,19 @@ void CameraServerNode::handle_point_cloud(
   }
 
   const std::string native_frame = pair.depth->header.frame_id;
+  const auto cloud_stamp = pair.depth->header.stamp;
   std::optional<Eigen::Isometry3f> transform;
   if (!req->target_frame.empty() && req->target_frame != native_frame) {
     try {
       const auto tf_msg = tf_buffer_->lookupTransform(
           req->target_frame, native_frame,
-          rclcpp::Time(from_ns(pair.stamp_ns)),
+          rclcpp::Time(cloud_stamp),
           rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
       transform = tf2::transformToEigen(tf_msg).cast<float>();
     } catch (const tf2::TransformException& e) {
       res->status = GetCameraPointCloud::Response::STATUS_TF_FAIL;
       res->error_msg = "tf " + req->target_frame + "<-" + native_frame +
-                       " at pair stamp: " + e.what();
+                       " at depth stamp: " + e.what();
       return;  // fail closed — a silently untransformed cloud is worse (spec §7)
     }
   }
@@ -1649,7 +1673,7 @@ void CameraServerNode::handle_point_cloud(
       return;
     }
   }
-  res->stamp = from_ns(pair.stamp_ns);
+  res->stamp = cloud_stamp;
   res->points.header.stamp = res->stamp;
   res->points.header.frame_id =
       req->target_frame.empty() ? native_frame : req->target_frame;
@@ -1674,7 +1698,7 @@ Expected: `status: 1`, `error_msg: 'no camera data'`, node does not crash. (Live
 - [ ] **Step 3: Append changelog line to README.md**
 
 ```markdown
-- 2026-07-13: get_point_cloud implemented — on-demand deprojection, stride/color, target_frame at pair stamp (TF fail-closed).
+- 2026-07-13: get_point_cloud implemented — on-demand deprojection, stride/color, target_frame at depth stamp (TF fail-closed).
 ```
 
 - [ ] **Step 4: Commit**

@@ -63,3 +63,5 @@ unsupported or internally inconsistent models fail closed.
 - 2026-07-23: added the opt-in zero-subscription legacy compatibility bridge
   with a dedicated client executor, bounded forwarding deadlines, and cleanup
   of timed-out requests.
+- 2026-07-23: added standalone gated launch (wrist/head/bridge) and wired the
+  head server into `vision_driver.launch.py` behind `enable_camera_server`.

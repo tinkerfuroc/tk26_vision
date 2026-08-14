@@ -19,7 +19,7 @@ import asyncio
 from types import SimpleNamespace
 
 import numpy as np
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PointStamped
 from rclpy.action import CancelResponse
 from std_msgs.msg import Header
 from tinker_vision_msgs_26.action import FeatureMatching
@@ -326,6 +326,7 @@ def test_feedback_uses_canonical_fields():
     assert feedback.delay_limit == 25.0
     assert feedback.stage == 'vlm_call'
     assert feedback.message == 'Matching candidates.'
+    assert feedback.input_frozen is False
 
 
 class _ImmediateFuture:
@@ -387,6 +388,20 @@ class _Logger:
 
 
 def test_matching_pipeline_publishes_stages_and_maps_centroid(monkeypatch):
+    events = []
+
+    class Transform:
+        def try_lookup(self, target, source, stamp, timeout_s):
+            events.append(('tf_lookup', target, source, stamp, timeout_s))
+            return object()
+
+        def transform_point(self, point, _transform):
+            events.append('transform_point')
+            result = PointStamped(point=point.point)
+            result.header.frame_id = 'map'
+            result.header.stamp = point.header.stamp
+            return result
+
     header = Header()
     header.frame_id = 'camera'
     centroid = Point(x=1.0, y=2.0, z=3.0)
@@ -412,6 +427,7 @@ def test_matching_pipeline_publishes_stages_and_maps_centroid(monkeypatch):
         qwen_api_backend='dashscope',
         vlm_max_retries=3,
         vlm_timeout_s=20.0,
+        _transform_helper=Transform(),
     )
     node.get_logger = lambda: logger
     goal = _GoalHandle(SimpleNamespace(
@@ -419,11 +435,12 @@ def test_matching_pipeline_publishes_stages_and_maps_centroid(monkeypatch):
         comparison_images=[],
         features=['wearing a blue shirt'],
         max_distance=5.0,
-        target_frame='camera',
+        target_frame='map',
     ))
     captured = {}
 
     def fake_match(*_args, **kwargs):
+        events.append('vlm')
         captured.update(kwargs)
         return MatchVlmResult(indices=[0], provider='gemini')
 
@@ -439,12 +456,24 @@ def test_matching_pipeline_publishes_stages_and_maps_centroid(monkeypatch):
     assert result.status == 0
     assert result.error_msg == ''
     assert len(result.centroids) == 1
-    assert result.centroids[0].header.frame_id == 'camera'
+    assert result.centroids[0].header.frame_id == 'map'
     assert result.centroids[0].point == centroid
+    assert events == [
+        ('tf_lookup', 'map', 'camera', header.stamp, 0.1),
+        'transform_point',
+        'vlm',
+    ]
     assert [feedback.stage for feedback in goal.feedback] == [
         'detecting',
-        'vlm_call',
         'transforming',
+        'input_frozen',
+        'vlm_call',
+    ]
+    assert [feedback.input_frozen for feedback in goal.feedback] == [
+        False,
+        False,
+        True,
+        True,
     ]
     assert all(feedback.status == 0 for feedback in goal.feedback)
     assert all(feedback.delay_limit > 0.0 for feedback in goal.feedback)
@@ -452,7 +481,76 @@ def test_matching_pipeline_publishes_stages_and_maps_centroid(monkeypatch):
     assert not captured['should_abort']()
 
 
-def test_stamped_tf_lookup_degrades_to_detection_frame():
+def test_matching_pipeline_does_not_freeze_or_call_vlm_when_tf_is_missing(
+    monkeypatch,
+):
+    class Transform:
+        def try_lookup(self, _target, _source, *, stamp, timeout_s):
+            del stamp, timeout_s
+            return None
+
+    header = Header()
+    header.frame_id = 'camera'
+    detection_response = SimpleNamespace(
+        status=0,
+        error_msg='',
+        header=header,
+        rgb_image=object(),
+        segments=[object()],
+        objects=[
+            SimpleNamespace(
+                cls='person',
+                centroid=Point(x=1.0, y=2.0, z=3.0),
+            )
+        ],
+    )
+    node = _node(
+        _action_gate=_Gate(),
+        _match_provider_chain=[('gemini', 'model')],
+        _vision_logger=_VisionLogger(),
+        bridge=_Bridge(),
+        detection_cli=_DetectionClient(detection_response),
+        log_prompts=False,
+        max_person_per_image=5,
+        qwen_api_backend='dashscope',
+        vlm_max_retries=3,
+        vlm_timeout_s=20.0,
+        _transform_helper=Transform(),
+    )
+    node.get_logger = lambda: _Logger()
+    goal = _GoalHandle(SimpleNamespace(
+        camera='orbbec',
+        comparison_images=[],
+        features=['wearing a blue shirt'],
+        max_distance=5.0,
+        target_frame='map',
+    ))
+
+    def unexpected_match(*_args, **_kwargs):
+        raise AssertionError('VLM must not run without capture-stamped TF')
+
+    monkeypatch.setattr(
+        feature_matching, 'request_match_indices_chain', unexpected_match
+    )
+    monkeypatch.setattr(
+        feature_matching, 'encode_to_data_url', lambda _image: 'data:image'
+    )
+
+    result = asyncio.run(node._run_feature_matching(goal))
+
+    assert result.status == 1
+    assert result.error_msg == (
+        'TF camera -> map failed before feature matching.'
+    )
+    assert result.centroids == []
+    assert [feedback.stage for feedback in goal.feedback] == [
+        'detecting',
+        'transforming',
+    ]
+    assert all(not feedback.input_frozen for feedback in goal.feedback)
+
+
+def test_stamped_tf_lookup_rejects_missing_target_transform():
     calls = []
 
     class Transform:
@@ -470,6 +568,4 @@ def test_stamped_tf_lookup_degrades_to_detection_frame():
     result = node._stamped_in_target_frame(point, header, 'map')
 
     assert calls == [('map', 'camera', header.stamp, 0.1)]
-    assert result.header.frame_id == 'camera'
-    assert result.header.stamp == header.stamp
-    assert result.point == point
+    assert result is None

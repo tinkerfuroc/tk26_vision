@@ -177,7 +177,9 @@ def test_camera_intake_preserves_reliable_rgbd_qos_and_sync(monkeypatch):
     assert cfg.camera_info.qos_depth == 10
     assert cfg.sync_queue == 3
     assert cfg.sync_slop_s == 0.1
-    assert cfg.age_source == 'recv'
+    assert cfg.backend == 'service'
+    assert cfg.age_source == 'stamp'
+    assert cfg.provider_endpoint == '/head_camera_server'
     assert captured['kwargs'] == {
         'callback_group': callback_group,
         'bridge': bridge,
@@ -423,8 +425,16 @@ def test_pipeline_snapshots_tf_before_vlm_and_preserves_geometry(
     assert [feedback.stage for feedback in goal.feedback] == [
         'acquiring_frame',
         'transforming',
+        'input_frozen',
         'vlm_call',
         'judging',
+    ]
+    assert [feedback.input_frozen for feedback in goal.feedback] == [
+        False,
+        False,
+        True,
+        True,
+        True,
     ]
     assert all(feedback.status == 0 for feedback in goal.feedback)
     assert result.status == 0
@@ -476,4 +486,7 @@ def test_tf_lookup_failure_keeps_status_one_and_skips_vlm(monkeypatch):
         'acquiring_frame',
         'transforming',
     ]
+    assert all(
+        feedback.input_frozen is False for feedback in goal.feedback
+    )
     assert goal.succeed_calls == 1

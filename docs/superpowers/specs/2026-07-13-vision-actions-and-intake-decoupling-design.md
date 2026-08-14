@@ -104,16 +104,21 @@ written for):
 int32 status          # 0 = normal; nonzero = abnormal (watchdog trip)
 float32 delay_limit   # server's promise: max seconds until next feedback/result
 string stage          # machine token: acquiring_frame | detecting | vlm_call |
-                      #   vlm_retry | vlm_fallback | judging | transforming
+                      #   vlm_retry | vlm_fallback | judging | transforming |
+                      #   input_frozen
 string message        # human-readable detail (provider/model, batch i/N, ...)
+bool input_frozen     # false until all camera/TF inputs are goal-owned;
+                      # true on input_frozen and every later stage
 ```
 
 `delay_limit` is the one field with a live client-side consumer (the
 `goal_timeout` watchdog, `ActionBase.py:538-542`); servers must set it
 honestly per stage (e.g. `vlm_timeout_s` + margin when entering `vlm_call`).
-`stage`/`message` have no BT consumer today; they are kept (cheap, useful
-for `ros2 action` CLI debugging and future BT use) but nothing may depend on
-them.
+`input_frozen` is the typed motion-release signal. Servers publish exactly one
+`input_frozen` stage after acquiring every image/depth/intrinsics/point-cloud
+and capture-stamped transform required by the remaining work, then keep the
+boolean true on all later feedback. `stage`/`message` remain useful for
+`ros2 action` CLI debugging.
 
 The old `.srv` files stay in `tinker_vision_msgs_26` untouched for one
 release (interface package is shared; deleting them is deferred cleanup —

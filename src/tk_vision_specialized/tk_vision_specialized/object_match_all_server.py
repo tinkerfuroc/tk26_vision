@@ -53,6 +53,13 @@ class NodeParams:
     max_depth_m: float
 
 
+def _build_vlm_clients(provider, judge_provider, model, judge_model, base_url):
+    return (
+        build_match_client(provider, model=model, base_url=base_url),
+        build_judge_client(judge_provider, model=judge_model, base_url=base_url),
+    )
+
+
 class ObjectMatchAllServer(Node):
     def __init__(self):
         super().__init__('object_match_all_server')
@@ -106,6 +113,15 @@ class ObjectMatchAllServer(Node):
         self.declare_parameter('sync_wait_time_s', 1.5)
         self.declare_parameter('min_depth_m', 0.05)
         self.declare_parameter('max_depth_m', 8.0)
+        self.declare_parameter('camera_backend', 'service')
+        self.declare_parameter(
+            'realsense_provider_endpoint', '/wrist_camera_server')
+        self.declare_parameter(
+            'orbbec_provider_endpoint', '/head_camera_server')
+        self.declare_parameter(
+            'transform_provider_endpoint', '/head_camera_server')
+        self.declare_parameter('camera_provider_wait_timeout_s', 0.5)
+        self.declare_parameter('camera_provider_response_timeout_s', 5.0)
         # Logging
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
@@ -180,11 +196,8 @@ class ObjectMatchAllServer(Node):
         judge_model = self.get_parameter('judge_model').value or model
         base_url = self.get_parameter('vlm_base_url').value or ''
 
-        self.match_client = build_match_client(
-            provider, model=model, base_url=base_url,
-        )
-        self.judge_client = build_judge_client(
-            judge_provider, model=judge_model,
+        self.match_client, self.judge_client = _build_vlm_clients(
+            provider, judge_provider, model, judge_model, base_url,
         )
 
         sam_weights = resolve_weights(

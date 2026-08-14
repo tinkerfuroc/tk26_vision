@@ -1,5 +1,6 @@
 # 1 Hz health snapshot. Spec §4.4.
 builtin_interfaces/Time last_pair_stamp
+builtin_interfaces/Time last_pair_received_at  # diagnostics only; never freshness
 float32 color_age_sec      # now - last color header stamp (-1 if never seen)
 float32 depth_age_sec      # now - last depth header stamp (-1 if never seen)
 float32 pair_age_sec       # now - min(color,depth) pair stamp (-1 if never)

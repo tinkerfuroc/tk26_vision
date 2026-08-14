@@ -216,7 +216,12 @@ def test_two_color_intakes_preserve_topics_reliable_qos_and_group(
     assert all(cfg.color.qos_depth == 10 for cfg in configs)
     assert all(cfg.depth is None for cfg in configs)
     assert all(cfg.camera_info is None for cfg in configs)
-    assert all(cfg.age_source == 'recv' for cfg in configs)
+    assert all(cfg.backend == 'service' for cfg in configs)
+    assert all(cfg.age_source == 'stamp' for cfg in configs)
+    assert [cfg.provider_endpoint for cfg in configs] == [
+        '/head_camera_server',
+        '/wrist_camera_server',
+    ]
     assert all(
         kwargs['callback_group'] is callback_group
         for _args, kwargs in captured
@@ -372,13 +377,21 @@ def test_batches_publish_canonical_feedback_and_preserve_vocab_order(
     assert all(call[1]['should_abort'] is not None for call in calls)
     assert [feedback.stage for feedback in goal.feedback] == [
         'acquiring_frame',
+        'input_frozen',
         'vlm_call',
         'vlm_call',
         'judging',
     ]
-    assert [feedback.message for feedback in goal.feedback[1:3]] == [
+    assert [feedback.message for feedback in goal.feedback[2:4]] == [
         'Scanning batch 1/2.',
         'Scanning batch 2/2.',
+    ]
+    assert [feedback.input_frozen for feedback in goal.feedback] == [
+        False,
+        True,
+        True,
+        True,
+        True,
     ]
     assert all(feedback.status == 0 for feedback in goal.feedback)
     assert all(feedback.delay_limit > 0.0 for feedback in goal.feedback)

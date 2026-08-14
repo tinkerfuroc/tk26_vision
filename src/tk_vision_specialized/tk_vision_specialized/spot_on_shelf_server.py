@@ -11,8 +11,8 @@ from rclpy.action import ActionServer
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 import numpy as np
-import tf2_ros
 import tf2_geometry_msgs
+from vision_util.tf_lookup import TransformHelper
 
 from tinker_vision_msgs_26.action import SpotOnShelf
 from tinker_vision_msgs_26.srv import ObjectDetection
@@ -28,6 +28,9 @@ class SpotOnShelfServer(Node):
         self.declare_parameter('detection_service', 'object_detection_yolo')
         self.declare_parameter('target_frame', 'base_link')
         self.declare_parameter('default_camera', 'orbbec')
+        self.declare_parameter('camera_backend', 'service')
+        self.declare_parameter(
+            'transform_provider_endpoint', '/head_camera_server')
 
         self.detection_service_name = self.get_parameter(
             'detection_service').value
@@ -43,8 +46,14 @@ class SpotOnShelfServer(Node):
         )
 
         # TF buffer for coordinate transformations
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self._transform_helper = TransformHelper(
+            self,
+            backend=self.get_parameter('camera_backend').value,
+            provider_endpoint=self.get_parameter(
+                'transform_provider_endpoint').value,
+        )
+        self.tf_buffer = self._transform_helper.buffer
+        self.tf_listener = self._transform_helper._listener
 
         # Create action server with reentrant callback group
         self._action_server = ActionServer(
@@ -158,18 +167,18 @@ class SpotOnShelfServer(Node):
         """Transform shelf endpoint poses to base_link frame."""
         target_frame = 'base_link'
 
-        # Wait for transform to be available
-        await self._wait_for_transform(
-            target_frame,
-            shelf_left.header.frame_id
-        )
-
-        # Get transform
-        transform = self.tf_buffer.lookup_transform(
+        transform = self._transform_helper.wait_lookup(
             target_frame,
             shelf_left.header.frame_id,
-            rclpy.time.Time()
+            deadline_s=5.0,
+            latest=False,
+            stamp=shelf_left.header.stamp,
         )
+        if transform is None:
+            raise RuntimeError(
+                f'Transform from {shelf_left.header.frame_id} to '
+                f'{target_frame} unavailable after 5.0s'
+            )
 
         # Transform both points
         left_point_stamped = tf2_geometry_msgs.do_transform_pose(

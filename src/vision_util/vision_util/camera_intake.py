@@ -1,7 +1,8 @@
 """Shared camera subscription, synchronization, and frame-cache utilities."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 import threading
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -12,6 +13,7 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import Header
 
 from vision_util.depth_reproject import (
     decode_depth_metres,
@@ -47,10 +49,26 @@ class IntakeConfig:
     sync_queue: int = 10
     sync_slop_s: float = 0.1
     age_source: str = 'recv'
+    backend: str = 'subscription'
+    provider_endpoint: str = ''
+    provider_wait_timeout_s: float = 0.5
+    provider_response_timeout_s: float = 10.0
 
     def __post_init__(self) -> None:
         if self.age_source not in ('recv', 'stamp'):
             raise ValueError("age_source must be 'recv' or 'stamp'")
+        if self.backend not in ('subscription', 'service'):
+            raise ValueError(
+                "backend must be 'subscription' or 'service'"
+            )
+        if self.backend == 'service' and not self.provider_endpoint.strip():
+            raise ValueError(
+                'provider_endpoint is required for the service backend'
+            )
+        if self.backend == 'service' and self.age_source != 'stamp':
+            raise ValueError(
+                "the service backend requires age_source='stamp'"
+            )
         if (
             self.color is None
             and self.depth is None
@@ -220,8 +238,22 @@ class CameraIntake:
         self._last_stale_warn = 0.0
         self._subscriptions = []
         self._sync = None
+        self._provider = None
+        self._provider_stamp_ns = None
 
-        if cfg.color is not None and cfg.depth is not None:
+        if cfg.backend == 'service':
+            # Import lazily so subscription-only users and their lightweight
+            # unit tests do not need generated provider service modules.
+            from camera_provider import CameraProvider
+
+            self._provider = CameraProvider(
+                node,
+                cfg.provider_endpoint,
+                callback_group=callback_group,
+                service_wait_timeout_s=cfg.provider_wait_timeout_s,
+                response_timeout_s=cfg.provider_response_timeout_s,
+            )
+        elif cfg.color is not None and cfg.depth is not None:
             color_sub = Subscriber(
                 node,
                 Image,
@@ -264,7 +296,7 @@ class CameraIntake:
                 )
             )
 
-        if cfg.camera_info is not None:
+        if cfg.backend == 'subscription' and cfg.camera_info is not None:
             self._subscriptions.append(
                 node.create_subscription(
                     CameraInfo,
@@ -326,6 +358,104 @@ class CameraIntake:
                 previous=self._latest,
             )
 
+    def _store_provider_result(self, result) -> Optional[FrameBundle]:
+        """Cache a provider payload without using receive time for age."""
+        from camera_provider import select_camera_info
+
+        color_msg = result.color if self.cfg.color is not None else None
+        depth_msg = result.depth if self.cfg.depth is not None else None
+        header_msg = color_msg if color_msg is not None else depth_msg
+        payload_header = getattr(header_msg, 'header', None)
+        header = (
+            copy.copy(payload_header)
+            if payload_header is not None
+            else Header()
+        )
+        stamp = getattr(result, 'stamp', None)
+        if stamp is None or _nanoseconds(stamp) <= 0:
+            stamp = getattr(header, 'stamp', None)
+        if stamp is None:
+            return None
+        stamp_ns = _nanoseconds(stamp)
+        if stamp_ns <= 0:
+            return None
+        header.stamp = stamp
+        if getattr(result, 'frame_id', ''):
+            header.frame_id = result.frame_id
+
+        info = None
+        if self.cfg.camera_info is not None:
+            info = select_camera_info(
+                result.depth_info,
+                result.color_info,
+                prefer_depth=self.cfg.depth is not None,
+            )
+            if info is not None:
+                k = _readonly(
+                    np.asarray(
+                        info.k, dtype=np.float64
+                    ).reshape(9).copy()
+                )
+            else:
+                k = None
+        else:
+            k = self._K
+
+        received_at = getattr(result, 'received_at', None)
+        try:
+            recv_time = Time.from_msg(received_at)
+        except Exception:
+            recv_time = self._node.get_clock().now()
+
+        with self._lock:
+            if (
+                self._provider_stamp_ns == stamp_ns
+                and self._latest is not None
+            ):
+                if info is not None:
+                    self._camera_info = info
+                    self._K = k
+                    self._latest.K = k
+                return self._latest
+            self._provider_stamp_ns = stamp_ns
+            if info is not None:
+                self._camera_info = info
+                self._K = k
+            self._seq += 1
+            self._latest = FrameBundle(
+                owner=self,
+                camera=self.cfg.camera,
+                seq=self._seq,
+                header=header,
+                recv_time=recv_time,
+                K=k,
+                color_msg=color_msg,
+                depth_msg=depth_msg,
+                previous=self._latest,
+            )
+            return self._latest
+
+    def _provider_snapshot(
+        self,
+        *,
+        max_age_s: float = 0.0,
+        captured_after=None,
+        wait_timeout_s: float = 0.0,
+    ):
+        result = self._provider.snapshot(
+            want_color=self.cfg.color is not None,
+            want_depth=self.cfg.depth is not None,
+            want_camera_info=self.cfg.camera_info is not None,
+            max_age_s=max(0.0, float(max_age_s)),
+            captured_after=captured_after,
+            wait_timeout_s=max(0.0, float(wait_timeout_s)),
+        )
+        # STALE and WAIT_TIMEOUT snapshots intentionally carry the newest
+        # payload, which is cached for the existing on_timeout='stale' mode.
+        if result.status not in (1, 5):
+            self._store_provider_result(result)
+        return result
+
     def _discard_bundle_locked(self, bundle: FrameBundle) -> None:
         if self._latest is bundle:
             previous = bundle._previous
@@ -358,6 +488,12 @@ class CameraIntake:
         max_age_s: Optional[float] = None,
     ) -> Optional[FrameBundle]:
         """Return the newest bundle, optionally rejecting an over-age frame."""
+        if self.cfg.backend == 'service':
+            result = self._provider_snapshot(
+                max_age_s=0.0 if max_age_s is None else max_age_s
+            )
+            if not result.ok:
+                return None
         with self._lock:
             bundle = self._latest
             if bundle is None:
@@ -379,6 +515,29 @@ class CameraIntake:
         """Poll for a fresh bundle, then fail or serve stale on timeout."""
         if on_timeout not in ('fail', 'stale'):
             raise ValueError("on_timeout must be 'fail' or 'stale'")
+        if self.cfg.backend == 'service':
+            now_ns = _nanoseconds(self._node.get_clock().now())
+            after_ns = max(
+                1, now_ns - int(max(0.0, float(max_age_s)) * 1e9)
+            )
+            result = self._provider_snapshot(
+                max_age_s=max_age_s,
+                captured_after=Time(nanoseconds=after_ns),
+                wait_timeout_s=timeout_s,
+            )
+            if result.ok:
+                return self.latest_cached(max_age_s=max_age_s)
+            if on_timeout == 'fail':
+                return None
+            stale = self.latest_cached()
+            if stale is not None:
+                now = time.monotonic()
+                if now - self._last_stale_warn >= self._STALE_WARN_PERIOD_S:
+                    self._node.get_logger().warn(
+                        f'{self.cfg.camera} frame is stale; proceeding anyway'
+                    )
+                    self._last_stale_warn = now
+            return stale
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         while True:
             bundle = self.latest(max_age_s=max_age_s)
@@ -404,6 +563,10 @@ class CameraIntake:
 
     def latest_new(self, last_seq) -> Any:
         """Return a new bundle, ``NO_NEW_FRAME``, or ``None`` when empty."""
+        if self.cfg.backend == 'service':
+            result = self._provider_snapshot()
+            if not result.ok:
+                return None
         with self._lock:
             bundle = self._latest
             if bundle is None:
@@ -416,6 +579,74 @@ class CameraIntake:
         """Return the latest read-only 9-element intrinsic matrix."""
         with self._lock:
             return self._K
+
+    def camera_info(self):
+        """Return the latest CameraInfo message, if one is available."""
+        with self._lock:
+            return self._camera_info
+
+    def latest_cached(
+        self,
+        max_age_s: Optional[float] = None,
+    ) -> Optional[FrameBundle]:
+        """Return the local cache without issuing a provider request."""
+        with self._lock:
+            bundle = self._latest
+            if bundle is None:
+                return None
+            if (
+                max_age_s is not None
+                and self._age_s(bundle) > float(max_age_s)
+            ):
+                return None
+            return bundle
+
+    @staticmethod
+    def with_backend_params(
+        node,
+        cfg: IntakeConfig,
+        *,
+        default_backend: str = 'service',
+        default_endpoint: str,
+    ) -> IntakeConfig:
+        """Apply conventional rollout parameters to an intake config."""
+
+        def value(name: str, default):
+            try:
+                node.declare_parameter(name, default)
+            except Exception:
+                pass
+            try:
+                return node.get_parameter(name).value
+            except Exception:
+                return default
+
+        backend = str(value('camera_backend', default_backend))
+        if backend not in ('subscription', 'service'):
+            backend = default_backend
+        endpoint_name = f'{cfg.camera}_provider_endpoint'
+        endpoint = str(value(endpoint_name, default_endpoint))
+
+        def number(name: str, default: float) -> float:
+            try:
+                return float(value(name, default))
+            except (TypeError, ValueError):
+                return float(default)
+
+        return replace(
+            cfg,
+            backend=backend,
+            provider_endpoint=endpoint,
+            age_source='stamp' if backend == 'service' else cfg.age_source,
+            provider_wait_timeout_s=number(
+                'camera_provider_wait_timeout_s',
+                cfg.provider_wait_timeout_s,
+            ),
+            provider_response_timeout_s=number(
+                'camera_provider_response_timeout_s',
+                cfg.provider_response_timeout_s,
+            ),
+        )
 
     @staticmethod
     def declare_params(node, camera: str, defaults) -> IntakeConfig:
@@ -441,6 +672,14 @@ class CameraIntake:
                 sync_queue=int(values.get('sync_queue', 10)),
                 sync_slop_s=float(values.get('sync_slop_s', 0.1)),
                 age_source=str(values.get('age_source', 'recv')),
+                backend=str(values.get('backend', 'subscription')),
+                provider_endpoint=str(values.get('provider_endpoint', '')),
+                provider_wait_timeout_s=float(
+                    values.get('provider_wait_timeout_s', 0.5)
+                ),
+                provider_response_timeout_s=float(
+                    values.get('provider_response_timeout_s', 10.0)
+                ),
             )
 
         def parameter(name: str, default):
@@ -477,4 +716,38 @@ class CameraIntake:
                 parameter('sync_slop_s', default_cfg.sync_slop_s)
             ),
             age_source=str(parameter('age_source', default_cfg.age_source)),
+            backend=str(parameter('backend', default_cfg.backend)),
+            provider_endpoint=str(
+                parameter(
+                    'provider_endpoint', default_cfg.provider_endpoint
+                )
+            ),
+            provider_wait_timeout_s=float(
+                parameter(
+                    'provider_wait_timeout_s',
+                    default_cfg.provider_wait_timeout_s,
+                )
+            ),
+            provider_response_timeout_s=float(
+                parameter(
+                    'provider_response_timeout_s',
+                    default_cfg.provider_response_timeout_s,
+                )
+            ),
         )
+
+
+def configure_camera_backend(
+    node,
+    cfg: IntakeConfig,
+    *,
+    default_backend: str = 'service',
+    default_endpoint: str,
+) -> IntakeConfig:
+    """Apply the standard camera-provider rollout parameters."""
+    return CameraIntake.with_backend_params(
+        node,
+        cfg,
+        default_backend=default_backend,
+        default_endpoint=default_endpoint,
+    )

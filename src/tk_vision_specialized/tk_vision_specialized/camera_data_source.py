@@ -28,12 +28,15 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import geometry_msgs.msg
 from geometry_msgs.msg import PointStamped
 from tf2_ros import (
-    Buffer, TransformListener,
-    LookupException, ConnectivityException, ExtrapolationException,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
 )
 from tf2_geometry_msgs import do_transform_point
 
 from vision_util.vision_logging import VisionLogger
+from vision_util.tf_lookup import TransformHelper
+from vision_util.depth_reproject import decode_depth_metres
 
 
 @dataclass
@@ -62,11 +65,58 @@ class CameraDataSource:
         self._params = params
 
         self.bridge = CvBridge()
+        try:
+            self.backend = str(
+                ros_node.get_parameter('camera_backend').value
+            )
+        except Exception:
+            self.backend = 'service'
+        if self.backend not in ('subscription', 'service'):
+            raise ValueError(
+                "camera_backend must be 'subscription' or 'service'"
+            )
 
-        self.tf_buffer = Buffer(
-            cache_time=rclpy.duration.Duration(seconds=60.0),
-        )
-        self.tf_listener = TransformListener(self.tf_buffer, ros_node)
+        if self.backend == 'service':
+            from camera_provider import CameraProvider
+
+            wait_timeout = float(
+                ros_node.get_parameter(
+                    'camera_provider_wait_timeout_s'
+                ).value
+            )
+            response_timeout = float(
+                ros_node.get_parameter(
+                    'camera_provider_response_timeout_s'
+                ).value
+            )
+            self._providers = {
+                camera: CameraProvider(
+                    ros_node,
+                    ros_node.get_parameter(
+                        f'{camera}_provider_endpoint'
+                    ).value,
+                    service_wait_timeout_s=wait_timeout,
+                    response_timeout_s=response_timeout,
+                )
+                for camera in ('realsense', 'orbbec')
+            }
+            transform_endpoint = ros_node.get_parameter(
+                'transform_provider_endpoint'
+            ).value
+            self._transform_helper = TransformHelper(
+                ros_node,
+                backend='service',
+                provider_endpoint=transform_endpoint,
+                provider_wait_timeout_s=wait_timeout,
+                provider_response_timeout_s=response_timeout,
+            )
+        else:
+            self._providers = {}
+            self._transform_helper = TransformHelper(
+                ros_node, cache_time_s=60.0
+            )
+        self.tf_buffer = self._transform_helper.buffer
+        self.tf_listener = self._transform_helper._listener
 
         self.lock_msg = threading.Lock()
         self.lock_info = threading.Lock()
@@ -86,43 +136,8 @@ class CameraDataSource:
             depth=5,
         )
 
-        # Realsense (color Image + aligned depth Image + CameraInfo)
-        self._rs_color = Subscriber(
-            ros_node, Image, topics.realsense_image, qos_profile=qos,
-        )
-        self._rs_depth = Subscriber(
-            ros_node, Image, topics.realsense_depth, qos_profile=qos,
-        )
-        self._rs_info = ros_node.create_subscription(
-            CameraInfo, topics.realsense_camera_info,
-            lambda msg: self._set_intrinsic('realsense', msg),
-            qos_profile=qos,
-        )
-        self._rs_sync = ApproximateTimeSynchronizer(
-            [self._rs_color, self._rs_depth], queue_size=5, slop=0.05,
-        )
-        self._rs_sync.registerCallback(
-            lambda c, d: self._on_sync('realsense', (c, d)),
-        )
-
-        # Orbbec (color Image + PointCloud2 depth + CameraInfo)
-        self._ob_color = Subscriber(
-            ros_node, Image, topics.orbbec_image, qos_profile=qos,
-        )
-        self._ob_depth = Subscriber(
-            ros_node, PointCloud2, topics.orbbec_depth, qos_profile=qos,
-        )
-        self._ob_info = ros_node.create_subscription(
-            CameraInfo, topics.orbbec_camera_info,
-            lambda msg: self._set_intrinsic('orbbec', msg),
-            qos_profile=qos,
-        )
-        self._ob_sync = ApproximateTimeSynchronizer(
-            [self._ob_color, self._ob_depth], queue_size=5, slop=0.05,
-        )
-        self._ob_sync.registerCallback(
-            lambda c, d: self._on_sync('orbbec', (c, d)),
-        )
+        if self.backend == 'subscription':
+            self._subscribe(topics, qos)
 
         # VisionLogger takes (node, enabled, base_folder). We read the
         # corresponding ROS params (declared by the owning node, e.g.
@@ -143,6 +158,46 @@ class CameraDataSource:
             ros_node,
             enabled=log_enabled,
             base_folder=log_folder,
+        )
+
+    def _subscribe(self, topics, qos):
+        """Create the rollback subscription backend."""
+        # Realsense (color Image + aligned depth Image + CameraInfo)
+        self._rs_color = Subscriber(
+            self._node, Image, topics.realsense_image, qos_profile=qos,
+        )
+        self._rs_depth = Subscriber(
+            self._node, Image, topics.realsense_depth, qos_profile=qos,
+        )
+        self._rs_info = self._node.create_subscription(
+            CameraInfo, topics.realsense_camera_info,
+            lambda msg: self._set_intrinsic('realsense', msg),
+            qos_profile=qos,
+        )
+        self._rs_sync = ApproximateTimeSynchronizer(
+            [self._rs_color, self._rs_depth], queue_size=5, slop=0.05,
+        )
+        self._rs_sync.registerCallback(
+            lambda c, d: self._on_sync('realsense', (c, d)),
+        )
+
+        # Orbbec (color Image + PointCloud2 depth + CameraInfo)
+        self._ob_color = Subscriber(
+            self._node, Image, topics.orbbec_image, qos_profile=qos,
+        )
+        self._ob_depth = Subscriber(
+            self._node, PointCloud2, topics.orbbec_depth, qos_profile=qos,
+        )
+        self._ob_info = self._node.create_subscription(
+            CameraInfo, topics.orbbec_camera_info,
+            lambda msg: self._set_intrinsic('orbbec', msg),
+            qos_profile=qos,
+        )
+        self._ob_sync = ApproximateTimeSynchronizer(
+            [self._ob_color, self._ob_depth], queue_size=5, slop=0.05,
+        )
+        self._ob_sync.registerCallback(
+            lambda c, d: self._on_sync('orbbec', (c, d)),
         )
 
     # ---------------- subscriber callbacks ----------------
@@ -166,6 +221,8 @@ class CameraDataSource:
     def snapshot(self, camera: str):
         """Wait briefly for a recent (color, depth) pair and return it
         alongside processed arrays. Returns None on timeout."""
+        if self.backend == 'service':
+            return self._provider_snapshot(camera)
         sync_thres_s = float(self._params.img_sync_thres_s)
         deadline = (
             self._node.get_clock().now()
@@ -199,6 +256,56 @@ class CameraDataSource:
             time.sleep(0.05)
         return None
 
+    def _provider_snapshot(self, camera: str):
+        provider = self._providers.get(camera)
+        if provider is None:
+            return None
+        if camera == 'orbbec':
+            bundle = provider.color_cloud_bundle(
+                want_camera_info=True,
+                max_age_s=float(self._params.img_sync_thres_s),
+                wait_timeout_s=float(self._params.sync_wait_time_s),
+            )
+            if not bundle.ok:
+                self._log.warning(
+                    f'orbbec provider bundle failed: {bundle.error_msg}'
+                )
+                return None
+            response = bundle.snapshot
+        else:
+            response = provider.snapshot(
+                want_color=True,
+                want_depth=True,
+                want_camera_info=True,
+                max_age_s=float(self._params.img_sync_thres_s),
+                wait_timeout_s=float(self._params.sync_wait_time_s),
+            )
+            if not response.ok:
+                self._log.warning(
+                    f'realsense provider snapshot failed: '
+                    f'{response.error_msg}'
+                )
+                return None
+        from camera_provider import select_camera_info
+
+        info = select_camera_info(
+            response.depth_info, response.color_info
+        )
+        if info is None:
+            return None
+        intrinsic = {
+            'fx': info.k[0], 'fy': info.k[4],
+            'cx': info.k[2], 'cy': info.k[5],
+            'width': info.width, 'height': info.height,
+            'frame_id': info.header.frame_id,
+        }
+        # The provider cloud is requested above to guarantee the custom
+        # consumer's color/cloud pair identity. The snapshot depth remains
+        # the pixel-aligned representation used by the mask-centroid logic.
+        return self._process_realsense(
+            response.color, response.depth, intrinsic,
+        )
+
     def _process_realsense(self, color_msg, depth_msg, intrinsic):
         rgb_bgr = self.bridge.imgmsg_to_cv2(
             color_msg, desired_encoding='bgr8',
@@ -206,7 +313,7 @@ class CameraDataSource:
         depth_mm = self.bridge.imgmsg_to_cv2(
             depth_msg, desired_encoding='passthrough',
         )
-        depth_m = depth_mm.astype(np.float32) / 1000.0
+        depth_m = decode_depth_metres(np.asarray(depth_mm))
         h, w = depth_m.shape[:2]
         fx, fy = intrinsic['fx'], intrinsic['fy']
         cx, cy = intrinsic['cx'], intrinsic['cy']

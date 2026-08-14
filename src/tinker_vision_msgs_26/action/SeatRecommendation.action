@@ -10,3 +10,5 @@ int32 status
 float32 delay_limit
 string stage
 string message
+# False until every camera/TF input is goal-owned; remains true thereafter.
+bool input_frozen

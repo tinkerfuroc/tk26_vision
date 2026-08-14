@@ -1,20 +1,17 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>monocular_depth</name>
-  <version>0.0.1</version>
-  <description>Depth Anything 3 monocular-depth-fused point-cloud action server. Lives in its own venv (.venv-da3) because depth_anything_3 pins numpy&lt;2.</description>
-  <maintainer email="cindy.w0135@gmail.com">cindy</maintainer>
+  <name>camera_provider</name>
+  <version>0.1.0</version>
+  <description>Bounded, typed clients for the shared camera and transform providers.</description>
+  <maintainer email="robotics@tinker.tw">Tinker Robotics</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
-  <depend>rclpy_action</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>tinker_vision_msgs_26</depend>
-  <depend>vision_util</depend>
-  <depend>camera_provider</depend>
-  <depend>message_filters</depend>
-  <depend>cv_bridge</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

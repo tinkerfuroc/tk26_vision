@@ -11,28 +11,38 @@ import rclpy.executors
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from tinker_vision_msgs_26.srv import DoorDetection
-from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
+)
 from vision_util.depth_reproject import depth_image_to_points
 
 
 class DoorDetectionService(Node):
-    def __init__(self):
-        super().__init__('door_detection_service')
+    def __init__(self, **node_kwargs):
+        super().__init__('door_detection_service', **node_kwargs)
 
         self.camera_intake = CameraIntake(
             self,
-            IntakeConfig(
-                camera='orbbec',
-                depth=StreamSpec(
-                    '/camera/depth/image_raw',
-                    best_effort=False,
-                    qos_depth=10,
+            configure_camera_backend(
+                self,
+                IntakeConfig(
+                    camera='orbbec',
+                    depth=StreamSpec(
+                        '/camera/depth/image_raw',
+                        best_effort=False,
+                        qos_depth=10,
+                    ),
+                    camera_info=StreamSpec(
+                        '/camera/color/camera_info',
+                        best_effort=False,
+                        qos_depth=10,
+                    ),
+                    age_source='stamp',
                 ),
-                camera_info=StreamSpec(
-                    '/camera/color/camera_info',
-                    best_effort=False,
-                    qos_depth=10,
-                ),
+                default_endpoint='/head_camera_server',
             ),
             callback_group=MutuallyExclusiveCallbackGroup(),
         )

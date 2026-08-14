@@ -33,6 +33,7 @@ TEST(FrameStore, EmptyStoreReturnsNullPair) {
   EXPECT_EQ(pair.color_stamp_ns, 0);
   EXPECT_EQ(pair.depth_stamp_ns, 0);
   EXPECT_EQ(pair.stamp_ns, 0);
+  EXPECT_EQ(pair.received_at_ns, 0);
   EXPECT_EQ(pair.seq, 0u);
 }
 
@@ -40,7 +41,7 @@ TEST(FrameStore, SetPairStoresPointersAndBumpsSeq) {
   FrameStore store;
   const auto color = make_image(100);
   const auto depth = make_image(99);
-  store.set_pair(color, depth);
+  store.set_pair(color, depth, 1234);
 
   const FramePair first = store.latest_pair();
   EXPECT_EQ(first.color, color);
@@ -48,13 +49,15 @@ TEST(FrameStore, SetPairStoresPointersAndBumpsSeq) {
   EXPECT_EQ(first.color_stamp_ns, 100);
   EXPECT_EQ(first.depth_stamp_ns, 99);
   EXPECT_EQ(first.stamp_ns, 99);
+  EXPECT_EQ(first.received_at_ns, 1234);
   EXPECT_EQ(first.seq, 1u);
 
-  store.set_pair(make_image(200), make_image(199));
+  store.set_pair(make_image(200), make_image(199), 5678);
   const FramePair second = store.latest_pair();
   EXPECT_EQ(second.color_stamp_ns, 200);
   EXPECT_EQ(second.depth_stamp_ns, 199);
   EXPECT_EQ(second.stamp_ns, 199);
+  EXPECT_EQ(second.received_at_ns, 5678);
   EXPECT_EQ(second.seq, 2u);
 }
 

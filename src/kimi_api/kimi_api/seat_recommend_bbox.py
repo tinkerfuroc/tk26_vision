@@ -24,7 +24,12 @@ from rclpy.node import Node
 from tinker_vision_msgs_26.action import SeatRecommendBbox
 from tinker_vision_msgs_26.msg import BoundingBox
 from vision_util.action_queue import QueuedActionGate
-from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
+)
 from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
 
@@ -238,7 +243,20 @@ class SeatRecommendBboxService(Node):
         # chain's worst case — 2 providers x vlm_max_retries x vlm_timeout_s
         # + backoff (2 x 3 x 25 + 3 ≈ 155 s at defaults) — without the
         # successful-fallback path falling off the back.
-        self._transform_helper = TransformHelper(self, cache_time_s=180.0)
+        try:
+            self.declare_parameter(
+                'transform_provider_endpoint', '/head_camera_server'
+            )
+        except Exception:
+            pass
+        self._transform_helper = TransformHelper(
+            self,
+            cache_time_s=180.0,
+            backend=self.get_parameter('camera_backend').value,
+            provider_endpoint=self.get_parameter(
+                'transform_provider_endpoint'
+            ).value,
+        )
 
         self._action_gate = QueuedActionGate()
         self.seat_action = self._create_seat_action()
@@ -256,7 +274,7 @@ class SeatRecommendBboxService(Node):
         depth_topic: str,
         camera_info_topic: str,
     ):
-        return CameraIntake(
+        cfg = configure_camera_backend(
             self,
             IntakeConfig(
                 camera='orbbec',
@@ -277,8 +295,13 @@ class SeatRecommendBboxService(Node):
                 ),
                 sync_queue=3,
                 sync_slop_s=0.1,
-                age_source='recv',
+                age_source='stamp',
             ),
+            default_endpoint='/head_camera_server',
+        )
+        return CameraIntake(
+            self,
+            cfg,
             callback_group=self.intake_cb_group,
             bridge=self.bridge,
         )
@@ -388,6 +411,7 @@ class SeatRecommendBboxService(Node):
         stage: str,
         message: str,
         delay_limit: float,
+        input_frozen: bool = False,
     ) -> None:
         self._raise_if_canceled(goal_handle)
         feedback = SeatRecommendBbox.Feedback()
@@ -395,6 +419,7 @@ class SeatRecommendBboxService(Node):
         feedback.delay_limit = float(delay_limit)
         feedback.stage = stage
         feedback.message = message
+        feedback.input_frozen = bool(input_frozen)
         goal_handle.publish_feedback(feedback)
 
     def _vlm_delay_limit(self) -> float:
@@ -672,6 +697,7 @@ class SeatRecommendBboxService(Node):
             stage='acquiring_frame',
             message='Acquiring the latest synchronized color and depth frame.',
             delay_limit=ACQUIRING_FRAME_DELAY_LIMIT_S,
+            input_frozen=False,
         )
         if not any(cam in request.camera for cam in self.camera_types):
             return self._fail(response, f'Unsupported camera: {request.camera}.')
@@ -701,6 +727,7 @@ class SeatRecommendBboxService(Node):
             stage='transforming',
             message='Looking up the frame-stamped target transform.',
             delay_limit=TRANSFORM_DELAY_LIMIT_S,
+            input_frozen=False,
         )
         transform = self._transform_helper.try_lookup(
             request.target_frame,
@@ -728,6 +755,16 @@ class SeatRecommendBboxService(Node):
             f'Camera data ready (color {color_img.shape[1]}x{color_img.shape[0]}, depth {depth_arr_m.shape[1]}x{depth_arr_m.shape[0]}). '
             f'Elapsed {(time.time_ns() - start_time) / 1e9:.2f}s.'
         )
+        self._publish_feedback(
+            goal_handle,
+            stage='input_frozen',
+            message=(
+                'Color, depth, intrinsics, and capture-stamped transform '
+                'are frozen for this goal.'
+            ),
+            delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
+        )
         # 2. VLM call. bbox_select (default) returns a cushion box + chosen seat
         # across a Qwen->Gemini provider chain; point is the legacy Gemini path.
         # `box_px` is the chosen cushion box in pixels (None for the point path
@@ -740,6 +777,7 @@ class SeatRecommendBboxService(Node):
             stage='vlm_call',
             message='Selecting and localizing an empty seat.',
             delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
         )
         if self.vlm_strategy == 'bbox_select':
             try:
@@ -799,6 +837,7 @@ class SeatRecommendBboxService(Node):
             stage='judging',
             message='Validating the selected seat and computing its centroid.',
             delay_limit=JUDGING_DELAY_LIMIT_S,
+            input_frozen=True,
         )
 
         if overridden_from:

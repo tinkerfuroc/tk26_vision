@@ -24,6 +24,7 @@ int32 STATUS_BAD_REQUEST=5
 int32 status
 string error_msg
 builtin_interfaces/Time stamp            # min(color stamp, depth stamp)
+builtin_interfaces/Time received_at      # provider receive time; diagnostics only
 string frame_id                          # common aligned optical frame
 sensor_msgs/Image color
 sensor_msgs/Image depth

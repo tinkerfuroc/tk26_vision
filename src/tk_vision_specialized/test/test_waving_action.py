@@ -309,7 +309,12 @@ def test_pipeline_uses_freshness_tf_and_shared_depth_helper(monkeypatch):
     assert node.transform_helper.lookup_calls == [(
         'map',
         'camera',
-        {'deadline_s': 5.0, 'latest': True, 'poll_s': 0.02},
+        {
+            'deadline_s': 5.0,
+            'latest': False,
+            'poll_s': 0.02,
+            'stamp': frame.header.stamp,
+        },
     )]
     assert len(depth_calls) == 1
     assert depth_calls[0][1] is frame.K
@@ -318,8 +323,16 @@ def test_pipeline_uses_freshness_tf_and_shared_depth_helper(monkeypatch):
     assert [feedback.stage for feedback in goal.feedback] == [
         'acquiring_frame',
         'transforming',
+        'input_frozen',
         'detecting',
         'judging',
+    ]
+    assert [feedback.input_frozen for feedback in goal.feedback] == [
+        False,
+        False,
+        True,
+        True,
+        True,
     ]
 
 

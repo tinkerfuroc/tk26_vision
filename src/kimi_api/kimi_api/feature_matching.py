@@ -117,6 +117,9 @@ class FeatureMatchingService(Node):
         self.declare_parameter('qwen_api_backend', 'dashscope')
         self.declare_parameter('vision_logging_enabled', True)
         self.declare_parameter('vision_log_folder', 'vision_log')
+        self.declare_parameter('camera_backend', 'service')
+        self.declare_parameter(
+            'transform_provider_endpoint', '/head_camera_server')
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
@@ -147,7 +150,13 @@ class FeatureMatchingService(Node):
         # — 2 providers x vlm_max_retries x vlm_timeout_s + backoff
         # (2 x 3 x 20 + 3 ≈ 125 s at defaults); 180 s keeps the successful-
         # Qwen-fallback path from falling off the back of the buffer.
-        self._transform_helper = TransformHelper(self, cache_time_s=180.0)
+        self._transform_helper = TransformHelper(
+            self,
+            cache_time_s=180.0,
+            backend=self.get_parameter('camera_backend').value,
+            provider_endpoint=self.get_parameter(
+                'transform_provider_endpoint').value,
+        )
 
         require_api_key()  # fail fast at init if the primary Gemini key is missing
         self._match_provider_chain = self._resolve_match_provider_chain()
@@ -205,19 +214,31 @@ class FeatureMatchingService(Node):
         point: Point,
         det_header,
         target_frame: str,
-    ) -> PointStamped:
-        """Wrap a centroid Point as PointStamped in target_frame.
+    ) -> PointStamped | None:
+        """Strictly wrap one centroid in ``target_frame``.
 
-        No-op when target_frame is empty or already matches detection's
-        header (the detection node has done the transform). On TF lookup
-        failure, log a warn and return the un-transformed point with the
-        detection-frame header so the message is at least self-consistent
-        — downstream consumers can still detect the frame mismatch and
-        abort if they care.
+        Returning ``None`` on a required TF failure prevents the action from
+        advertising frozen inputs and later returning a point in an unexpected
+        frame.
         """
+        points = self._centroids_in_target_frame(
+            [point], det_header, target_frame
+        )
+        return points[0] if points is not None else None
+
+    def _centroids_in_target_frame(
+        self,
+        points: list[Point],
+        det_header,
+        target_frame: str,
+    ) -> list[PointStamped] | None:
+        """Transform all candidate centroids with one capture-stamped lookup."""
         src_frame = det_header.frame_id
         if not target_frame or target_frame == src_frame:
-            return PointStamped(header=det_header, point=point)
+            return [
+                PointStamped(header=det_header, point=point)
+                for point in points
+            ]
         tf = self._transform_helper.try_lookup(
             target_frame,
             src_frame,
@@ -227,19 +248,23 @@ class FeatureMatchingService(Node):
         if tf is None:
             self.get_logger().warn(
                 f'TF {src_frame} -> {target_frame} failed; '
-                'returning detection-frame point'
+                'rejecting feature-matching inputs'
             )
-            return PointStamped(header=det_header, point=point)
-        ps = PointStamped(header=det_header, point=point)
-        ps_out = self._transform_helper.transform_point(ps, tf)
-        if ps_out is None:
-            self.get_logger().warn(
-                f'TF {src_frame} -> {target_frame} failed while transforming; '
-                'returning detection-frame point'
-            )
-            return ps
-        ps_out.header.frame_id = target_frame
-        return ps_out
+            return None
+
+        transformed = []
+        for point in points:
+            ps = PointStamped(header=det_header, point=point)
+            ps_out = self._transform_helper.transform_point(ps, tf)
+            if ps_out is None:
+                self.get_logger().warn(
+                    f'TF {src_frame} -> {target_frame} failed while '
+                    'transforming candidate centroids'
+                )
+                return None
+            ps_out.header.frame_id = target_frame
+            transformed.append(ps_out)
+        return transformed
 
     def feature_matching_handle_accepted_callback(self, goal_handle) -> None:
         """Queue an accepted goal for serialized execution."""
@@ -264,6 +289,7 @@ class FeatureMatchingService(Node):
         stage: str,
         message: str,
         delay_limit: float,
+        input_frozen: bool = False,
     ) -> None:
         self._raise_if_canceled(goal_handle)
         feedback = FeatureMatching.Feedback()
@@ -271,6 +297,7 @@ class FeatureMatchingService(Node):
         feedback.delay_limit = float(delay_limit)
         feedback.stage = stage
         feedback.message = message
+        feedback.input_frozen = bool(input_frozen)
         goal_handle.publish_feedback(feedback)
 
     def _vlm_delay_limit(self) -> float:
@@ -380,6 +407,7 @@ class FeatureMatchingService(Node):
             stage='detecting',
             message='Detecting person candidates.',
             delay_limit=DETECTION_DELAY_LIMIT_S,
+            input_frozen=False,
         )
         self.get_logger().info('Calling detection service...')
         if not self.detection_cli.wait_for_service(timeout_sec=1.0):
@@ -476,6 +504,31 @@ class FeatureMatchingService(Node):
             f'Persons cropped + references encoded. Time spent: {(time.time_ns() - start_time) / 1e6:.2f} ms'
         )
 
+        if (
+            request.target_frame
+            and request.target_frame != detection_res.header.frame_id
+        ):
+            self._publish_feedback(
+                goal_handle,
+                stage='transforming',
+                message='Transforming candidate centroids at capture time.',
+                delay_limit=2.0,
+                input_frozen=False,
+            )
+        candidate_centroids = self._centroids_in_target_frame(
+            [centroid for _, _, centroid in cropped_person_imgs],
+            detection_res.header,
+            request.target_frame,
+        )
+        if candidate_centroids is None:
+            response.status = 1
+            response.error_msg = (
+                f'TF {detection_res.header.frame_id} -> '
+                f'{request.target_frame} failed before feature matching.'
+            )
+            response.centroids = []
+            return response
+
         n_cand = len(cropped_person_imgs)
         sys_prompt = build_matching_sys_prompt(n_cand, n_feats, text_only_mode)
 
@@ -511,9 +564,20 @@ class FeatureMatchingService(Node):
 
         self._publish_feedback(
             goal_handle,
+            stage='input_frozen',
+            message=(
+                'Candidate images and capture-stamped centroids are frozen '
+                'for this goal.'
+            ),
+            delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
+        )
+        self._publish_feedback(
+            goal_handle,
             stage='vlm_call',
             message='Matching features against person candidates.',
             delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
         )
         self.get_logger().info('Sending request to VLM...')
         result = None
@@ -633,22 +697,12 @@ class FeatureMatchingService(Node):
             _emit_vision_log(None, response.status, response.error_msg)
             return response
 
-        self._publish_feedback(
-            goal_handle,
-            stage='transforming',
-            message='Transforming matched centroids.',
-            delay_limit=2.0,
-        )
         # patch_result (in _match_vlm.py) guarantees every value is in
         # [0, n_cand) — build centroids directly without per-element
         # re-validation.
         response.error_msg = ''
         response.centroids = [
-            self._stamped_in_target_frame(
-                cropped_person_imgs[cand_id][2],
-                detection_res.header,
-                request.target_frame,
-            )
+            candidate_centroids[cand_id]
             for cand_id in result
         ]
         response.status = 0

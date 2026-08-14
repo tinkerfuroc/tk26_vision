@@ -28,7 +28,12 @@ from tinker_vision_msgs_26.srv import (
     ObjectDetectionGeneralist as ObjectDetection,
 )
 from vision_util.action_queue import QueuedActionGate
-from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
+)
 from vision_util.vision_logging import VisionLogger
 
 from ._env import (
@@ -238,7 +243,7 @@ class FeatureService(Node):
         )
 
     def _create_seat_color_intake(self):
-        return CameraIntake(
+        cfg = configure_camera_backend(
             self,
             IntakeConfig(
                 camera='orbbec',
@@ -247,7 +252,13 @@ class FeatureService(Node):
                     best_effort=False,
                     qos_depth=10,
                 ),
+                age_source='stamp',
             ),
+            default_endpoint='/head_camera_server',
+        )
+        return CameraIntake(
+            self,
+            cfg,
             callback_group=self.intake_cb_group,
             bridge=self.bridge,
         )
@@ -347,6 +358,7 @@ class FeatureService(Node):
         stage: str,
         message: str,
         delay_limit: float,
+        input_frozen: bool = False,
     ) -> None:
         self._raise_if_canceled(goal_handle)
         feedback = action_type.Feedback()
@@ -354,6 +366,7 @@ class FeatureService(Node):
         feedback.delay_limit = float(delay_limit)
         feedback.stage = stage
         feedback.message = message
+        feedback.input_frozen = bool(input_frozen)
         goal_handle.publish_feedback(feedback)
 
     def _vlm_delay_limit(self) -> float:
@@ -450,6 +463,7 @@ class FeatureService(Node):
             stage='detecting',
             message='Detecting the person addressing the robot.',
             delay_limit=DETECTION_DELAY_LIMIT_S,
+            input_frozen=False,
         )
         if not self.detection_cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('Detection service unavailable.')
@@ -594,9 +608,18 @@ class FeatureService(Node):
         self._publish_feedback(
             goal_handle,
             FeatureExtraction,
+            stage='input_frozen',
+            message='Person crop captured; no further camera or TF input is required.',
+            delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
+        )
+        self._publish_feedback(
+            goal_handle,
+            FeatureExtraction,
             stage='vlm_call',
             message='Extracting the selected person features.',
             delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
         )
         t_vlm_start = time.time_ns()
         try:
@@ -640,6 +663,7 @@ class FeatureService(Node):
             stage='acquiring_frame',
             message='Acquiring the latest color frame.',
             delay_limit=2.0,
+            input_frozen=False,
         )
 
         color_img = None
@@ -697,9 +721,18 @@ class FeatureService(Node):
         self._publish_feedback(
             goal_handle,
             SeatRecommendation,
+            stage='input_frozen',
+            message='Color frame captured; no further camera or TF input is required.',
+            delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
+        )
+        self._publish_feedback(
+            goal_handle,
+            SeatRecommendation,
             stage='vlm_call',
             message='Generating the seat recommendation.',
             delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
         )
         try:
             vlm_result = request_feature_description_chain(

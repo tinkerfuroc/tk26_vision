@@ -33,11 +33,9 @@ import rclpy.executors
 import torch
 from cv_bridge import CvBridge
 from depth_anything_3.api import DepthAnything3
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.action import ActionServer
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from tinker_vision_msgs_26.action import MonocularDepthPC
 
@@ -45,6 +43,12 @@ from vision_util._pc_utils import (
     build_xy_table_cuda,
     make_pc2_xyzrgb,
     pack_rgb_u8_to_float32_cuda,
+)
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
 )
 
 
@@ -89,6 +93,13 @@ class MonocularDepthPCService(Node):
         self.declare_parameter('output_frame_id', '')
         self.declare_parameter('debug_pc_topic', '~/debug_points')
         self.declare_parameter('vision_logging_enabled', False)
+        self.declare_parameter('camera_backend', 'service')
+        self.declare_parameter(
+            'realsense_provider_endpoint', '/wrist_camera_server')
+        self.declare_parameter(
+            'orbbec_provider_endpoint', '/head_camera_server')
+        self.declare_parameter('camera_provider_wait_timeout_s', 0.5)
+        self.declare_parameter('camera_provider_response_timeout_s', 5.0)
 
         self.da3_model_id = (
             self.get_parameter('da3_model').get_parameter_value().string_value
@@ -116,14 +127,6 @@ class MonocularDepthPCService(Node):
         self.bridge = CvBridge()
 
         self._load_da3()
-
-        self.lock_img = threading.Lock()
-        self.recent_img = {
-            _REALSENSE: (None, None),
-            _ORBBEC: (None, None),
-        }
-        self.lock_info = threading.Lock()
-        self.camera_info = {_REALSENSE: None, _ORBBEC: None}
 
         self.lock_intr = threading.Lock()
         self._intr_key = {_REALSENSE: None, _ORBBEC: None}
@@ -164,49 +167,35 @@ class MonocularDepthPCService(Node):
         self.get_logger().info('DA3 model ready.')
 
     def _subscribe_cameras(self):
-        # RealSense + Orbbec drivers publish image streams with SensorDataQoS
-        # (best_effort). Default rclpy subs are reliable -> no QoS match ->
-        # frames silently never arrive. Use qos_profile_sensor_data on the
-        # image streams. CameraInfo is reliable on both drivers, depth=10 OK.
+        self._intakes = {}
         for cam, topics in _TOPICS.items():
             cb_sync = MutuallyExclusiveCallbackGroup()
-            color_sub = Subscriber(
-                self, Image, topics['color'],
-                qos_profile=qos_profile_sensor_data,
+            cfg = configure_camera_backend(
+                self,
+                IntakeConfig(
+                    camera=cam,
+                    color=StreamSpec(
+                        topics['color'], best_effort=True, qos_depth=5),
+                    depth=StreamSpec(
+                        topics['depth'], best_effort=True, qos_depth=5),
+                    camera_info=StreamSpec(
+                        topics['info'], best_effort=False, qos_depth=10),
+                    sync_queue=3,
+                    sync_slop_s=0.05,
+                    age_source='stamp',
+                ),
+                default_endpoint=(
+                    '/wrist_camera_server'
+                    if cam == _REALSENSE
+                    else '/head_camera_server'
+                ),
+            )
+            self._intakes[cam] = CameraIntake(
+                self,
+                cfg,
                 callback_group=cb_sync,
+                bridge=self.bridge,
             )
-            depth_sub = Subscriber(
-                self, Image, topics['depth'],
-                qos_profile=qos_profile_sensor_data,
-                callback_group=cb_sync,
-            )
-            sync = ApproximateTimeSynchronizer(
-                [color_sub, depth_sub], queue_size=3, slop=0.05,
-            )
-            sync.registerCallback(self._make_frame_cb(cam))
-            setattr(self, f'_sync_{cam}', sync)
-
-            self.create_subscription(
-                CameraInfo,
-                topics['info'],
-                self._make_info_cb(cam),
-                qos_profile=10,
-                callback_group=MutuallyExclusiveCallbackGroup(),
-            )
-
-    def _make_frame_cb(self, cam):
-        # message_filters does NOT await coroutines — must be sync.
-        def _cb(color_msg, depth_msg):
-            with self.lock_img:
-                self.recent_img[cam] = (color_msg, depth_msg)
-        return _cb
-
-    def _make_info_cb(self, cam):
-        def _cb(info: CameraInfo):
-            with self.lock_info:
-                self.camera_info[cam] = info
-            self._maybe_update_xy_table(cam, info)
-        return _cb
 
     def _maybe_update_xy_table(self, cam: str, info: CameraInfo):
         h, w = int(info.height), int(info.width)
@@ -275,14 +264,17 @@ class MonocularDepthPCService(Node):
     def _snapshot(self, cam: str):
         if cam not in _TOPICS:
             raise RuntimeError(f"Unknown camera '{cam}'")
-        with self.lock_img:
-            color, depth = self.recent_img[cam]
-            color_msg = copy.deepcopy(color)
-            depth_msg = copy.deepcopy(depth)
-        with self.lock_info:
-            info = copy.deepcopy(self.camera_info[cam])
-        if color_msg is None or depth_msg is None or info is None:
-            raise RuntimeError(f"No live frames yet for '{cam}'")
+        bundle = self._intakes[cam].wait_fresh(
+            max_age_s=0.5,
+            timeout_s=1.5,
+            on_timeout='fail',
+        )
+        info = self._intakes[cam].camera_info()
+        if bundle is None or info is None:
+            raise RuntimeError(f"No fresh provider frame for '{cam}'")
+        color_msg = bundle.color_msg
+        depth_msg = bundle.depth_msg
+        self._maybe_update_xy_table(cam, info)
         return color_msg, depth_msg, info
 
     @torch.inference_mode()

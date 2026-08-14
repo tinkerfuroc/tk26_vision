@@ -67,6 +67,12 @@ else
   note "FAIL: status heartbeat did not publish: $OUT"
   FAIL=1
 fi
+if grep -q "last_pair_received_at" <<<"$OUT"; then
+  note "PASS: status heartbeat includes receive-time diagnostics"
+else
+  note "FAIL: status heartbeat missing last_pair_received_at: $OUT"
+  FAIL=1
+fi
 if grep -Eq "color_age_sec:[[:space:]]*-1(\.0+)?" <<<"$OUT"; then
   note "PASS: empty-store color age is -1"
 else

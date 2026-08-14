@@ -16,7 +16,8 @@ int64_t stamp_ns_of(const sensor_msgs::msg::Image& image) {
 }  // namespace
 
 void FrameStore::set_pair(sensor_msgs::msg::Image::ConstSharedPtr color,
-                          sensor_msgs::msg::Image::ConstSharedPtr depth) {
+                          sensor_msgs::msg::Image::ConstSharedPtr depth,
+                          int64_t received_at_ns) {
   if (!color || !depth) {
     return;
   }
@@ -29,6 +30,7 @@ void FrameStore::set_pair(sensor_msgs::msg::Image::ConstSharedPtr color,
     pair_.depth_stamp_ns = stamp_ns_of(*pair_.depth);
     pair_.stamp_ns =
         std::min(pair_.color_stamp_ns, pair_.depth_stamp_ns);
+    pair_.received_at_ns = received_at_ns;
     pair_.seq += 1;
   }
   cv_.notify_all();

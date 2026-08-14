@@ -65,13 +65,14 @@ class _Time:
         return _Time(self.nanoseconds - other.nanoseconds)
 
 
-def test_subscriber_intakes_preserve_qos_and_ats(monkeypatch):
+def test_provider_intakes_preserve_rollout_fallback_qos(monkeypatch):
     captured = []
 
     class FakeIntake:
         def __init__(self, node, cfg, callback_group=None, *, bridge=None):
             captured.append((node, cfg, callback_group, bridge))
-            self._subscriptions = [object(), object(), object()]
+            self.cfg = cfg
+            self._subscriptions = []
 
     monkeypatch.setattr(yolo, '_CompatibleCameraIntake', FakeIntake)
     monkeypatch.setattr(
@@ -95,7 +96,12 @@ def test_subscriber_intakes_preserve_qos_and_ats(monkeypatch):
 
     assert len(captured) == 2
     for _, cfg, callback_group, bridge in captured:
-        assert cfg.age_source == 'recv'
+        assert cfg.backend == 'service'
+        assert cfg.age_source == 'stamp'
+        assert cfg.provider_endpoint in (
+            '/wrist_camera_server',
+            '/head_camera_server',
+        )
         assert cfg.sync_queue == 10
         assert cfg.sync_slop_s == 0.1
         assert cfg.color.best_effort is True
@@ -106,6 +112,8 @@ def test_subscriber_intakes_preserve_qos_and_ats(monkeypatch):
         assert cfg.camera_info.qos_depth == 10
         assert callback_group == 'callback-group'
         assert bridge is node.bridge
+    assert node.camera_info_sub_realsense is None
+    assert node.camera_info_sub_orbbec is None
 
 
 def test_camera_intake_mirrors_legacy_compatibility_state(monkeypatch):
@@ -166,6 +174,8 @@ def test_freshness_uses_one_call_time_and_fixed_point_one_second_polls(
     ])
 
     class Intake:
+        cfg = SimpleNamespace(backend='subscription')
+
         def latest(self):
             return next(bundles)
 
@@ -195,6 +205,41 @@ def test_freshness_uses_one_call_time_and_fixed_point_one_second_polls(
     assert result[0] is not served.color_msg
     assert clock.calls == 1
     assert sleeps == [0.1, 0.1]
+
+
+def test_provider_freshness_delegates_once_to_stamp_based_wait():
+    served = SimpleNamespace(
+        color_msg={'frame': 'color'},
+        depth_msg={'frame': 'depth'},
+    )
+
+    class Intake:
+        cfg = SimpleNamespace(backend='service')
+
+        def __init__(self):
+            self.calls = []
+
+        def wait_fresh(self, **kwargs):
+            self.calls.append(kwargs)
+            return served
+
+    intake = Intake()
+    node = SimpleNamespace(
+        _camera_intakes={'orbbec': intake},
+        sync_wait_time_limit=5,
+        img_sync_thres=0.2,
+    )
+
+    result = yolo.YOLOSegmentationNode._wait_for_recent_frame(
+        node, 'orbbec'
+    )
+
+    assert result == (served.color_msg, served.depth_msg)
+    assert intake.calls == [{
+        'max_age_s': 0.2,
+        'timeout_s': 0.5,
+        'on_timeout': 'fail',
+    }]
 
 
 def test_acquire_depth_delegates_ffs_without_binding_it_to_camera_frame():

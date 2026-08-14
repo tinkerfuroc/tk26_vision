@@ -22,7 +22,12 @@ from rclpy.node import Node
 from std_msgs.msg import Header
 from tinker_vision_msgs_26.action import ObjectScan
 from vision_util.action_queue import QueuedActionGate
-from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
+)
 
 from ._env import (
     default_flash_model,
@@ -120,7 +125,7 @@ class ObjectScanServer(Node):
         )
 
     def _create_color_intake(self, camera: str, image_topic: str):
-        return CameraIntake(
+        cfg = configure_camera_backend(
             self,
             IntakeConfig(
                 camera=camera,
@@ -129,8 +134,17 @@ class ObjectScanServer(Node):
                     best_effort=False,
                     qos_depth=10,
                 ),
-                age_source='recv',
+                age_source='stamp',
             ),
+            default_endpoint=(
+                '/wrist_camera_server'
+                if camera == 'realsense'
+                else '/head_camera_server'
+            ),
+        )
+        return CameraIntake(
+            self,
+            cfg,
             callback_group=self.intake_cb_group,
             bridge=self.bridge,
         )
@@ -197,6 +211,7 @@ class ObjectScanServer(Node):
         stage: str,
         message: str,
         delay_limit: float,
+        input_frozen: bool = False,
     ) -> None:
         self._raise_if_canceled(goal_handle)
         feedback = ObjectScan.Feedback()
@@ -204,6 +219,7 @@ class ObjectScanServer(Node):
         feedback.delay_limit = float(delay_limit)
         feedback.stage = stage
         feedback.message = message
+        feedback.input_frozen = bool(input_frozen)
         goal_handle.publish_feedback(feedback)
 
     def _vlm_delay_limit(self) -> float:
@@ -294,6 +310,7 @@ class ObjectScanServer(Node):
             stage='acquiring_frame',
             message=f'Acquiring a fresh {camera} color frame.',
             delay_limit=ACQUIRING_FRAME_DELAY_LIMIT_S,
+            input_frozen=False,
         )
         frame = self._camera_intakes[camera].latest(
             max_age_s=FRAME_MAX_AGE_S
@@ -323,6 +340,13 @@ class ObjectScanServer(Node):
             self.get_logger().error(result.error_msg)
             return result
 
+        self._publish_feedback(
+            goal_handle,
+            stage='input_frozen',
+            message='Color frame captured; no further camera or TF input is required.',
+            delay_limit=self._vlm_delay_limit(),
+            input_frozen=True,
+        )
         groups = _batches(vocabulary, self.batch_size)
         batch_results = self._run_batches(
             goal_handle,
@@ -334,6 +358,7 @@ class ObjectScanServer(Node):
             stage='judging',
             message=f'Combining results from {len(groups)} batches.',
             delay_limit=2.0,
+            input_frozen=True,
         )
 
         found_set = set()
@@ -419,6 +444,7 @@ class ObjectScanServer(Node):
                             f'{len(groups)}.'
                         ),
                         delay_limit=self._vlm_delay_limit(),
+                        input_frozen=True,
                     )
                     future = executor.submit(run_batch, next_index)
                     pending[future] = next_index

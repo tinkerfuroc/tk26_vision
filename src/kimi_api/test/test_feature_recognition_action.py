@@ -393,7 +393,13 @@ def test_extraction_pipeline_awaits_detection_and_publishes_stages(
     assert len(detection_client.requests) == 1
     assert [feedback.stage for feedback in goal.feedback] == [
         'detecting',
+        'input_frozen',
         'vlm_call',
+    ]
+    assert [feedback.input_frozen for feedback in goal.feedback] == [
+        False,
+        True,
+        True,
     ]
     assert all(feedback.status == 0 for feedback in goal.feedback)
     assert all(feedback.delay_limit > 0.0 for feedback in goal.feedback)
@@ -459,7 +465,13 @@ def test_seat_pipeline_uses_latest_cached_frame_and_publishes_stages(
     assert intake.latest_calls == [((), {})]
     assert [feedback.stage for feedback in goal.feedback] == [
         'acquiring_frame',
+        'input_frozen',
         'vlm_call',
+    ]
+    assert [feedback.input_frozen for feedback in goal.feedback] == [
+        False,
+        True,
+        True,
     ]
     assert all(feedback.status == 0 for feedback in goal.feedback)
     assert all(feedback.delay_limit > 0.0 for feedback in goal.feedback)

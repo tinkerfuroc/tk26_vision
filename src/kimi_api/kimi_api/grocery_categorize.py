@@ -26,14 +26,13 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from scipy.cluster.vq import kmeans2
 from sensor_msgs.msg import PointCloud2
-from tf2_ros.buffer import Buffer
-from tf2_ros.transform_listener import TransformListener
 from tinker_vision_msgs_26.action import Categorize
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
 from ._categorize_vlm import ShelfVlmError, request_shelf_layer_chain
 from ._env import default_model, load_env, require_api_key, resolve_qwen_target
 from ._image_utils import encode_to_data_url
+from vision_util.tf_lookup import TransformHelper
 
 USE_SHELF_HEIGHT = False
 PROJECT_ON_LINE = False
@@ -65,6 +64,13 @@ class GroceryCategorizeAction(Node):
         self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
         self.declare_parameter('categorize_model_qwen', '')
         self.declare_parameter('qwen_api_backend', 'dashscope')
+        self.declare_parameter('camera_backend', 'service')
+        self.declare_parameter(
+            'orbbec_provider_endpoint', '/head_camera_server')
+        self.declare_parameter(
+            'transform_provider_endpoint', '/head_camera_server')
+        self.declare_parameter('camera_provider_wait_timeout_s', 0.5)
+        self.declare_parameter('camera_provider_response_timeout_s', 5.0)
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
         self.vlm_timeout_s = self.get_parameter('vlm_timeout_s').get_parameter_value().double_value
@@ -93,13 +99,31 @@ class GroceryCategorizeAction(Node):
         require_api_key()  # fail fast at init if the primary Gemini key is missing
         self._categorize_provider_chain = self._resolve_categorize_provider_chain()
 
-        self.orbec_pc_sub = self.create_subscription(
-            PointCloud2,
-            '/camera/depth/points',
-            self.orbec_pc_callback,
-            qos_profile=1,
-            callback_group=MutuallyExclusiveCallbackGroup(),
-        )
+        self.camera_backend = self.get_parameter('camera_backend').value
+        if self.camera_backend == 'service':
+            from camera_provider import CameraProvider
+
+            self.camera_provider = CameraProvider(
+                self,
+                self.get_parameter('orbbec_provider_endpoint').value,
+                service_wait_timeout_s=self.get_parameter(
+                    'camera_provider_wait_timeout_s').value,
+                response_timeout_s=self.get_parameter(
+                    'camera_provider_response_timeout_s').value,
+            )
+            self.orbec_pc_sub = None
+        elif self.camera_backend == 'subscription':
+            self.camera_provider = None
+            self.orbec_pc_sub = self.create_subscription(
+                PointCloud2,
+                '/camera/depth/points',
+                self.orbec_pc_callback,
+                qos_profile=1,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+        else:
+            raise ValueError(
+                "camera_backend must be 'subscription' or 'service'")
 
         self.detection_cli = self.create_client(
             ObjectDetection, detection_service, callback_group=self.client_cb_group,
@@ -114,8 +138,17 @@ class GroceryCategorizeAction(Node):
         self.env_pc_lock = threading.Lock()
         self.last_time = None
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._transform_helper = TransformHelper(
+            self,
+            backend=self.camera_backend,
+            provider_endpoint=(
+                self.get_parameter('transform_provider_endpoint').value
+                if self.camera_backend == 'service'
+                else ''
+            ),
+        )
+        self.tf_buffer = self._transform_helper.buffer
+        self.tf_listener = self._transform_helper._listener
 
         self.get_logger().info(
             f'GroceryCategorize initialized (model={self.llm_model}, '
@@ -174,6 +207,23 @@ class GroceryCategorizeAction(Node):
             result.status = 3
             result.error_msg = 'Shelf point frame is not map.'
             return result
+
+        cloud_stamp = None
+        if self.camera_backend == 'service':
+            cloud_result = self.camera_provider.point_cloud(
+                include_color=False,
+                max_age_s=0.5,
+            )
+            if not cloud_result.ok:
+                result.status = 1
+                result.error_msg = (
+                    f'Camera point cloud unavailable: '
+                    f'{cloud_result.error_msg}.'
+                )
+                return result
+            with self.env_pc_lock:
+                self.env_pc = cloud_result.points
+            cloud_stamp = cloud_result.stamp
 
         # 1. Get image from orbbec and call object detection, get shelf + items segmentation
         if not self.detection_cli.wait_for_service(timeout_sec=1.0):
@@ -343,11 +393,14 @@ class GroceryCategorizeAction(Node):
             pt.z += 0.1
         else:
             try:
-                transform = self.tf_buffer.lookup_transform(
-                    target_frame='base_link',
-                    source_frame=self.pt_shelf_left.header.frame_id,
-                    time=rclpy.time.Time(),
+                transform = self._transform_helper.try_lookup(
+                    'base_link',
+                    self.pt_shelf_left.header.frame_id,
+                    stamp=cloud_stamp,
+                    timeout_s=0.2,
                 )
+                if transform is None:
+                    raise RuntimeError('transform provider unavailable')
             except Exception:
                 self.get_logger().warn(
                     f'Failed to lookup transform from {self.pt_shelf_left.header.frame_id} to base_link.'

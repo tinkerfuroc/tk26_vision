@@ -19,7 +19,12 @@ from rclpy.executors import MultiThreadedExecutor
 
 # Shared logger
 from vision_util.action_queue import QueuedActionGate
-from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
+)
 from vision_util.depth_reproject import waving_optical_points
 from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
@@ -71,7 +76,11 @@ class DetectWavingPersonsNode(Node):
             camera_info_topic,
             sync_slop_sec,
         )
-        self.transform_helper = TransformHelper(self)
+        self.transform_helper = TransformHelper(
+            self,
+            backend=self._camera_backend(),
+            provider_endpoint=self._transform_provider_endpoint(),
+        )
         self.declare_parameter('model_path', 'yolo11m-seg.pt')
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.yolo = YOLO(str(resolve_weights(model_path)))
@@ -198,7 +207,7 @@ class DetectWavingPersonsNode(Node):
         camera_info_topic,
         sync_slop_s,
     ):
-        return CameraIntake(
+        cfg = configure_camera_backend(
             self,
             IntakeConfig(
                 camera='orbbec',
@@ -212,9 +221,30 @@ class DetectWavingPersonsNode(Node):
                 sync_slop_s=sync_slop_s,
                 age_source='stamp',
             ),
+            default_endpoint='/head_camera_server',
+        )
+        return CameraIntake(
+            self,
+            cfg,
             callback_group=self.intake_cb_group,
             bridge=self.bridge,
         )
+
+    def _camera_backend(self):
+        try:
+            self.declare_parameter('camera_backend', 'service')
+        except Exception:
+            pass
+        return self.get_parameter('camera_backend').value
+
+    def _transform_provider_endpoint(self):
+        try:
+            self.declare_parameter(
+                'transform_provider_endpoint', '/head_camera_server'
+            )
+        except Exception:
+            pass
+        return self.get_parameter('transform_provider_endpoint').value
 
     def _create_action_server(self):
         return ActionServer(
@@ -358,6 +388,7 @@ class DetectWavingPersonsNode(Node):
         stage: str,
         message: str,
         delay_limit: float,
+        input_frozen: bool = False,
     ) -> None:
         self._raise_if_canceled(goal_handle)
         feedback = DetectWaving.Feedback()
@@ -365,6 +396,7 @@ class DetectWavingPersonsNode(Node):
         feedback.delay_limit = float(delay_limit)
         feedback.stage = stage
         feedback.message = message
+        feedback.input_frozen = bool(input_frozen)
         goal_handle.publish_feedback(feedback)
 
     def _vlm_delay_limit(self) -> float:
@@ -711,6 +743,7 @@ class DetectWavingPersonsNode(Node):
             stage='acquiring_frame',
             message='Acquiring a fresh synchronized color and depth frame.',
             delay_limit=FRAME_WAIT_TIMEOUT_S,
+            input_frozen=False,
         )
         frame = self.camera_intake.wait_fresh(
             max_age_s=FRAME_MAX_AGE_S,
@@ -768,6 +801,7 @@ class DetectWavingPersonsNode(Node):
                 stage='vlm_call',
                 message='Starting VLM waving detection.',
                 delay_limit=self._vlm_delay_limit(),
+                input_frozen=False,
             )
             vlm_future = self._start_vlm_call(
                 rgb_image, request.min_waving_persons,
@@ -780,22 +814,22 @@ class DetectWavingPersonsNode(Node):
         self.get_logger().info('Data copied for processing. Starting detection...')
         transform = None
         if request.target_frame and request.target_frame != header.frame_id:
-            # Snapshot once at the start of the callback. Latest-available
-            # TF, generous 5 s budget -- the pan-tilt + base chain is fixed
-            # while the service runs, so a one-time snapshot is correct
-            # for every centroid below.
+            # Snapshot once at the image capture stamp. The same time-correct
+            # transform is then used for every centroid below.
             self._publish_feedback(
                 goal_handle,
                 stage='transforming',
                 message='Snapshotting the latest target transform.',
                 delay_limit=5.0,
+                input_frozen=False,
             )
             transform = self.transform_helper.wait_lookup(
                 request.target_frame,
                 header.frame_id,
                 deadline_s=5.0,
-                latest=True,
+                latest=False,
                 poll_s=0.02,
+                stamp=header.stamp,
             )
             self._raise_if_canceled(goal_handle)
             if transform is None:
@@ -820,9 +854,20 @@ class DetectWavingPersonsNode(Node):
 
         self._publish_feedback(
             goal_handle,
+            stage='input_frozen',
+            message=(
+                'Color, depth, intrinsics, and capture-stamped transform '
+                'are frozen for this goal.'
+            ),
+            delay_limit=max(5.0, self._vlm_delay_limit()),
+            input_frozen=True,
+        )
+        self._publish_feedback(
+            goal_handle,
             stage='detecting',
             message='Running person segmentation and waving detection.',
             delay_limit=max(5.0, self._vlm_delay_limit()),
+            input_frozen=True,
         )
         try:
             points, validmask_points = waving_optical_points(
@@ -1012,6 +1057,7 @@ class DetectWavingPersonsNode(Node):
             stage='judging',
             message='Finalizing waving detections and centroids.',
             delay_limit=3.0,
+            input_frozen=True,
         )
 
         # sort waving person centroids from closest to farthest (keep annotations + masks aligned)

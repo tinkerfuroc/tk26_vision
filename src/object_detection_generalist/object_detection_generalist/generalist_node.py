@@ -51,7 +51,12 @@ from tinker_vision_msgs_26.msg import Object
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist
 
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
-from vision_util.camera_intake import CameraIntake, IntakeConfig, StreamSpec
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
+)
 from vision_util.weights_cache import resolve_weights
 
 from .sam_mask import SamPredictor
@@ -936,24 +941,35 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         ).value
         self._orbbec_response_depth_intake = CameraIntake(
             self,
-            IntakeConfig(
-                camera='orbbec_response_depth',
-                depth=StreamSpec(
-                    depth_image_topic,
-                    best_effort=True,
-                    qos_depth=1,
+            configure_camera_backend(
+                self,
+                IntakeConfig(
+                    camera='orbbec_response_depth',
+                    depth=StreamSpec(
+                        depth_image_topic,
+                        best_effort=True,
+                        qos_depth=1,
+                    ),
+                    age_source='stamp',
                 ),
-                age_source='recv',
+                default_endpoint='/head_camera_server',
             ),
             callback_group=MutuallyExclusiveCallbackGroup(),
             bridge=self.bridge,
         )
         self._orbbec_depth_image_sub = (
             self._orbbec_response_depth_intake._subscriptions[0]
+            if self._orbbec_response_depth_intake._subscriptions
+            else None
         )
-        self.get_logger().info(
-            f'Subscribed to orbbec depth Image on {depth_image_topic}'
-        )
+        if self._orbbec_response_depth_intake.cfg.backend == 'service':
+            self.get_logger().info(
+                'Using head camera provider for orbbec response depth'
+            )
+        else:
+            self.get_logger().info(
+                f'Subscribed to orbbec depth Image on {depth_image_topic}'
+            )
 
     def _orbbec_depth_image_callback(self, msg: Image) -> None:
         """Compatibility callback forwarding to the response-depth intake."""

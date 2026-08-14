@@ -19,6 +19,9 @@ struct FramePair {
   // Conservative freshness/snapshot stamp: min(color_stamp, depth_stamp), so
   // a pair satisfies captured_after only when both images do.
   int64_t stamp_ns = 0;
+  // ROS-clock time at which the provider accepted this pair. Diagnostics
+  // only: freshness remains based on the image header stamps above.
+  int64_t received_at_ns = 0;
   uint64_t seq = 0;  // Monotonic valid synced-pair counter.
 };
 
@@ -29,7 +32,8 @@ class FrameStore {
   /// Stores a complete pair and wakes freshness waiters. Incomplete pairs are
   /// ignored: they do not replace the current pair, advance seq, or notify.
   void set_pair(sensor_msgs::msg::Image::ConstSharedPtr color,
-                sensor_msgs::msg::Image::ConstSharedPtr depth);
+                sensor_msgs::msg::Image::ConstSharedPtr depth,
+                int64_t received_at_ns = 0);
   void set_color_info(sensor_msgs::msg::CameraInfo::ConstSharedPtr info);
   void set_depth_info(sensor_msgs::msg::CameraInfo::ConstSharedPtr info);
 

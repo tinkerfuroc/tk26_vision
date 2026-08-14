@@ -44,7 +44,14 @@ def _camera_module_with_ros_fakes():
 
     class CameraInfo:
         def __init__(self):
+            self.width = 640
+            self.height = 480
             self.k = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+    class Header:
+        def __init__(self):
+            self.stamp = types.SimpleNamespace(sec=0, nanosec=0)
+            self.frame_id = ''
 
     class CvBridge:
         def imgmsg_to_cv2(self, msg, desired_encoding='passthrough'):
@@ -83,6 +90,8 @@ def _camera_module_with_ros_fakes():
         'rclpy.time': types.ModuleType('rclpy.time'),
         'sensor_msgs': types.ModuleType('sensor_msgs'),
         'sensor_msgs.msg': types.ModuleType('sensor_msgs.msg'),
+        'std_msgs': types.ModuleType('std_msgs'),
+        'std_msgs.msg': types.ModuleType('std_msgs.msg'),
     }
     modules['cv_bridge'].CvBridge = CvBridge
     modules['message_filters'].Subscriber = Subscriber
@@ -95,9 +104,11 @@ def _camera_module_with_ros_fakes():
     modules['rclpy.time'].Time = FakeTime
     modules['sensor_msgs.msg'].Image = Image
     modules['sensor_msgs.msg'].CameraInfo = CameraInfo
+    modules['std_msgs.msg'].Header = Header
     modules['rclpy'].qos = modules['rclpy.qos']
     modules['rclpy'].time = modules['rclpy.time']
     modules['sensor_msgs'].msg = modules['sensor_msgs.msg']
+    modules['std_msgs'].msg = modules['std_msgs.msg']
     missing = object()
     previous = {
         name: sys.modules.get(name, missing)
@@ -192,6 +203,8 @@ def _pair(stamp_ns=0, color_encoding='bgr8'):
 
 def _with_intrinsics(intake):
     info = CameraInfo()
+    info.width = 2
+    info.height = 1
     info.k = [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0]
     intake._camera_info_callback(info)
 
@@ -308,3 +321,116 @@ def test_depth_decode_failure_also_restores_previous():
     with pytest.raises(ValueError):
         intake.latest().depth_m()
     assert intake.latest() is good
+
+
+def test_service_backend_preserves_bundle_api_and_stamp_freshness(
+    monkeypatch,
+):
+    calls = []
+    color, depth = _pair(stamp_ns=9_500_000_000)
+    info = CameraInfo()
+    info.k = [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0]
+
+    class Result:
+        ok = True
+        status = 0
+        error_msg = ''
+        stamp = types.SimpleNamespace(sec=9, nanosec=400_000_000)
+        received_at = types.SimpleNamespace(sec=9, nanosec=600_000_000)
+        frame_id = 'provider_optical'
+        color_info = info
+        depth_info = info
+
+        def __init__(self):
+            self.color = color
+            self.depth = depth
+
+    class Provider:
+        def __init__(self, node, endpoint, **kwargs):
+            assert endpoint == '/head_camera_server'
+
+        def snapshot(self, **kwargs):
+            calls.append(kwargs)
+            return Result()
+
+    import camera_provider
+
+    monkeypatch.setattr(camera_provider, 'CameraProvider', Provider)
+    node = FakeNode(now_ns=10_000_000_000)
+    cfg = camera_intake.IntakeConfig(
+        camera='orbbec',
+        color=camera_intake.StreamSpec('/color'),
+        depth=camera_intake.StreamSpec('/depth'),
+        camera_info=camera_intake.StreamSpec('/info'),
+        age_source='stamp',
+        backend='service',
+        provider_endpoint='/head_camera_server',
+    )
+    intake = camera_intake.CameraIntake(node, cfg)
+
+    bundle = intake.wait_fresh(max_age_s=1.0, timeout_s=0.7)
+    assert bundle.color_msg is color
+    assert bundle.depth_msg is depth
+    assert bundle.header.stamp.nanosec == 400_000_000
+    assert bundle.header.frame_id == 'provider_optical'
+    assert bundle.recv_time.nanoseconds == 9_600_000_000
+    assert intake.intrinsics()[0] == 2.0
+    assert not intake._subscriptions
+    assert calls[0]['max_age_s'] == 1.0
+    assert calls[0]['wait_timeout_s'] == 0.7
+    assert calls[0]['captured_after'].nanoseconds == 9_000_000_000
+
+
+def test_service_camera_info_only_builds_header_and_recovers_same_stamp(
+    monkeypatch,
+):
+    class Provider:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    import camera_provider
+
+    monkeypatch.setattr(camera_provider, 'CameraProvider', Provider)
+    intake = camera_intake.CameraIntake(
+        FakeNode(now_ns=10_000_000_000),
+        camera_intake.IntakeConfig(
+            camera='camera_info_only',
+            camera_info=camera_intake.StreamSpec('/info'),
+            age_source='stamp',
+            backend='service',
+            provider_endpoint='/camera_server',
+        ),
+    )
+    invalid = CameraInfo()
+    invalid.width = 0
+    valid = CameraInfo()
+    valid.width = 640
+    valid.height = 480
+    valid.k = [
+        400.0, 0.0, 320.0,
+        0.0, 401.0, 240.0,
+        0.0, 0.0, 1.0,
+    ]
+
+    def result(info):
+        return types.SimpleNamespace(
+            color=None,
+            depth=None,
+            stamp=types.SimpleNamespace(sec=9, nanosec=500_000_000),
+            received_at=types.SimpleNamespace(
+                sec=9, nanosec=600_000_000
+            ),
+            frame_id='camera_info_frame',
+            color_info=info,
+            depth_info=invalid,
+        )
+
+    first = intake._store_provider_result(result(invalid))
+    assert first.header.stamp.nanosec == 500_000_000
+    assert first.header.frame_id == 'camera_info_frame'
+    assert first.K is None
+
+    second = intake._store_provider_result(result(valid))
+    assert second is first
+    assert second.K[0] == 400.0
+    assert intake.camera_info() is valid

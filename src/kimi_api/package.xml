@@ -17,6 +17,7 @@
   <depend>cv_bridge</depend>
   <depend>message_filters</depend>
   <depend>vision_util</depend>
+  <depend>camera_provider</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -2,6 +2,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.time import Time
 import numpy as np
 import cv2
 import threading
@@ -29,6 +30,7 @@ from vision_util.camera_intake import (
     CameraIntake,
     IntakeConfig,
     StreamSpec,
+    configure_camera_backend,
 )
 from vision_util.depth_reproject import (
     decode_depth_metres,
@@ -63,6 +65,23 @@ class _CompatibleCameraIntake(CameraIntake):
             self._compat_owner.recent_publish_time[self.cfg.camera] = (
                 bundle.recv_time if bundle is not None else None
             )
+
+    def _store_provider_result(self, result):
+        bundle = super()._store_provider_result(result)
+        if bundle is None:
+            return None
+        with self._compat_owner.lock_msg:
+            self._compat_owner.recent_sync_msg[self.cfg.camera] = (
+                bundle.color_msg, bundle.depth_msg
+            )
+            self._compat_owner.recent_publish_time[self.cfg.camera] = (
+                Time.from_msg(bundle.header.stamp)
+            )
+        info = self.camera_info()
+        if info is not None:
+            with self._compat_owner.lock_info:
+                self._compat_owner.camera_intrinsic[self.cfg.camera] = info
+        return bundle
 
 
 class YOLOSegmentationNode(Node):
@@ -113,7 +132,26 @@ class YOLOSegmentationNode(Node):
         )
 
         # Keep the public buffer/listener aliases used by inherited servers.
-        self._tf_helper = TransformHelper(self, cache_time_s=180.0)
+        try:
+            self.declare_parameter('camera_backend', 'service')
+        except Exception:
+            pass
+        try:
+            self.declare_parameter(
+                'transform_provider_endpoint', '/head_camera_server'
+            )
+        except Exception:
+            pass
+        camera_backend = self.get_parameter('camera_backend').value
+        transform_endpoint = self.get_parameter(
+            'transform_provider_endpoint'
+        ).value
+        self._tf_helper = TransformHelper(
+            self,
+            cache_time_s=180.0,
+            backend=camera_backend,
+            provider_endpoint=transform_endpoint,
+        )
         self.tf_buffer = self._tf_helper.buffer
         self.tf_listener = self._tf_helper._listener
 
@@ -269,28 +307,38 @@ class YOLOSegmentationNode(Node):
         for camera in ('realsense', 'orbbec'):
             if camera not in self.camera_types:
                 continue
-            cfg = IntakeConfig(
-                camera=camera,
-                color=StreamSpec(
-                    self.get_parameter(f'{camera}_image_topic').value,
-                    best_effort=True,
-                    qos_depth=10,
+            cfg = configure_camera_backend(
+                self,
+                IntakeConfig(
+                    camera=camera,
+                    color=StreamSpec(
+                        self.get_parameter(
+                            f'{camera}_image_topic').value,
+                        best_effort=True,
+                        qos_depth=10,
+                    ),
+                    depth=StreamSpec(
+                        self.get_parameter(
+                            f'{camera}_depth_topic').value,
+                        best_effort=True,
+                        qos_depth=10,
+                    ),
+                    camera_info=StreamSpec(
+                        self.get_parameter(
+                            f'{camera}_camera_info_topic'
+                        ).value,
+                        best_effort=False,
+                        qos_depth=10,
+                    ),
+                    sync_queue=10,
+                    sync_slop_s=0.1,
+                    age_source='stamp',
                 ),
-                depth=StreamSpec(
-                    self.get_parameter(f'{camera}_depth_topic').value,
-                    best_effort=True,
-                    qos_depth=10,
+                default_endpoint=(
+                    '/wrist_camera_server'
+                    if camera == 'realsense'
+                    else '/head_camera_server'
                 ),
-                camera_info=StreamSpec(
-                    self.get_parameter(
-                        f'{camera}_camera_info_topic'
-                    ).value,
-                    best_effort=False,
-                    qos_depth=10,
-                ),
-                sync_queue=10,
-                sync_slop_s=0.1,
-                age_source='recv',
             )
             intake = _CompatibleCameraIntake(
                 self,
@@ -302,9 +350,19 @@ class YOLOSegmentationNode(Node):
             setattr(
                 self,
                 f'camera_info_sub_{camera}',
-                intake._subscriptions[-1],
+                (
+                    intake._subscriptions[-1]
+                    if intake._subscriptions
+                    else None
+                ),
             )
-            self.get_logger().info(f'Subscribed to {camera} camera')
+            if cfg.backend == 'service':
+                self.get_logger().info(
+                    f'Using {camera} camera provider at '
+                    f'{cfg.provider_endpoint}'
+                )
+            else:
+                self.get_logger().info(f'Subscribed to {camera} camera')
 
     def _init_publishers(self):
         """Initialize publishers."""
@@ -1033,16 +1091,32 @@ class YOLOSegmentationNode(Node):
         )
 
     def _wait_for_recent_frame(self, camera: str, *, warn: bool = False):
-        """Return the current intake pair using the legacy freshness policy.
+        """Return a current intake pair using its configured backend.
 
-        The timestamp sampled at service-call entry intentionally stays fixed
-        across all configured 0.1 s polls. This preserves the original
-        five-poll default and accepts a frame received while the call waits.
+        The subscription path keeps the legacy fixed-call-time polling policy.
+        The service path delegates freshness to the provider's header stamps.
         """
-        call_time = self.get_clock().now()
         intake = self._camera_intakes.get(camera)
+        if intake is None:
+            return None
+        if intake.cfg.backend == 'service':
+            bundle = intake.wait_fresh(
+                max_age_s=self.img_sync_thres,
+                timeout_s=self.sync_wait_time_limit * 0.1,
+                on_timeout='fail',
+            )
+            if bundle is None:
+                if warn:
+                    self.get_logger().warn(
+                        f'Skipping detection: no recent {camera} provider '
+                        'data within sync threshold'
+                    )
+                return None
+            return copy.deepcopy((bundle.color_msg, bundle.depth_msg))
+
+        call_time = self.get_clock().now()
         for _ in range(self.sync_wait_time_limit):
-            bundle = intake.latest() if intake is not None else None
+            bundle = intake.latest()
             recent_time = bundle.recv_time if bundle is not None else None
             if recent_time is None or (
                 (call_time - recent_time).nanoseconds / 1e9

@@ -10,7 +10,9 @@
   <depend>rclpy</depend>
   <depend>rclpy_action</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
   <depend>tinker_vision_msgs_26</depend>
+  <depend>camera_provider</depend>
   <depend>message_filters</depend>
   <depend>cv_bridge</depend>
   <depend>tf2_ros</depend>

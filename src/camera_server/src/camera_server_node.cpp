@@ -316,7 +316,8 @@ void CameraServerNode::on_synced(Image::ConstSharedPtr color,
         color->header.frame_id.c_str(), depth->header.frame_id.c_str());
     return;
   }
-  store_.set_pair(std::move(color), std::move(depth));
+  const int64_t received_at_ns = get_clock()->now().nanoseconds();
+  store_.set_pair(std::move(color), std::move(depth), received_at_ns);
   last_pair_arrival_steady_ns_.store(steady_now_ns());
 }
 
@@ -359,6 +360,8 @@ void CameraServerNode::publish_status() {
           ? static_cast<float>((now_ns - pair.stamp_ns) * 1e-9)
           : -1.0F;
   status.last_pair_stamp = from_ns(pair.color ? pair.stamp_ns : 0);
+  status.last_pair_received_at =
+      from_ns(pair.color ? pair.received_at_ns : 0);
   status.pair_seq = pair.seq;
   status.sync_fps =
       elapsed > 0.0
@@ -531,6 +534,7 @@ void CameraServerNode::handle_snapshot(
   }
 
   response->stamp = from_ns(pair.stamp_ns);
+  response->received_at = from_ns(pair.received_at_ns);
   response->frame_id = response_frame(pair);
   if (request->want_color) {
     response->color = *pair.color;
@@ -600,6 +604,9 @@ void CameraServerNode::handle_point_cloud(
       acquire_pair(request->max_age_sec, request->captured_after,
                    request->wait_timeout_sec, pair,
                    response->error_msg);
+  if (pair.depth) {
+    response->received_at = from_ns(pair.received_at_ns);
+  }
   switch (acquisition) {
     case AcquisitionStatus::kOk:
       response->status = GetCameraPointCloud::Response::STATUS_OK;

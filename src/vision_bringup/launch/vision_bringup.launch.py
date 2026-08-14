@@ -138,7 +138,9 @@ def generate_launch_description():
         _node('kimi_api', 'feature_matching', _if('enable_hri')),
         _node('kimi_api', 'seat_recommend_bbox', _if('enable_hri')),
         # --- GPSR-only ---
-        _node('vision_util', 'get_image', _if('enable_gpsr')),
+        # Legacy camera service names are owned by the subscription-free
+        # provider compatibility bridge during cutover.
+        _node('camera_server', 'camera_compat_bridge', _if('enable_gpsr')),
         # --- PickAndPlace-only ---
         _node('kimi_api', 'object_scan',
               _if_any('enable_pick_place', 'enable_pnp')),

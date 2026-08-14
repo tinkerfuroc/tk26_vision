@@ -294,6 +294,17 @@ class PlacingLocationServer(YOLOSegmentationNode):
         return 'orbbec'
 
     def _wait_for_recent_frame(self, camera: str):
+        intake = self._camera_intakes.get(camera)
+        if intake is not None and intake.cfg.backend == 'service':
+            bundle = intake.wait_fresh(
+                max_age_s=self.img_sync_thres,
+                timeout_s=self.sync_wait_time_limit * 0.1,
+                on_timeout='fail',
+            )
+            if bundle is None:
+                return None
+            return copy.deepcopy((bundle.color_msg, bundle.depth_msg))
+
         call_time = self.get_clock().now()
         for _ in range(self.sync_wait_time_limit):
             with self.lock_msg:
@@ -309,6 +320,9 @@ class PlacingLocationServer(YOLOSegmentationNode):
         return None
 
     def _get_intrinsic(self, camera: str):
+        intake = self._camera_intakes.get(camera)
+        if intake is not None and intake.cfg.backend == 'service':
+            return copy.deepcopy(intake.camera_info())
         with self.lock_info:
             return copy.deepcopy(self.camera_intrinsic.get(camera))
 

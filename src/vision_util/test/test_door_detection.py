@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import CameraInfo
 from tinker_vision_msgs_26.srv import DoorDetection
 
@@ -34,7 +35,11 @@ class TestDoorDetectionService(unittest.TestCase):
         rclpy.shutdown()
 
     def setUp(self):
-        self.node = DoorDetectionService()
+        self.node = DoorDetectionService(
+            parameter_overrides=[
+                Parameter('camera_backend', value='subscription'),
+            ],
+        )
         self.bridge = CvBridge()
 
     def tearDown(self):
@@ -68,6 +73,7 @@ class TestDoorDetectionService(unittest.TestCase):
         intake = self.node.camera_intake
         cfg = intake.cfg
 
+        self.assertEqual(cfg.backend, 'subscription')
         self.assertIsNone(cfg.color)
         self.assertIsNone(intake._sync)
         self.assertEqual(cfg.depth.topic, '/camera/depth/image_raw')

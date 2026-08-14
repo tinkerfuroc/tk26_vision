@@ -52,7 +52,6 @@ def test_orbbec_response_depth_is_independent_best_effort_depth_one(
     monkeypatch,
 ):
     captured = {}
-    subscription = object()
 
     class FakeIntake:
         def __init__(self, node, cfg, callback_group=None, *, bridge=None):
@@ -62,7 +61,8 @@ def test_orbbec_response_depth_is_independent_best_effort_depth_one(
                 callback_group=callback_group,
                 bridge=bridge,
             )
-            self._subscriptions = [subscription]
+            self.cfg = cfg
+            self._subscriptions = []
 
     monkeypatch.setattr(generalist_node, 'CameraIntake', FakeIntake)
     monkeypatch.setattr(
@@ -75,7 +75,10 @@ def test_orbbec_response_depth_is_independent_best_effort_depth_one(
         bridge=object(),
         _orbbec_response_depth_intake=None,
         get_parameter=lambda name: SimpleNamespace(
-            value='/camera/depth/image_raw'
+            value={
+                'orbbec_depth_image_topic':
+                    '/camera/depth/image_raw',
+            }[name]
         ),
         get_logger=lambda: _Logger(),
     )
@@ -92,10 +95,12 @@ def test_orbbec_response_depth_is_independent_best_effort_depth_one(
     assert cfg.depth.topic == '/camera/depth/image_raw'
     assert cfg.depth.best_effort is True
     assert cfg.depth.qos_depth == 1
-    assert cfg.age_source == 'recv'
+    assert cfg.backend == 'service'
+    assert cfg.age_source == 'stamp'
+    assert cfg.provider_endpoint == '/head_camera_server'
     assert captured['callback_group'] == 'response-depth-group'
     assert captured['bridge'] is node.bridge
-    assert node._orbbec_depth_image_sub is subscription
+    assert node._orbbec_depth_image_sub is None
 
 
 def test_orbbec_response_depth_callback_forwards_to_depth_only_intake():

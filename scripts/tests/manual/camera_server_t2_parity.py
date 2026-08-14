@@ -118,6 +118,15 @@ def main():
         if ok:
             age = (node.get_clock().now().nanoseconds - timestamp_ns(first.stamp)) * 1e-9
             record("pair age < 1s", 0.0 <= age < 1.0, f"(age={age:.3f}s)")
+            received_ns = timestamp_ns(first.received_at)
+            transport_lag = (
+                received_ns - timestamp_ns(first.stamp)
+            ) * 1e-9
+            record(
+                "snapshot receive time present",
+                received_ns > 0,
+                f"(transport_lag={transport_lag:.3f}s)",
+            )
             skew = abs(timestamp_ns(first.color.header.stamp) -
                        timestamp_ns(first.depth.header.stamp)) * 1e-9
             record("color/depth skew <= 0.1s", skew <= 0.1, f"(skew={skew:.3f}s)")
@@ -182,6 +191,10 @@ def main():
         record("get_point_cloud returns a populated cloud", cloud_ok,
                f"(points={getattr(getattr(cloud, 'points', None), 'width', 0)})")
         if cloud_ok:
+            record(
+                "cloud receive time present",
+                timestamp_ns(cloud.received_at) > 0,
+            )
             field_names = {field.name for field in cloud.points.fields}
             record("colored cloud has XYZRGB fields",
                    {"x", "y", "z", "rgb"}.issubset(field_names),

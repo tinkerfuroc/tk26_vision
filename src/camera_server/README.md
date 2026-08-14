@@ -7,20 +7,24 @@ time-correct transforms **on demand**:
 - `~/get_snapshot` (`tinker_vision_msgs_26/srv/GetCameraSnapshot`) — latest
   synced color+depth pair + camera infos + transforms at the conservative
   pair stamp (`min(color_stamp, depth_stamp)`), with `max_age` /
-  `captured_after` freshness semantics applying to both images.
+  `captured_after` freshness semantics applying to both images. `received_at`
+  is diagnostic only and never participates in freshness decisions.
 - `~/get_point_cloud` (`GetCameraPointCloud`) — CPU deprojection of registered
   depth from the cached pair (stride / XYZ or XYZRGB / optional target frame
-  at the depth image stamp).
+  at the depth image stamp), with diagnostic `received_at`.
 - `~/get_transform` (`GetTransform`) — lookup against the server's warm 180 s
   TF buffer, for on-demand consumers with cold local buffers.
-- `~/status` (`CameraServerStatus`, 1 Hz) — stream ages, sync fps, pair seq.
+- `~/status` (`CameraServerStatus`, 1 Hz) — stream ages, sync fps, pair seq,
+  and `last_pair_received_at`.
 
 Two instances: `wrist_camera_server` (launched by the manipulation bringup
 that owns the RealSense) and `head_camera_server` (launched by
 `vision_bringup/vision_driver.launch.py`). A separate `camera_compat_bridge`
 executable serves the legacy `get_image_service` / `get_point_cloud_service` /
 `get_orbbec_pc` names by forwarding to the servers — param-gated, OFF by
-default (the Python utility nodes keep those names until cutover).
+default in the standalone camera-server launch. `vision_bringup` starts the
+bridge for GPSR and no longer starts the Python legacy service node, avoiding
+duplicate service names during cutover.
 
 Design: `../../docs/specs/2026-07-13-camera-server-design.md`.
 Consumers are NOT migrated by this package's introduction (Appendix A of the

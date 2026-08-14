@@ -309,6 +309,7 @@ TEST_F(CameraServerNodeTest,
   }));
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(nanoseconds(response->stamp), nanoseconds(older));
+  EXPECT_GT(nanoseconds(response->received_at), 0);
   EXPECT_EQ(response->frame_id, "camera_optical");
   EXPECT_EQ(response->color.width, 0U);
   EXPECT_EQ(response->depth.width, 1U);
@@ -328,6 +329,7 @@ TEST_F(CameraServerNodeTest,
   std::lock_guard<std::mutex> lock(status_mutex_);
   EXPECT_EQ(nanoseconds(last_status_.last_pair_stamp),
             nanoseconds(older));
+  EXPECT_GT(nanoseconds(last_status_.last_pair_received_at), 0);
   EXPECT_GT(last_status_.sync_fps, 0.0F);
   EXPECT_TRUE(std::isfinite(last_status_.pair_age_sec));
 }
@@ -347,6 +349,7 @@ TEST_F(CameraServerNodeTest,
   })) << (native ? native->error_msg : "no response");
   ASSERT_NE(native, nullptr);
   EXPECT_EQ(nanoseconds(native->stamp), nanoseconds(depth_stamp));
+  EXPECT_GT(nanoseconds(native->received_at), 0);
   EXPECT_EQ(nanoseconds(native->points.header.stamp),
             nanoseconds(depth_stamp));
   EXPECT_EQ(native->points.header.frame_id, "camera_optical");
@@ -403,6 +406,7 @@ TEST_F(CameraServerNodeTest, CloudFreshnessUsesOlderImageStamp) {
   EXPECT_EQ(response->status,
             PointCloud::Response::STATUS_WAIT_TIMEOUT) << response->error_msg;
   EXPECT_TRUE(response->points.data.empty());
+  EXPECT_GT(nanoseconds(response->received_at), 0);
 }
 
 TEST_F(CameraServerNodeTest, StaticTransformAndFreshnessFailuresAreStable) {

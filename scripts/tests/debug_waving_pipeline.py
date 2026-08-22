@@ -19,7 +19,6 @@ Compare `results.csv` and stdout summary between the two runs.
 
 import argparse
 import csv
-import os
 import sys
 import time
 from pathlib import Path
@@ -28,6 +27,7 @@ import cv2
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
+
 
 # Lazy-import heavy deps so --help works without them.
 def _lazy_imports():
@@ -70,7 +70,7 @@ def is_waving_fixed(landmarks, img_h):
     lh, le, ls = landmarks[PL.LEFT_WRIST],  landmarks[PL.LEFT_ELBOW],  landmarks[PL.LEFT_SHOULDER]
     MIN_VIS, SHOULDER_TOL, ELBOW_TOL = 0.5, 0.1, 0.1
     right_visible = min(rh.visibility, re.visibility, rs.visibility) >= MIN_VIS
-    left_visible  = min(lh.visibility, le.visibility, ls.visibility) >= MIN_VIS
+    left_visible = min(lh.visibility, le.visibility, ls.visibility) >= MIN_VIS
     if not (right_visible or left_visible):
         return False
     right_wave = right_visible and (
@@ -96,7 +96,6 @@ def evaluate_image(img_path, label, yolo, pose, predicate, conf_thresh, out_over
     t0 = time.perf_counter()
     results = yolo(img, conf=conf_thresh, verbose=False)
     boxes = results[0].boxes
-    masks = results[0].masks
 
     overlay = img.copy()
     n_persons = 0

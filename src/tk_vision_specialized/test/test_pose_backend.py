@@ -44,12 +44,17 @@ class _FakeLandmarker:
 @pytest.fixture
 def fake_mp(monkeypatch):
     """Patch PoseBackend's factory so no model file / libmediapipe is needed."""
-    calls = {"gpu_raises": False, "gpu_detect_raises": False, "poses": [[_FakeNormLm(0.1, 0.2, 0.0, 0.9)] * 33]}
+    calls = {
+        "gpu_raises": False,
+        "gpu_detect_raises": False,
+        "poses": [[_FakeNormLm(0.1, 0.2, 0.0, 0.9)] * 33],
+    }
 
     def _create(model_path, delegate, min_conf):
         if delegate == "gpu" and calls["gpu_raises"]:
             raise RuntimeError("no EGL")
-        return _FakeLandmarker(delegate, calls["poses"], gpu_detect_raises=calls["gpu_detect_raises"])
+        return _FakeLandmarker(
+            delegate, calls["poses"], gpu_detect_raises=calls["gpu_detect_raises"])
 
     monkeypatch.setattr(pb, "_create_landmarker", _create)
     monkeypatch.setattr(pb, "_to_mp_image", lambda rgb: rgb)
@@ -85,7 +90,7 @@ def test_gpu_warmup_failure_closes_landmarker_and_falls_back(fake_mp):
     assert be.active_delegate == "cpu"
     assert "GPU detect failed" in be.fallback_reason
     # GPU landmarker must be created but closed before falling back
-    gpu_created = [l for l in _FakeLandmarker.created if l.delegate == "gpu"]
+    gpu_created = [lm for lm in _FakeLandmarker.created if lm.delegate == "gpu"]
     assert len(gpu_created) == 1
     assert gpu_created[0].closed is True
     # final active landmarker must be CPU
@@ -96,7 +101,7 @@ def test_cpu_requested_never_tries_gpu(fake_mp):
     fake_mp["gpu_raises"] = True  # would raise if attempted
     be = PoseBackend("dummy.task", delegate="cpu")
     assert be.active_delegate == "cpu" and be.fallback_reason is None
-    assert [l.delegate for l in _FakeLandmarker.created] == ["cpu"]
+    assert [lm.delegate for lm in _FakeLandmarker.created] == ["cpu"]
 
 
 def test_invalid_delegate_rejected(fake_mp):
@@ -127,7 +132,8 @@ def test_process_rejects_non_rgb_uint8(fake_mp):
 
 def test_close_is_idempotent(fake_mp):
     be = PoseBackend("dummy.task", delegate="cpu")
-    be.close(); be.close()
+    be.close()
+    be.close()
     assert _FakeLandmarker.created[-1].closed
 
 

@@ -10,7 +10,6 @@ import logging
 from pathlib import Path
 
 import cv2
-import numpy as np
 import pytest
 
 from vision_util.weights_cache import find_cached
@@ -25,7 +24,8 @@ JOINTS = [PoseLandmarkIdx.NOSE, PoseLandmarkIdx.LEFT_SHOULDER, PoseLandmarkIdx.R
 
 MODEL = find_cached("pose_landmarker_full.task")
 pytestmark = pytest.mark.skipif(
-    MODEL is None, reason="pose_landmarker_full.task not in weights cache — run scripts/download_models.py")
+    MODEL is None,
+    reason="pose_landmarker_full.task not in weights cache — run scripts/download_models.py")
 
 
 class _Stub:

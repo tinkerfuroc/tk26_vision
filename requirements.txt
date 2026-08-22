@@ -196,7 +196,7 @@ pillow==12.2.0
 pluggy==1.6.0
 polars==1.39.3
 polars-runtime-32==1.39.3
-protobuf==3.20.3
+protobuf==6.33.6
 psutil==7.2.2
 py-trees==2.4.0
 py-trees-ros==2.4.0

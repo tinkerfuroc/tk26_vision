@@ -140,6 +140,13 @@ else
     fail "T0.6" "import/cache-dir failure (see $LOG_DIR/t0.6_weights_cache.log)"
 fi
 
+section "T0.6b — pose landmarker bundle staged"
+if python3 -c "from vision_util.weights_cache import find_cached; import sys; sys.exit(0 if find_cached('pose_landmarker_full.task') else 1)" 2>"$LOG_DIR/t0.6b_pose_model.log"; then
+    pass "T0.6b"
+else
+    fail "T0.6b" "pose_landmarker_full.task missing from weights cache — run scripts/download_models.py (test_pose_parity.py would otherwise skip)"
+fi
+
 section "T0.7 — .env sanity"
 if have_api_key; then
     pass "T0.7 (API key populated)"

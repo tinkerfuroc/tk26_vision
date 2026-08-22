@@ -25,6 +25,9 @@ POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
 )
+# The pose_parity fixture (test_pose_parity.py) was recorded against this exact
+# bundle — verify any freshly downloaded file against it before trusting it.
+POSE_MODEL_SHA256 = "4eaa5eb7a98365221087693fcc286334cf0858e2eb6e15b506aa4a7ecdcec4ad"
 
 
 class PoseLandmarkIdx(enum.IntEnum):

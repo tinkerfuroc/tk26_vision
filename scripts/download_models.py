@@ -31,6 +31,7 @@ sys.path.insert(0, str(VISION_DIR / "src" / "tk_vision_specialized"))
 from vision_util.weights_cache import resolve_weights  # noqa: E402
 from tk_vision_specialized._pose_backend import (  # noqa: E402
     POSE_MODEL_FILENAME,
+    POSE_MODEL_SHA256,
     POSE_MODEL_URL,
 )
 
@@ -73,6 +74,7 @@ def warm_torchvision() -> None:
 
 def fetch_pose_landmarker() -> None:
     """Stage the MediaPipe Tasks pose bundle used by waving_person_server."""
+    import hashlib
     from urllib.request import urlopen
     from vision_util.weights_cache import _writable_cache, find_cached
     print("staging mediapipe pose landmarker (.task)…")
@@ -82,9 +84,20 @@ def fetch_pose_landmarker() -> None:
         return
     target = _writable_cache() / POSE_MODEL_FILENAME
     part = target.with_suffix(target.suffix + ".part")
-    with urlopen(POSE_MODEL_URL, timeout=60) as resp, open(part, "wb") as fp:
-        while chunk := resp.read(1 << 20):
-            fp.write(chunk)
+    try:
+        with urlopen(POSE_MODEL_URL, timeout=60) as resp, open(part, "wb") as fp:
+            while chunk := resp.read(1 << 20):
+                fp.write(chunk)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    digest = hashlib.sha256(part.read_bytes()).hexdigest()
+    if digest != POSE_MODEL_SHA256:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"pose_landmarker_full.task digest mismatch: expected {POSE_MODEL_SHA256}, "
+            f"got {digest} (downloaded from {POSE_MODEL_URL})"
+        )
     part.replace(target)   # atomic: a partial file never satisfies find_cached
     print(f"  ✓ {POSE_MODEL_FILENAME:<26} {human_size(target)}  ({target})")
 

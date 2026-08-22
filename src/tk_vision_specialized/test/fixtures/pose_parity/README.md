@@ -11,5 +11,9 @@ identical `is_waving` verdicts and near-identical landmarks.
 Sources: ultralytics `bus.jpg`, `zidane.jpg` (crops 00–05); live Orbbec frames
 none — camera was not running when recorded.
 
+Each crop entry in `expected_0.10.9.json` also carries a `source` key naming
+the originating image filename; it is informational only and ignored by
+`test_pose_parity.py`.
+
 Do not regenerate under a newer mediapipe; the value of this fixture is that
 it encodes the legacy behaviour.

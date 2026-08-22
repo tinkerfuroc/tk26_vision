@@ -16,6 +16,191 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-08-22 — .env-driven VLM model ids, tensorboard 2.20, FoundationStereo TensorRT revival
+
+**Why:** a dependency scan of `tk26_vision` surfaced three low-risk, high-value gaps: (1) every
+vision node's VLM model id was a code literal even though the workspace `.env` already carried
+newer choices (`LLM_MODEL`, `FLASH_MODEL`) that only `kimi_api/_env.py` read; (2) `tensorboard
+2.11.2` in `.venv-vision-main` pinned `protobuf 3.20.3` for no reason other than being the
+version torchreid's install happened to pull, with nothing else in the venv needing protobuf 3;
+(3) `.venv-fs` had no `tensorrt` and no FoundationStereo weights/engines existed on this box at
+all — the `weights_root` in `foundation_stereo.yaml` pointed at a directory that didn't exist, so
+`foundation_stereo_node` (which serves only `fast_trt`) was dead here. The scan's environment
+ceilings: **Python 3.10** (system + all four tk26 venvs), **NVIDIA driver 560.35 / CUDA 12.6**,
+and the system `cv_bridge` built against **NumPy 1.x** (hence every GPU venv pins `numpy<2`).
+Deferred out of this session (not touched): OpenCV consolidation across the three vendored
+camera-SDK builds, `openai` 3.x, a NumPy 2 migration, and any torch/CUDA version change.
+**`monocular_depth` removal was explicitly ruled out of scope by the user** — it stays as-is.
+
+### 1. Model-id resolver (`vision_util.vlm_models`)
+
+New `src/vision_util/vision_util/vlm_models.py` (stdlib-only — kept import-clean so
+`tk_vision_specialized`'s VLM clients, which deliberately don't depend on `kimi_api`, can use it
+too). Resolution chain, first non-empty wins, whitespace-stripped, empty string = unset:
+
+```
+vision_vlm_model()   : VISION_VLM_MODEL       -> LLM_MODEL   -> 'google/gemini-2.5-pro'
+vision_flash_model() : VISION_VLM_FLASH_MODEL -> FLASH_MODEL -> 'google/gemini-2.5-flash'
+vision_qwen_model()  : VISION_QWEN_MODEL                     -> 'qwen3-vl-plus'
+```
+
+Every literal-default call site across `kimi_api`, `object_detection_generalist`,
+`tk_vision_specialized`, and the dev/bench scripts now calls the resolver instead (behaviour is
+identical when no `VISION_*`/`LLM_MODEL`/`FLASH_MODEL` key is set — same string, same fallback).
+`kimi_api/_env.py`'s `default_model()`/`default_flash_model()` became thin aliases.
+`src/tk_vision_specialized/test/test_no_hardcoded_vlm_models.py` greps production code for the
+three legacy literals and fails the build if one reappears — this is the guard, replacing what
+would otherwise be N per-node "declared default equals resolver" tests.
+
+`.env` values set at the workspace root (`/home/tinker/tk25_ws/.env`), and mirrored with the
+resolution-chain comment in `src/kimi_api/.env.example`:
+
+```
+VISION_VLM_MODEL=google/gemini-3.1-pro-preview
+VISION_VLM_FLASH_MODEL=google/gemini-3.7-flash
+VISION_QWEN_MODEL=qwen3-vl-plus
+```
+
+(Qwen stays on `qwen3-vl-plus` — DashScope's newer `qwen3.7-plus` is a thinking-by-default hybrid
+model the calibrated bbox decoder hasn't been benchmarked against.) Explicit `-p …model:=` ROS
+params still override; nodes log the resolved default once at INFO on startup.
+
+### 2. `.venv-vision-main`: tensorboard 2.11.2 → 2.20.0, protobuf 3.20.3 → 6.33.6
+
+```
+pip install --no-deps tensorboard==2.20.0 tensorboard-data-server==0.7.2 protobuf==6.33.6
+```
+
+Verbatim freeze diff (`pip freeze | sort | diff before -`) — exactly three packages moved, nothing
+else:
+
+```
+218c218
+< protobuf==3.20.3
+---
+> protobuf==6.33.6
+334,335c334,335
+< tensorboard==2.11.2
+< tensorboard-data-server==0.6.1
+---
+> tensorboard==2.20.0
+> tensorboard-data-server==0.7.2
+```
+
+`pip check` output byte-identical before/after (pre-existing `dinov2`/`approach-planner` unmet
+optional-extra lines, unrelated). 2.11-era orphans (`google-auth`, `google-auth-oauthlib`,
+`requests-oauthlib`, `tensorboard-plugin-wit`) were left installed but unused — same policy as the
+jax orphans elsewhere in this venv; see the follow-ups below.
+
+**Gate:** `import torchreid` + `vision_track.reid.reid_backbone.build_reid_backbone
+('osnet_ain_x1_0')` still build (imagenet-init weights load from
+`~/.cache/torch/checkpoints/osnet_ain_x1_0_imagenet.pth` as documented); full `src/vision_track`
+suite — `323 passed, 3 deselected, 6 warnings in 15.00s`. Pins landed in
+`.venv-vision-main.uv-project/pyproject.toml` (`protobuf==6.33.6`), root `requirements.txt`, and
+`uv.lock` (`uv lock` re-resolved only the `protobuf` package entry — no other package's `name`
+field changed).
+
+### 3. `.venv-fs`: `tensorrt-cu12` 10.16.1.11 + local TRT engines
+
+```
+pip install --no-deps --extra-index-url https://pypi.nvidia.com \
+  tensorrt-cu12==10.16.1.11 tensorrt-cu12-bindings==10.16.1.11 tensorrt-cu12-libs==10.16.1.11
+```
+
+Verbatim freeze diff:
+
+```
+368a369,371
+> tensorrt_cu12==10.16.1.11
+> tensorrt_cu12_bindings==10.16.1.11
+> tensorrt_cu12_libs==10.16.1.11
+```
+
+(pip spells the meta-package with underscores, as anticipated.) `pip check` byte-identical
+before/after. `import tensorrt` → `10.16.1.11`; `Builder(...).platform_has_fast_fp16` → `True` on
+this RTX 2080 Ti. The `-libs` wheel is **~4.3 GB** (not the ~1 GB originally estimated) and pip's
+in-memory HTTP cache aborted the first download attempt with `ValueError: Memoryview is too
+large` (a `cachecontrol`/`msgpack` limitation, not a dependency conflict) — resolved with
+`--no-cache-dir` on retry. `.venv-fs.uv-project/unlockable.txt` gained an `# INSTALLED 2026-08-22
+on tinker (RTX 2080 Ti)` note; `.venv-fs`'s `freeze.lock.txt` now exists (427 lines).
+
+`weights_root` moved from a nonexistent path to `~/.cache/tk26_vision/weights/foundation_stereo`
+(`StereoRunner.__init__` now applies `os.path.expanduser` before use, matching the existing
+`$FOUNDATION_STEREO_VENDOR_ROOT` convention). `fetch_fast_fs_weights.py` (new,
+`foundation_stereo.scripts`) pulled the `23-36-37` Fast-FoundationStereo checkpoint via `gdown
+--folder` from the upstream Drive folder, verified/wrote `SHA256SUMS`
+(`af0658f289ec840b292645f8d5538978f06e8cabaa1fd31e84acc91af268e990
+model_best_bp2_serialize.pth`, 71.1 MB), and is idempotent on re-run (verify-only, no re-download).
+One deviation from the original spec: the installed `gdown==6.0.0`'s `--folder` CLI rejects
+`--remaining-ok` (not a Drive/quota/layout problem), so that flag was dropped from the invocation.
+
+`build_trt_engines.py` (new) ran the vendored `Fast-FoundationStereo/scripts/make_onnx.py`
+(`--height 576 --width 960 --valid_iters 4 --max_disp 192`) to export ONNX, then built each graph
+into an FP16 TensorRT engine via the TensorRT Python API (`Builder`/`OnnxParser`, explicit batch,
+`FP16` flag, 4 GiB workspace). Log tail on the RTX 2080 Ti (shared with a running simulator, `nice
+-n 10`):
+
+```
+built feature_runner.engine in 250 s
+built post_runner.engine in 1273 s
+installed /home/tinker/.cache/tk26_vision/weights/foundation_stereo/Fast-FoundationStereo/output_two_stage: ['feature_runner.engine', 'onnx.yaml', 'post_runner.engine']
+```
+
+Total wall time ~26 minutes end-to-end (over the ~20-minute budget estimate — TensorRT's FP16
+tactic search on `post_runner`'s larger op graph, which includes the GWC/cost-volume path,
+dominated). Installed engine sizes: `feature_runner.engine` ≈ 21.97 MB, `post_runner.engine` ≈
+15.98 MB, `onnx.yaml` 201 B. Engines are GPU/TensorRT-version-locked to this box and are not
+committed to git — rebuild with `build_trt_engines` on every other deployment machine.
+
+**Warmup gate (the end-to-end verification):**
+
+```
+[INFO] foundation_stereo ready: profile=d435, trt_variant=output_two_stage, weights_root=/home/tinker/.cache/tk26_vision/weights/foundation_stereo, stream_enabled=False, trt_variants=['output_two_stage']
+[INFO] warmup ok: variant=output_two_stage loaded + first-forward in 15.71s
+```
+
+No load-time traceback; the RealSense IR1/IR2 topics were not publishing in this session
+(`/camera/camera/infra1/image_rect_raw` — `does not appear to be published yet`), so the live
+`get_depth` service-call leg of the gate was skipped per the accepted fallback and the warmup
+forward is the recorded gate result.
+
+### Verification (Task 8, full stack)
+
+`.venv-vision-main` unit suites (lint tests excluded, repo-wide pre-existing): `vision_util` 56
+passed / 3 deselected, `kimi_api` 183 passed / 3 deselected, `tk_vision_specialized` 173 passed / 3
+skipped / 3 deselected, `object_detection_generalist` 35 passed, `vision_track` 323 passed / 3
+deselected — **770 passed, 3 skipped (pre-existing, no live LLM key), 0 failed**. `.venv-fs`
+(`foundation_stereo`, run via the system pytest appended to `sys.path` — see the README's
+provisioning note): **15 passed, 0 failed** (`test_color_align.py` excluded — it imports the
+already-renamed `foundation_stereo.color_align` module, pre-existing stale-test/renamed-module
+drift unrelated to this session's scope, present identically on `$MAIN`).
+
+`scripts/tests/t0_static.sh` against `$MAIN`: **17 pass / 7 fail / 1 skip.** Every failing row
+(`T0.1`, `T0.5` × 4, `T0.fs.shebang`, `T0.fs.pytest`) traces to the **shared `/home/tinker/tk25_ws/
+install/` tree being stale relative to this branch's worktree source** (stale shebangs, a
+`tinker_vision_msgs_26` install missing actions the source declares, `camera_provider` not on the
+installed entry script's `PYTHONPATH`) — pre-existing environment/install-tree drift, not a
+regression from this session, and expected to clear once this branch is merged and `$MAIN` is
+rebuilt. `T0.fs.vendor` (vendored source trees present) was already green and unaffected by the
+TensorRT install; the strongest positive evidence tensorrt is correctly wired is the warmup gate
+above succeeding end-to-end with real TRT engines.
+
+### Open follow-ups
+
+- **Benchmark the new default models before competition use.** `VISION_VLM_MODEL=google/gemini-
+  3.1-pro-preview` and `VISION_VLM_FLASH_MODEL=google/gemini-3.7-flash` are `.env` picks, not yet
+  run through `src/kimi_api/seat_bench` — the bbox/pointing prompts were calibrated against
+  `gemini-2.5-pro`/`gemini-2.5-flash`; re-run the seat_bench report against the new models before
+  relying on them live.
+- **D405 FoundationStereo engine variant.** The built engines target the D435's 50 mm baseline;
+  D405 (18 mm) needs its own `build_trt_engines` run with the D405 baseline baked in for
+  geometrically correct depth (existing README follow-up, still open).
+- **Drop the tensorboard-2.11-era orphans.** `google-auth`, `google-auth-oauthlib`,
+  `requests-oauthlib`, `tensorboard-plugin-wit` remain installed in `.venv-vision-main` from the
+  pre-upgrade tensorboard 2.11.2 dependency chain and are no longer required by tensorboard 2.20.0;
+  left in place this pass (same policy as the jax orphans) but worth a follow-up `pip uninstall` +
+  freeze-diff pass.
+
 ## 2026-08-22 — MediaPipe 0.10.9 → 1.0.1 Tasks-API port (waving)
 
 **Why:** `waving_person_server`'s pose pass used the legacy MediaPipe

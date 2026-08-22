@@ -66,10 +66,16 @@ The shared vision venv. Covers `object_detection_new`, `object_detection_general
   2.11.0+cu128). Run **after** `uv sync`, venv-scoped:
   ```bash
   uv pip install --python /home/tinker/tk25_ws/src/tk26_vision/.venv-vision-main/bin/python \
-    torchreid==0.2.5 gdown==6.1.0 tensorboard==2.20.0
+    torchreid==0.2.5 gdown==6.1.0 tensorboard==2.20.0 tensorboard-data-server==0.7.2
   ```
   `tensorboard` is a runtime import dep of torchreid's `__init__` (loads the training engine), so it
   is required even for inference-only use — no `--no-deps` deviation.
+  **protobuf 6.33.6 (2026-08-22):** unlike tensorboard, `protobuf` **is** a locked dependency —
+  `.venv-vision-main.uv-project/pyproject.toml` and `uv.lock` pin it at `protobuf==6.33.6` (was
+  `3.20.3`, the version tensorboard 2.11.2 used to pin transitively), so a plain `uv sync --frozen`
+  brings the right version without a hand-install. The `--no-deps` bump that produced this pin moved
+  exactly `protobuf`, `tensorboard`, and `tensorboard-data-server`; `pip check` was unchanged before
+  vs. after.
 - **Editable/git sources needing a local tree:** `clip` is a **git dep**
   (`clip @ git+https://github.com/ultralytics/CLIP.git@81ff68ed7…`) resolved + built by `uv sync` —
   needs network to github.com at sync time; **no local tree**. No editable/directory sources.
@@ -179,7 +185,14 @@ torchaudio 2.8.0+cu128, triton 3.4.0), numpy **1.26.4** (pinned via the sidecar'
   ```
 - **Unlockables:** `tensorrt-cu12==10.16.1.11` (NVIDIA index; the wheel pulls `-bindings` + `-libs`
   automatically). It is listed commented-out in the sidecar's `unlockable.txt`; install it by hand
-  per STEP 2.
+  per STEP 2. **Installed 2026-08-22** on this box — `unlockable.txt` carries an `# INSTALLED
+  2026-08-22 on tinker (RTX 2080 Ti)` note under the entry. The actual `--no-deps` install used to
+  land it named all three packages explicitly (`tensorrt-cu12==10.16.1.11
+  tensorrt-cu12-bindings==10.16.1.11 tensorrt-cu12-libs==10.16.1.11`); freeze diff was exactly those
+  three additions, `pip check` unchanged. **`freeze.lock.txt` now exists for this venv** (427 lines,
+  git-ignored, same convention as `.venv-vision-main`/`.venv-da3`) and is the diff-target for any
+  further install. The `-libs` wheel is ~4.3 GB — see the README's provisioning note about
+  `--no-cache-dir` and the "no pytest of its own" test-invocation workaround.
 - **Editable/git sources needing a local tree:** the `foundation_stereo` ROS package itself —
   installed by `build_foundation_stereo.sh` as a colcon develop-install, wired into the venv via the
   STEP-4 `foundation_stereo.pth` pointing at `/home/tinker/tk25_ws/build/foundation_stereo`. Also
@@ -201,10 +214,13 @@ torchaudio 2.8.0+cu128, triton 3.4.0), numpy **1.26.4** (pinned via the sidecar'
     `cv_bridge.boost`. Do not bump.
   - The STEP-4 `foundation_stereo.pth` is **fragile across `--force`** — it is the single most common
     "FoundationStereo imports nothing" failure. Re-add it after any venv wipe.
-  - **Runtime asset (out of scope, blocks real use):** FoundationStereo TRT **engines** at
-    `weights_root` (default `/home/tinker/projects/vision_tests/dualrRGB-foundationStereo`) are GPU-
-    and TRT-version-locked and **must be re-exported on the target GPU** — copying engines across
-    machines won't work (and the D435 50 mm-baseline engine is geometrically wrong on D405).
+  - **Runtime asset:** FoundationStereo TRT **engines** at `weights_root` (default
+    `~/.cache/tk26_vision/weights/foundation_stereo`, user-expanded) are GPU- and TRT-version-locked
+    and **must be re-exported on the target GPU** — copying engines across machines won't work (and
+    the D435 50 mm-baseline engine is geometrically wrong on D405). Fetch the checkpoint with
+    `fetch_fast_fs_weights` and build the two-stage FP16 engines with `build_trt_engines`; see
+    `src/foundation_stereo/README.md` § Weights & engines for the exact commands, the resulting
+    layout, and the measured build/warmup timings on this box.
   - Build only via `build_foundation_stereo.sh` (or `tkbuild tk26_vision --packages-select
     foundation_stereo`).
 

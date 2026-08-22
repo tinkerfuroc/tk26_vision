@@ -34,7 +34,9 @@ pip install --upgrade pip wheel
 pip install torch==2.8.0 torchvision==0.23.0 \
     --index-url https://download.pytorch.org/whl/cu128
 pip install -r src/foundation_stereo/requirements.txt
-pip install tensorrt==10.16.1.11
+pip install --no-deps --extra-index-url https://pypi.nvidia.com \
+    tensorrt-cu12==10.16.1.11 tensorrt-cu12-bindings==10.16.1.11 \
+    tensorrt-cu12-libs==10.16.1.11
 pip freeze > .venv-fs/freeze.lock.txt
 ```
 
@@ -42,6 +44,75 @@ Critical: `.venv-fs/lib/python3.10/site-packages/numpy` **must be 1.x**
 (currently `1.26.4`). The system `cv_bridge.boost` is compiled against
 NumPy 1.x and segfaults on import if NumPy 2.x is present. The lock file
 is the source of truth; diff against it before any further `pip install`.
+
+The `tensorrt-cu12-libs` wheel is **~4.3 GB** (not ~1 GB as its size might
+suggest at a glance) — pip's HTTP response cache can abort mid-download on
+a wheel this large with `ValueError: Memoryview is too large` (a
+`cachecontrol`/`msgpack` in-memory-caching limitation, not a dependency
+conflict); add `--no-cache-dir` to the `pip install` above if that happens.
+`.venv-fs` has `include-system-site-packages = false` in practice and
+carries **no `pytest` of its own** — run this package's tests by appending
+the system pytest to `sys.path` *after* the venv's site-packages (putting
+it on `PYTHONPATH` directly clashes with the venv's `sympy`):
+
+```bash
+PYTHONPATH=src/foundation_stereo:$PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv-fs/bin/python -c "
+import sys
+sys.path.append('/usr/lib/python3/dist-packages')
+import pytest
+sys.exit(pytest.main(['-v', 'src/foundation_stereo/test']))
+"
+```
+
+### Weights & engines
+
+Fetch the checkpoint, then build the local TensorRT engines (both scripts
+are installed as console entry points after a build — `ros2 run
+foundation_stereo fetch_fast_fs_weights` / `build_trt_engines` — or run
+directly against `.venv-fs`'s python from `src/foundation_stereo`):
+
+```bash
+cd src/tk26_vision/src/foundation_stereo
+../../.venv-fs/bin/python -m foundation_stereo.scripts.fetch_fast_fs_weights
+../../.venv-fs/bin/python -m foundation_stereo.scripts.build_trt_engines
+```
+
+`fetch_fast_fs_weights` pulls the upstream `23-36-37` Fast-FoundationStereo
+checkpoint via `gdown --folder` (Google Drive), keeps only that checkpoint,
+and writes/verifies a `SHA256SUMS` alongside it — idempotent, fails loudly
+(non-zero exit, exact error, no workaround) if Drive is unreachable or the
+folder layout has changed. `build_trt_engines` runs the vendored
+`Fast-FoundationStereo/scripts/make_onnx.py` (576×960, 4 iters, max_disp
+192) to export ONNX, then builds each graph into an FP16 TensorRT engine
+via the TensorRT Python API (`trtexec` isn't shipped in the pip wheels).
+
+Resulting layout under `weights_root` (default
+`~/.cache/tk26_vision/weights/foundation_stereo`):
+
+```
+Fast-FoundationStereo/
+├── weights/23-36-37/
+│   ├── model_best_bp2_serialize.pth   # 71.1 MB checkpoint
+│   ├── cfg.yaml
+│   └── SHA256SUMS
+└── output_two_stage/                  # the default_trt_variant
+    ├── feature_runner.engine          # ~22.0 MB
+    ├── post_runner.engine             # ~16.0 MB
+    └── onnx.yaml
+```
+
+**Engines are GPU/TensorRT-version-locked — rebuild per box.** They are
+not committed to git and won't load on a different GPU or a different
+TensorRT minor version; re-run `build_trt_engines` on each deployment
+machine. On an RTX 2080 Ti (shared with a running simulator, `nice -n 10`)
+the two-stage build took ~26 minutes end-to-end — ONNX export, then
+`feature_runner.engine` in 250 s and `post_runner.engine` in 1273 s (TRT's
+FP16 tactic search on the larger post-processing graph dominates); budget
+accordingly rather than the ~20-minute rule of thumb. Once built, node
+warmup (`warmup_on_launch:=true`, the default) loads both engines and runs
+one forward — measured on this box: `warmup ok: variant=output_two_stage
+loaded + first-forward in 15.71s`.
 
 ## Vendored tree resolution (both build modes)
 
@@ -275,7 +346,7 @@ the D405 baseline baked in.
 
 | Param | Default | Notes |
 |---|---|---|
-| `weights_root` | `/home/tinker/projects/vision_tests/dualrRGB-foundationStereo` | Root containing `FoundationStereo/` and `Fast-FoundationStereo/` sub-trees. |
+| `weights_root` | `~/.cache/tk26_vision/weights/foundation_stereo` | Root containing `FoundationStereo/` and `Fast-FoundationStereo/` sub-trees. User-expanded (`os.path.expanduser`) before use. |
 | `camera_profile` | `"d435"` | Picks defaults for the topic params + baseline. See [§ Camera profile parameters](#camera-profile-parameters). |
 | `default_model_kind` | `"fast_trt"` | **Ignored.** Kept for backwards compatibility; the node only serves `fast_trt`. |
 | `default_trt_variant` | `"output_two_stage"` | Which compiled engine to use as default. Engines are auto-discovered under `weights_root/Fast-FoundationStereo/`. |

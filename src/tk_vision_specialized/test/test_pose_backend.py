@@ -25,13 +25,16 @@ class _FakeResult:
 class _FakeLandmarker:
     created = []
 
-    def __init__(self, delegate, poses):
+    def __init__(self, delegate, poses, gpu_detect_raises=False):
         self.delegate = delegate
         self.poses = poses
         self.closed = False
+        self.gpu_detect_raises = gpu_detect_raises
         _FakeLandmarker.created.append(self)
 
     def detect(self, _image):
+        if self.delegate == "gpu" and self.gpu_detect_raises:
+            raise RuntimeError("GPU detect failed")
         return _FakeResult(self.poses)
 
     def close(self):
@@ -41,12 +44,12 @@ class _FakeLandmarker:
 @pytest.fixture
 def fake_mp(monkeypatch):
     """Patch PoseBackend's factory so no model file / libmediapipe is needed."""
-    calls = {"gpu_raises": False, "poses": [[_FakeNormLm(0.1, 0.2, 0.0, 0.9)] * 33]}
+    calls = {"gpu_raises": False, "gpu_detect_raises": False, "poses": [[_FakeNormLm(0.1, 0.2, 0.0, 0.9)] * 33]}
 
     def _create(model_path, delegate, min_conf):
         if delegate == "gpu" and calls["gpu_raises"]:
             raise RuntimeError("no EGL")
-        return _FakeLandmarker(delegate, calls["poses"])
+        return _FakeLandmarker(delegate, calls["poses"], gpu_detect_raises=calls["gpu_detect_raises"])
 
     monkeypatch.setattr(pb, "_create_landmarker", _create)
     monkeypatch.setattr(pb, "_to_mp_image", lambda rgb: rgb)
@@ -74,8 +77,19 @@ def test_gpu_failure_falls_back_to_cpu(fake_mp):
     be = PoseBackend("dummy.task", delegate="gpu")
     assert be.active_delegate == "cpu"
     assert "no EGL" in be.fallback_reason
-    # the failed GPU attempt must not leak an open landmarker
-    assert all(l.closed for l in _FakeLandmarker.created if l.delegate == "gpu")
+
+
+def test_gpu_warmup_failure_closes_landmarker_and_falls_back(fake_mp):
+    fake_mp["gpu_detect_raises"] = True
+    be = PoseBackend("dummy.task", delegate="gpu")
+    assert be.active_delegate == "cpu"
+    assert "GPU detect failed" in be.fallback_reason
+    # GPU landmarker must be created but closed before falling back
+    gpu_created = [l for l in _FakeLandmarker.created if l.delegate == "gpu"]
+    assert len(gpu_created) == 1
+    assert gpu_created[0].closed is True
+    # final active landmarker must be CPU
+    assert be._lm.delegate == "cpu"
 
 
 def test_cpu_requested_never_tries_gpu(fake_mp):

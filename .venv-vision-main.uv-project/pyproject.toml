@@ -54,7 +54,7 @@ dependencies = [
     "matplotlib==3.10.8",
     "mccabe==0.7.0",
     "mdurl==0.1.2",
-    "mediapipe==0.10.9",
+    "mediapipe==1.0.1",
     "mpmath==1.3.0",
     "netifaces==0.11.0",
     "networkx==3.4.2",

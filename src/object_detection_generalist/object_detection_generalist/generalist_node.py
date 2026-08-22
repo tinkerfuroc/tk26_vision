@@ -61,7 +61,7 @@ from vision_util.vlm_models import vision_flash_model, vision_qwen_model
 from vision_util.weights_cache import resolve_weights
 
 from .sam_mask import SamPredictor
-from .vlm_bbox import VlmBboxError, request_bboxes
+from .vlm_bbox import VlmBboxError, load_env, request_bboxes
 from .world_bbox import WorldDetector, WorldDetectorError
 
 
@@ -93,6 +93,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
     def __init__(self, node_name='generalist_detection_node',
                  parameter_overrides=None):
+        # Load .env (VISION_* model-id overrides) before the base class's
+        # __init__ calls self._declare_parameters() — vlm_model,
+        # vlm_fallback_models, and dashscope_qwen_model default from
+        # vision_util.vlm_models(), which reads os.environ at declare time.
+        load_env()
         super().__init__(
             node_name=node_name,
             parameter_overrides=parameter_overrides or [],

@@ -18,16 +18,36 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import openai
 
+# vision_util source isn't on sys.path until colcon-installed, but running
+# this straight from the repo is convenient — splice it in ahead of time.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent.parent / "src" / "vision_util"))
+from vision_util.vlm_models import vision_flash_model, vision_qwen_model  # noqa: E402
+
 # --- model selection (mirrors object_detection_generalist) -----------------
-GEMINI_MODEL = "google/gemini-2.5-flash"   # primary, via OpenRouter
-QWEN_MODEL = "qwen3-vl-plus"               # fallback, via DashScope
+# Resolved lazily (call-time, not import-time) so a caller's load_env() —
+# called after `import scan_core` — is honored.
+
+
+def _gemini_model() -> str:
+    """Primary VLM, via OpenRouter."""
+    return vision_flash_model()
+
+
+def _qwen_model() -> str:
+    """Fallback VLM, via DashScope."""
+    return vision_qwen_model()
+
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
@@ -131,12 +151,12 @@ def _client_for(provider: str):
         key = openrouter_api_key()
         if not key:
             raise RuntimeError("OPENROUTER_API_KEY not set")
-        return openai.OpenAI(api_key=key, base_url=OPENROUTER_BASE_URL), GEMINI_MODEL
+        return openai.OpenAI(api_key=key, base_url=OPENROUTER_BASE_URL), _gemini_model()
     if provider == "qwen":
         key = dashscope_api_key()
         if not key:
             raise RuntimeError("DASHSCOPE_API_KEY / DASHCOPE_API_KEY not set")
-        return openai.OpenAI(api_key=key, base_url=DASHSCOPE_BASE_URL), QWEN_MODEL
+        return openai.OpenAI(api_key=key, base_url=DASHSCOPE_BASE_URL), _qwen_model()
     raise RuntimeError(f"unknown provider {provider!r}")
 
 

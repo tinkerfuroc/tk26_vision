@@ -57,6 +57,7 @@ from vision_util.camera_intake import (
     StreamSpec,
     configure_camera_backend,
 )
+from vision_util.vlm_models import vision_flash_model, vision_qwen_model
 from vision_util.weights_cache import resolve_weights
 
 from .sam_mask import SamPredictor
@@ -155,14 +156,14 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         #   - force_vlm_sam=True  → VLM only, regardless of enable_vlm.
         #   - use_vlm_sam_fallback=True → race YOLO-World vs VLM concurrently.
         self.declare_parameter('enable_vlm', False)
-        self.declare_parameter('vlm_model', 'google/gemini-2.5-flash')
+        self.declare_parameter('vlm_model', vision_flash_model())
         # Fallback chain. A 'dashscope/' prefix routes the model to Alibaba
         # DashScope's OpenAI-compatible endpoint (separate DASHSCOPE_API_KEY +
         # base URL) instead of OpenRouter — see vlm_bbox._split_provider. qwen
         # is served via DashScope so it stays reachable on networks where
         # openrouter.ai is blocked.
         self.declare_parameter(
-            'vlm_fallback_models', ['dashscope/qwen3-vl-plus']
+            'vlm_fallback_models', [f'dashscope/{vision_qwen_model()}']
         )
         # Convenience switch: make the DashScope qwen model the PRIMARY VLM and
         # drop OpenRouter from the chain entirely. Use this on networks where
@@ -172,8 +173,12 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # `vlm_fallback_models` is emptied (overriding the two params above).
         #   ros2 run ... --ros-args -p prefer_dashscope_qwen:=true
         self.declare_parameter('prefer_dashscope_qwen', False)
-        self.declare_parameter('dashscope_qwen_model', 'dashscope/qwen3-vl-plus')
+        self.declare_parameter('dashscope_qwen_model', f'dashscope/{vision_qwen_model()}')
         self.declare_parameter('vlm_fallback_on_empty', False)
+        self.get_logger().info(
+            f'VLM model defaults: flash={vision_flash_model()} '
+            f'qwen={vision_qwen_model()} (from .env VISION_*)'
+        )
         # vlm_timeout_s is the OVERALL wall-clock budget across all retries
         # and fallback models for one /object_detection_generalist call.
         # vlm_per_attempt_timeout_s is the per-attempt cap forwarded to httpx

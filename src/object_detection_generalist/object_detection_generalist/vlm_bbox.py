@@ -293,9 +293,10 @@ def _split_provider(model_name: str) -> Tuple[str, str]:
 
     A ``dashscope/`` prefix routes the request to Alibaba DashScope's
     OpenAI-compatible endpoint (separate API key + base URL); the prefix is
-    stripped before the id is sent to the API, so ``'dashscope/qwen3-vl-plus'``
-    calls model ``'qwen3-vl-plus'`` against the DashScope host. Everything else
-    goes to the default OpenRouter gateway unchanged. Routing is data-driven via
+    stripped before the id is sent to the API, so a ``dashscope/``-prefixed
+    entry (e.g. the VISION_QWEN_MODEL default) calls the bare model id
+    against the DashScope host. Everything else goes to the default
+    OpenRouter gateway unchanged. Routing is data-driven via
     the existing ``vlm_fallback_models`` param — no new routing parameter — so
     the qwen fallback reaches DashScope even when ``openrouter.ai`` is blocked.
     """

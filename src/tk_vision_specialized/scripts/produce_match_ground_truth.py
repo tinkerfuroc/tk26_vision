@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import cv2
+from vision_util.vlm_models import vision_qwen_model
 
 from tk_vision_specialized.qwen_match_vlm import request_match_bboxes
 from tk_vision_specialized.items_map_loader import ItemsMapLoader
@@ -39,7 +40,7 @@ def _parse_args():
         '--provider', default='qwen', choices=['qwen'],
         help='Only qwen is supported (production single-cat path).',
     )
-    p.add_argument('--vlm-model', default='qwen3-vl-plus')
+    p.add_argument('--vlm-model', default=vision_qwen_model())
     p.add_argument('--top-k', type=int, default=3)
     p.add_argument('--min-conf', type=float, default=0.6)
     p.add_argument('--timeout-s', type=float, default=12.0)

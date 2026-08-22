@@ -8,6 +8,7 @@ from typing import Sequence
 
 import numpy as np
 from dotenv import load_dotenv
+from vision_util.vlm_models import vision_vlm_model
 
 from ._vlm_common import strip_fences, encode_data_url
 from .nms import MatchRow, Bbox
@@ -21,7 +22,10 @@ load_dotenv(override=False)
 
 
 _GEMINI_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'
-_GEMINI_DEFAULT_MODEL = 'google/gemini-2.5-pro'
+
+
+def _gemini_default_model() -> str:
+    return vision_vlm_model()
 
 
 def _decode_bbox_pixels(
@@ -110,7 +114,7 @@ class GeminiMatchClient:
                 'OPENROUTER_API_KEY not found in env '
                 '(required for Gemini provider)'
             )
-        self._model = model or _GEMINI_DEFAULT_MODEL
+        self._model = model or _gemini_default_model()
         self._base_url = base_url or _GEMINI_DEFAULT_BASE_URL
 
     def match_batch(

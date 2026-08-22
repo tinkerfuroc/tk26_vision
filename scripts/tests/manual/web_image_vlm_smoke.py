@@ -81,6 +81,7 @@ try:
     from kimi_api._image_utils import encode_to_data_url
     from object_detection_generalist.vlm_bbox import request_bboxes
     from kimi_api._seat_vlm import request_seat
+    from vision_util.vlm_models import vision_flash_model
 except ImportError as exc:
     print(
         f'[FATAL] failed to import workspace packages: {exc}\n'
@@ -956,7 +957,7 @@ def main() -> int:
             return 2
 
     if not args.model:
-        args.model = os.environ.get('LLM_MODEL') or 'google/gemini-2.5-flash'
+        args.model = vision_flash_model()
 
     # Set up logging — create the run directory and tee stdout/stderr to run.log.
     logger = TestLogger(args.log_dir)

@@ -17,6 +17,7 @@ from typing import Protocol, Sequence
 
 import numpy as np
 from dotenv import load_dotenv
+from vision_util.vlm_models import vision_qwen_model
 
 from ._vlm_common import strip_fences, encode_data_url
 from .nms import MatchRow, Bbox
@@ -24,7 +25,10 @@ from .nms import MatchRow, Bbox
 
 _QWEN_DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 _QWEN_KEY_NAMES = ('DASHCOPE_API_KEY', 'DASHSCOPE_API_KEY')
-_QWEN_DEFAULT_MODEL = 'qwen3-vl-plus'
+
+
+def _qwen_default_model() -> str:
+    return vision_qwen_model()
 
 
 # Load `.env` once at module import so per-instance resolution can rely on
@@ -151,7 +155,7 @@ class QwenMatchClient:
                 'DashScope API key not found in env (looked for '
                 f'{_QWEN_KEY_NAMES})'
             )
-        self._model = model or _QWEN_DEFAULT_MODEL
+        self._model = model or _qwen_default_model()
         self._base_url = base_url or _QWEN_DEFAULT_BASE_URL
 
     def match_batch(

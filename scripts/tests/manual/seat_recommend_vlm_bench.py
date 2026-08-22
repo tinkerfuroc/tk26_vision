@@ -42,11 +42,15 @@ import cv2
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _KIMI_SRC = _REPO_ROOT / 'src' / 'tk26_vision' / 'src' / 'kimi_api'
+_VISION_UTIL_SRC = _REPO_ROOT / 'src' / 'tk26_vision' / 'src' / 'vision_util'
 if str(_KIMI_SRC) not in sys.path:
     sys.path.insert(0, str(_KIMI_SRC))
+if str(_VISION_UTIL_SRC) not in sys.path:
+    sys.path.insert(0, str(_VISION_UTIL_SRC))
 
 from kimi_api._env import load_env, require_api_key  # noqa: E402
 from kimi_api._seat_vlm import VlmSeatError, request_seat  # noqa: E402
+from vision_util.vlm_models import vision_vlm_model  # noqa: E402
 
 
 @dataclass
@@ -155,7 +159,7 @@ def write_summary_md(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', default='google/gemini-2.5-pro',
+    parser.add_argument('--model', default=vision_vlm_model(),
                         help='OpenRouter model id (matches seat_recommend_bbox default).')
     parser.add_argument('--n-images', type=int, default=8)
     parser.add_argument('--trials', type=int, default=3)

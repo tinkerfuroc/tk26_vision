@@ -23,8 +23,8 @@ ensure_kimi_api_importable()
 from kimi_api import _env  # noqa: E402
 
 
-GEMINI_MODEL = "google/gemini-2.5-pro"
-QWEN_MODEL = "qwen3-vl-plus"
+GEMINI_MODEL = _env.vision_vlm_model()
+QWEN_MODEL = _env.vision_qwen_model()
 
 
 @dataclass

@@ -287,7 +287,7 @@ class FoundationStereoNode(Node):
 
     def _declare_parameters(self) -> None:
         self.declare_parameter("weights_root",
-                               "/home/tinker/projects/vision_tests/dualrRGB-foundationStereo")
+                               "~/.cache/tk26_vision/weights/foundation_stereo")
         self.declare_parameter("camera_profile", "d435")
         # `default_model_kind` is kept for backwards-compat but ignored;
         # the node serves only `fast_trt`. Any other value in a request

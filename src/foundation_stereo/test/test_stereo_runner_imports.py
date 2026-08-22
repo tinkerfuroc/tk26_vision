@@ -52,3 +52,12 @@ def test_default_iters_table_complete():
     from foundation_stereo import stereo_runner
     for kind in ("vitl", "vits", "fast_fp32", "fast_fp16"):
         assert kind in stereo_runner._DEFAULT_ITERS
+
+
+def test_weights_root_is_user_expanded(tmp_path, monkeypatch):
+    """`~` in weights_root must be expanded so the yaml default works."""
+    from foundation_stereo import stereo_runner
+    monkeypatch.setenv("HOME", str(tmp_path))
+    runner = stereo_runner.StereoRunner(weights_root="~/wr")
+    assert runner._weights_root == os.path.join(str(tmp_path), "wr")
+    assert runner._fast_pickle.startswith(str(tmp_path))

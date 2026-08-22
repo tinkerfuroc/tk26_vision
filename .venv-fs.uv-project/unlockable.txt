@@ -4,6 +4,7 @@
 #
 # tensorrt_cu12==10.16.1.11
 #   NVIDIA TensorRT (cu12). Install via `pip install --extra-index-url https://pypi.nvidia.com tensorrt-cu12==<ver>` after torch lands.
+#   INSTALLED 2026-08-22 on tinker (RTX 2080 Ti); see src/foundation_stereo/README.md § Provisioning.
 
 # tensorrt_cu12_bindings==10.16.1.11
 #   Bundled with tensorrt-cu12; installed automatically by that package's wheel.

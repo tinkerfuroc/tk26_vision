@@ -52,6 +52,11 @@ class PlacingLocationServer(YOLOSegmentationNode):
 
     def __init__(self, node_name='placing_location_server',
                  parameter_overrides=None):
+        # Load .env (VISION_* model-id overrides) before the base class's
+        # __init__ calls self._declare_parameters() — vlm_model and
+        # placing_model_qwen default from vision_util.vlm_models(), which
+        # reads os.environ at declare time.
+        load_env()
         super().__init__(
             node_name=node_name,
             parameter_overrides=parameter_overrides or [],

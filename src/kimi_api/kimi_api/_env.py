@@ -8,7 +8,7 @@ first API call.
 
 import os
 
-from vision_util.vlm_models import (  # noqa: E402  (re-exported for kimi_api callers)
+from vision_util.vlm_models import (  # re-exported for kimi_api callers
     vision_vlm_model,
     vision_flash_model,
     vision_qwen_model,

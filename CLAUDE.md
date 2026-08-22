@@ -182,7 +182,7 @@ The `requirements.txt` skips DA3's heavy export-pipeline deps (`pycolmap`, `open
 
 `feature_recognition`, `feature_matching`, `grocery_categorize` require `OPENROUTER_API_KEY`. Copy `src/tk26_vision/src/kimi_api/.env.example` to the workspace-root `.env` and fill in the key — `python-dotenv` auto-loads `.env` from CWD upward at node startup. Missing key ⇒ `RuntimeError` at node init.
 
-Optional: `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `LLM_MODEL` (default from `VISION_VLM_MODEL`, also `-p llm_model:=…`).
+Optional: `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `LLM_MODEL` (overridden by `VISION_VLM_MODEL` when set; default `google/gemini-2.5-pro`, also `-p llm_model:=…`).
 
 **Model ids:** every vision VLM default resolves via `vision_util.vlm_models` — `VISION_VLM_MODEL` → `LLM_MODEL` → `google/gemini-2.5-pro`; `VISION_VLM_FLASH_MODEL` → `FLASH_MODEL` → `google/gemini-2.5-flash`; `VISION_QWEN_MODEL` → `qwen3-vl-plus`. Set them in the workspace `.env`; explicit `-p …model:=` params still override. `test_no_hardcoded_vlm_models.py` fails if a literal id reappears in production code.
 

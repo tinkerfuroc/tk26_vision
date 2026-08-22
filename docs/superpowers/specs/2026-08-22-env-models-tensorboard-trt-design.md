@@ -58,8 +58,8 @@ def vision_flash_model() -> str:  # VISION_VLM_FLASH_MODEL → FLASH_MODEL → '
 def vision_qwen_model() -> str:   # VISION_QWEN_MODEL → 'qwen3-vl-plus'
 ```
 
-Each reads `os.environ`, strips whitespace, and treats empty strings as unset. `.env` is
-already loaded (`load_dotenv()` from CWD upward) by every VLM-using entry point before
+Each reads `os.environ`, strips whitespace, and treats empty strings as unset. Each
+VLM-using entry point loads `.env` itself (`load_dotenv()` from CWD upward) before its
 parameters are declared; the resolver does not load `.env` itself.
 
 `kimi_api/_env.py` re-exports the three functions; `default_model()` /

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from vision_util import weights_cache
-from vision_util.weights_cache import resolve_weights
+from vision_util.weights_cache import find_cached, resolve_weights
 
 
 @pytest.fixture
@@ -181,3 +181,33 @@ def test_cwd_is_restored_after_download(isolated_cache, monkeypatch, tmp_path):
         assert Path.cwd() == starting_cwd
     finally:
         os.chdir("/")
+
+
+def test_find_cached_returns_cache_hit(isolated_cache):
+    path = _touch(isolated_cache, "pose_landmarker_full.task")
+    assert find_cached("pose_landmarker_full.task") == path
+
+
+def test_find_cached_returns_none_on_miss_without_downloading(isolated_cache, monkeypatch):
+    def _boom(*_a, **_k):
+        raise AssertionError("find_cached must never download")
+    monkeypatch.setattr(weights_cache, "_download", _boom)
+    assert find_cached("pose_landmarker_full.task") is None
+
+
+def test_find_cached_honours_env_override(isolated_cache, monkeypatch, tmp_path):
+    override = tmp_path / "override"
+    path = _touch(override, "pose_landmarker_full.task")
+    monkeypatch.setenv(weights_cache._ENV_VAR, str(override))
+    assert find_cached("pose_landmarker_full.task") == path
+
+
+def test_find_cached_absolute_path(tmp_path):
+    path = _touch(tmp_path, "x.task")
+    assert find_cached(str(path)) == path
+    assert find_cached(str(tmp_path / "missing.task")) is None
+
+
+def test_find_cached_rejects_relative_with_separator(isolated_cache):
+    with pytest.raises(ValueError):
+        find_cached("models/pose_landmarker_full.task")

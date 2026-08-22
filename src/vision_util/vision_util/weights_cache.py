@@ -14,6 +14,8 @@ Lookup order:
     5. Auto-download via Ultralytics into the writable cache (#4 if env var is
        unset, otherwise into ``$TK26_MODEL_CACHE``).
 
+``find_cached`` performs steps 1–4 only (no download) for non-Ultralytics assets.
+
 The download step ``os.chdir``'s to the cache because Ultralytics always
 writes to CWD regardless of the filename it was asked to load. A ``FileLock``
 serialises concurrent downloads if several nodes start at once.
@@ -139,3 +141,29 @@ def resolve_weights(name: str) -> Path:
         if target.exists():
             return target
         return _download(name, cache)
+
+
+def find_cached(name: str) -> "Path | None":
+    """Locate ``name`` in the weight cache **without** downloading.
+
+    Same path rules as :func:`resolve_weights` (absolute path honoured,
+    relative path with separators rejected, otherwise the
+    ``$TK26_MODEL_CACHE`` / ``~/.cache/tk26_vision/weights`` search order),
+    but a miss returns ``None`` instead of invoking the Ultralytics
+    downloader. Use it for non-Ultralytics assets such as MediaPipe
+    ``.task`` bundles, which ``scripts/download_models.py`` stages.
+    """
+    if not name:
+        raise ValueError("find_cached: name must be non-empty")
+    candidate = Path(name)
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+    if os.sep in name or (os.altsep and os.altsep in name):
+        raise ValueError(
+            f"find_cached: relative paths with separators are rejected "
+            f"(got {name!r}) — pass a bare filename or an absolute path"
+        )
+    for path in _search_paths(name):
+        if path.exists():
+            return path
+    return None

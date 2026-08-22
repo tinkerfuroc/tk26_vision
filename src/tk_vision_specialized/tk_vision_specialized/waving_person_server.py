@@ -9,7 +9,6 @@ import os
 import time
 import queue
 import numpy as np
-import mediapipe as mp
 from ultralytics import YOLO
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError as FutureTimeoutError
@@ -29,6 +28,13 @@ from vision_util.depth_reproject import waving_optical_points
 from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
 from vision_util.weights_cache import resolve_weights
+from vision_util.weights_cache import find_cached
+from ._pose_backend import (
+    PoseBackend,
+    PoseLandmarkIdx,
+    POSE_MODEL_FILENAME,
+    draw_pose,
+)
 from ._waving_vlm import (
     request_waving_persons_chain,
     build_provider_models,
@@ -84,14 +90,27 @@ class DetectWavingPersonsNode(Node):
         self.declare_parameter('model_path', 'yolo11m-seg.pt')
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.yolo = YOLO(str(resolve_weights(model_path)))
-        self.mp_pose = mp.solutions.pose
-        self.mp_draw = mp.solutions.drawing_utils
-        # static_image_mode=True: each YOLO ROI is independent; the default
-        # (False) builds a video tracker that pollutes subsequent crops.
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=True,
-            min_detection_confidence=0.5,
-        )
+        # Pose backend (MediaPipe Tasks PoseLandmarker). IMAGE mode with one
+        # pose per call is the Tasks equivalent of the legacy
+        # static_image_mode=True: each YOLO ROI is independent, no tracker
+        # state leaks between crops.
+        self.declare_parameter('pose_model_path', POSE_MODEL_FILENAME)
+        self.declare_parameter('pose_delegate', 'gpu')
+        pose_model_name = self.get_parameter('pose_model_path').get_parameter_value().string_value
+        pose_delegate = self.get_parameter('pose_delegate').get_parameter_value().string_value
+        pose_model = find_cached(pose_model_name)
+        if pose_model is None:
+            raise RuntimeError(
+                f'Pose model {pose_model_name!r} not found in the weights cache; '
+                f'run scripts/download_models.py (or set pose_model_path to an absolute path).')
+        self.pose = PoseBackend(str(pose_model), delegate=pose_delegate,
+                                min_detection_confidence=0.5)
+        if self.pose.fallback_reason:
+            self.get_logger().warning(
+                f'pose delegate: requested {pose_delegate!r}, running on cpu '
+                f'({self.pose.fallback_reason})')
+        else:
+            self.get_logger().info(f'pose delegate: {self.pose.active_delegate} ({pose_model})')
 
         # show_window=true pops up a real cv2.imshow window with per-person
         # bounding boxes, fed from a bounded queue by a dedicated background
@@ -359,6 +378,7 @@ class DetectWavingPersonsNode(Node):
             pass
 
     def destroy_node(self):
+        self.pose.close()
         self._vlm_executor.shutdown(wait=False)
         self._window_shutdown.set()
         if self._window_thread is not None:
@@ -463,8 +483,7 @@ class DetectWavingPersonsNode(Node):
             if landmarks is not None:
                 roi = frame[y1:y2, x1:x2]
                 if roi.size > 0:
-                    self.mp_draw.draw_landmarks(
-                        roi, landmarks, self.mp_pose.POSE_CONNECTIONS)
+                    draw_pose(roi, landmarks)
         return frame
 
     def _annotate_all_persons(self, rgb_bgr, person_annotations):
@@ -490,8 +509,7 @@ class DetectWavingPersonsNode(Node):
             if landmarks is not None:
                 roi = frame[y1:y2, x1:x2]
                 if roi.size > 0:
-                    self.mp_draw.draw_landmarks(
-                        roi, landmarks, self.mp_pose.POSE_CONNECTIONS)
+                    draw_pose(roi, landmarks)
         return frame
 
     def _publish_debug_image(self, image, header, *,
@@ -679,8 +697,8 @@ class DetectWavingPersonsNode(Node):
         if pose_landmarks is None:
             return False
 
-        landmarks = pose_landmarks.landmark
-        PL = mp.solutions.pose.PoseLandmark
+        landmarks = pose_landmarks
+        PL = PoseLandmarkIdx
         nose = landmarks[PL.NOSE]
         rh = landmarks[PL.RIGHT_WRIST]
         re = landmarks[PL.RIGHT_ELBOW]
@@ -920,9 +938,8 @@ class DetectWavingPersonsNode(Node):
                     # the MediaPipe pose pass entirely (saves the per-ROI
                     # inference); YOLO masks below still feed VLM centroids.
                     if run_mediapipe:
-                        pose_results = self.pose.process(
+                        landmarks = self.pose.process(
                             cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB))
-                        landmarks = pose_results.pose_landmarks
                         is_wave = self.is_waving(landmarks, person_roi)
                     else:
                         landmarks = None

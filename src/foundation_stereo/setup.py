@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'foundation_stereo_node = foundation_stereo.foundation_stereo_node:main',
+            'fetch_fast_fs_weights = foundation_stereo.scripts.fetch_fast_fs_weights:main',
         ],
     },
 )

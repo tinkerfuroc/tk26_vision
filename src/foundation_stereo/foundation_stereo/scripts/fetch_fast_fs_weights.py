@@ -24,6 +24,12 @@ DRIVE_FOLDER_ID = "1HuTt7UIp7gQsMiDvJwVuWmKpvFzIIMap"   # readme "Weights and Tr
 CKPT_NAME = "23-36-37"
 PICKLE_NAME = "model_best_bp2_serialize.pth"
 
+# Validated digest for the 23-36-37 checkpoint (task-6 report). Passed as the
+# default `expected` to verify_or_write_sums / --expected-sha256 below, so a
+# corrupted download or a Drive-side swap is caught before SHA256SUMS is
+# (re)written, rather than only being trust-on-first-use.
+EXPECTED_SHA256 = "af0658f289ec840b292645f8d5538978f06e8cabaa1fd31e84acc91af268e990"
+
 
 def checkpoint_path(weights_root: str) -> Path:
     root = Path(os.path.expanduser(weights_root))
@@ -38,9 +44,14 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def verify_or_write_sums(ckpt_dir: Path) -> str:
+def verify_or_write_sums(ckpt_dir: Path, expected: str | None = EXPECTED_SHA256) -> str:
     pickle = ckpt_dir / PICKLE_NAME
     digest = _sha256(pickle)
+    if expected and digest != expected:
+        raise RuntimeError(
+            f"{pickle} sha256 {digest} != expected {expected}; "
+            "refusing to trust this checkpoint (pass --expected-sha256 '' "
+            "to disable this check for a future checkpoint)")
     sums = ckpt_dir / "SHA256SUMS"
     if sums.exists():
         recorded = sums.read_text().split()[0]
@@ -74,6 +85,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--weights-root", default=DEFAULT_WEIGHTS_ROOT)
     ap.add_argument("--folder-id", default=DRIVE_FOLDER_ID)
+    ap.add_argument(
+        "--expected-sha256", default=EXPECTED_SHA256,
+        help="Expected sha256 of the checkpoint pickle; raises if it "
+             "doesn't match. Pass '' to disable (e.g. for a future "
+             "checkpoint whose digest isn't validated yet).")
     args = ap.parse_args()
     pickle = checkpoint_path(args.weights_root)
     if not pickle.exists():
@@ -81,7 +97,7 @@ def main() -> int:
     if not pickle.exists():
         print(f"ERROR: {pickle} still missing after download", file=sys.stderr)
         return 1
-    digest = verify_or_write_sums(pickle.parent)
+    digest = verify_or_write_sums(pickle.parent, expected=args.expected_sha256 or None)
     print(f"ok {pickle} ({pickle.stat().st_size / 1e6:.1f} MB) sha256 {digest[:16]}…")
     return 0
 

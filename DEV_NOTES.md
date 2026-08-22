@@ -16,6 +16,95 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-08-22 — MediaPipe 0.10.9 → 1.0.1 Tasks-API port (waving)
+
+**Why:** `waving_person_server`'s pose pass used the legacy MediaPipe
+**Solutions** API (`mp.solutions.pose`), pinned `mediapipe==0.10.9`. Upstream
+dropped `mp.solutions` entirely from **0.10.30** onward (last Solutions
+release: 0.10.21; Google ended Solutions support in March 2023) — any bump
+without a port raises `AttributeError: module 'mediapipe' has no attribute
+'solutions'` at node construction. Ported the pose pass to the Tasks API
+`PoseLandmarker` on `mediapipe==1.0.1` behind a new `_pose_backend.py`
+adapter (GPU delegate first, automatic CPU fallback with a logged reason),
+with **no change** to `is_waving` semantics or the default `'vlm'`
+`waving_detector` mode.
+
+**Benchmark** (RTX 2080 Ti shared with the sim, 6 YOLO person crops,
+per-crop median):
+
+| Path | Median latency | VRAM | Init |
+|---|---|---|---|
+| 0.10.9 Solutions, full | ~90 ms | — | — |
+| 1.0.1 Tasks, full, CPU | ~60 ms | — | — |
+| 1.0.1 Tasks, full, GPU | ~7.8 ms (lite 6.5, heavy 11) | ~60 MiB (lite 53, heavy 82) | one-time 3–6 s |
+
+CPU landmarks from 1.0.1 are numerically identical to 0.10.9 (same BlazePose
+weights); the fp16 GPU path differs by up to ~0.04 in normalized `y` and
+never flips a verdict on the sample crops.
+
+**Parity gate:** `src/tk_vision_specialized/test/test_pose_parity.py` against
+a fixture frozen **before** the venv upgrade (while 0.10.9 was still
+importable) — 6 YOLO-cropped person ROIs from the two Ultralytics sample
+images, 3 detected, **0 with `is_waving=True`** (no live person/camera was
+available when the fixture was recorded, so no positive wave verdict is
+covered yet — see follow-up below). Checks: hard CPU verdict + landmark
+parity (`|Δy| ≤ 0.01`, `|Δvisibility| ≤ 0.05`), a soft-skip/hard-verdict GPU
+variant (`|Δy| ≤ 0.05`), a forced-GPU-failure fallback test, and a
+drawing-smoke test for `draw_pose`.
+
+**Task 8 stack-wide verification (verbatim results):**
+- `test_pose_parity.py`: CPU parity and forced-GPU-fallback tests **pass**.
+  `test_gpu_parity` **SKIPPED on 0.10.9** (its GL delegate cannot init
+  headless on this box) and **PASSES on 1.0.1**.
+- Offline per-crop pose latency (substitute for live T2 — no camera/sim was
+  running on the box during verification), 60 timed calls over the 6 fixture
+  crops, GPU delegate: **median 8.165 ms, p90 19.0 ms**, `active_delegate:
+  gpu` throughout — comfortably under the ≤ 20 ms median acceptance bar.
+- Ported-node startup log (worktree source, direct run):
+  `pose delegate: gpu (/home/tinker/.cache/tk26_vision/weights/pose_landmarker_full.task)`,
+  no traceback. The GPU delegate prints an `Unable to initialize EGL` probe
+  stack trace on init even when it ultimately succeeds on GPU — ignore it
+  unless it's followed by an actual Python traceback.
+- `pip freeze` diff vs. the pre-upgrade snapshot is exactly two lines:
+  `mediapipe 0.10.9 → 1.0.1` and `clip @ git+https://github.com/ultralytics/clip@81ff68e…`
+  — the latter is a **pre-existing** declared dependency in
+  `pyproject.toml`/`uv.lock` that Ultralytics' auto-installer (via `uv`)
+  pulled in during smoke runs; not part of this port, left in place. `pip
+  check` output is unchanged from before the upgrade (only the pre-existing
+  `dinov2`/`approach-planner` unmet-dependency complaints, unrelated to
+  mediapipe). `protobuf` stays pinned at 3.20.3 (still required by
+  `tensorboard 2.11.2`, a runtime import dep of torchreid).
+- **Main-checkout caveat:** the shared `.venv-vision-main` is now globally on
+  1.0.1. Any checkout whose `waving_person_server.py` is still the
+  pre-port version (e.g. the main checkout's `install/` tree, until this
+  branch is merged and rebuilt) fails at node construction with
+  `AttributeError: module 'mediapipe' has no attribute 'solutions'` — seen
+  as `t1_startup.sh`'s `T1.16` failure when run from the main checkout.
+  Fix: merge this branch and rerun `./scripts/build.sh`.
+- Running the parity test requires ROS sourced (it imports the node module
+  for the unbound `is_waving`); `scripts/tests/conftest.py` (new) puts
+  `src/vision_util` on `sys.path` so `test_weights_cache.py` sees the source
+  tree rather than a stale colcon install. `t0_static.sh` has no
+  waving-specific row; `t1_startup.sh`'s `T1.16` is the waving startup check.
+
+**Non-goals / still open:**
+- The rgb8-vs-bgr8 colour-order normalizer for `waving_person_server`
+  remains an open follow-up (flagged separately so benchmarks attribute
+  correctly).
+- Default `waving_detector` unchanged (`'vlm'`); this port only affects the
+  `'hybrid'`/`'mediapipe'` fast paths.
+- `lite`/`heavy` pose-model tuning and a YOLO11-pose alternative are both
+  out of scope (reachable via param, not defaulted; would need a re-tuned
+  labelled ground-truth set respectively).
+- `protobuf==3.20.3` stays pinned; the jax/jaxlib orphans left behind by
+  0.10.9 were not cleaned up.
+- The parity fixture has **no positive (`is_waving=True`) case** — it was
+  recorded from static sample images with no live waving frames available.
+  Follow-up: record a *new* fixture with live waving frames on **1.0.1**
+  (the existing `scripts/tests/record_pose_fixture.py` requires 0.10.9 to be
+  importable, so it cannot be reused for this; note any new recorder or
+  fixture explicitly as 1.0.1-only).
+
 ## 2026-06-27 — handeye 0.8.0: head warm-start + pan_tilt parity ports (needs operator-in-the-loop)
 
 Landed the head-Orbbec warm-start + four pan_tilt parity ports for `handeye_calib`

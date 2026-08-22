@@ -5,6 +5,7 @@ Needs the real model file in the weights cache (scripts/download_models.py);
 skips — loudly — if it is absent so weight-less CI doesn't fail, but T0 on the
 robot must have it so the skip never masks a regression.
 """
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -13,7 +14,7 @@ import cv2
 import pytest
 
 from vision_util.weights_cache import find_cached
-from tk_vision_specialized._pose_backend import PoseBackend, PoseLandmarkIdx
+from tk_vision_specialized._pose_backend import PoseBackend, PoseLandmarkIdx, POSE_MODEL_SHA256
 from tk_vision_specialized.waving_person_server import DetectWavingPersonsNode
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pose_parity"
@@ -88,6 +89,11 @@ def test_fixture_is_legacy():
     assert EXPECTED["mediapipe_version"] == "0.10.9"
     assert len(EXPECTED["crops"]) >= 6
     assert any(c["detected"] for c in EXPECTED["crops"])
+    staged_digest = hashlib.sha256(MODEL.read_bytes()).hexdigest()
+    assert staged_digest == POSE_MODEL_SHA256, (
+        "staged pose_landmarker_full.task is not the bundle the parity fixture "
+        "was verified against — re-stage with scripts/download_models.py"
+    )
 
 
 def test_cpu_parity(cpu_backend):

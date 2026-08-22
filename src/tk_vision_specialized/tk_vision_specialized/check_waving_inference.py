@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Manual waving-detection inference dump for eyeballing pose/YOLO output.
+
+The pose pass now runs the Tasks ``PoseLandmarker`` in IMAGE mode (no video
+tracker), matching ``waving_person_server``, whereas the pre-2026-08 version
+used the legacy Solutions video graph — latency/verdict deltas against old
+dumps are expected.
+"""
 
 import argparse
 import json

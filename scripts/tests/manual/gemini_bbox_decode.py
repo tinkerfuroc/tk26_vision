@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 import cv2
+from vision_util.vlm_models import vision_vlm_model
 
 
 def main() -> int:
@@ -34,7 +35,7 @@ def main() -> int:
                         help='Path to input JPEG/PNG.')
     parser.add_argument('--prompt', required=True,
                         help='Natural-language target class.')
-    parser.add_argument('--model', default='google/gemini-2.5-pro',
+    parser.add_argument('--model', default=vision_vlm_model(),
                         help='OpenRouter model slug.')
     parser.add_argument('--max-retries', type=int, default=3)
     parser.add_argument('--timeout-s', type=float, default=20.0)

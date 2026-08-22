@@ -8,6 +8,12 @@ first API call.
 
 import os
 
+from vision_util.vlm_models import (  # noqa: E402  (re-exported for kimi_api callers)
+    vision_vlm_model,
+    vision_flash_model,
+    vision_qwen_model,
+)
+
 
 def load_env():
     """Best-effort load of a `.env` file from CWD and parents."""
@@ -36,11 +42,13 @@ def base_url() -> str:
 
 
 def default_model() -> str:
-    return os.environ.get('LLM_MODEL', 'google/gemini-2.5-pro')
+    """Primary vision VLM (VISION_VLM_MODEL -> LLM_MODEL -> legacy literal)."""
+    return vision_vlm_model()
 
 
 def default_flash_model() -> str:
-    return os.environ.get('FLASH_MODEL', 'google/gemini-2.5-flash')
+    """Fast vision VLM (VISION_VLM_FLASH_MODEL -> FLASH_MODEL -> legacy literal)."""
+    return vision_flash_model()
 
 
 def gemini_api_key() -> str:
@@ -98,8 +106,6 @@ _VALID_QWEN_BACKENDS = ('dashscope', 'openrouter')
 # constant has been updated accordingly.
 _OPENROUTER_QWEN_DEFAULT_MODEL = 'qwen/qwen3-vl-32b-instruct'
 
-_DASHSCOPE_DEFAULT_MODEL = 'qwen3-vl-plus'
-
 
 def resolve_qwen_target(
     backend: str,
@@ -131,7 +137,7 @@ def resolve_qwen_target(
     model = model_param_value or ''
 
     if backend == 'dashscope':
-        resolved_model = model or _DASHSCOPE_DEFAULT_MODEL
+        resolved_model = model or vision_qwen_model()
         if '/' in resolved_model:
             raise RuntimeError(
                 f"qwen_api_backend='dashscope' but model {resolved_model!r} "

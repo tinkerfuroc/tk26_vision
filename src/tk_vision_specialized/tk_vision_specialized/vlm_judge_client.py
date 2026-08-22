@@ -9,6 +9,7 @@ from typing import Protocol, Sequence
 
 import numpy as np
 from dotenv import load_dotenv
+from vision_util.vlm_models import vision_vlm_model, vision_qwen_model
 
 from ._vlm_common import strip_fences, encode_data_url
 
@@ -21,10 +22,17 @@ load_dotenv(override=False)
 
 _QWEN_DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 _QWEN_KEY_NAMES = ('DASHCOPE_API_KEY', 'DASHSCOPE_API_KEY')
-_QWEN_DEFAULT_MODEL = 'qwen3-vl-plus'
+
+
+def _qwen_default_model() -> str:
+    return vision_qwen_model()
+
 
 _GEMINI_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'
-_GEMINI_DEFAULT_MODEL = 'google/gemini-2.5-pro'
+
+
+def _gemini_default_model() -> str:
+    return vision_vlm_model()
 
 
 @dataclass(frozen=True)
@@ -173,7 +181,7 @@ class QwenJudgeClient(_BaseJudgeClient):
                 'DashScope API key not found in env '
                 f'(looked for {_QWEN_KEY_NAMES})'
             )
-        self._model = model or _QWEN_DEFAULT_MODEL
+        self._model = model or _qwen_default_model()
         self._base_url = base_url or _QWEN_DEFAULT_BASE_URL
 
 
@@ -186,7 +194,7 @@ class GeminiJudgeClient(_BaseJudgeClient):
                 'OPENROUTER_API_KEY not found in env '
                 '(required for Gemini provider)'
             )
-        self._model = model or _GEMINI_DEFAULT_MODEL
+        self._model = model or _gemini_default_model()
         self._base_url = base_url or _GEMINI_DEFAULT_BASE_URL
 
 

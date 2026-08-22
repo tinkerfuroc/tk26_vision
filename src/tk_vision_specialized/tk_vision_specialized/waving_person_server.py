@@ -27,6 +27,7 @@ from vision_util.camera_intake import (
 from vision_util.depth_reproject import waving_optical_points
 from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
+from vision_util.vlm_models import vision_vlm_model, vision_qwen_model
 from vision_util.weights_cache import resolve_weights
 from vision_util.weights_cache import find_cached
 from ._pose_backend import (
@@ -170,8 +171,12 @@ class DetectWavingPersonsNode(Node):
         self.declare_parameter('enable_vlm_fallback', True)
         self.declare_parameter('vlm_provider', 'qwen')
         self.declare_parameter('vlm_fallback_provider', 'gemini')
-        self.declare_parameter('vlm_model_qwen', 'qwen3-vl-plus')
-        self.declare_parameter('vlm_model_gemini', 'google/gemini-2.5-pro')
+        self.declare_parameter('vlm_model_qwen', vision_qwen_model())
+        self.declare_parameter('vlm_model_gemini', vision_vlm_model())
+        self.get_logger().info(
+            f'VLM model defaults: gemini={vision_vlm_model()} '
+            f'qwen={vision_qwen_model()} (from .env VISION_*)'
+        )
         self.declare_parameter('vlm_timeout_s', 20.0)
         self.declare_parameter('vlm_max_retries', 3)
         self.declare_parameter('vlm_dedup_iou', 0.3)

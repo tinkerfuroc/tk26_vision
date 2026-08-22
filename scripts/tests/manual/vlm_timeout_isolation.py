@@ -48,6 +48,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 for _src_dir in (
     _REPO_ROOT / 'src' / 'tk26_vision' / 'src' / 'kimi_api',
     _REPO_ROOT / 'src' / 'tk26_vision' / 'src' / 'object_detection_generalist',
+    _REPO_ROOT / 'src' / 'tk26_vision' / 'src' / 'vision_util',
 ):
     if str(_src_dir) not in sys.path:
         sys.path.insert(0, str(_src_dir))
@@ -63,6 +64,7 @@ from object_detection_generalist.vlm_bbox import (  # noqa: E402
     _RESPONSE_SCHEMA,
     request_bboxes as production_request_bboxes,
 )
+from vision_util.vlm_models import vision_flash_model  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +372,7 @@ def write_summary_md(path: Path, stats: dict[str, dict], *, n_images: int, trial
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', default='google/gemini-2.5-flash')
+    parser.add_argument('--model', default=vision_flash_model())
     parser.add_argument('--n-images', type=int, default=10)
     parser.add_argument('--trials', type=int, default=3)
     parser.add_argument('--per-attempt-s', type=float, default=10.0)

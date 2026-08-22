@@ -32,6 +32,7 @@ from vision_util.camera_intake import (
 )
 from vision_util.tf_lookup import TransformHelper
 from vision_util.vision_logging import VisionLogger
+from vision_util.vlm_models import vision_vlm_model
 
 from ._env import load_env, require_api_key, resolve_qwen_target
 from ._seat_bbox_vlm import request_seat_bbox_chain, VlmSeatBboxError
@@ -65,7 +66,7 @@ class SeatRecommendBboxService(Node):
         # extra latency is acceptable for an HRI intake step. Override
         # with `-p llm_model:=google/gemini-2.5-flash` for cheap regression
         # checks where accuracy isn't being measured.
-        self.declare_parameter('llm_model', 'google/gemini-2.5-pro')
+        self.declare_parameter('llm_model', vision_vlm_model())
         # 35 s (was 20) — Pro + thinking adds 3–8 s vs. Flash; 20 s was
         # already tight on cluttered scenes and tripped the timeout when
         # thinking is enforced.
@@ -126,8 +127,11 @@ class SeatRecommendBboxService(Node):
         self.declare_parameter('vlm_provider', 'qwen')
         self.declare_parameter('vlm_fallback_provider', 'gemini')  # '' to disable
         self.declare_parameter('bbox_model_qwen', '')
-        self.declare_parameter('bbox_model_gemini', 'google/gemini-2.5-pro')
+        self.declare_parameter('bbox_model_gemini', vision_vlm_model())
         self.declare_parameter('qwen_api_backend', 'dashscope')
+        self.get_logger().info(
+            f'VLM model defaults: gemini={vision_vlm_model()} (from .env VISION_*)'
+        )
 
         self.log_prompts = self.get_parameter('log_prompts').get_parameter_value().bool_value
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value

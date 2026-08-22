@@ -41,8 +41,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parents[2]
 DEFAULT_VISION_LOG = WORKSPACE_ROOT / 'vision_log'
 
-PRO_MODEL = 'google/gemini-2.5-pro'
-FLASH_MODEL = 'google/gemini-2.5-flash'
+# vision_util source isn't on sys.path until colcon-installed, but running
+# this straight from the repo is convenient — splice it in ahead of time.
+sys.path.insert(0, str(SCRIPT_DIR.parent / "src" / "vision_util"))
+from vision_util.vlm_models import vision_vlm_model, vision_flash_model  # noqa: E402
+
+PRO_MODEL = vision_vlm_model()
+FLASH_MODEL = vision_flash_model()
 DEFAULT_REPEATS = 3
 DEFAULT_TIMEOUT_S = 30.0
 

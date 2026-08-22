@@ -42,6 +42,7 @@ from tinker_vision_msgs_26.srv import PlacingLocation
 
 from kimi_api._env import load_env, require_dashscope_api_key
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
+from vision_util.vlm_models import vision_vlm_model, vision_qwen_model
 
 from .placing_vlm import VlmPlacingError, request_placing_bboxes_chain
 
@@ -69,12 +70,16 @@ class PlacingLocationServer(YOLOSegmentationNode):
         # (size + spatial context) materially improves over Flash on this
         # task. Flip via -p vlm_model:=google/gemini-2.5-flash if latency
         # matters more than ranking quality.
-        self.declare_parameter('vlm_model', 'google/gemini-2.5-pro')
+        self.declare_parameter('vlm_model', vision_vlm_model())
         self.declare_parameter('vlm_timeout_s', 8.0)
         self.declare_parameter('vlm_max_retries', 1)
         self.declare_parameter('default_max_candidates', 5)
         self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
-        self.declare_parameter('placing_model_qwen', 'qwen3-vl-plus')
+        self.declare_parameter('placing_model_qwen', vision_qwen_model())
+        self.get_logger().info(
+            f'VLM model defaults: gemini={vision_vlm_model()} '
+            f'qwen={vision_qwen_model()} (from .env VISION_*)'
+        )
 
     def _load_parameters(self):
         super()._load_parameters()

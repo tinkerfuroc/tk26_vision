@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'foundation_stereo_node = foundation_stereo.foundation_stereo_node:main',
             'fetch_fast_fs_weights = foundation_stereo.scripts.fetch_fast_fs_weights:main',
+            'build_trt_engines = foundation_stereo.scripts.build_trt_engines:main',
         ],
     },
 )

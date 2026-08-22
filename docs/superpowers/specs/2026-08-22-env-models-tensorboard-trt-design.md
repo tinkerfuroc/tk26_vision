@@ -25,8 +25,9 @@ user selected these three items and ruled torch unchanged and `monocular_depth` 
   explicit ROS params still override.
 - `tensorboard 2.20.0` + `protobuf 6.33.6` in `.venv-vision-main`, nothing else moved.
 - `tensorrt-cu12 10.16.1.11` in `.venv-fs` and working two-stage FP16 engines for the
-  `20-30-48` Fast-FoundationStereo checkpoint built on this RTX 2080 Ti, discoverable by the
-  node under the existing default variant name.
+  `23-36-37` Fast-FoundationStereo checkpoint (the one `stereo_runner.py` already maps for
+  its `fast_fp16`/`fast_fp32` kinds) built on this RTX 2080 Ti, discoverable by the node
+  under the existing default variant name.
 
 ## Non-goals
 
@@ -122,19 +123,23 @@ Gate: `import torchreid` and `vision_track.reid.reid_backbone` building `osnet_a
    Freeze diff: exactly those three additions. `import tensorrt` → `10.16.1.11`;
    `src/foundation_stereo/test/test_stereo_runner_imports.py` green. `unlockable.txt` gains a
    "installed 2026-08-22" note; `freeze.lock.txt` refreshed.
-2. **Weights root** moves to `~/.cache/tk26_vision/weights/foundation_stereo` (expanded with
-   `os.path.expanduser` in the node/runner if not already). Layout:
-   `…/foundation_stereo/Fast-FoundationStereo/ckpt/20-30-48/model_best_bp2_serialize.pth`
-   (+ `cfg.yaml`) and `…/Fast-FoundationStereo/output_two_stage/{feature_runner.engine,
-   post_runner.engine, onnx.yaml}`. `foundation_stereo.yaml` updated.
+2. **Weights root** moves to `~/.cache/tk26_vision/weights/foundation_stereo`.
+   `StereoRunner.__init__` applies `os.path.expanduser` to `weights_root` (today only the
+   `$FOUNDATION_STEREO_VENDOR_ROOT` override is expanded). Layout follows the runner's
+   existing `_fast_pickle` path:
+   `…/foundation_stereo/Fast-FoundationStereo/weights/23-36-37/model_best_bp2_serialize.pth`
+   and `…/Fast-FoundationStereo/output_two_stage/{feature_runner.engine, post_runner.engine,
+   onnx.yaml}`. `foundation_stereo.yaml` updated.
 3. **`src/foundation_stereo/scripts/fetch_fast_fs_weights.py`** — `gdown --folder` of the
-   upstream Drive folder (readme link), keeping only the `20-30-48` checkpoint; idempotent;
+   upstream Drive folder (readme link), keeping only the `23-36-37` checkpoint; idempotent;
    writes `SHA256SUMS` after the first successful download and verifies on later runs. If
    Drive is unreachable or the folder layout differs, it exits non-zero with the exact error —
    no workaround.
 4. **`src/foundation_stereo/scripts/build_trt_engines.py`** — runs the vendored
-   `Fast-FoundationStereo/scripts/make_onnx.py` (`--height 576 --width 960 --valid_iters 4
-   --max_disp 192`, the configuration the previous engines used) into a temp dir, then builds
+   `Fast-FoundationStereo/scripts/make_onnx.py` on the `23-36-37` pickle (`--height 576
+   --width 960 --valid_iters 4 --max_disp 192` — the resolution/iteration configuration the
+   previous `…_576x960_iters4` engines used; both dims are multiples of 32 as the exporter
+   asserts) into a temp dir, then builds
    each ONNX with the TensorRT Python API (`Builder`, `OnnxParser`, explicit batch, `FP16`
    flag, `set_memory_pool_limit(WORKSPACE, 4 GiB)`), writes the serialized engines plus
    `onnx.yaml` into `output_two_stage/` (refuses to overwrite without `--force`), and prints

@@ -82,7 +82,9 @@ drawing-smoke test for `draw_pose`.
   as `t1_startup.sh`'s `T1.16` failure when run from the main checkout.
   Fix: merge this branch and rerun `./scripts/build.sh`.
 - Running the parity test requires ROS sourced (it imports the node module
-  for the unbound `is_waving`); `scripts/tests/conftest.py` (new) puts
+  for the unbound `is_waving`), and `export ROS2_PTH_WARNED=1` silences the
+  venv's ROS-path banner (also set it before any `pip freeze` capture so the
+  banner doesn't pollute the diff). `scripts/tests/conftest.py` (new) puts
   `src/vision_util` on `sys.path` so `test_weights_cache.py` sees the source
   tree rather than a stale colcon install. `t0_static.sh` has no
   waving-specific row; `t1_startup.sh`'s `T1.16` is the waving startup check.

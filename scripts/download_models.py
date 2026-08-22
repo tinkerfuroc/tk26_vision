@@ -9,7 +9,7 @@ the nodes use, so any future cold-start resolves to a local file.
 Coverage:
   * Ultralytics YOLO / YOLO-seg / YOLO-World / SAM (MobileSAM) .pt weights
   * torchvision ResNet50 + ResNet18 ImageNet weights (custom ReID)
-  * MediaPipe Pose landmark model (waving detection)
+  * MediaPipe Tasks pose landmarker bundle (waving detection)
 
 Not covered (API-only, no local weights):
   * Gemini 2.5 Flash via OpenRouter (object_detection_generalist, enable_vlm)
@@ -26,8 +26,13 @@ VISION_DIR = SCRIPT_DIR.parent
 # vision_util source isn't on sys.path until colcon-installed, but running
 # this straight from the repo is convenient — splice it in ahead of time.
 sys.path.insert(0, str(VISION_DIR / "src" / "vision_util"))
+sys.path.insert(0, str(VISION_DIR / "src" / "tk_vision_specialized"))
 
 from vision_util.weights_cache import resolve_weights  # noqa: E402
+from tk_vision_specialized._pose_backend import (  # noqa: E402
+    POSE_MODEL_FILENAME,
+    POSE_MODEL_URL,
+)
 
 # Default manifest — what the nodes declare out of the box. Extra sizes are
 # opt-in; nobody wants ~1 GB of l/x variants they never load.
@@ -66,19 +71,22 @@ def warm_torchvision() -> None:
     print("  ✓ resnet50 + resnet18")
 
 
-def warm_mediapipe() -> None:
-    print("warming mediapipe pose landmark model…")
-    try:
-        import mediapipe as mp
-    except ImportError as exc:
-        print(f"  ! mediapipe unavailable ({exc}); skipping. "
-              "`pip install mediapipe` in .venv-vision-main if you use "
-              "tk_vision_specialized.waving_person_server.")
+def fetch_pose_landmarker() -> None:
+    """Stage the MediaPipe Tasks pose bundle used by waving_person_server."""
+    from urllib.request import urlopen
+    from vision_util.weights_cache import _writable_cache, find_cached
+    print("staging mediapipe pose landmarker (.task)…")
+    existing = find_cached(POSE_MODEL_FILENAME)
+    if existing is not None:
+        print(f"  ✓ {POSE_MODEL_FILENAME:<26} {human_size(existing)}  ({existing})")
         return
-    pose = mp.solutions.pose.Pose(min_detection_confidence=0.5,
-                                  min_tracking_confidence=0.5)
-    pose.close()
-    print("  ✓ mediapipe pose")
+    target = _writable_cache() / POSE_MODEL_FILENAME
+    part = target.with_suffix(target.suffix + ".part")
+    with urlopen(POSE_MODEL_URL, timeout=60) as resp, open(part, "wb") as fp:
+        while chunk := resp.read(1 << 20):
+            fp.write(chunk)
+    part.replace(target)   # atomic: a partial file never satisfies find_cached
+    print(f"  ✓ {POSE_MODEL_FILENAME:<26} {human_size(target)}  ({target})")
 
 
 def main() -> None:
@@ -87,7 +95,7 @@ def main() -> None:
                     help="also warm l/x variants (~1 GB extra)")
     ap.add_argument("--skip-ultralytics", action="store_true")
     ap.add_argument("--skip-torchvision", action="store_true")
-    ap.add_argument("--skip-mediapipe", action="store_true")
+    ap.add_argument("--skip-pose", "--skip-mediapipe", dest="skip_pose", action="store_true")
     args = ap.parse_args()
 
     names = list(DEFAULT_MANIFEST)
@@ -98,8 +106,8 @@ def main() -> None:
         warm_ultralytics(names)
     if not args.skip_torchvision:
         warm_torchvision()
-    if not args.skip_mediapipe:
-        warm_mediapipe()
+    if not args.skip_pose:
+        fetch_pose_landmarker()
 
     print("all vision checkpoints staged in the shared weights cache.")
 

@@ -7,7 +7,6 @@ import time
 from datetime import datetime
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -15,7 +14,9 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
-from vision_util.weights_cache import resolve_weights
+from vision_util.weights_cache import resolve_weights, find_cached
+
+from ._pose_backend import PoseBackend, PoseLandmarkIdx, POSE_MODEL_FILENAME, draw_pose
 
 
 class WavingInferenceCheckNode(Node):
@@ -32,12 +33,12 @@ class WavingInferenceCheckNode(Node):
 
         self.bridge = CvBridge()
         self.yolo = YOLO(str(resolve_weights(model_path)))
-        self.pose = mp.solutions.pose.Pose(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self.mp_draw = mp.solutions.drawing_utils
-        self.mp_pose = mp.solutions.pose
+        pose_model = find_cached(POSE_MODEL_FILENAME)
+        if pose_model is None:
+            raise RuntimeError(f'{POSE_MODEL_FILENAME} missing; run scripts/download_models.py')
+        self.pose = PoseBackend(str(pose_model), delegate='gpu')
+        self.get_logger().info(f'pose delegate: {self.pose.active_delegate} '
+                               f'{self.pose.fallback_reason or ""}')
 
         self.latest_image = None
         self.latest_stamp = None
@@ -82,15 +83,15 @@ class WavingInferenceCheckNode(Node):
     ELBOW_TOL_NORM = 0.1
 
     def _is_waving(self, landmarks):
-        nose = landmarks[self.mp_pose.PoseLandmark.NOSE]
+        nose = landmarks[PoseLandmarkIdx.NOSE]
 
-        right_hand = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST]
-        right_elbow = landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW]
-        right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        right_hand = landmarks[PoseLandmarkIdx.RIGHT_WRIST]
+        right_elbow = landmarks[PoseLandmarkIdx.RIGHT_ELBOW]
+        right_shoulder = landmarks[PoseLandmarkIdx.RIGHT_SHOULDER]
 
-        left_hand = landmarks[self.mp_pose.PoseLandmark.LEFT_WRIST]
-        left_elbow = landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW]
-        left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+        left_hand = landmarks[PoseLandmarkIdx.LEFT_WRIST]
+        left_elbow = landmarks[PoseLandmarkIdx.LEFT_ELBOW]
+        left_shoulder = landmarks[PoseLandmarkIdx.LEFT_SHOULDER]
 
         right_hand_above_head = right_hand.y < nose.y
         left_hand_above_head = left_hand.y < nose.y
@@ -185,48 +186,44 @@ class WavingInferenceCheckNode(Node):
                     continue
 
                 mp_t0 = time.perf_counter()
-                pose_result = self.pose.process(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+                pose_lms = self.pose.process(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
                 mp_ms = (time.perf_counter() - mp_t0) * 1000.0
 
                 person_record = {
                     'person_index': person_idx,
                     'bbox_xyxy': [x1, y1, x2, y2],
                     'mediapipe_ms': mp_ms,
-                    'has_landmarks': pose_result.pose_landmarks is not None,
+                    'has_landmarks': pose_lms is not None,
                     'is_waving': False,
                 }
 
-                if pose_result.pose_landmarks is not None:
-                    lm = pose_result.pose_landmarks.landmark
+                if pose_lms is not None:
+                    lm = pose_lms
                     person_record['is_waving'] = self._is_waving(lm)
                     person_record['keypoints'] = {
-                        'nose': self._get_landmark_dict(lm, self.mp_pose.PoseLandmark.NOSE),
+                        'nose': self._get_landmark_dict(lm, PoseLandmarkIdx.NOSE),
                         'right_wrist': self._get_landmark_dict(
-                            lm, self.mp_pose.PoseLandmark.RIGHT_WRIST
+                            lm, PoseLandmarkIdx.RIGHT_WRIST
                         ),
                         'right_elbow': self._get_landmark_dict(
-                            lm, self.mp_pose.PoseLandmark.RIGHT_ELBOW
+                            lm, PoseLandmarkIdx.RIGHT_ELBOW
                         ),
                         'right_shoulder': self._get_landmark_dict(
-                            lm, self.mp_pose.PoseLandmark.RIGHT_SHOULDER
+                            lm, PoseLandmarkIdx.RIGHT_SHOULDER
                         ),
                         'left_wrist': self._get_landmark_dict(
-                            lm, self.mp_pose.PoseLandmark.LEFT_WRIST
+                            lm, PoseLandmarkIdx.LEFT_WRIST
                         ),
                         'left_elbow': self._get_landmark_dict(
-                            lm, self.mp_pose.PoseLandmark.LEFT_ELBOW
+                            lm, PoseLandmarkIdx.LEFT_ELBOW
                         ),
                         'left_shoulder': self._get_landmark_dict(
-                            lm, self.mp_pose.PoseLandmark.LEFT_SHOULDER
+                            lm, PoseLandmarkIdx.LEFT_SHOULDER
                         ),
                     }
 
                     roi_draw = annotated[y1:y2, x1:x2]
-                    self.mp_draw.draw_landmarks(
-                        roi_draw,
-                        pose_result.pose_landmarks,
-                        self.mp_pose.POSE_CONNECTIONS,
-                    )
+                    draw_pose(roi_draw, pose_lms)
 
                     wave_txt = 'WAVING' if person_record['is_waving'] else 'NOT_WAVING'
                     wave_color = (0, 0, 255) if person_record['is_waving'] else (255, 255, 0)

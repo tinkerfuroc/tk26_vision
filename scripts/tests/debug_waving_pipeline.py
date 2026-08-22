@@ -27,20 +27,27 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+REPO = Path(__file__).resolve().parents[2]
+
 # Lazy-import heavy deps so --help works without them.
 def _lazy_imports():
-    global YOLO, mp
+    global YOLO, PoseBackend, PoseLandmarkIdx, draw_pose, find_cached
     from ultralytics import YOLO  # noqa: PLC0415
-    import mediapipe as mp  # noqa: PLC0415
-    return YOLO, mp
+    sys.path.insert(0, str(REPO / "src" / "tk_vision_specialized"))
+    sys.path.insert(0, str(REPO / "src" / "vision_util"))
+    from tk_vision_specialized._pose_backend import (  # noqa: PLC0415
+        PoseBackend, PoseLandmarkIdx, draw_pose,
+    )
+    from vision_util.weights_cache import find_cached  # noqa: PLC0415
+    return YOLO, PoseBackend
 
 
 # ----- gesture predicates -----------------------------------------------------
 
-def is_waving_legacy(landmarks, mp_mod, img_h):
+def is_waving_legacy(landmarks, img_h):
     """The pre-fix predicate verbatim from waving_person_server.py.
     Reproduces both bugs: (B1) normalized vs pixel mix, (B2) no visibility."""
-    PL = mp_mod.solutions.pose.PoseLandmark
+    PL = PoseLandmarkIdx
     rh, re, rs = landmarks[PL.RIGHT_WRIST], landmarks[PL.RIGHT_ELBOW], landmarks[PL.RIGHT_SHOULDER]
     lh, le, ls = landmarks[PL.LEFT_WRIST],  landmarks[PL.LEFT_ELBOW],  landmarks[PL.LEFT_SHOULDER]
     rh_above_sh = rh.y <= rs.y
@@ -54,11 +61,11 @@ def is_waving_legacy(landmarks, mp_mod, img_h):
             or (lh_above_el and le_above_sh))
 
 
-def is_waving_fixed(landmarks, mp_mod, img_h):
+def is_waving_fixed(landmarks, img_h):
     """Audit-fixed predicate — must match `is_waving` in waving_person_server.py.
     Per-side visibility gate + normalized tolerance. Tuned 2026-05-04 against
     expanded GT set (41 images)."""
-    PL = mp_mod.solutions.pose.PoseLandmark
+    PL = PoseLandmarkIdx
     rh, re, rs = landmarks[PL.RIGHT_WRIST], landmarks[PL.RIGHT_ELBOW], landmarks[PL.RIGHT_SHOULDER]
     lh, le, ls = landmarks[PL.LEFT_WRIST],  landmarks[PL.LEFT_ELBOW],  landmarks[PL.LEFT_SHOULDER]
     MIN_VIS, SHOULDER_TOL, ELBOW_TOL = 0.5, 0.1, 0.1
@@ -79,7 +86,7 @@ def is_waving_fixed(landmarks, mp_mod, img_h):
 
 # ----- per-image evaluation ---------------------------------------------------
 
-def evaluate_image(img_path, label, yolo, pose, mp_mod, predicate, conf_thresh, out_overlay_dir):
+def evaluate_image(img_path, label, yolo, pose, predicate, conf_thresh, out_overlay_dir):
     img = cv2.imread(str(img_path))
     if img is None:
         return {"image": img_path.name, "label": label, "prediction": None,
@@ -112,23 +119,22 @@ def evaluate_image(img_path, label, yolo, pose, mp_mod, predicate, conf_thresh, 
             if roi.size == 0:
                 continue
             rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            pose_res = pose.process(rgb_roi)
+            lms = pose.process(rgb_roi)
 
             verdict = False
             mean_v = 0.0
-            if pose_res.pose_landmarks is not None:
-                PL = mp_mod.solutions.pose.PoseLandmark
+            if lms is not None:
+                PL = PoseLandmarkIdx
                 ks = (PL.RIGHT_WRIST, PL.RIGHT_ELBOW, PL.RIGHT_SHOULDER,
                       PL.LEFT_WRIST,  PL.LEFT_ELBOW,  PL.LEFT_SHOULDER)
-                vis = [pose_res.pose_landmarks.landmark[k].visibility for k in ks]
+                vis = [lms[k].visibility for k in ks]
                 mean_v = float(np.mean(vis))
                 max_vis = max(max_vis, mean_v)
                 if mean_v >= 0.5:
                     n_visible += 1
-                verdict = predicate(pose_res.pose_landmarks.landmark, mp_mod, roi.shape[0])
+                verdict = predicate(lms, roi.shape[0])
                 # Draw landmarks on overlay (use roi coordinates remapped)
-                draw_landmarks_on_overlay(
-                    overlay, roi, pose_res.pose_landmarks, mp_mod, x1, y1)
+                draw_landmarks_on_overlay(overlay, roi, lms, x1, y1)
 
             person_verdicts.append(((x1, y1, x2, y2), verdict, mean_v))
             if verdict:
@@ -164,18 +170,12 @@ def evaluate_image(img_path, label, yolo, pose, mp_mod, predicate, conf_thresh, 
     }
 
 
-def draw_landmarks_on_overlay(overlay, roi, pose_landmarks, mp_mod, x_off, y_off):
+def draw_landmarks_on_overlay(overlay, roi, pose_landmarks, x_off, y_off):
     """Draw MediaPipe landmarks back onto the full overlay image."""
     h, w = roi.shape[:2]
-    drawing = mp_mod.solutions.drawing_utils
-    style = mp_mod.solutions.drawing_styles
-    # mp draws into a copy of the roi, then we paste it
+    # draw_pose draws into a copy of the roi, then we paste it
     roi_copy = roi.copy()
-    drawing.draw_landmarks(
-        roi_copy, pose_landmarks,
-        mp_mod.solutions.pose.POSE_CONNECTIONS,
-        landmark_drawing_spec=style.get_default_pose_landmarks_style(),
-    )
+    draw_pose(roi_copy, pose_landmarks)
     overlay[y_off:y_off + h, x_off:x_off + w] = roi_copy
 
 
@@ -191,9 +191,14 @@ def main():
                    help="use the pre-fix is_waving (bugs B1+B2) for baseline measurement")
     args = p.parse_args()
 
-    YOLO, mp = _lazy_imports()
+    YOLO, PoseBackend = _lazy_imports()
     yolo = YOLO(args.model)
-    pose = mp.solutions.pose.Pose(static_image_mode=True, min_detection_confidence=0.5)
+    pose_model = find_cached("pose_landmarker_full.task")
+    if pose_model is None:
+        raise SystemExit(
+            "pose_landmarker_full.task missing from the weights cache; "
+            "run scripts/download_models.py first.")
+    pose = PoseBackend(str(pose_model), delegate="gpu")
     predicate = is_waving_legacy if args.legacy_is_waving else is_waving_fixed
 
     data_dir = Path(args.data_dir)
@@ -211,7 +216,7 @@ def main():
             if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
                 continue
             print(f"  [{label_str}] {img_path.name}", file=sys.stderr)
-            row = evaluate_image(img_path, label, yolo, pose, mp,
+            row = evaluate_image(img_path, label, yolo, pose,
                                  predicate, args.min_person_conf, overlay_dir)
             rows.append(row)
 

@@ -1,7 +1,7 @@
 foundation_stereo:
   ros__parameters:
     # Paths & model defaults
-    weights_root: "/home/tinker/projects/vision_tests/dualrRGB-foundationStereo"
+    weights_root: "~/.cache/tk26_vision/weights/foundation_stereo"
     camera_profile: "d435"
     # The node only serves `fast_trt`. default_model_kind is kept for
     # backwards-compat but ignored; non-fast_trt requests are rejected.

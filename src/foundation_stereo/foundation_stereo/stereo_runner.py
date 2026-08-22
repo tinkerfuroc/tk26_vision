@@ -138,6 +138,7 @@ class InferResult:
 
 class StereoRunner:
     def __init__(self, weights_root: str):
+        weights_root = os.path.realpath(os.path.expanduser(weights_root))
         self._weights_root = weights_root
         self._fs_pretrained = os.path.join(
             weights_root, "FoundationStereo", "pretrained_models"

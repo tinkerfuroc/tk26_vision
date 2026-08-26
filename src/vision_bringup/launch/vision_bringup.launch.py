@@ -128,7 +128,11 @@ def generate_launch_description():
         _node('vision_track', 'person_track_server',
               _if_any('enable_hri', 'enable_gpsr')),
         _node('tk_vision_specialized', 'waving_person_server',
-              _if_any('enable_hri', 'enable_gpsr', 'enable_restaurant')),
+              _if_any('enable_hri', 'enable_gpsr', 'enable_restaurant'),
+              # Force show_window off, same as detect_waving.launch.py: the
+              # node's True default SIGABRTs headless (cv2's Qt has no
+              # "offscreen" platform plugin in .venv-vision-main).
+              parameters=[{'show_window': False}]),
         _node('kimi_api', 'feature_recognition',
               _if_any('enable_hri', 'enable_gpsr')),
         _node('pan_tilt', 'follow_head',

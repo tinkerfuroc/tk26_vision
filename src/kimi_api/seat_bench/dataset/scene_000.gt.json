@@ -1,0 +1,9 @@
+{
+  "id": "scene_000",
+  "image_wh": [1280, 720],
+  "seats": [
+    {"label": "left chair", "occupied": true, "cushion_bbox": [235, 420, 430, 510]},
+    {"label": "middle chair", "occupied": false, "cushion_bbox": [480, 425, 660, 520]},
+    {"label": "right chair", "occupied": true, "cushion_bbox": [680, 430, 900, 560]}
+  ]
+}

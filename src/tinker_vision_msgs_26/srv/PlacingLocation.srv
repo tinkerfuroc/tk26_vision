@@ -1,0 +1,41 @@
+# Tabletop placing-location request.
+#
+# Asks a VLM-only service to enumerate clear, flat regions on a desktop
+# where the described item could be placed, and returns 3D points
+# ordered best-to-worst.
+
+# camera in ['realsense', 'orbbec']
+string camera
+
+# Free-form description of the item to place (e.g. 'a coke can ~6 cm wide').
+# The VLM uses this to size and rank candidate regions.
+string item_description
+
+# TF frame to express centroids in. Empty string = raw camera frame.
+string target_frame
+
+# 0 = use the server default (5). Otherwise clamped to [1, 10].
+uint8 max_candidates
+
+bool return_rgb_image
+# Annotated overlay image (VLM bboxes + centroid pixels) for debugging.
+bool return_debug_overlay
+
+---
+
+std_msgs/Header header
+# 0 = ok (>=1 candidate); 1 = empty (VLM returned no regions or all were
+# rejected for missing depth); -1 = hard error (camera/intrinsics/VLM
+# unconfigured — see error_msg).
+int32 status
+string error_msg
+
+# Candidate placing points, ordered best -> worst.
+geometry_msgs/PointStamped[] candidate_points
+# Parallel array (same length as candidate_points) of pixel-space bboxes
+# returned by the VLM. Useful for debugging and for callers that want to
+# render the suggested region on the input frame.
+tinker_vision_msgs_26/BoundingBox[] candidate_bboxes
+
+sensor_msgs/Image rgb_image
+sensor_msgs/Image debug_overlay

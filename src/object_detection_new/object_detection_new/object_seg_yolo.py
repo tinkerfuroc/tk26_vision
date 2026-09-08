@@ -1,30 +1,22 @@
 import math
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.time import Time
 import numpy as np
 import cv2
-from pathlib import Path
 import threading
 import copy
-import os
 import torch
 import time
+from typing import Tuple
 
 # ROS2 messages
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Header
 import geometry_msgs.msg
 from tinker_vision_msgs_26.msg import Object, Objects
 from tinker_vision_msgs_26.srv import ObjectDetection
-
-# TF2 for coordinate transformations
-from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
-from tf2_geometry_msgs import do_transform_point
-
-# Message filters for synchronization
-from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 # Computer vision
 from ultralytics import YOLO
@@ -32,6 +24,64 @@ from cv_bridge import CvBridge
 
 # Shared logger
 from vision_util.vision_logging import VisionLogger
+from vision_util.mask_utils import largest_connected_component_in_bbox
+from vision_util.weights_cache import resolve_weights
+from vision_util.camera_intake import (
+    CameraIntake,
+    IntakeConfig,
+    StreamSpec,
+    configure_camera_backend,
+)
+from vision_util.depth_reproject import (
+    decode_depth_metres,
+    depth_image_to_points,
+    realsense_body_axes_points,
+)
+from vision_util.depth_source import FfsPreferredDepthSource
+from vision_util.tf_lookup import TransformHelper
+
+
+class _CompatibleCameraIntake(CameraIntake):
+    """Mirror intake state into the legacy attributes used by subclasses."""
+
+    def __init__(self, node, cfg, callback_group=None, *, bridge=None):
+        self._compat_owner = node
+        super().__init__(
+            node, cfg, callback_group=callback_group, bridge=bridge
+        )
+
+    def _camera_info_callback(self, msg: CameraInfo) -> None:
+        super()._camera_info_callback(msg)
+        with self._compat_owner.lock_info:
+            self._compat_owner.camera_intrinsic[self.cfg.camera] = msg
+
+    def _store(self, *, color_msg, depth_msg) -> None:
+        super()._store(color_msg=color_msg, depth_msg=depth_msg)
+        bundle = self.latest()
+        with self._compat_owner.lock_msg:
+            self._compat_owner.recent_sync_msg[self.cfg.camera] = (
+                color_msg, depth_msg
+            )
+            self._compat_owner.recent_publish_time[self.cfg.camera] = (
+                bundle.recv_time if bundle is not None else None
+            )
+
+    def _store_provider_result(self, result):
+        bundle = super()._store_provider_result(result)
+        if bundle is None:
+            return None
+        with self._compat_owner.lock_msg:
+            self._compat_owner.recent_sync_msg[self.cfg.camera] = (
+                bundle.color_msg, bundle.depth_msg
+            )
+            self._compat_owner.recent_publish_time[self.cfg.camera] = (
+                Time.from_msg(bundle.header.stamp)
+            )
+        info = self.camera_info()
+        if info is not None:
+            with self._compat_owner.lock_info:
+                self._compat_owner.camera_intrinsic[self.cfg.camera] = info
+        return bundle
 
 
 class YOLOSegmentationNode(Node):
@@ -51,36 +101,70 @@ class YOLOSegmentationNode(Node):
         # Load parameters
         self._load_parameters()
 
+        self.bridge = CvBridge()
+
+        # These dictionaries and locks are compatibility attributes consumed
+        # by ObjectMatchServer and PlacingLocationServer. CameraIntake owns the
+        # authoritative cache and mirrors each update here.
+        self.lock_msg = threading.RLock()
+        self.lock_info = threading.RLock()
+        self.camera_intrinsic = {
+            'realsense': None,
+            'orbbec': None,
+        }
+        self.recent_sync_msg = {
+            'realsense': None,
+            'orbbec': None,
+        }
+        self.recent_publish_time = {
+            'realsense': None,
+            'orbbec': None,
+        }
+        self._camera_intakes = {}
+
+        # FFS captures its own stereo pair, so native depth is supplied only
+        # if fallback is selected. Thread-local storage keeps that per call.
+        self._native_depth_context = threading.local()
+        self._depth_source = FfsPreferredDepthSource(
+            self,
+            self._native_depth_provider,
+            bridge=self.bridge,
+        )
+
+        # Keep the public buffer/listener aliases used by inherited servers.
+        try:
+            self.declare_parameter('camera_backend', 'service')
+        except Exception:
+            pass
+        try:
+            self.declare_parameter(
+                'transform_provider_endpoint', '/head_camera_server'
+            )
+        except Exception:
+            pass
+        camera_backend = self.get_parameter('camera_backend').value
+        transform_endpoint = self.get_parameter(
+            'transform_provider_endpoint'
+        ).value
+        self._tf_helper = TransformHelper(
+            self,
+            cache_time_s=180.0,
+            backend=camera_backend,
+            provider_endpoint=transform_endpoint,
+        )
+        self.tf_buffer = self._tf_helper.buffer
+        self.tf_listener = self._tf_helper._listener
+
         # Initialize components
         self._init_model()
         self._init_subscribers()
         self._init_publishers()
         self._init_service()
 
-        # State variables
-        self.bridge = CvBridge()
+        # Per-call audit: filled by `_acquire_depth`; consumed by the sidecar
+        # JSON writer downstream. 'native' until FFS path runs once.
+        self._last_depth_source: str = 'native'
 
-        # TF2 buffer and listener for coordinate transformations
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # Thread locks for data protection
-        self.lock_msg = threading.Lock()
-        self.lock_info = threading.Lock()
-
-        # Camera data storage (per camera type)
-        self.camera_intrinsic = {
-            'realsense': None,
-            'orbbec': None
-        }
-        self.recent_sync_msg = {
-            'realsense': None,
-            'orbbec': None
-        }
-        self.recent_publish_time = {
-            'realsense': None,
-            'orbbec': None
-        }
         self.get_logger().info('YOLO Segmentation Node initialized successfully')
 
     def _declare_parameters(self):
@@ -102,7 +186,7 @@ class YOLOSegmentationNode(Node):
         self.declare_parameter(
             'orbbec_image_topic', '/camera/color/image_raw')
         self.declare_parameter(
-            'orbbec_depth_topic', '/camera/depth_registered/points')
+            'orbbec_depth_topic', '/camera/depth/image_raw')
         self.declare_parameter(
             'orbbec_camera_info_topic', '/camera/color/camera_info')        
         # Hz, 0 = no continuous publishing
@@ -136,6 +220,17 @@ class YOLOSegmentationNode(Node):
         # Default empty; specialist entry point overrides to ['person'] so a
         # custom-trained competition model never emits people.
         self.declare_parameter('excluded_classes', [''])
+
+        # FoundationStereo depth fallback. When prefer_ffs=True (default) the
+        # node queries the FFS depth service first and falls back to the native
+        # camera depth only if the call fails or times out. Set prefer_ffs=False
+        # to skip FFS and use native depth unconditionally.
+        self.declare_parameter('prefer_ffs', True)
+        self.declare_parameter('ffs_service', '/foundation_stereo/get_depth')
+        self.declare_parameter('ffs_wait_for_service_s', 0.2)
+        self.declare_parameter('ffs_call_timeout_s', 8.0)
+        self.declare_parameter('ffs_align_to_color', True)
+        self.declare_parameter('ffs_fallback_log_period_s', 30.0)
 
         self.get_logger().info('Parameters declared successfully')
 
@@ -192,44 +287,7 @@ class YOLOSegmentationNode(Node):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.get_logger().info(f'Using device: {self.device}')
         try:
-            model_file = Path(self.model_path)
-            found = False
-
-            # If not absolute path, search for it
-            if not model_file.is_absolute():
-                # Try to find in installed share directory first
-                try:
-                    from ament_index_python.packages import get_package_share_directory
-                    share_dir = Path(get_package_share_directory('object_detection_new'))
-                    self.get_logger().info(f'Package share directory: {share_dir}')
-                    share_model = 'models/' + self.model_path
-                    file_path = os.path.join(share_dir, share_model)
-                    self.get_logger().info(f'Checking share directory: {file_path}')
-                    if os.path.exists(file_path):
-                        model_file = file_path
-                        found = True
-                        self.get_logger().info('Found model in share directory')
-                except Exception as e:
-                    self.get_logger().warn(f'Could not check share directory: {e}')
-
-                # Try to find in package source directory
-                if not found:
-                    pkg_dir = Path(__file__).parent.parent
-                    src_model = pkg_dir / 'models' / self.model_path
-                    self.get_logger().info(f'Checking source directory: {src_model}')
-                    if os.path.exists(src_model):
-                        model_file = src_model
-                        found = True
-                        self.get_logger().info('Found model in source directory')
-            else:
-                found = os.path.exists(model_file)
-
-            if not found:
-                self.get_logger().warn(
-                    f'Model not found, will try to download {self.model_path}'
-                )
-                model_file = Path(self.model_path)
-
+            model_file = resolve_weights(self.model_path)
             self.model = YOLO(str(model_file))
             self.model.to(self.device)
             self.get_logger().info(f'YOLO model loaded from {model_file}')
@@ -245,73 +303,66 @@ class YOLOSegmentationNode(Node):
             raise
 
     def _init_subscribers(self):
-        """Initialize image and depth subscribers with synchronization."""
-        qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
-
-        # Subscribe to both realsense and orbbec cameras
-        if 'realsense' in self.camera_types:
-            cb_realsense = MutuallyExclusiveCallbackGroup()
-
-            realsense_image_topic = self.get_parameter('realsense_image_topic').value
-            realsense_depth_topic = self.get_parameter('realsense_depth_topic').value
-            realsense_camera_info_topic = self.get_parameter('realsense_camera_info_topic').value
-
-            image_sub_realsense = Subscriber(
-                self, Image, realsense_image_topic, qos_profile=qos_profile
+        """Initialize one synchronized CameraIntake per configured camera."""
+        for camera in ('realsense', 'orbbec'):
+            if camera not in self.camera_types:
+                continue
+            cfg = configure_camera_backend(
+                self,
+                IntakeConfig(
+                    camera=camera,
+                    color=StreamSpec(
+                        self.get_parameter(
+                            f'{camera}_image_topic').value,
+                        best_effort=True,
+                        qos_depth=10,
+                    ),
+                    depth=StreamSpec(
+                        self.get_parameter(
+                            f'{camera}_depth_topic').value,
+                        best_effort=True,
+                        qos_depth=10,
+                    ),
+                    camera_info=StreamSpec(
+                        self.get_parameter(
+                            f'{camera}_camera_info_topic'
+                        ).value,
+                        best_effort=False,
+                        qos_depth=10,
+                    ),
+                    sync_queue=10,
+                    sync_slop_s=0.1,
+                    age_source='stamp',
+                ),
+                default_endpoint=(
+                    '/wrist_camera_server'
+                    if camera == 'realsense'
+                    else '/head_camera_server'
+                ),
             )
-            depth_sub_realsense = Subscriber(
-                self, Image, realsense_depth_topic, qos_profile=qos_profile
+            intake = _CompatibleCameraIntake(
+                self,
+                cfg,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+                bridge=self.bridge,
             )
-
-            sync_realsense = ApproximateTimeSynchronizer(
-                [image_sub_realsense, depth_sub_realsense],
-                queue_size=10,
-                slop=0.1
+            self._camera_intakes[camera] = intake
+            setattr(
+                self,
+                f'camera_info_sub_{camera}',
+                (
+                    intake._subscriptions[-1]
+                    if intake._subscriptions
+                    else None
+                ),
             )
-            sync_realsense.registerCallback(self._realsense_callback)
-
-            self.camera_info_sub_realsense = self.create_subscription(
-                CameraInfo,
-                realsense_camera_info_topic,
-                self._camera_info_realsense_callback,
-                qos_profile=10,
-                callback_group=cb_realsense
-            )
-            self.get_logger().info('Subscribed to realsense camera')
-
-        if 'orbbec' in self.camera_types:
-            cb_orbbec = MutuallyExclusiveCallbackGroup()
-
-            orbbec_image_topic = self.get_parameter('orbbec_image_topic').value
-            orbbec_depth_topic = self.get_parameter('orbbec_depth_topic').value
-            orbbec_camera_info_topic = self.get_parameter('orbbec_camera_info_topic').value
-
-            image_sub_orbbec = Subscriber(
-                self, Image, orbbec_image_topic, qos_profile=qos_profile
-            )
-            depth_sub_orbbec = Subscriber(
-                self, PointCloud2, orbbec_depth_topic, qos_profile=qos_profile
-            )
-
-            sync_orbbec = ApproximateTimeSynchronizer(
-                [image_sub_orbbec, depth_sub_orbbec],
-                queue_size=10,
-                slop=0.1
-            )
-            sync_orbbec.registerCallback(self._orbbec_callback)
-
-            self.camera_info_sub_orbbec = self.create_subscription(
-                CameraInfo,
-                orbbec_camera_info_topic,
-                self._camera_info_orbbec_callback,
-                qos_profile=10,
-                callback_group=cb_orbbec
-            )
-            self.get_logger().info('Subscribed to orbbec camera')
+            if cfg.backend == 'service':
+                self.get_logger().info(
+                    f'Using {camera} camera provider at '
+                    f'{cfg.provider_endpoint}'
+                )
+            else:
+                self.get_logger().info(f'Subscribed to {camera} camera')
 
     def _init_publishers(self):
         """Initialize publishers."""
@@ -338,144 +389,104 @@ class YOLOSegmentationNode(Node):
         self.get_logger().info(f'Detection service created: {service_name}')
 
     def _camera_info_realsense_callback(self, msg: CameraInfo):
-        """Store realsense camera intrinsic parameters."""
-        self.lock_info.acquire()
-        self.camera_intrinsic['realsense'] = msg
-        self.lock_info.release()
+        """Compatibility callback forwarding to the RealSense intake."""
+        self._camera_intakes['realsense']._camera_info_callback(msg)
 
     def _camera_info_orbbec_callback(self, msg: CameraInfo):
-        """Store orbbec camera intrinsic parameters."""
-        self.lock_info.acquire()
-        self.camera_intrinsic['orbbec'] = msg
-        self.lock_info.release()
+        """Compatibility callback forwarding to the Orbbec intake."""
+        self._camera_intakes['orbbec']._camera_info_callback(msg)
 
     def _realsense_callback(self, rgb_msg: Image, depth_msg: Image):
-        """Process synchronized realsense RGB and depth messages."""
-        self.lock_msg.acquire()
-        self.recent_sync_msg['realsense'] = (rgb_msg, depth_msg)
-        self.recent_publish_time['realsense'] = self.get_clock().now()
-        self.lock_msg.release()
+        """Compatibility callback forwarding to the RealSense intake."""
+        self._camera_intakes['realsense']._sync_callback(rgb_msg, depth_msg)
 
-    def _orbbec_callback(self, rgb_msg: Image, depth_msg: PointCloud2):
-        """Process synchronized orbbec RGB and depth messages."""
-        self.lock_msg.acquire()
-        self.recent_sync_msg['orbbec'] = (rgb_msg, depth_msg)
-        self.recent_publish_time['orbbec'] = self.get_clock().now()
-        self.lock_msg.release()
+    def _orbbec_callback(self, rgb_msg: Image, depth_msg: Image):
+        """Compatibility callback forwarding to the Orbbec intake."""
+        self._camera_intakes['orbbec']._sync_callback(rgb_msg, depth_msg)
 
-    def _depth_to_points(self, depth_img: np.ndarray, intrinsic: CameraInfo) -> tuple:
-        """Convert depth image to 3D points using camera intrinsics.
-        
-        Returns points in camera frame where:
-        - points[:, :, 0] = x_camera (left/right in camera frame, derived from pixel rows)
-        - points[:, :, 1] = y_camera (up/down in camera frame, derived from pixel columns)
-        - points[:, :, 2] = z_camera (forward/depth)
-        
-        This matches the convention used in seg_langsam.py
+    def _orbbec_depth_to_array(self, depth_msg: Image, intrinsic: CameraInfo) -> tuple:
+        """Reproject the Orbbec's registered depth Image to a points array.
+
+        Depth is registered to color (depth_registration:=true), so its
+        shape and frame always match the live color stream -- at whatever
+        resolution the driver is launched with, never a fixed size.
         """
-        H, W = depth_img.shape
-        fx = intrinsic.k[0]
-        fy = intrinsic.k[4]
-        cx = intrinsic.k[2]
-        cy = intrinsic.k[5]
-
-        # Create coordinate grids matching seg_langsam convention
-        # points_x corresponds to rows (H dimension) - lateral position in camera frame
-        # points_y corresponds to columns (W dimension) - vertical position in camera frame
-        points_x = np.repeat(np.expand_dims(np.arange(0, H), axis=1), W, axis=1)
-        points_y = np.repeat(np.expand_dims(np.arange(0, W), axis=0), H, axis=0)
-        
-        # Back-project to 3D using pinhole camera model
-        points_x = (points_x - cy) * depth_img / fy
-        points_y = (points_y - cx) * depth_img / fx
-
-        # Stack to get points [H, W, 3] where axis 2 = [x, y, z] in camera frame
-        points = np.stack([points_x, points_y, depth_img], axis=-1)
-
-        # Valid mask
-        valid_mask = np.ones_like(depth_img, dtype=bool)
-        valid_mask[depth_img > self.max_depth] = False
-        valid_mask[depth_img < self.min_depth] = False
-        valid_mask[np.isnan(depth_img)] = False
+        depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        depth_m = decode_depth_metres(depth_raw)
+        points, valid_mask = depth_image_to_points(
+            depth_m,
+            intrinsic.k,
+            valid_band=(self.min_depth, self.max_depth),
+            return_valid_mask=True,
+        )
 
         return points, valid_mask
 
-    def _pointcloud_to_array(self, pc_msg: PointCloud2, intrinsic: CameraInfo) -> tuple:
+    def _native_depth_provider(self):
+        depth_msg = getattr(self._native_depth_context, 'depth_msg', None)
+        if depth_msg is None:
+            raise RuntimeError('native RealSense depth is unavailable')
+        return depth_msg
+
+    def _acquire_depth(self, depth_msg: Image) -> Tuple[np.ndarray, str]:
+        """Acquire a realsense depth image in meters, preferring the
+        FoundationStereo service when ``prefer_ffs`` is enabled.
+
+        Returns ``(depth_meters_float32, source)`` where ``source`` is
+        ``'ffs'`` (the FFS service answered with status=0) or ``'native'``
+        (FFS disabled, unavailable, or failed and we fell back to the
+        synced realsense depth message). The native branch handles the
+        `16UC1` mm → float meters conversion that previously lived inline
+        in `_process_realsense_data`; FFS output is already `32FC1` meters
+        and is returned unchanged.
+
+        Param reads are per-call so `ros2 param set prefer_ffs false` /
+        `... true` flips take effect on the next service call without a
+        node restart.
         """
-        Convert PointCloud2 to point array (Orbbec format).
-
-        Orbbec outputs unordered point cloud, need to reproject to image grid.
-        """
-        h, w = 720, 1280
-        K = np.array(intrinsic.k).reshape((3, 3))
-
-        # Parse point cloud. Derive floats/point from point_step so both the 4-float
-        # xyz layout (Femto Bolt default) and the 5-float xyzrgb layout
-        # (enable_colored_point_cloud:=true) work — point_step is bytes/point, /4 = floats/point.
-        floats_per_point = pc_msg.point_step // 4
-        arr = np.frombuffer(pc_msg.data, dtype='<f4')
-        N = len(arr) // floats_per_point
-        points = arr.reshape((N, floats_per_point))[:, [0, 1, 2]]
-
-        # Project to image coordinates
-        points_homo = points / np.repeat(points[:, 2:3], 3, axis=1)
-        coor_homo = (K @ points_homo.T).T
-        coor = np.rint(coor_homo[:, :2]).astype(int)
-
-        # Create depth image
-        depth_img = np.zeros((h, w, 3))
-        valid_coords = (coor[:, 0] >= 0) & (coor[:, 0] < w) & \
-                       (coor[:, 1] >= 0) & (coor[:, 1] < h)
-        depth_img[coor[valid_coords, 1], coor[valid_coords, 0], :] = points[valid_coords]
-
-        # Valid mask
-        valid_mask = (depth_img[:, :, 2] > self.min_depth) & \
-                     (depth_img[:, :, 2] < self.max_depth)
-
-        return depth_img, valid_mask
+        self._native_depth_context.depth_msg = depth_msg
+        try:
+            return self._depth_source.acquire(
+                align_to_color=bool(
+                    self.get_parameter('ffs_align_to_color').value
+                )
+            )
+        finally:
+            del self._native_depth_context.depth_msg
 
     def _process_realsense_data(self, rgb_msg: Image, depth_msg: Image,
                                 intrinsic: CameraInfo) -> tuple:
         """Process realsense RGB-D data into usable format."""
-        
+
         rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-        depth_img = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
-        depth_img = depth_img.astype(float) / 1000.0  # mm to meters
+        depth_img, depth_source = self._acquire_depth(depth_msg)
+        # Stash on the node so the sidecar JSON writer downstream can include
+        # which depth source served this call. Per-call, overwritten on every
+        # `_process_realsense_data`.
+        self._last_depth_source = depth_source
 
-        H, W = depth_img.shape
-        fx, fy, cx, cy = tuple(intrinsic.k[[0, 4, 2, 5]])
-        points_x = np.repeat(np.expand_dims(np.arange(0, H), axis=1), W, axis=1)
-        points_y = np.repeat(np.expand_dims(np.arange(0, W), axis=0), H, axis=0)
-        points_x = (points_x - cx) * depth_img / fx
-        points_y = (points_y - cy) * depth_img / fy
-        
-        validmask_points = np.ones_like(depth_img)
-        validmask_points[depth_img > 10] = 0
-        validmask_points[depth_img < 1e-6] = 0
-        # depth_img *= validmask_points
-        depth_img[depth_img > 10] = 10
-        depth_img[depth_img < 1e-6] = 0
-
-        points = np.stack([points_x, points_y, depth_img], axis=2)
+        points, validmask_points = realsense_body_axes_points(
+            depth_img,
+            intrinsic.k,
+            valid_band=(1e-6, 10.0),
+            clip=(0.0, 10.0),
+        )
 
         return rgb_img, points, validmask_points, depth_msg.header
 
-        # points, valid_mask = self._depth_to_points(depth_img, intrinsic)
-
-        # return rgb_img, points, valid_mask, depth_msg.header
-
-    def _process_orbbec_data(self, rgb_msg: Image, depth_msg: PointCloud2,
+    def _process_orbbec_data(self, rgb_msg: Image, depth_msg: Image,
                              intrinsic: CameraInfo) -> tuple:
         """Process orbbec RGB-D data into usable format."""
         rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-        points, valid_mask = self._pointcloud_to_array(depth_msg, intrinsic)
+        points, valid_mask = self._orbbec_depth_to_array(depth_msg, intrinsic)
 
         return rgb_img, points, valid_mask, depth_msg.header
 
     def _sort_objects_and_segments(self, objects: list, segments: list, 
                                      sort_mode: str, camera: str = 'orbbec',
                                      source_frame: str = 'camera_link',
-                                     header: Header = None) -> tuple:
+                                     header: Header = None,
+                                     closest_distances: list = None) -> tuple:
         """
         Sort detected objects and their corresponding segments based on centroid position.
         
@@ -488,12 +499,13 @@ class YOLOSegmentationNode(Node):
         sort_mode : str
             Sorting mode: 'none', 'closest', 'highest'
             - 'none': No sorting (original detection order)
-            - 'closest': Sort by distance (closest first)
-                - For realsense: uses centroid.x (forward distance in ROS frame)
-                - For orbbec: uses centroid.z (forward distance in ROS frame)
+            - 'closest': Sort by 3D distance from the camera to the centroid.
+              When `closest_distances` is provided, those camera-frame distances
+              are used even if returned object centroids have been transformed
+              into a target frame such as base_link or map.
             - 'highest': Sort by height (highest first, based on centroid.z in map frame)
         camera : str, optional
-            Camera type ('realsense' or 'orbbec') - determines which axis to use for distance
+            Camera type ('realsense' or 'orbbec')
         source_frame : str, optional
             Source frame for transformations (e.g., 'camera_link')
         header : Header, optional
@@ -513,21 +525,28 @@ class YOLOSegmentationNode(Node):
         indexed_objects = list(enumerate(objects))
         
         if sort_mode == 'closest':
-            # Sort by distance - axis depends on camera type
-            # RealSense: forward is X axis (after our coordinate transform)
-            # Orbbec: forward is Z axis (standard ROS convention)
-            if camera == 'realsense':
-                indexed_objects.sort(key=lambda x: x[1].centroid.x)
-                if indexed_objects:
-                    self.get_logger().info(
-                        f"Sorted by closest (realsense): nearest at x={indexed_objects[0][1].centroid.x:.2f}m"
-                    )
-            else:  # orbbec or default
-                indexed_objects.sort(key=lambda x: x[1].centroid.z)
-                if indexed_objects:
-                    self.get_logger().info(
-                        f"Sorted by closest (orbbec): nearest at z={indexed_objects[0][1].centroid.z:.2f}m"
-                    )
+            # Sort by 3D distance from camera to seen centroid. If the caller
+            # passes raw camera-frame distances, prefer those; otherwise fall
+            # back to the current centroid frame for older call sites.
+            def _dist_sq(obj):
+                c = obj.centroid
+                return c.x * c.x + c.y * c.y + c.z * c.z
+            if closest_distances is not None:
+                indexed_objects.sort(key=lambda x: closest_distances[x[0]])
+            else:
+                indexed_objects.sort(key=lambda x: _dist_sq(x[1]))
+            if indexed_objects:
+                nearest = indexed_objects[0][1].centroid
+                nearest_d = (
+                    closest_distances[indexed_objects[0][0]]
+                    if closest_distances is not None
+                    else _dist_sq(indexed_objects[0][1]) ** 0.5
+                )
+                self.get_logger().info(
+                    f"Sorted by closest ({camera}): nearest at "
+                    f"({nearest.x:.2f}, {nearest.y:.2f}, {nearest.z:.2f}) m, "
+                    f"camera_distance={nearest_d:.2f} m"
+                )
         
         elif sort_mode == 'highest':
             # Try to transform to map frame for proper height sorting
@@ -535,20 +554,18 @@ class YOLOSegmentationNode(Node):
             transform = None
             
             if source_frame and header:
-                try:
-                    # Check if map frame exists
-                    transform = self.tf_buffer.lookup_transform(
-                        'map',
-                        source_frame,
-                        header.stamp,
-                        timeout=rclpy.duration.Duration(seconds=0.1)
-                    )
+                transform = self._tf_helper.try_lookup(
+                    'map',
+                    source_frame,
+                    stamp=header.stamp,
+                    timeout_s=0.1,
+                )
+                if transform is not None:
                     use_map_frame = True
                     self.get_logger().info("Using map frame for height sorting")
-                    
-                except (LookupException, ConnectivityException, ExtrapolationException) as e:
+                else:
                     self.get_logger().warn(
-                        f"Failed to get transform from {source_frame} to map frame: {e}. "
+                        f"Failed to get transform from {source_frame} to map frame. "
                         f"Falling back to 'closest' sorting mode."
                     )
                     sort_mode = 'closest'
@@ -572,7 +589,11 @@ class YOLOSegmentationNode(Node):
                         point_stamped.point = obj.centroid
                         
                         # Transform point
-                        transformed_point = do_transform_point(point_stamped, transform)
+                        transformed_point = self._tf_helper.transform_point(
+                            point_stamped, transform
+                        )
+                        if transformed_point is None:
+                            raise RuntimeError('point transform failed')
                         self.get_logger().info(
                             f"Object {idx} original point at {obj.centroid} ({point_stamped.point}), transformed to {transformed_point.point}")
                         height = transformed_point.point.z
@@ -597,11 +618,23 @@ class YOLOSegmentationNode(Node):
                         f"All points: {[f'z={item[2]:.2f}m' for item in transformed_heights]}"
                     )
             else:
-                # Fallback to closest sorting
-                indexed_objects.sort(key=lambda x: x[1].centroid.z)
+                # Fallback to closest sorting.
+                def _dist_sq_fb(obj):
+                    c = obj.centroid
+                    return c.x * c.x + c.y * c.y + c.z * c.z
+                if closest_distances is not None:
+                    indexed_objects.sort(key=lambda x: closest_distances[x[0]])
+                else:
+                    indexed_objects.sort(key=lambda x: _dist_sq_fb(x[1]))
                 if indexed_objects:
+                    nearest_d_fb = (
+                        closest_distances[indexed_objects[0][0]]
+                        if closest_distances is not None
+                        else _dist_sq_fb(indexed_objects[0][1]) ** 0.5
+                    )
                     self.get_logger().info(
-                        f"Fallback: sorted by closest at z={indexed_objects[0][1].centroid.z:.2f}m"
+                        f"Fallback: sorted by closest at "
+                        f"camera_distance={nearest_d_fb:.2f}m"
                     )
         else:
             self.get_logger().warn(f'Unknown sort_mode: {sort_mode}, using none')
@@ -622,7 +655,8 @@ class YOLOSegmentationNode(Node):
             valid_mask: np.ndarray, header: Header,
             camera: str = 'realsense',
             request_segments: bool = False,
-            sort_mode: str = 'none') -> tuple:
+            sort_mode: str = 'none',
+            target_frame: str = '') -> tuple:
         """
         Run object detection and return results.
 
@@ -679,9 +713,19 @@ class YOLOSegmentationNode(Node):
         objects_msg.objects = []
 
         segments = []
+        closest_distances = []
         detection_info = []  # Store info for visualization: (bbox, mask, cls_name, conf, centroid)
         detection_info_all = []
-        
+
+        # Look up the source -> target frame transform once for the whole
+        # batch. None when no transform is needed; failure aborts cleanly.
+        centroid_tf, batch_ok = self._lookup_centroid_transform(
+            header.frame_id, target_frame, header.stamp, camera,
+        )
+        if not batch_ok:
+            objects_msg.status = 1
+            return objects_msg, []
+
         # Process detections
         for result in results:
             
@@ -721,6 +765,12 @@ class YOLOSegmentationNode(Node):
                 mask = masks[i].data.cpu().numpy().squeeze()
                 mask = mask[:h, :w]  # Crop to original size
                 mask = (mask > 0.5).astype(bool)
+                # Drop disconnected fragments inside the detector bbox.
+                # Running CC globally can pick an unrelated fragment outside
+                # the bbox, leaving centroid ROI empty.
+                mask = largest_connected_component_in_bbox(
+                    mask, (x1, y1, x2, y2)
+                )
 
                 detection_info_all.append({
                     'bbox': (x1, y1, x2, y2),
@@ -746,7 +796,20 @@ class YOLOSegmentationNode(Node):
 
                 if cls_name != target_cls:
                     continue
-                
+
+                closest_distance = math.sqrt(
+                    centroid.x * centroid.x
+                    + centroid.y * centroid.y
+                    + centroid.z * centroid.z
+                )
+
+                # Express centroid in target_frame; the source->target
+                # lookup was hoisted above, so this is just in-memory math.
+                if centroid_tf is not None:
+                    centroid = self._apply_centroid_transform(
+                        centroid, centroid_tf, header.frame_id, header.stamp,
+                    )
+
                 # Store detection info for visualization
                 detection_info.append({
                     'bbox': (x1, y1, x2, y2),
@@ -755,7 +818,7 @@ class YOLOSegmentationNode(Node):
                     'conf': conf,
                     'centroid': centroid
                 })
-                
+
                 # Create Object message
                 obj = Object()
                 obj.conf = conf
@@ -767,6 +830,7 @@ class YOLOSegmentationNode(Node):
                 obj.being_pointed = 0
 
                 objects_msg.objects.append(obj)
+                closest_distances.append(closest_distance)
 
                 if request_segments:
                     segments.append(mask.astype(np.uint8) * 255)
@@ -780,7 +844,8 @@ class YOLOSegmentationNode(Node):
             objects_msg.objects, segments, sort_mode,
             camera=camera,
             source_frame=source_frame,
-            header=header
+            header=header,
+            closest_distances=closest_distances,
         )
         
         # # Also sort detection_info to match
@@ -808,6 +873,12 @@ class YOLOSegmentationNode(Node):
 
         objects_msg.status = 0 if len(objects_msg.objects) > 0 else 1
 
+        # Centroids were transformed into target_frame above; reflect that
+        # on the response header so the (PointStamped header, point) pair
+        # the BT consumes is self-consistent.
+        if target_frame and self._frame_supports_tf_transform(camera):
+            objects_msg.header.frame_id = target_frame
+
         return objects_msg, segments
 
     def _calculate_centroid(
@@ -825,7 +896,9 @@ class YOLOSegmentationNode(Node):
         roi_mask = mask[y1:y2, x1:x2]
         roi_valid = valid_mask[y1:y2, x1:x2]
         if np.sum(roi_mask) == 0:
-            self.get_logger().warn('No valid mask pixels in ROI for centroid calculation!')
+            self.get_logger().warn(
+                f'empty mask in bbox={bbox}; falling back to bbox depth'
+            )
             roi_mask = np.ones_like(roi_mask)
         roi_points = points[y1:y2, x1:x2]
 
@@ -870,6 +943,62 @@ class YOLOSegmentationNode(Node):
             point.z = float(centroid_3d[2])
 
         return point
+
+    # RealSense centroids use hand-rolled body-axis values (x=fwd, y=left,
+    # z=up) that disagree with their reported optical header.frame_id;
+    # skipping TF preserves existing grasp-service behavior. Orbbec values
+    # match their frame_id and transform cleanly.
+    _CAMERAS_WITH_UNRELIABLE_FRAME_ID = frozenset({'realsense'})
+
+    def _frame_supports_tf_transform(self, camera: str) -> bool:
+        return camera not in self._CAMERAS_WITH_UNRELIABLE_FRAME_ID
+
+    def _lookup_centroid_transform(self, source_frame: str,
+                                   target_frame: str, stamp,
+                                   camera: str = 'orbbec'):
+        """Look up source_frame -> target_frame once per service call.
+
+        Returns (tf_or_None, batch_ok).
+          * tf_or_None=None, batch_ok=True  — no transform needed (empty
+            target, same frame, or camera flagged unreliable). Loop just
+            uses the raw centroids.
+          * tf_or_None=<TransformStamped>, batch_ok=True — apply this to
+            every centroid; do_transform_point is in-memory math.
+          * tf_or_None=None, batch_ok=False — TF lookup failed; caller
+            should abort the batch rather than emit mis-framed centroids.
+
+        Hoisted out of the per-detection loop so a 20-person scene with
+        an unavailable TF doesn't pay 20 × the lookup_transform timeout.
+        """
+        if not target_frame or target_frame == source_frame:
+            return None, True
+        if not self._frame_supports_tf_transform(camera):
+            return None, True
+        tf = self._tf_helper.try_lookup(
+            target_frame,
+            source_frame,
+            stamp=stamp,
+            timeout_s=0.1,
+        )
+        if tf is None:
+            self.get_logger().warn(
+                f'TF {source_frame} -> {target_frame} failed; '
+                'dropping batch'
+            )
+            return None, False
+        return tf, True
+
+    def _apply_centroid_transform(self, point, tf,
+                                  source_frame: str, stamp):
+        """Apply a pre-fetched transform to a centroid Point. Cheap; no I/O."""
+        ps = geometry_msgs.msg.PointStamped()
+        ps.header.frame_id = source_frame
+        ps.header.stamp = stamp
+        ps.point = point
+        transformed = self._tf_helper.transform_point(ps, tf)
+        if transformed is None:
+            raise RuntimeError('centroid point transform failed')
+        return transformed.point
 
     def _visualize_all_detections(
             self, img: np.ndarray, detection_info: list, displaying_all=False):
@@ -942,11 +1071,12 @@ class YOLOSegmentationNode(Node):
             ).astype(np.uint8)
             vis_img = cv2.addWeighted(vis_img, 0.7, mask_overlay, 0.3, 0)
         
-        # Save with timestamp
+        # Save with timestamp into the shared session run_dir.
         timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-        if displaying_all:
-            timestamp += '_all'
-        filename = f'{self.vision_log_folder}/detection_{timestamp}.png'
+        suffix = 'detection_all' if displaying_all else 'detection'
+        filename = self._vision_logger.aux_path(
+            timestamp, suffix, 'png', branch='yolo',
+        )
         cv2.imwrite(filename, vis_img)
         self.get_logger().info(f'Saved visualization to {filename}')
 
@@ -959,6 +1089,56 @@ class YOLOSegmentationNode(Node):
             rgb_img, detections, request_ctx=request_ctx,
             branch=branch, extras=extras, timings=timings,
         )
+
+    def _wait_for_recent_frame(self, camera: str, *, warn: bool = False):
+        """Return a current intake pair using its configured backend.
+
+        The subscription path keeps the legacy fixed-call-time polling policy.
+        The service path delegates freshness to the provider's header stamps.
+        """
+        intake = self._camera_intakes.get(camera)
+        if intake is None:
+            return None
+        if intake.cfg.backend == 'service':
+            bundle = intake.wait_fresh(
+                max_age_s=self.img_sync_thres,
+                timeout_s=self.sync_wait_time_limit * 0.1,
+                on_timeout='fail',
+            )
+            if bundle is None:
+                if warn:
+                    self.get_logger().warn(
+                        f'Skipping detection: no recent {camera} provider '
+                        'data within sync threshold'
+                    )
+                return None
+            return copy.deepcopy((bundle.color_msg, bundle.depth_msg))
+
+        call_time = self.get_clock().now()
+        for _ in range(self.sync_wait_time_limit):
+            bundle = intake.latest()
+            recent_time = bundle.recv_time if bundle is not None else None
+            if recent_time is None or (
+                (call_time - recent_time).nanoseconds / 1e9
+                > self.img_sync_thres
+            ):
+                if warn:
+                    self.get_logger().warn(
+                        f'Skipping detection: no recent {camera} data '
+                        f'within sync threshold (called at {call_time}, '
+                        f'most recent {recent_time})'
+                    )
+                time.sleep(0.1)
+                continue
+
+            # Match the old second lock/read: a newer pair that arrived after
+            # the freshness check is the pair served to the caller.
+            latest = intake.latest()
+            if latest is not None:
+                return copy.deepcopy(
+                    (latest.color_msg, latest.depth_msg)
+                )
+        return None
 
     def _detection_service_callback(
             self, request: ObjectDetection.Request,
@@ -977,24 +1157,7 @@ class YOLOSegmentationNode(Node):
         else:
             self.get_logger().warn(f'Unknown camera: {request.camera}, using orbbec')
 
-        rec_msg = None
-        call_time = self.get_clock().now()
-        for i in range(self.sync_wait_time_limit):
-            self.lock_msg.acquire()
-            recent_time = self.recent_publish_time[camera]
-            self.lock_msg.release()
-            if self.recent_publish_time[camera] is None \
-                or (call_time - recent_time).nanoseconds / 1e9 > self.img_sync_thres:
-                self.get_logger().warn(
-                    f'Skipping detection: no recent {camera} data within sync threshold (called at {call_time}, most recent {recent_time})'
-                )
-                time.sleep(0.1)
-            else:
-                self.lock_msg.acquire()
-                rec_msg = copy.deepcopy(self.recent_sync_msg.get(camera))
-                self.lock_msg.release()
-                break
-        
+        rec_msg = self._wait_for_recent_frame(camera, warn=True)
 
         if rec_msg is None:
             response.header = Header(stamp=self.get_clock().now().to_msg())
@@ -1060,7 +1223,8 @@ class YOLOSegmentationNode(Node):
                 header,
                 camera=camera,
                 request_segments=request_segments,
-                sort_mode=sort_mode
+                sort_mode=sort_mode,
+                target_frame=request.target_frame,
             )
 
             # Fill response
@@ -1107,17 +1271,39 @@ class YOLOSegmentationNode(Node):
                         'target_frame': request.target_frame,
                         'sort_mode': sort_mode,
                         'n_all_detections': len(self._last_detection_info_all),
+                        'depth_source': self._last_depth_source,
                     },
                     branch='yolo',
                     timings={'yolo': time.perf_counter() - _t0},
                 )
 
         except Exception as e:
-            self.get_logger().error(f'Detection failed: {e}')
+            self.get_logger().exception(f'Detection failed: {e}')
             response.header = Header(stamp=self.get_clock().now().to_msg())
             response.status = 1
             response.objects = []
             response.person_id = 0
+            # Failure-case audit trail: rgb_img is in scope here (raise came
+            # from _detect_objects, after _process_*_data succeeded).
+            # Pre-rgb early returns above (no camera msg / no intrinsics /
+            # camera-data parse error) intentionally don't log — there is
+            # no image to render.
+            if self._vision_logger.enabled:
+                self._vision_logger.write(
+                    rgb_img, [],
+                    request_ctx={
+                        'service': 'tk23_ObjectDetection',
+                        'prompt': request.prompt,
+                        'camera': request.camera,
+                        'flags': request.flags,
+                        'target_frame': request.target_frame,
+                        'sort_mode': sort_mode,
+                        'error': str(e),
+                        'depth_source': self._last_depth_source,
+                    },
+                    branch='error',
+                    timings={'yolo': time.perf_counter() - _t0},
+                )
 
         return response
 

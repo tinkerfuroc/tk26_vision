@@ -1,0 +1,8 @@
+# Re-lock the running person tracker on an externally-confirmed target
+# (e.g. the raise-hand operator), preserving the multi-view gallery.
+sensor_msgs/RegionOfInterest bbox   # target box in the current color frame
+string frame_id                     # color frame the bbox is expressed in (sanity/logging)
+---
+bool success
+int32 target_track_id               # the (re)locked track id, -1 on failure
+string message

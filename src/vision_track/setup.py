@@ -12,6 +12,9 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'webui'), glob('webui/*')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         # Include model files
         ('share/' + package_name + '/models', glob('*.pt')),
     ],
@@ -26,6 +29,8 @@ setup(
         'console_scripts': [
             'person_track_server = vision_track.person_track_node:main',
             'person_track_test_client = vision_track.person_track_test_client:main',
+            'track_web = vision_track.track_web:main',
+            'sim_track_server = vision_track.sim_track_server:main',
         ],
     },
 )

@@ -8,35 +8,31 @@ that layer and returns a PointStamped.
 Changes from tk23:
 - API key/base URL/model from environment.
 - `detection_service` ROS param (default `object_detection`) for retargeting.
-- Temporary JPEG encoded via `tempfile.NamedTemporaryFile`.
+- JPEG encoding shared with feature_recognition / feature_matching via
+  `kimi_api._image_utils.encode_to_data_url` (in-memory `cv2.imencode`).
 - Dead Chinese-prompt block removed.
 """
 
-import base64
-import json
-import os
-import tempfile
 import threading
 import time
 
-import cv2
 import geometry_msgs.msg
 import numpy as np
 import rclpy
 import tf2_geometry_msgs  # noqa: F401  (registers PointStamped transform)
 from cv_bridge import CvBridge
-from openai import OpenAI
 from rclpy.action import ActionServer
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from scipy.cluster.vq import kmeans2
 from sensor_msgs.msg import PointCloud2
-from tf2_ros.buffer import Buffer
-from tf2_ros.transform_listener import TransformListener
 from tinker_vision_msgs_26.action import Categorize
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as ObjectDetection
 
-from ._env import base_url, default_model, load_env, require_api_key
+from ._categorize_vlm import ShelfVlmError, request_shelf_layer_chain
+from ._env import default_model, load_env, require_api_key, resolve_qwen_target
+from ._image_utils import encode_to_data_url
+from vision_util.tf_lookup import TransformHelper
 
 USE_SHELF_HEIGHT = False
 PROJECT_ON_LINE = False
@@ -46,18 +42,6 @@ def get_bounding_box(mask):
     nonzero = np.nonzero(mask)
     x1, y1, x2, y2 = np.min(nonzero[0]), np.min(nonzero[1]), np.max(nonzero[0]), np.max(nonzero[1])
     return x1, y1, x2, y2
-
-
-def _encode_to_data_url(img) -> str:
-    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        cv2.imwrite(tmp_path, img)
-        with open(tmp_path, 'rb') as f:
-            data = f.read()
-    finally:
-        os.unlink(tmp_path)
-    return f'data:image/jpg;base64,{base64.b64encode(data).decode("utf-8")}'
 
 
 class GroceryCategorizeAction(Node):
@@ -70,8 +54,36 @@ class GroceryCategorizeAction(Node):
 
         self.declare_parameter('llm_model', default_model())
         self.declare_parameter('detection_service', 'object_detection_generalist')
+        # 60 s, not the 20 s the other kimi_api nodes use: the default model
+        # here is gemini-2.5-pro on a two-image prompt, and the seat-bench
+        # measurements for that model (n=144) put the median at 15.5 s and
+        # p90 at 28.4 s — a 20 s cap would cancel roughly a third of calls
+        # that the pre-fallback code (no per-call timeout) completed.
+        self.declare_parameter('vlm_timeout_s', 60.0)
+        self.declare_parameter('vlm_max_retries', 3)
+        self.declare_parameter('vlm_fallback_provider', 'qwen')  # '' to disable
+        self.declare_parameter('categorize_model_qwen', '')
+        self.declare_parameter('qwen_api_backend', 'dashscope')
+        self.declare_parameter('camera_backend', 'service')
+        self.declare_parameter(
+            'orbbec_provider_endpoint', '/head_camera_server')
+        self.declare_parameter(
+            'transform_provider_endpoint', '/head_camera_server')
+        self.declare_parameter('camera_provider_wait_timeout_s', 0.5)
+        self.declare_parameter('camera_provider_response_timeout_s', 5.0)
         self.llm_model = self.get_parameter('llm_model').get_parameter_value().string_value
         detection_service = self.get_parameter('detection_service').get_parameter_value().string_value
+        self.vlm_timeout_s = self.get_parameter('vlm_timeout_s').get_parameter_value().double_value
+        self.vlm_max_retries = (
+            self.get_parameter('vlm_max_retries').get_parameter_value().integer_value
+        )
+        self.vlm_fallback_provider = (
+            self.get_parameter('vlm_fallback_provider').get_parameter_value().string_value
+        )
+        self.categorize_model_qwen = (
+            self.get_parameter('categorize_model_qwen').get_parameter_value().string_value
+        )
+        self.qwen_api_backend = self.get_parameter('qwen_api_backend').value
 
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
@@ -84,15 +96,34 @@ class GroceryCategorizeAction(Node):
             callback_group=self.server_cb_group,
         )
 
-        self.client = OpenAI(api_key=require_api_key(), base_url=base_url())
+        require_api_key()  # fail fast at init if the primary Gemini key is missing
+        self._categorize_provider_chain = self._resolve_categorize_provider_chain()
 
-        self.orbec_pc_sub = self.create_subscription(
-            PointCloud2,
-            '/camera/depth/points',
-            self.orbec_pc_callback,
-            qos_profile=1,
-            callback_group=MutuallyExclusiveCallbackGroup(),
-        )
+        self.camera_backend = self.get_parameter('camera_backend').value
+        if self.camera_backend == 'service':
+            from camera_provider import CameraProvider
+
+            self.camera_provider = CameraProvider(
+                self,
+                self.get_parameter('orbbec_provider_endpoint').value,
+                service_wait_timeout_s=self.get_parameter(
+                    'camera_provider_wait_timeout_s').value,
+                response_timeout_s=self.get_parameter(
+                    'camera_provider_response_timeout_s').value,
+            )
+            self.orbec_pc_sub = None
+        elif self.camera_backend == 'subscription':
+            self.camera_provider = None
+            self.orbec_pc_sub = self.create_subscription(
+                PointCloud2,
+                '/camera/depth/points',
+                self.orbec_pc_callback,
+                qos_profile=1,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+        else:
+            raise ValueError(
+                "camera_backend must be 'subscription' or 'service'")
 
         self.detection_cli = self.create_client(
             ObjectDetection, detection_service, callback_group=self.client_cb_group,
@@ -107,13 +138,46 @@ class GroceryCategorizeAction(Node):
         self.env_pc_lock = threading.Lock()
         self.last_time = None
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._transform_helper = TransformHelper(
+            self,
+            backend=self.camera_backend,
+            provider_endpoint=(
+                self.get_parameter('transform_provider_endpoint').value
+                if self.camera_backend == 'service'
+                else ''
+            ),
+        )
+        self.tf_buffer = self._transform_helper.buffer
+        self.tf_listener = self._transform_helper._listener
 
         self.get_logger().info(
             f'GroceryCategorize initialized (model={self.llm_model}, '
             f'detection_service={detection_service}).'
         )
+
+    def _resolve_categorize_provider_chain(self) -> list:
+        """Ordered (provider, model) chain for shelf-layer categorization:
+        Gemini (self.llm_model, already required at init) then, if
+        configured, a Qwen fallback that is dropped with a warning when
+        its key is missing rather than failing node startup."""
+        chain = [('gemini', self.llm_model)]
+        fb = self.vlm_fallback_provider
+        if fb and fb != 'gemini':
+            if fb != 'qwen':
+                self.get_logger().warn(f'Unknown fallback provider {fb!r}; ignoring.')
+            else:
+                try:
+                    _, _, resolved_model = resolve_qwen_target(
+                        self.qwen_api_backend, self.categorize_model_qwen)
+                    chain.append(('qwen', resolved_model))
+                except RuntimeError:
+                    self.get_logger().warn(
+                        f'Fallback provider {fb!r} key missing; fallback disabled.'
+                    )
+        self.get_logger().info(
+            f'grocery_categorize provider chain: {[p for p, _ in chain]}'
+        )
+        return chain
 
     async def orbec_pc_callback(self, msg):
         if self.last_time is None or self.last_time + 0.5 < time.time():
@@ -143,6 +207,23 @@ class GroceryCategorizeAction(Node):
             result.status = 3
             result.error_msg = 'Shelf point frame is not map.'
             return result
+
+        cloud_stamp = None
+        if self.camera_backend == 'service':
+            cloud_result = self.camera_provider.point_cloud(
+                include_color=False,
+                max_age_s=0.5,
+            )
+            if not cloud_result.ok:
+                result.status = 1
+                result.error_msg = (
+                    f'Camera point cloud unavailable: '
+                    f'{cloud_result.error_msg}.'
+                )
+                return result
+            with self.env_pc_lock:
+                self.env_pc = cloud_result.points
+            cloud_stamp = cloud_result.stamp
 
         # 1. Get image from orbbec and call object detection, get shelf + items segmentation
         if not self.detection_cli.wait_for_service(timeout_sec=1.0):
@@ -232,8 +313,8 @@ class GroceryCategorizeAction(Node):
         feedback_msg.message = 'Determining layer to put on...'
         goal_handle.publish_feedback(feedback_msg)
 
-        obj_seg_url = _encode_to_data_url(obj_segment)
-        shelf_img_url = _encode_to_data_url(rgb_image)
+        obj_seg_url = encode_to_data_url(obj_segment)
+        shelf_img_url = encode_to_data_url(rgb_image)
 
         sys_prompt = (
             f'You will be given a picture of a shelf with {goal_handle.request.n_layers} main'
@@ -246,7 +327,7 @@ class GroceryCategorizeAction(Node):
             '  "shelf_description": [description of items on each main visible layer and their'
             ' attributes, in detail, with the bottom layer being layer 0],\n'
             '  "reason": [reason for placing the object in the desired layer in one or two'
-            ' sentences]\n'
+            ' sentences],\n'
             '  "layer": [integer number of the layer the new object should be placed on, with the'
             ' bottom layer being layer 0]\n'
             '}'
@@ -255,47 +336,25 @@ class GroceryCategorizeAction(Node):
 
         self.get_logger().info(f'API prompt: {sys_prompt}')
 
-        completion = None
         try:
-            completion = self.client.chat.completions.create(
-                model=self.llm_model,
-                messages=[
-                    {'role': 'system', 'content': sys_prompt},
-                    {
-                        'role': 'user',
-                        'content': [
-                            {'type': 'text', 'text': 'picture of shelf'},
-                            {'type': 'image_url', 'image_url': {'url': shelf_img_url}},
-                            {'type': 'text', 'text': 'picture of new object.'},
-                            {'type': 'image_url', 'image_url': {'url': obj_seg_url}},
-                        ],
-                    },
-                ],
+            shelf_res = request_shelf_layer_chain(
+                sys_prompt, shelf_img_url, obj_seg_url,
+                provider_models=self._categorize_provider_chain,
+                qwen_api_backend=self.qwen_api_backend,
+                timeout_s=self.vlm_timeout_s,
+                max_retries=self.vlm_max_retries,
+                logger=self.get_logger(),
             )
-        except Exception as e:
-            self.get_logger().warn(f'API call failed: {e}')
-
-        response = None
-        try:
-            response = json.loads(completion.choices[0].message.content)
-        except Exception as e:
-            self.get_logger().error(f'Failed to parse response: {e}.')
-            self.get_logger().info(f'API response: {completion}.')
+        except ShelfVlmError as exc:
+            self.get_logger().error(f'Shelf-layer VLM call failed on every provider: {exc}')
             result.status = 4
-            result.error_msg = f'Failed to parse response: {completion}.'
+            result.error_msg = f'VLM call failed on every provider: {exc}.'
             return result
 
-        if 'layer' not in response:
-            result.status = 4
-            result.error_msg = "Response missing 'layer' field."
-            return result
-        if 'shelf_description' not in response:
-            result.status = 4
-            result.error_msg = "Response missing 'shelf_description' field."
-            return result
-        self.get_logger().info(f'API response: {response}')
+        response = shelf_res.response
+        self.get_logger().info(f'API response (provider={shelf_res.provider}): {response}')
         layer = response['layer']
-        result.place_reason = response['reason']
+        result.place_reason = str(response['reason'])
 
         self.get_logger().info(f'Layer to put on: {layer}.')
         self.get_logger().info(f"Description of items on each layer: {response['shelf_description']}.")
@@ -334,11 +393,14 @@ class GroceryCategorizeAction(Node):
             pt.z += 0.1
         else:
             try:
-                transform = self.tf_buffer.lookup_transform(
-                    target_frame='base_link',
-                    source_frame=self.pt_shelf_left.header.frame_id,
-                    time=rclpy.time.Time(),
+                transform = self._transform_helper.try_lookup(
+                    'base_link',
+                    self.pt_shelf_left.header.frame_id,
+                    stamp=cloud_stamp,
+                    timeout_s=0.2,
                 )
+                if transform is None:
+                    raise RuntimeError('transform provider unavailable')
             except Exception:
                 self.get_logger().warn(
                     f'Failed to lookup transform from {self.pt_shelf_left.header.frame_id} to base_link.'

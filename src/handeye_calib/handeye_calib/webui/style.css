@@ -1,0 +1,639 @@
+/* handeye_calib calibrate_web — v2 skeleton.
+ *
+ * CSS variables, status-line classes, gate-pill colours, button styles and
+ * side-tab layout are copied VERBATIM from src/pan_tilt/webui/style.css so
+ * the two calibration tools share the same visual language. Pan-tilt-specific
+ * selectors (.xarm-panels, .calib-resid-grid, .live-frame, etc.) are left out
+ * — those reappear under handeye-specific names in T2-T5.
+ */
+
+:root {
+  --bg: #151922;
+  --bg-panel: #1f2430;
+  --fg: #e3e7ef;
+  --fg-muted: #8a93a6;
+  --accent: #4da3ff;
+  --ok: #5fd37f;
+  --warn: #ffcc5c;
+  --err: #ff7a7a;
+  --border: #2c3140;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* T2: live camera panel width (resizable via #cam-resize handle). Persisted
+     to localStorage key `handeye-cam-w`; app.js restores on page load. */
+  --cam-w: 480px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- header / connection pill --------------------------------------- */
+header.bg-panel {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 20px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+header .title {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.conn-indicator {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.conn-indicator.connected { color: var(--ok); }
+.conn-indicator.dropped   { color: var(--err); }
+
+/* ---- main layout ---------------------------------------------------- *
+ * Two-column flex: sticky cam-panel on the left, scrollable controls    *
+ * column on the right. Previously the cam-panel was `float: left` which *
+ * only wrapped the FIRST ~270 px of content around it — long capture-   *
+ * tab scrolls left the camera off-screen at the top while the controls  *
+ * kept going. Now `align-items: flex-start` keeps the cam its natural   *
+ * (16:9 of --cam-w) height, and `position: sticky` pins it during scroll.
+ */
+main {
+  flex: 1 1 0;
+  min-height: 0;
+  padding: 12px 16px;
+  overflow-y: auto;
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+/* ---- Left dock: sticky camera + joint editor stacked vertically --- *
+ * The whole dock is sticky as a unit. Cap its height at viewport so   *
+ * it scrolls internally if camera + joint editor combined exceed the  *
+ * screen (rare on a normal monitor — camera 270 px + joint editor    *
+ * ~300 px = ~570 px).                                                 */
+.left-dock {
+  position: sticky;
+  top: 0;
+  flex: 0 0 var(--cam-w);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+}
+
+.joint-dock {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+.joint-dock h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.controls-col {
+  flex: 1 1 0;
+  min-width: 0;  /* allow children to shrink instead of overflowing the flex row */
+}
+
+/* ---- T2: live frame panel (resizable; inside .left-dock) ------------ *
+ * Selectors copied from src/pan_tilt/webui/style.css ( .feed-col +     *
+ * .live-frame ) and renamed to .cam-panel for the handeye DOM ids the  *
+ * brief names. The pan_tilt visual layout (16:9 panel, corner resize   *
+ * handle, top-strip toolbar, bottom-left badge, dashed-border          *
+ * placeholder) is preserved verbatim — only selector names differ.     *
+ *                                                                       *
+ * 2026-06-20: the cam-panel is now a child of .left-dock (which is the *
+ * sticky flex item); cam-panel itself is full-width inside that dock.  */
+.cam-panel {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #0a0f18;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.cam-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+.cam-img:not([src]), .cam-img[src=""] { visibility: hidden; }
+
+.cam-resize {
+  position: absolute;
+  right: 0; bottom: 0;
+  width: 14px; height: 14px;
+  cursor: nwse-resize;
+  background: linear-gradient(135deg, transparent 45%, var(--border) 50%, transparent 55%);
+  z-index: 3;
+  touch-action: none;
+  user-select: none;
+}
+.cam-resize:hover,
+.cam-resize.dragging {
+  background: linear-gradient(135deg, transparent 45%, var(--accent) 50%, transparent 55%);
+}
+
+.frame-toolbar {
+  position: absolute; top: 0; left: 0; right: 0;
+  background: rgba(0, 0, 0, .65);
+  padding: 4px 8px;
+  display: flex; gap: 12px; flex-wrap: wrap;
+  z-index: 2;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--fg-muted);
+}
+.frame-toolbar label { cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
+.frame-toolbar input { accent-color: var(--accent); }
+
+.detection-badge {
+  position: absolute; bottom: 4px; left: 4px;
+  font-family: var(--mono); font-size: 11px;
+  background: rgba(0, 0, 0, .7);
+  padding: 4px 8px;
+  border-radius: 3px;
+  color: var(--fg-muted);
+  z-index: 2;
+}
+.detection-badge.ok  { color: var(--ok); }
+.detection-badge.err { color: var(--err); }
+
+.frame-placeholder {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  color: var(--fg-muted); font-family: var(--mono); font-size: 11px;
+  text-align: center; padding: 10px 14px;
+  border: 1px dashed var(--border); border-radius: 4px;
+  background: rgba(10, 15, 24, .8);
+  max-width: 90%;
+  display: none;
+  z-index: 1;
+}
+.cam-panel.no-frame .frame-placeholder { display: block; }
+
+/* ---- side tabs ------------------------------------------------------ */
+.side-tabs {
+  display: flex;
+  gap: 2px;
+  margin: 0 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+.side-tab {
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  margin-bottom: -1px;
+}
+.side-tab:hover { color: var(--fg); }
+.side-tab.active {
+  color: var(--accent);
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+.side-panel-content { display: none; }
+.side-panel-content.active { display: block; }
+
+/* ---- buttons (verbatim from pan_tilt) ------------------------------- */
+button {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.primary {
+  background: var(--accent);
+  color: #061628;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+button.primary:hover { background: #6bb6ff; color: #061628; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ---- status line + helpers (verbatim from pan_tilt) ---------------- */
+.status-line {
+  font-family: var(--mono);
+  font-size: 12px;
+  min-height: 1.3em;
+  margin: 6px 0;
+  color: var(--fg-muted);
+}
+.status-line.ok   { color: var(--ok); }
+.status-line.err  { color: var(--err); }
+.status-line.warn { color: var(--warn); }
+
+.muted { color: var(--fg-muted); font-size: 12px; margin: 4px 0; }
+.warn  { color: var(--warn);     font-size: 12px; }
+
+/* ---- gate pill (PASS / WARN / FAIL) -------------------------------- */
+.gate-pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  background: #2c3140;
+  color: var(--fg-muted);
+}
+.gate-pill.pass { background: var(--ok);   color: #0e1014; }
+.gate-pill.warn { background: var(--warn); color: #0e1014; }
+.gate-pill.fail { background: var(--err);  color: #fff;     }
+
+/* ---- T3: Info tab kv-table + matrix block --------------------------- *
+ * Mirrors pan_tilt's `table.kv` and `pre` patterns so the two tools'    *
+ * Info tabs read identically. The label column is fixed-width muted     *
+ * mono; the value column wraps. The matrix-block is a monospace pre     *
+ * with the same panel chrome as the rest of the dark surfaces.         */
+.kv-table {
+  width: 100%;
+  max-width: 520px;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
+.kv-table td { padding: 3px 0; vertical-align: top; }
+.kv-table td:first-child { color: var(--fg-muted); width: 140px; }
+
+.matrix-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  border-radius: 3px;
+  overflow-x: auto;
+  max-width: 520px;
+  margin: 4px 0 12px;
+  white-space: pre;
+}
+
+/* ---- T3: Move tab — joint editor + unit toggle + presets ------------ *
+ * Mirrors pan_tilt's xArm Waypoints visual layout: a two-column joint   *
+ * grid of `J0..J6 [input]` rows, an inline rad/deg radio toggle, and a  *
+ * preset-bar grid for one-click jumps. Selectors are renamed to match   *
+ * the DOM ids the T3 brief names (#move-joint-inputs / #move-presets / *
+ * #move-unit-toggle) but the visual look is preserved verbatim.        */
+/* .move-panel removed 2026-06-20 — joint editor lives in .joint-dock
+   inside the sticky .left-dock; presets moved to .presets-panel on the
+   right. Selectors below are still consumed by the relocated DOM ids. */
+
+.presets-panel { margin-bottom: 16px; }
+
+.unit-toggle {
+  margin: 8px 0 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.unit-toggle label { margin-right: 16px; color: var(--fg-muted); cursor: pointer; }
+.unit-toggle input { accent-color: var(--accent); }
+
+.joint-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.joint-grid .joint-row { display: flex; align-items: center; gap: 8px; }
+.joint-grid .joint-row label {
+  font-family: var(--mono);
+  font-size: 12px;
+  width: 40px;
+  color: var(--fg-muted);
+}
+.joint-grid .joint-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+
+.preset-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+  max-width: 600px;
+  margin-top: 6px;
+}
+
+/* ---- T4: Capture tab — settle badge, diversity meter, gallery ------- *
+ * Mirrors pan_tilt's calib gallery visual language (dark surface tiles, *
+ * monospace metadata strip, single primary action button, small        *
+ * destructive "x" button) so the two tools' capture flows look the     *
+ * same. The diversity-meter is a slim coloured bar at the top of the   *
+ * gallery — green when coverage_deg >= target, warn at half, err below.*/
+.capture-panel { max-width: 600px; }
+
+.stability-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg-muted);
+  margin: 0 0 8px;
+}
+.stability-badge.ok   { color: var(--ok);   border-color: var(--ok); }
+.stability-badge.warn { color: var(--warn); border-color: var(--warn); }
+.stability-badge.err  { color: var(--err);  border-color: var(--err); }
+
+.diversity-meter {
+  margin: 10px 0 14px;
+}
+.diversity-meter .bar {
+  width: 100%;
+  height: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.diversity-meter .fill {
+  height: 100%;
+  width: 0%;
+  background: var(--err);
+  transition: width 0.2s ease-out, background 0.2s ease-out;
+}
+.diversity-meter .fill.warn { background: var(--warn); }
+.diversity-meter .fill.ok   { background: var(--ok); }
+.diversity-meter .label {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  margin-top: 4px;
+}
+
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+  margin-top: 6px;
+}
+.gallery-empty {
+  grid-column: 1 / -1;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  text-align: center;
+}
+.gallery-item {
+  position: relative;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.gallery-item .gallery-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: #000;
+  border-radius: 3px;
+}
+.gallery-item .gallery-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  line-height: 1.3;
+}
+.gallery-item .gallery-meta .gallery-idx {
+  color: var(--accent);
+  font-weight: 600;
+}
+.gallery-item .gallery-delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--err);
+  border: 1px solid var(--err);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1;
+}
+.gallery-item .gallery-delete:hover {
+  background: var(--err);
+  color: #fff;
+}
+
+/* ---- T5: Solve tab — method picker + comparison table + canvases --- *
+ * Same monospace / muted-label visual grammar as the rest of the dark   *
+ * surfaces. method-table mirrors pan_tilt's per-method residual table:  *
+ * left-aligned name column, right-aligned numeric column, the row with  *
+ * the best (lowest) reproj_px highlighted via .best. The canvas-row     *
+ * sits a histogram + scatter side-by-side; both are 360x140 vanilla     *
+ * canvas2d (no chart library). Coverage canvas is wider (600x400) to    *
+ * fit the projected board centroids comfortably.                       */
+.solve-panel { max-width: 720px; }
+.solve-panel h3 {
+  margin: 14px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.method-table {
+  width: 100%;
+  max-width: 360px;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
+.method-table th,
+.method-table td { padding: 3px 8px; }
+.method-table th {
+  text-align: left;
+  color: var(--fg-muted);
+  font-weight: normal;
+  border-bottom: 1px solid var(--border);
+}
+.method-table td.num { text-align: right; }
+.method-table tr.best td { color: var(--ok); font-weight: 600; }
+.method-table tr.empty td { color: var(--fg-muted); font-style: italic; }
+
+.canvas-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+}
+.canvas-row canvas,
+#coverage {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  display: block;
+  max-width: 100%;
+}
+
+/* ---- T6: Promote tab — side-by-side unified-diff blocks ------------ *
+ * Two diff-halves (yaml + xacro) stack at narrow widths and split to    *
+ * two columns at >=1200px so a desktop operator can compare both        *
+ * proposed writes at once. Each half gets its own Show/Apply button,    *
+ * status line, and backup-path line. The diff-block is a dark monospace *
+ * pre, with line classes (.diff-add / .diff-del / .diff-hunk) coloured  *
+ * for cheap unified-diff syntax highlighting. The badge next to each    *
+ * heading shows the resolved target path; the warn line surfaces the    *
+ * vendor-path refusal banner.                                          */
+.promote-panel {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  max-width: 1400px;
+}
+@media (min-width: 1200px) {
+  .promote-panel {
+    grid-template-columns: 1fr 1fr;
+  }
+  .promote-panel > .row {
+    grid-column: 1 / -1;
+  }
+}
+.diff-half {
+  background: var(--bg-panel);
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.diff-half h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.diff-block {
+  background: #0a0a0a;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  white-space: pre;
+  max-height: 50vh;
+  overflow: auto;
+  margin: 8px 0;
+}
+.diff-block:empty {
+  display: none;
+}
+.diff-block .diff-add  { color: var(--ok); }
+.diff-block .diff-del  { color: var(--err); }
+.diff-block .diff-hunk { color: var(--accent); }
+.diff-warn {
+  color: var(--err);
+  font-weight: 600;
+}
+.badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-muted);
+  background: #0a0a0a;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  word-break: break-all;
+}
+
+/* ---- T2: Waypoints sub-panel (Capture tab, above manual capture) -------- */
+.waypoints-panel { margin-bottom: 20px; }
+.waypoints-list {
+  list-style: none; padding: 0; margin: 6px 0 0;
+  border: 1px solid var(--border); border-radius: 4px;
+  max-height: 220px; overflow-y: auto;
+}
+.waypoint-row {
+  display: grid;
+  grid-template-columns: 40px 1fr auto;
+  gap: 8px; align-items: center;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono); font-size: 12px;
+}
+.waypoint-row:last-child { border-bottom: none; }
+.waypoint-idx { color: var(--accent); font-weight: 600; }
+.waypoint-joints { color: var(--fg-muted); }
+.waypoint-actions button { padding: 2px 8px; font-size: 11px; }
+.waypoints-empty {
+  padding: 12px;
+  color: var(--fg-muted);
+  font-style: italic; text-align: center;
+}
+
+/* ---- T4: Auto-capture sequence controls (below waypoints, above capture) */
+.sequence-controls { margin-top: 16px; }
+.sequence-log {
+  list-style: none; padding: 6px 10px; margin: 6px 0 0;
+  background: var(--bg);
+  border: 1px solid var(--border); border-radius: 3px;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--fg-muted);
+  max-height: 180px; overflow-y: auto;
+}
+.sequence-log li { padding: 2px 0; border-bottom: 1px solid var(--border); }
+.sequence-log li:last-child { border-bottom: none; }
+
+/* Calibration settings panel (Info tab): calib_frame + depth knobs + emitter. */
+.settings-panel { font-family: var(--mono); font-size: 12px; }
+.settings-section { margin: 10px 0; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.settings-section:last-child { border-bottom: none; }
+.settings-section > label { display: block; margin: 5px 0; color: var(--fg-muted); cursor: pointer; }
+.settings-label { color: var(--fg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.settings-hint { color: var(--fg-muted); font-size: 10px; opacity: 0.8; margin-top: 4px; }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+.settings-grid label { display: flex; justify-content: space-between; align-items: center; gap: 6px; color: var(--fg-muted); }
+.settings-grid input[type="number"] { width: 78px; }
+.settings-panel input[type="number"] { font-family: var(--mono); background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px; }
+.settings-panel input[type="radio"], .settings-panel input[type="checkbox"] { accent-color: var(--accent); margin-right: 4px; }

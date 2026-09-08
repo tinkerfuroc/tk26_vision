@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,7 +20,9 @@ from .core.tracking_pipeline import (
 )
 from .core.tracking_types import TargetAppearance, TrackerState, TrackingResult
 from .core.registry import PersonRegistry
+from .core.operator_init import select_operator_detection
 from .reid.appearance_manager import update_appearance
+from .reid.embedding_cache import FrameEmbeddingCache
 from .reid.reid import AppearanceExtractor, ReIDMatcher
 from .reid.reid_search import find_best_match_reid
 
@@ -43,6 +46,15 @@ class YOLOTracker:
         target_track_id: ID of the object being tracked
     """
     
+    # Upper bound on per-track-id state dicts (candidate_consistency,
+    # relative_positions). ByteTrack ids grow monotonically for the life of the
+    # process, so these dicts would otherwise accumulate one entry per id
+    # forever. _prune_track_state lazily evicts GONE ids once a dict exceeds this
+    # cap; current ids are never evicted, so scenes with <= this many distinct
+    # ids behave identically to before. Generous on purpose — real scenes have
+    # far fewer simultaneous people; this only triggers on long-run id buildup.
+    MAX_TRACK_STATE_IDS = 256
+
     # Default YOLO model for segmentation
     DEFAULT_MODEL = "yolo11s-seg.pt"
     
@@ -69,7 +81,16 @@ class YOLOTracker:
         warmup: bool = True,
         enable_reid: bool = True,
         inference_size: Optional[int] = None,
-        reid_verification_interval: int = 5
+        reid_verification_interval: int = 5,
+        reid_backbone: str = "osnet_ain_x1_0",
+        reid_weights_path: str = "",
+        reid_fp16: bool = True,
+        reid_gallery_enabled: bool = True,
+        reid_gallery_size: int = 6,
+        reid_gallery_novelty_max: float = 0.85,
+        reid_gallery_score_mode: str = "max",
+        keep_gallery_thumbs: bool = False,
+        yolo_track_conf: float = 0.15,
     ):
         """
         Initialize the YOLO tracker.
@@ -83,10 +104,42 @@ class YOLOTracker:
             enable_reid: Whether to enable re-identification features
             inference_size: Optional inference size (imgsz). Lower for speed, higher for accuracy.
             reid_verification_interval: Run a full-frame ReID sanity check every N frames while tracking
+            reid_backbone: OSNet variant for the deep ReID term ('osnet_ain_x1_0' default)
+            reid_weights_path: optional ReID-trained checkpoint overriding the imagenet init
+            reid_fp16: run the ReID deep forward in half precision (CUDA only;
+                no-op on CPU). Default True for throughput in multi-person scenes.
+            reid_gallery_enabled: enable the multi-view reacquisition gallery on
+                the target appearance (kill-switch; False restores legacy behavior)
+            reid_gallery_size: K diverse views kept in the gallery
+            reid_gallery_novelty_max: admit a view only if its cosine to existing
+                views is below this threshold
+            reid_gallery_score_mode: gallery scoring mode ('max' | 'top2_mean')
+            keep_gallery_thumbs: stash a person-segmented BGRA view crop (mask
+                alpha, transparent background) alongside each admitted gallery
+                feature for the track_web dashboard (off by default; pure
+                visualization, never feeds scoring)
+            yolo_track_conf: LOW detection conf fed to model.track so ByteTrack's
+                two-stage (high/low) association recovery actually runs — kept
+                separate from confidence_threshold, which still gates detect()
+                calls and downstream consumers
         """
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.inference_size = inference_size
+        self.reid_backbone = reid_backbone
+        self.reid_weights_path = reid_weights_path
+        self.reid_fp16 = reid_fp16
+        self.reid_gallery_enabled = reid_gallery_enabled
+        self.reid_gallery_size = reid_gallery_size
+        self.reid_gallery_novelty_max = reid_gallery_novelty_max
+        self.reid_gallery_score_mode = reid_gallery_score_mode
+        self.keep_gallery_thumbs = keep_gallery_thumbs
+        # Issue 3: gallery-admission gate on BOTH bbox w/h ratio AND mask-fill
+        # (upright + clean). The node overrides these from ROS params; these are
+        # the instance defaults.
+        self.gallery_min_mask_fill = 0.35
+        self.gallery_max_aspect_ratio = 0.5
+        self.yolo_track_conf = yolo_track_conf
         self.state = TrackerState.UNINITIALIZED
         self.target_track_id: Optional[int] = None
         self.original_track_id: Optional[int] = None
@@ -104,13 +157,23 @@ class YOLOTracker:
 
         self.device = self._get_device(device)
         logger.info(f"Using device: {self.device}")
-        
+
+        # Resolve the project ByteTrack config (installed share/ path) so the
+        # high/low association thresholds + buffer are ours, not stock.
+        self.tracker_cfg = self._resolve_tracker_cfg()
+        logger.info(f"Using tracker config: {self.tracker_cfg}")
+
         # Load YOLO model
         self.model = self._load_model(model_path)
         
         # Initialize appearance extractor for re-identification
         if self.enable_reid:
-            self.appearance_extractor = AppearanceExtractor(self.device)
+            self.appearance_extractor = AppearanceExtractor(
+                self.device,
+                reid_backbone=self.reid_backbone,
+                reid_weights_path=self.reid_weights_path,
+                reid_fp16=self.reid_fp16,
+            )
             logger.info("Re-identification enabled")
         else:
             self.appearance_extractor = None
@@ -119,6 +182,15 @@ class YOLOTracker:
         if warmup:
             self._warmup_model()
 
+    def _configure_gallery(self, appearance) -> None:
+        """Apply this tracker's gallery ROS params to a TargetAppearance."""
+        appearance.configure_gallery(
+            enabled=self.reid_gallery_enabled,
+            size=self.reid_gallery_size,
+            novelty_max=self.reid_gallery_novelty_max,
+            score_mode=self.reid_gallery_score_mode,
+        )
+
     def _init_reid_settings(self, enable_reid: bool, reid_verification_interval: int) -> None:
         """Initialize ReID and tracking thresholds."""
         self.enable_reid = enable_reid
@@ -126,11 +198,21 @@ class YOLOTracker:
         self.reid_threshold = ReIDMatcher.REID_THRESHOLD
         self.frames_lost = 0
         self.max_frames_lost = 600
+        self.frame_rate: float = 30.0
         self.frame_count = 0
         self.reid_extraction_interval = 3
         self.fast_tracking_mode = False
         self.reid_verification_interval = max(0, reid_verification_interval)
         self.feature_refresh_interval = 1.5
+        # Phase 3: per-frame embedding cache so the four ReID embed call sites
+        # within one update() reuse the score-pass feature dict instead of
+        # re-embedding the same crop up to 4x/frame. Keyed by (track_id,
+        # frame_count); a new frame_count drops the previous frame's entries.
+        self.embedding_cache = FrameEmbeddingCache(max_entries=32)
+        # Dashboard telemetry: latest per-candidate ReID similarities
+        # {track_id: similarity}, refreshed by the scoring/periodic-validation
+        # paths and consumed by build_debug_state for the track_web overlay.
+        self.last_debug_scores: dict = {}
 
     def _init_motion_tracking(self) -> None:
         """Initialize spatial continuity and motion tracking state."""
@@ -152,6 +234,13 @@ class YOLOTracker:
         self.candidate_consistency: Dict[int, List[float]] = {}
         self.CONSISTENCY_WINDOW = 5
         self.CONSISTENCY_THRESHOLD = 0.15
+        # Phase 2: operator's last known median depth (m), plumbed from the node
+        # (only the node owns the depth image). None ⇒ depth gate permissive.
+        self.operator_last_depth_m: Optional[float] = None
+        self.crosser_depth_jump_m = 0.6
+        # Per-frame map: track_id -> candidate median depth (m), set by the node
+        # before each tracker.update so the pipeline can gate ReID candidates.
+        self.candidate_depths_m: Dict[int, float] = {}
 
     def _init_occlusion_state(self) -> None:
         """Set up occlusion tracking defaults."""
@@ -172,7 +261,56 @@ class YOLOTracker:
         self.pending_reid_match: Optional[Tuple[int, float]] = None
         self.reid_fit_streak = 0
         self.reid_fit_id: Optional[int] = None
-    
+        # Phase 3 (Issue 3): pursue look-alikes during passive reacquisition
+        # without lowering any commit bar.
+        #  - single_person_pursue_floor: lone-candidate similarity floor to PURSUE
+        #    (keep in play) in reid_search._single_candidate_guard. Below it the
+        #    candidate is discarded. Default = reid_threshold (0.55).
+        #  - single_person_commit_bar: lone-candidate similarity bar to COMMIT a
+        #    re-lock (held HIGH; the old hard-coded _single_candidate_guard 0.72).
+        #    A lone frame is a confirm hit only at sim >= this bar.
+        #  - provisional_commit_window: N-of-M window (M). _confirm_reid_candidate
+        #    commits once reid_confirmation_frames (N) confirm hits occur within
+        #    the last M frames; reid_confirm_window holds the per-frame verdicts.
+        # The node overrides all three from ROS params.
+        self.single_person_pursue_floor = 0.55
+        self.single_person_commit_bar = 0.72
+        self.provisional_commit_window = 18
+        self.reid_confirm_window: list = []
+        # Issue 1: relaxed lone-candidate recovery while latched in NEEDS_HELP.
+        # in_needs_help mirrors the node's _help_latched (set per iteration before
+        # update). When True AND exactly one person is visible,
+        # _confirm_reid_candidate relaxes the lone commit bar to
+        # single_person_commit_bar_help (0.62) and requires needs_help_confirm_frames
+        # (N) confirm hits within the last needs_help_commit_window (M) frames.
+        # The node overrides the three knobs from ROS params.
+        self.in_needs_help = False
+        self.single_person_commit_bar_help = 0.62
+        self.needs_help_confirm_frames = 12
+        self.needs_help_commit_window = 16
+        # Issue 2: reseed confirmation gate. After a reseed (manual or waving),
+        # the seeded id must be present + ReID-confirmed for
+        # reseed_confirmation_frames consecutive frames before the lock commits.
+        # While probation is active (reseed_probation_id is not None) the
+        # per-frame probation step in tracking_pipeline owns target_lost. The
+        # node param overrides reseed_confirmation_frames.
+        self.reseed_probation_id: Optional[int] = None
+        self.reseed_probation_count = 0
+        self.reseed_confirmation_frames = 5
+        # Phase 2: asymmetric-hysteresis recovery policy params (defaults;
+        # the node overrides from ROS params). Pure FSM lives in core/.
+        self.max_recovery_frames = 45
+        self.provisional_high_bar = 0.72
+        self.provisional_distinct_margin = 0.10
+        self.lock_state_machine = None  # set by node after construction
+        self.last_lock_decision = None  # latest FSM verdict for the node to read
+        self.last_reid_margin = 0.0  # best-vs-second margin from reid_search
+        # True when the recovery path (reidentify_target) authoritatively
+        # stepped the FSM this frame. The node defers to last_lock_decision
+        # then instead of re-stepping present=True (which would defeat the
+        # asymmetric hysteresis on a partial-confirm recovery frame).
+        self.last_frame_recovery = False
+
     def _get_device(self, device: Optional[str]) -> str:
         """
         Determine the best available device.
@@ -207,6 +345,15 @@ class YOLOTracker:
             from ultralytics import YOLO
             
             logger.info(f"Loading YOLO model: {model_path}")
+            if str(model_path).endswith(".engine"):
+                # Optional best-effort TensorRT top-end (Phase 3 Task 4).
+                # Ultralytics loads .engine transparently; the engine is
+                # resolution/batch-locked, so the runtime imgsz MUST match the
+                # export imgsz or detections will be silently wrong.
+                logger.warning(
+                    "Loading a TensorRT engine — runtime imgsz MUST match the "
+                    "export imgsz (resolution/batch-locked)."
+                )
             model = YOLO(model_path)
             model.to(self.device)
             
@@ -225,25 +372,40 @@ class YOLOTracker:
     def _warmup_model(self, warmup_iterations: int = 3):
         """
         Warm up the model by running inference on dummy data.
-        
+
+        Warms the REAL hot path: ``model.track()`` at the configured
+        ``inference_size`` on a camera-sized frame, not just ``predict`` on a
+        640x640 dummy. The first live ``track()`` call otherwise pays cuDNN
+        autotune + ByteTrack init (~700 ms) — a freeze that lands right after
+        lock, drops the track, and triggers an immediate, unrecoverable loss.
+        Moving that cost here (a zeros frame yields no detections, so ByteTrack
+        state stays clean) keeps the first tracked frame fast. Also warms the
+        batched ReID scoring path used during reacquisition.
+
         Args:
             warmup_iterations: Number of warmup iterations
         """
         logger.info("Warming up model...")
-        
-        # Create dummy input
-        dummy_input = np.zeros((640, 640, 3), dtype=np.uint8)
-        
-        for i in range(warmup_iterations):
-            _ = self.model(dummy_input, verbose=False)
-            
-        # Warmup appearance extractor if enabled
+
+        # Camera-sized dummy so cuDNN autotunes the real letterbox/imgsz shapes.
+        dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        for _ in range(warmup_iterations):
+            _ = self.detect(dummy)               # predict path (init/detect)
+            _ = self.track(dummy, persist=True)  # track path (tracking loop)
+
+        # Warmup appearance extractor if enabled (single + batched ReID forward).
         if self.enable_reid and self.appearance_extractor is not None:
-            dummy_crop = np.zeros((100, 100, 3), dtype=np.uint8)
             _ = self.appearance_extractor.extract_features(
-                dummy_input, (0, 0, 100, 100), None
+                dummy, (0, 0, 100, 100), None
             )
-            
+            batch = getattr(self.appearance_extractor, "extract_features_batch", None)
+            if batch is not None:
+                try:
+                    _ = batch(dummy, [(0, 0, 100, 100)], [None], [0])
+                except Exception:
+                    pass
+
         logger.info("Model warmup complete")
     
     def detect(
@@ -276,7 +438,17 @@ class YOLOTracker:
         )
         
         return self._parse_results(results[0])
-    
+
+    def _resolve_tracker_cfg(self) -> str:
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            cfg = os.path.join(get_package_share_directory("vision_track"), "config", "bytetrack.yaml")
+            if os.path.exists(cfg):
+                return cfg
+        except Exception:
+            pass
+        return "bytetrack.yaml"
+
     def track(
         self,
         frame: np.ndarray,
@@ -295,11 +467,12 @@ class YOLOTracker:
             List of TrackingResult objects with track IDs
         """
         track_kwargs = dict(
-            conf=self.confidence_threshold,
+            conf=self.yolo_track_conf,
             iou=self.iou_threshold,
             classes=classes,
             persist=persist,
-            tracker="bytetrack.yaml",
+            tracker=self.tracker_cfg,
+            half=True,
             verbose=False,
         )
         if self.inference_size is not None:
@@ -336,8 +509,12 @@ class YOLOTracker:
         Returns:
             True if initialization successful, False otherwise
         """
-        # Reset tracker state
-        self.model.predictor = None  # Reset predictor to clear tracking state
+        # Reset tracker state. Clear ByteTrack history WITHOUT nulling the
+        # predictor: dropping model.predictor discards the cuDNN-autotuned graphs
+        # built during warmup, forcing a ~2s re-autotune on the next track() —
+        # a freeze right at lock that drops the just-acquired target into an
+        # immediate false loss (see _reset_bytetrack_state).
+        self._reset_bytetrack_state()
         self.target_track_id = None
         self.original_track_id = None  # Reset original ID
         self.target_class_id = None
@@ -348,7 +525,8 @@ class YOLOTracker:
         self.last_reid_switch_time = 0.0
         self.consecutive_reid_frames = 0
         self.pending_reid_match = None
-        
+        self.reid_confirm_window = []  # Phase 3: clear N-of-M commit window
+
         # Perform initial detection/tracking
         results = self.track(frame, persist=True)
         
@@ -381,16 +559,29 @@ class YOLOTracker:
             if best_match is not None:
                 selected_result = best_match
         
-        # If target_class is provided, find first object of that class
+        # If target_class is provided, pick the best operator candidate
+        # (nearest + most central, conf tie-break) instead of results[0].
         elif target_class is not None:
-            for result in results:
-                if result.class_name.lower() == target_class.lower():
-                    selected_result = result
-                    break
-        
-        # If no specific target, track the first detected object
+            img_h, img_w = frame.shape[:2]
+            selected_result = select_operator_detection(
+                results,
+                image_wh=(img_w, img_h),
+                # No depth image at init time in this path; centeredness +
+                # confidence drive the choice. The node's depth-aware init is a
+                # Phase 2 concern — here depth is unavailable.
+                depth_lookup=lambda _bbox: None,
+                target_class=target_class,
+            )
+
+        # If no specific target, track the best central candidate of any class.
         else:
-            selected_result = results[0]
+            img_h, img_w = frame.shape[:2]
+            selected_result = select_operator_detection(
+                results,
+                image_wh=(img_w, img_h),
+                depth_lookup=lambda _bbox: None,
+                target_class=results[0].class_name,
+            ) or results[0]
         
         if selected_result is not None:
             self.target_track_id = selected_result.track_id
@@ -411,7 +602,75 @@ class YOLOTracker:
         
         self.state = TrackerState.LOST
         return False
-    
+
+    def _apply_reseed(self, selected_result, fresh_reid_feature) -> int:
+        """Accept an externally-confirmed detection and enter reseed probation.
+
+        Unlike initialize_tracking (which resets appearance), this keeps the
+        multi-view gallery + person registry (same operator, self-identified),
+        appends the fresh confirmed view, and re-locks the ids — but it does NOT
+        instant-lock. Issue 2: a single IoU-selected frame has no appearance
+        check, so the reseed now starts a short *probation* instead of jumping
+        to TRACKING. The seeded id must be present + ReID-confirmed for
+        reseed_confirmation_frames consecutive frames (per-frame gate in
+        tracking_pipeline._step_reseed_probation) before the lock commits and
+        target_lost flips False. Returns the seeded track id (meaning "accepted,
+        confirming", not "locked"), or -1 if selected_result is None.
+        """
+        if selected_result is None:
+            return -1
+        self.target_track_id = selected_result.track_id
+        self.original_track_id = selected_result.track_id
+        self.target_class_id = selected_result.class_id
+        self.target_class_name = selected_result.class_name
+        self.frames_lost = 0
+        # Issue 2: enter probation (REIDENTIFYING), NOT an instant TRACKING lock.
+        self.state = TrackerState.REIDENTIFYING
+        # Re-lock onto a confirmed view: clear stale occlusion bookkeeping so a
+        # mid-occlusion reseed doesn't carry a pre-occlusion appearance snapshot.
+        self.is_occluded = False
+        self.pre_occlusion_appearance = None
+        if self.target_appearance is not None and fresh_reid_feature is not None:
+            self.target_appearance.gallery.maybe_add(fresh_reid_feature)
+        # Arm the reseed probation: confirm over N frames before committing.
+        self.reseed_probation_id = self.target_track_id
+        self.reseed_probation_count = 0
+        # Re-arm the FSM probationally (reidentifying, NOT tracking) so the node
+        # does not report a lock until the probation confirms; this also lifts
+        # the FSM out of a terminal 'lost' so it can be stepped again.
+        if self.lock_state_machine is not None and self.original_track_id is not None:
+            self.lock_state_machine.start_probation(self.original_track_id)
+        return self.target_track_id
+
+    def reseed_target(self, frame, bbox, target_class: str = "person") -> int:
+        """Detect on `frame`, match `bbox`, and re-lock preserving the gallery.
+
+        Returns the locked track id, or -1 if no detection matches the bbox.
+        """
+        results = self.track(frame, persist=True)
+        if not results:
+            return -1
+        candidates = [r for r in results
+                      if target_class is None or r.class_name.lower() == target_class.lower()]
+        if not candidates:
+            candidates = results
+        best = self._find_best_match_iou(candidates, bbox)
+        if best is None:
+            return -1
+        fresh = None
+        if self.appearance_extractor is not None:
+            feats = self.appearance_extractor.extract_features_batch(
+                frame, [best.bbox], [best.mask], [best.class_id])
+            if feats and feats[0] and "reid" in feats[0]:
+                fresh = feats[0]["reid"]
+        # Gallery-additive only: append the fresh view to the multi-view deep
+        # gallery (via _apply_reseed) but deliberately do NOT overwrite the
+        # color/identity anchors. The reseed match is geometric (IoU) only, so
+        # promoting the crop to the anchor would let a wrong-overlap box poison
+        # identity -- precision is sacred. The deep gallery's max-over-views
+        # still helps recognise the new appearance under drift.
+        return self._apply_reseed(best, fresh)
+
     def _update_appearance(
         self,
         frame: np.ndarray,
@@ -620,8 +879,34 @@ class YOLOTracker:
         # Convert variance to score (lower variance = higher score)
         # variance of 0.01 = score ~0.9, variance of 0.04 = score ~0.6
         score = max(0.0, 1.0 - variance / self.CONSISTENCY_THRESHOLD)
-        
+
         return score
+
+    def _prune_track_state(self, current_ids) -> None:
+        """Bound the per-track-id state dicts by evicting gone ids.
+
+        ByteTrack assigns a fresh, monotonically increasing id every time a
+        person enters/leaves, so ``candidate_consistency`` and
+        ``relative_positions`` would otherwise grow one entry per id for the life
+        of the process — a slow host-RAM leak over long runs.
+
+        This eviction is lazy and behavior-preserving:
+
+        - It only acts on a dict once it exceeds ``MAX_TRACK_STATE_IDS``, so any
+          scene with <= cap distinct ids is left EXACTLY as before (no eviction).
+        - It only removes ids NOT in ``current_ids`` (i.e. people no longer
+          visible this frame), so a currently-relevant id — even one flickering
+          through occlusion — is never dropped, and scoring for visible ids is
+          unchanged.
+
+        Args:
+            current_ids: the set of person track_ids visible THIS frame.
+        """
+        current = set(current_ids)
+        for state in (self.candidate_consistency, self.relative_positions):
+            if len(state) > self.MAX_TRACK_STATE_IDS:
+                for track_id in [k for k in state if k not in current]:
+                    del state[track_id]
 
     def _periodic_reid_validation(
         self,
@@ -662,31 +947,29 @@ class YOLOTracker:
         
         return (pred_x, pred_y)
     
-    def _update_target_velocity(self, current_center: Tuple[float, float]):
-        """
-        Update target velocity estimate with smoothing.
-        
+    def _update_target_velocity(self, current_center: Tuple[float, float], dt: Optional[float] = None):
+        """Update target velocity estimate with smoothing.
+
         Args:
-            current_center: Current target center (cx, cy)
+            current_center: Current target center (cx, cy).
+            dt: Scene-time delta (s) between this and the previous center,
+                derived from frame stamps. When None, falls back to wall-clock
+                (legacy behavior) so non-stamped callers keep working.
         """
-        current_time = time.time()
-        
-        if self.last_known_center is not None and self.last_position_time > 0:
-            dt = current_time - self.last_position_time
-            if dt > 0.001:  # Avoid division by zero
-                # Raw velocity
-                vx = (current_center[0] - self.last_known_center[0]) / dt
-                vy = (current_center[1] - self.last_known_center[1]) / dt
-                
-                # Smooth with exponential moving average
-                alpha = 0.3
-                old_vx, old_vy = self.target_velocity
-                self.target_velocity = (
-                    alpha * vx + (1 - alpha) * old_vx,
-                    alpha * vy + (1 - alpha) * old_vy
-                )
-        
-        self.last_position_time = current_time
+        if dt is None:
+            current_time = time.time()
+            dt = (current_time - self.last_position_time) if self.last_position_time > 0 else 0.0
+            self.last_position_time = current_time
+
+        if self.last_known_center is not None and dt > 0.001:
+            vx = (current_center[0] - self.last_known_center[0]) / dt
+            vy = (current_center[1] - self.last_known_center[1]) / dt
+            alpha = 0.3
+            old_vx, old_vy = self.target_velocity
+            self.target_velocity = (
+                alpha * vx + (1 - alpha) * old_vx,
+                alpha * vy + (1 - alpha) * old_vy,
+            )
     
     def _register_other_persons(self, frame: np.ndarray, results: List[TrackingResult]):
         """Register other persons via the shared pipeline helper."""
@@ -804,9 +1087,28 @@ class YOLOTracker:
         """
         return self.tracked_results
     
+    def _reset_bytetrack_state(self):
+        """Clear ByteTrack track history while keeping the autotuned predictor.
+
+        Nulling ``self.model.predictor`` (the old approach) also discards the
+        cuDNN graphs warmed in ``_warmup_model``, so the next ``track()`` pays a
+        full ~2s re-autotune — a freeze that lands right after lock and drops the
+        target. Resetting the tracker objects in place clears the id/track state
+        without that cost. Falls back to a no-op if the ultralytics tracker has
+        no ``reset`` (continued ids are harmless — the pipeline maps every match
+        back to ``original_track_id``).
+        """
+        pred = getattr(self.model, 'predictor', None)
+        trackers = getattr(pred, 'trackers', None) if pred is not None else None
+        for trk in (trackers or []):
+            try:
+                trk.reset()
+            except Exception:  # noqa: BLE001 — best-effort; keep the predictor
+                pass
+
     def reset(self):
         """Reset the tracker state."""
-        self.model.predictor = None
+        self._reset_bytetrack_state()
         self.target_track_id = None
         self.original_track_id = None
         self.target_class_id = None
@@ -821,6 +1123,18 @@ class YOLOTracker:
         self.pending_reid_match = None
         self.reid_fit_streak = 0
         self.reid_fit_id = None
+        self.reid_confirm_window = []  # Phase 3: clear N-of-M commit window
+        # Issue 2: clear any in-flight reseed probation.
+        self.reseed_probation_id = None
+        self.reseed_probation_count = 0
+        # dead: original_track_id already None here (cleared above), so this
+        # start() never fires on reset(). The FSM is (re)started on the next
+        # initialize_tracking() commit instead; kept for symmetry/intent.
+        if self.lock_state_machine is not None and self.original_track_id is not None:
+            self.lock_state_machine.start(self.original_track_id)
+        self.last_lock_decision = None
+        self.last_reid_margin = 0.0
+        self.last_frame_recovery = False
         # Clear the person registry
         self.person_registry.clear()
         # Reset camera motion detection
@@ -838,9 +1152,16 @@ class YOLOTracker:
         self.relative_positions.clear()
         # Reset candidate consistency tracking
         self.candidate_consistency.clear()
+        # Phase 2: clear depth-gate state (operator depth + per-candidate depths)
+        self.operator_last_depth_m = None
+        self.candidate_depths_m = {}
         # Reset frame counter
         self.frame_count = 0
         self.fast_tracking_mode = False
+        # Phase 3: drop any stale per-frame embeddings.
+        self.embedding_cache.clear()
+        # Dashboard telemetry: clear stale per-candidate similarities.
+        self.last_debug_scores = {}
         logger.info("Tracker reset")
     
     def get_class_names(self) -> Dict[int, str]:

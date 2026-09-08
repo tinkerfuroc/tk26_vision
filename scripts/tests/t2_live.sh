@@ -145,9 +145,9 @@ stop_all_nodes
 section "T2.7/T2.8 — feature_recognition (live OpenRouter)"
 if have_api_key; then
     start_node feature_recognition kimi_api feature_recognition
-    if wait_for_service /feature_extraction_service 20; then
-        out="$LOG_DIR/T2.7.svcout"
-        svc_call "$out" 60 /feature_extraction_service tinker_vision_msgs_26/srv/FeatureExtraction \
+    if wait_for_action /feature_extraction_service 20; then
+        out="$LOG_DIR/T2.7.actout"
+        act_call "$out" 60 /feature_extraction_service tinker_vision_msgs_26/action/FeatureExtraction \
             "{camera: 'orbbec'}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.7" "traceback"
@@ -156,8 +156,8 @@ if have_api_key; then
         else
             fail "T2.7" "head: $(head -c 500 "$out")"
         fi
-        out="$LOG_DIR/T2.8.svcout"
-        svc_call "$out" 60 /seat_recommend_service tinker_vision_msgs_26/srv/SeatRecommendation \
+        out="$LOG_DIR/T2.8.actout"
+        act_call "$out" 60 /seat_recommend_service tinker_vision_msgs_26/action/SeatRecommendation \
             "{camera: 'orbbec', names: ['alice'], features: ['adult wearing glasses']}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.8" "traceback"
@@ -167,7 +167,7 @@ if have_api_key; then
             fail "T2.8" "head: $(head -c 500 "$out")"
         fi
     else
-        fail "T2.7/T2.8" "feature_extraction_service never appeared"
+        fail "T2.7/T2.8" "feature_extraction_service action never appeared"
     fi
     stop_all_nodes
 else
@@ -179,9 +179,9 @@ if have_api_key; then
     start_node yolo_default_for_match object_detection_new yolo_seg_default_node
     wait_for_service /object_detection 30 || true
     start_node feature_matching kimi_api feature_matching
-    if wait_for_service /feature_matching_service 20; then
-        out="$LOG_DIR/T2.9.svcout"
-        svc_call "$out" 60 /feature_matching_service tinker_vision_msgs_26/srv/FeatureMatching \
+    if wait_for_action /feature_matching_service 20; then
+        out="$LOG_DIR/T2.9.actout"
+        act_call "$out" 60 /feature_matching_service tinker_vision_msgs_26/action/FeatureMatching \
             "{camera: 'orbbec', features: ['red bottle'], max_distance: 2.0, target_frame: 'base_link'}"
         if grep -qE 'Traceback' "$out"; then
             fail "T2.9" "traceback"
@@ -192,7 +192,7 @@ if have_api_key; then
             fail "T2.9" "head: $(head -c 500 "$out")"
         fi
     else
-        fail "T2.9" "feature_matching_service never appeared"
+        fail "T2.9" "feature_matching_service action never appeared"
     fi
     stop_all_nodes
 else
@@ -290,7 +290,7 @@ if wait_for_service /object_detection_generalist 30; then
     # VLM+SAM branch — only run if we have a real key (Gemini call costs)
     if have_api_key; then
         out="$LOG_DIR/T2.14_vlm.svcout"
-        # 90 s timeout: Gemini 2.5 Pro is 9-14 s/call plus FastSAM + sync warmup
+        # 90 s timeout: Gemini 2.5 Pro is 9-14 s/call plus SAM + sync warmup
         svc_call "$out" 90 /object_detection_generalist tinker_vision_msgs_26/srv/ObjectDetectionGeneralist \
             "{camera: 'realsense', prompt: 'spatula', use_vlm_sam_fallback: true}"
         if grep -qE 'Traceback' "$out"; then
@@ -321,6 +321,43 @@ else
 fi
 # Live positive-case check still needs operator (person in Orbbec frame) — left to T4.
 stop_all_nodes
+
+section "T2.16 — /object_match_all empty-scene invariant"
+# This is a "shape" check: with DASHSCOPE_API_KEY=fake, every match_batch
+# will fail (auth), so the pipeline returns no candidates. The server's
+# empty-scene invariant is status=1 + detection_source='vlm_match_all', and
+# that's what we assert. Same response shape whether the scene is genuinely
+# empty or the VLM auth fails per batch.
+#
+# Soft camera check: the top-level precheck already gates this in the
+# default flow, but be tolerant of --no-precheck so the case skips cleanly
+# instead of hanging on a 'No camera data' wait.
+need_orbbec=1
+if [ "$NO_PRECHECK" -eq 1 ]; then
+    wait_for_topic_hz /camera/color/image_raw "$MIN_HZ" 5 || need_orbbec=0
+fi
+if [ "$need_orbbec" -eq 1 ]; then
+    DASHSCOPE_API_KEY=fake start_node object_match_all_t2.16 \
+        tk_vision_specialized object_match_all_server
+    if wait_for_service /object_match_all 30; then
+        sleep 5  # warmup: let snapshot buffer pair color + depth/PC
+        out="$LOG_DIR/T2.16.svcout"
+        svc_call "$out" 30 /object_match_all tinker_vision_msgs_26/srv/ObjectMatchAll \
+            "{camera: 'orbbec', category_filter: [], target_frame: '', sort_closest: false, sort_highest: false, return_rgb_image: false, return_depth_image: false, return_segments: false}"
+        if grep -qE 'Traceback' "$out"; then
+            fail "T2.16" "traceback in response"
+        elif grep -qE 'status=1' "$out" && grep -qE "detection_source='vlm_match_all'" "$out"; then
+            pass "T2.16 empty-scene invariant status=1 detection_source=vlm_match_all"
+        else
+            fail "T2.16" "head: $(head -c 500 "$out")"
+        fi
+    else
+        fail "T2.16" "/object_match_all never appeared (log tail: $(tail -5 "$LAST_LOG" | tr '\n' '|'))"
+    fi
+    stop_all_nodes
+else
+    skip "T2.16" "cameras not running (--no-precheck path)"
+fi
 
 section "T2.13 — person_track action"
 start_node person_track vision_track person_track_server --ros-args -p enable_reid:=false

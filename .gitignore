@@ -4,11 +4,36 @@ log/
 .vscode/
 **/*.pt
 
-scripts/tests/logs/
+vision_log/
+.ros/
+log/
 
+debug_renders/**
 
-thirdparty/
+.venv**/
+!.venv*.uv-project/
+
+src/items/
+
+scripts/tests/logs/*
+!scripts/tests/logs/waving_bench_session_*.md
+
+# Scratch outputs from calibration CLI / tests.
+calib_log/
+calib_out/
+*.draft.yaml
+
+# Auto-generated calib config backups + prune artifacts (calib_web rotates
+# calibration.yaml on every overwrite into .yaml.old-<timestamp>; the prune
+# tool drops .pruned.<phase>.<ts>.yaml + prune_report.<phase>.<ts>.json).
+src/pan_tilt/config/calibration.yaml.old-*
+src/pan_tilt/config/calibration.pruned.*.yaml
+src/pan_tilt/config/prune_report.*.json
+calibration_data/
+
+thirdparty/*
 !thirdparty/README.md
+!thirdparty/foundation_stereo/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -218,3 +243,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.superpowers/

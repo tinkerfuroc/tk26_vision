@@ -11,185 +11,130 @@ logger = logging.getLogger(__name__)
 
 class PersonReIDModel:
     """
-    Enhanced Person Re-Identification model.
-    
-    Uses multiple complementary feature types for robust person matching:
-    1. Deep CNN features with part-based pooling (global + horizontal parts)
-    2. Channel attention for emphasizing discriminative features
-    3. Multiple spatial scales for better robustness
-    
-    Key insight: Generic ImageNet features are NOT discriminative enough for person ReID.
-    This model applies transformations to make features more person-specific.
+    Person Re-Identification model wrapping a pluggable deep backbone.
+
+    The deep term is a genuinely pretrained OSNet (via torchreid), exposed behind
+    a stable ``extract_features(crop) -> L2-normalized np.ndarray`` interface so
+    reid_search / appearance_manager are untouched.
+
+    This replaces the legacy random-head path (a ResNet50 with untrained
+    channel_attention / bottleneck / part_bottlenecks modules — a random
+    projection of ImageNet features with no ReID checkpoint), which was the #1
+    root cause of wrong identity locks.
+
+    Weight strategy: the default backbone (osnet_ain_x1_0) is imagenet-init;
+    loading a Market/MSMT-trained checkpoint via ``reid_weights_path`` is the
+    recommended upgrade for maximal lookalike discrimination (config-only).
     """
-    
-    def __init__(self, device: str = "cpu"):
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        backbone_name: str = "osnet_ain_x1_0",
+        reid_weights_path: str = "",
+        fp16: bool = False,
+    ):
         """
         Initialize the Person ReID model.
-        
+
         Args:
-            device: Device for computation
+            device: Device for computation.
+            backbone_name: OSNet variant ('osnet_ain_x1_0' default,
+                'osnet_x0_25' alt).
+            reid_weights_path: optional ReID-trained checkpoint overriding the
+                imagenet init; empty ⇒ keep imagenet.
+            fp16: run the deep forward in half precision (CUDA only). On CPU it
+                is a silent no-op (torch half on CPU is unsupported/slow), so the
+                effective flag is gated on ``device == "cuda"``. Output stays
+                float32 + L2-normalized regardless.
         """
         self.device = device
-        self.feature_dim = 512  # Output feature dimension
-        self.model = None
-        self.use_deep_features = False
-        
-        self._load_reid_model()
-    
-    def _load_reid_model(self):
-        """Load an enhanced ReID model with attention mechanisms."""
-        try:
-            from torchvision.models import resnet50, ResNet50_Weights
-            
-            # Use ResNet50 for better feature extraction (deeper = more discriminative)
-            base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-            
-            # Feature backbone (remove avgpool and fc) - outputs 2048 channels
-            self.backbone = torch.nn.Sequential(
-                *list(base_model.children())[:-2],
-            )
-            
-            # Channel attention module - helps focus on discriminative channels
-            self.channel_attention = torch.nn.Sequential(
-                torch.nn.AdaptiveAvgPool2d(1),
-                torch.nn.Flatten(),
-                torch.nn.Linear(2048, 512),
-                torch.nn.ReLU(inplace=True),
-                torch.nn.Linear(512, 2048),
-                torch.nn.Sigmoid()
-            )
-            
-            # Bottleneck to reduce to 512 dimensions (standard ReID size)
-            self.bottleneck = torch.nn.Sequential(
-                torch.nn.Linear(2048, 512),
-                torch.nn.BatchNorm1d(512),
-                torch.nn.ReLU(inplace=True)
-            )
-            
-            # Part-based bottlenecks (for 4 horizontal parts)
-            self.part_bottlenecks = torch.nn.ModuleList([
-                torch.nn.Sequential(
-                    torch.nn.Linear(2048, 128),
-                    torch.nn.BatchNorm1d(128),
-                    torch.nn.ReLU(inplace=True)
-                ) for _ in range(4)
-            ])
-            
-            # Global average pooling
-            self.gap = torch.nn.AdaptiveAvgPool2d(1)
-            
-            # Part pooling - 4 horizontal strips (head, upper body, lower body, legs)
-            self.part_pool = torch.nn.AdaptiveAvgPool2d((4, 1))
-            
-            # Move to device
-            self.backbone.to(self.device)
-            self.channel_attention.to(self.device)
-            self.bottleneck.to(self.device)
-            self.part_bottlenecks.to(self.device)
-            self.gap.to(self.device)
-            self.part_pool.to(self.device)
-            
-            # Set to eval mode
-            self.backbone.eval()
-            self.channel_attention.eval()
-            self.bottleneck.eval()
-            self.part_bottlenecks.eval()
-            
-            self.use_deep_features = True
-            self.feature_dim = 512 + 128 * 4  # global (512) + 4 parts (128 each)
-            logger.info("Loaded ResNet50-based Person ReID model with attention")
-            
-        except Exception as e:
-            logger.warning(f"Could not load enhanced ReID model: {e}")
-            self._load_fallback_model()
-    
-    def _load_fallback_model(self):
-        """Fallback to simpler model if enhanced fails."""
-        try:
-            from torchvision.models import resnet18, ResNet18_Weights
-            
-            base_model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-            self.backbone = torch.nn.Sequential(
-                *list(base_model.children())[:-2],
-            )
-            self.gap = torch.nn.AdaptiveAvgPool2d(1)
-            self.backbone.to(self.device)
-            self.gap.to(self.device)
-            self.backbone.eval()
-            
-            self.channel_attention = None
-            self.bottleneck = None
-            self.part_bottlenecks = None
-            self.part_pool = None
-            
-            self.use_deep_features = True
-            self.feature_dim = 512
-            logger.info("Loaded fallback ResNet18 ReID model")
-            
-        except Exception as e:
-            logger.warning(f"Could not load fallback model: {e}")
-            self.use_deep_features = False
-    
+        self.backbone_name = backbone_name
+        # CUDA-gated: fp16 only takes effect on cuda; CPU stays float32.
+        self.fp16 = bool(fp16) and str(device) == "cuda"
+        from .reid_backbone import build_reid_backbone
+        self.backbone = build_reid_backbone(
+            backbone_name,
+            device=device,
+            reid_weights_path=reid_weights_path,
+            fp16=self.fp16,
+        )
+        self.feature_dim = self.backbone.feature_dim
+        # True iff a real deep backbone is available. Lets call sites (and the
+        # batch path) cheaply short-circuit to zero vectors when it isn't.
+        self.use_deep_features = self.backbone is not None
+
     def extract_features(self, crop: np.ndarray) -> np.ndarray:
+        """Extract an L2-normalized ReID embedding from a person crop (RGB)."""
+        return self.backbone.extract_features(crop)
+
+    @staticmethod
+    def _stack_crops(crops: list) -> "torch.Tensor":
+        """Resize + ImageNet-normalize K crops into one [K,3,256,128] CPU tensor.
+
+        Numerically identical preprocessing to the OSNet backbone's per-crop
+        ``extract_features`` (resize to (W,H)=(128,256), /255, ImageNet
+        normalize, permute to CHW). Empty list -> a real [0,3,256,128] tensor so
+        downstream stacking/forward is well-defined.
         """
-        Extract discriminative ReID features from a person crop.
-        
-        Args:
-            crop: Person crop (RGB), should be the full person bounding box
-            
-        Returns:
-            L2-normalized feature vector optimized for person matching
+        from .reid_backbone import (
+            _IMAGENET_MEAN,
+            _IMAGENET_STD,
+            _REID_H,
+            _REID_W,
+        )
+        if not crops:
+            return torch.zeros((0, 3, _REID_H, _REID_W), dtype=torch.float32)
+        batch = np.empty((len(crops), _REID_H, _REID_W, 3), dtype=np.float32)
+        for i, crop in enumerate(crops):
+            resized = cv2.resize(crop, (_REID_W, _REID_H))
+            batch[i] = (resized.astype(np.float32) / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
+        tensor = torch.from_numpy(batch).permute(0, 3, 1, 2).contiguous()
+        return tensor
+
+    def extract_features_batch(self, crops: list) -> np.ndarray:
+        """Embed K crops in ONE forward pass. Row i == extract_features(crops[i]).
+
+        Returns [K, feature_dim] float32, each row L2-normalized. Empty -> [0, dim].
+
+        Degenerate crops (None / empty / <2px on a side) are handled exactly as
+        the per-crop path: their row is a zero vector and they do NOT consume a
+        deep forward slot, so the batched output stays row-equivalent to looping
+        ``extract_features``.
         """
         if not self.use_deep_features or self.backbone is None:
-            return np.zeros(self.feature_dim, dtype=np.float32)
-        
-        # Resize to standard ReID size (256x128 is standard for person ReID)
-        # Height > Width because people are taller than wide
-        crop_resized = cv2.resize(crop, (128, 256))
-        
-        # ImageNet normalization
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        crop_normalized = (crop_resized / 255.0 - mean) / std
-        
-        # Convert to tensor [1, 3, 256, 128]
-        tensor = torch.from_numpy(crop_normalized).float()
-        tensor = tensor.permute(2, 0, 1).unsqueeze(0)
-        tensor = tensor.to(self.device)
-        
+            return np.zeros((len(crops), self.feature_dim), dtype=np.float32)
+        if not crops:
+            return np.zeros((0, self.feature_dim), dtype=np.float32)
+
+        out = np.zeros((len(crops), self.feature_dim), dtype=np.float32)
+        valid_idx = []
+        valid_crops = []
+        for i, crop in enumerate(crops):
+            if (
+                crop is None
+                or crop.size == 0
+                or crop.shape[0] < 2
+                or crop.shape[1] < 2
+            ):
+                continue  # leave zero row (mirrors OSNetBackbone.extract_features)
+            valid_idx.append(i)
+            valid_crops.append(crop)
+
+        if not valid_crops:
+            return out
+
+        tensor = self._stack_crops(valid_crops).to(self.device)
+        if self.fp16:
+            tensor = tensor.half()
         with torch.no_grad():
-            # Get feature maps [1, 2048, 8, 4] or [1, 512, 8, 4] for ResNet18
-            features = self.backbone(tensor)
-            
-            if self.channel_attention is not None:
-                # Apply channel attention
-                attn_weights = self.channel_attention(features)
-                attn_weights = attn_weights.view(-1, features.shape[1], 1, 1)
-                features = features * attn_weights
-                
-                # Global features
-                global_feat = self.gap(features).flatten(1)  # [1, 2048]
-                global_feat = self.bottleneck(global_feat)  # [1, 512]
-                
-                # Part-based features (4 horizontal strips)
-                part_features = self.part_pool(features)  # [1, 2048, 4, 1]
-                part_feats = []
-                for i in range(4):
-                    part_i = part_features[:, :, i, :].flatten(1)  # [1, 2048]
-                    part_i = self.part_bottlenecks[i](part_i)  # [1, 128]
-                    part_feats.append(part_i)
-                part_feat = torch.cat(part_feats, dim=1)  # [1, 512]
-                
-                # Concatenate global + parts
-                combined = torch.cat([global_feat, part_feat], dim=1)  # [1, 1024]
-            else:
-                # Simple fallback
-                combined = self.gap(features).flatten(1)  # [1, 512]
-            
-            # L2 normalize - CRITICAL for cosine similarity to work properly
-            combined = torch.nn.functional.normalize(combined, p=2, dim=1)
-        
-        return combined.cpu().numpy().flatten()
+            feats = self.backbone.model(tensor)            # [P, feature_dim]
+            feats = feats.float()                          # upcast before normalize
+            feats = torch.nn.functional.normalize(feats, p=2, dim=1)
+        feats = feats.cpu().numpy().astype(np.float32)
+        for slot, i in enumerate(valid_idx):
+            out[i] = feats[slot]
+        return out
 
 
 class AppearanceExtractor:
@@ -205,17 +150,33 @@ class AppearanceExtractor:
     # COCO class ID for person
     PERSON_CLASS_ID = 0
     
-    def __init__(self, device: str = "cpu"):
+    def __init__(
+        self,
+        device: str = "cpu",
+        reid_backbone: str = "osnet_ain_x1_0",
+        reid_weights_path: str = "",
+        reid_fp16: bool = False,
+    ):
         """
         Initialize the appearance extractor.
-        
+
         Args:
-            device: Device to use for computation
+            device: Device to use for computation.
+            reid_backbone: OSNet variant for the person ReID deep term.
+            reid_weights_path: optional ReID-trained checkpoint overriding the
+                imagenet init.
+            reid_fp16: run the person ReID deep forward in half precision
+                (CUDA only; silent no-op on CPU).
         """
         self.device = device
-        
+
         # Person-specific ReID model
-        self.person_reid = PersonReIDModel(device)
+        self.person_reid = PersonReIDModel(
+            device,
+            backbone_name=reid_backbone,
+            reid_weights_path=reid_weights_path,
+            fp16=reid_fp16,
+        )
         
         # General feature extractor for non-person objects
         self._load_general_feature_extractor()
@@ -243,22 +204,83 @@ class AppearanceExtractor:
             self.general_model = None
             self.use_general_cnn = False
     
+    def _segment_crop_for_reid(self, crop: np.ndarray,
+                               mask_crop: Optional[np.ndarray]) -> np.ndarray:
+        """Person-segment a crop for the deep OSNet embedding (at OSNet's input size).
+
+        OSNet ingests 3-channel RGB (no alpha), so we feed it a
+        "transparent-background" person via: dilate the mask (keep the silhouette
+        and tolerate loose YOLO-seg edges) -> tight-crop to the mask bbox (evicts
+        a co-bbox bystander in the corner of a loose person box and re-centers the
+        person) -> soft-attenuate out-of-mask pixels toward a blurred copy (removes
+        the bystander/background identity while staying near OSNet's training
+        distribution; not a hard black rectangle).
+
+        Perf rationale (regression fix): the blur and the soft-attenuation are
+        done AFTER resizing the tight crop to OSNet's fixed input size
+        ``(_REID_W, _REID_H) = (128, 256)``, NOT on the full-resolution person
+        crop. ``person_reid.extract_features`` / ``_stack_crops`` resize every crop
+        to (128, 256) anyway, so blurring at full res first and resizing after is
+        equivalent to blurring at (128, 256) — but the full-res ``GaussianBlur``
+        cost scales with the person's pixel area (big/near people = many ms,
+        called ~2x/person/frame in the hot path; this dropped the tracking loop
+        from ~30 Hz to ~13 Hz). At the fixed 128x256 size the blur is a constant
+        ~0.3 ms regardless of person size, and the 128x256 image handed to OSNet
+        is the same. ``sigmaX`` is scaled down to 5 (appropriate at this scale).
+
+        Applied identically on the single and batched deep paths (row-equivalence).
+        mask_crop None / empty / all-zero -> return crop unchanged.
+        """
+        from .reid_backbone import _REID_H, _REID_W
+        if mask_crop is None or mask_crop.size == 0:
+            return crop
+        m = (mask_crop > 0).astype(np.uint8)
+        if int(m.sum()) == 0:
+            return crop
+        kernel = np.ones((3, 3), np.uint8)
+        dil = cv2.dilate(m, kernel, iterations=2)
+        ys, xs = np.where(dil > 0)
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        crop_tc = crop[y1:y2, x1:x2]
+        dil_tc = dil[y1:y2, x1:x2]
+        # Resize to OSNet's fixed input size BEFORE the expensive blur, so the
+        # blur cost is constant (~0.3 ms) instead of scaling with person area.
+        # NEAREST keeps the mask crisp 0/1 (no fractional selection at edges).
+        resized = cv2.resize(crop_tc, (_REID_W, _REID_H))
+        dil_rs = cv2.resize(dil_tc, (_REID_W, _REID_H),
+                            interpolation=cv2.INTER_NEAREST)
+        blurred = cv2.GaussianBlur(resized, (0, 0), sigmaX=5)
+        out = resized.copy()
+        bg = dil_rs == 0
+        if np.any(bg):
+            out[bg] = (0.15 * resized[bg] + 0.85 * blurred[bg]).astype(resized.dtype)
+        return out
+
     def extract_features(
         self,
         frame: np.ndarray,
         bbox: Tuple[int, int, int, int],
         mask: Optional[np.ndarray] = None,
-        class_id: int = -1
+        class_id: int = -1,
+        compute_reid: bool = True
     ) -> Dict[str, np.ndarray]:
         """
         Extract appearance features from a detection.
-        
+
         Args:
             frame: Full frame (RGB)
             bbox: Bounding box (x1, y1, x2, y2)
             mask: Optional segmentation mask
             class_id: Class ID of the detection (0 for person in COCO)
-            
+            compute_reid: Run the per-detection deep OSNet forward (+ its
+                segmentation) to populate ``features['reid']``. Default True so a
+                direct caller still gets the deep vector. ``extract_features_batch``
+                passes False because it discards this single forward and overwrites
+                ``'reid'`` with one batched forward — gating it here skips K wasted
+                single forwards + K wasted segmentations in the batch hot path.
+                Color/size/mask-coverage features are computed regardless.
+
         Returns:
             Dictionary with different feature types
         """
@@ -288,9 +310,13 @@ class AppearanceExtractor:
         
         # Use specialized features for persons
         if class_id == self.PERSON_CLASS_ID:
-            # Person ReID features
-            features['reid'] = self.person_reid.extract_features(crop)
-            
+            # Person ReID features. Skipped in the batch path (compute_reid=False):
+            # it discards this single forward and overwrites 'reid' with one
+            # batched forward, so running it here is pure waste.
+            if compute_reid:
+                features['reid'] = self.person_reid.extract_features(
+                    self._segment_crop_for_reid(crop, mask_crop))
+
             # Body part color histograms
             features['body_color'] = self._extract_body_part_colors(crop, mask_crop)
             
@@ -318,9 +344,58 @@ class AppearanceExtractor:
         if mask_crop is not None and mask_crop.size > 0:
             area_ratio = float(np.sum(mask_crop) / max(mask_crop.size, 1))
             features['mask_coverage'] = np.array([area_ratio], dtype=np.float32)
-        
+
         return features
-    
+
+    def extract_features_batch(self, frame, bboxes, masks, class_ids) -> list:
+        """Vectorize the deep ReID forward across N detections.
+
+        Returns list[dict] aligned to ``bboxes``; each dict == ``extract_features``
+        for that detection. The per-detection color/size dicts are built exactly
+        as the single-crop path (byte-identical), and ONLY the ``'reid'`` deep
+        vector is recomputed via one batched forward — collapsing K deep passes
+        into one while preserving full row-equivalence. Non-person / invalid-bbox
+        entries are left as the per-crop path produced them (no batch slot used).
+        """
+        n = len(bboxes)
+        masks = masks if masks is not None else [None] * n
+        class_ids = class_ids if class_ids is not None else [-1] * n
+
+        # Build per-detection dicts (incl. color/size) with the existing per-crop
+        # path, and collect the person crops that need a deep embedding.
+        out = [None] * n
+        person_idx = []
+        person_crops = []
+        for i in range(n):
+            # compute_reid=False: the per-detection single deep forward +
+            # segmentation are discarded (we overwrite 'reid' with the batched
+            # forward below), so skip them here. Color/size dict still built.
+            d = self.extract_features(
+                frame, bboxes[i], masks[i], class_ids[i], compute_reid=False)
+            out[i] = d
+            if class_ids[i] == self.PERSON_CLASS_ID and d:
+                # Recompute the same clamped crop used inside extract_features
+                # (cheap numpy slice) so the batch forward sees identical pixels.
+                x1, y1, x2, y2 = bboxes[i]
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    raw = frame[y1:y2, x1:x2].copy()
+                    mci = masks[i][y1:y2, x1:x2] if masks[i] is not None else None
+                    person_idx.append(i)
+                    person_crops.append(self._segment_crop_for_reid(raw, mci))
+
+        if person_crops:
+            deep = self.person_reid.extract_features_batch(person_crops)  # [P, dim]
+            for slot, i in enumerate(person_idx):
+                # 'reid' is no longer pre-set (compute_reid=False above), so set
+                # it unconditionally. person_idx entries are valid persons by
+                # construction (non-empty dict + valid crop).
+                if out[i] is not None:
+                    out[i]["reid"] = deep[slot]
+        return out
+
     def _extract_body_part_colors(
         self,
         crop: np.ndarray,
@@ -584,14 +659,14 @@ class ReIDMatcher:
     Deep features capture body shape/pose, color features capture clothing.
     """
     
-    # Weights for PERSON re-identification
-    # Deep features are most discriminative when trained properly
-    # Body color is critical as a backup and for clothing-based discrimination
-    WEIGHT_REID = 0.55        # Person ReID deep features (ResNet50)
-    WEIGHT_BODY_COLOR = 0.28  # Body part colors (clothing)
-    WEIGHT_COLOR = 0.08       # General color histogram
-    WEIGHT_UPPER = 0.05       # Upper-body color signature
-    WEIGHT_LOWER = 0.04       # Lower-body color signature
+    # Weights for PERSON re-identification.
+    # Phase 1: the deep term is now a genuinely pretrained OSNet (not the old
+    # untrained random head), so it dominates; color is demoted to a backup cue.
+    WEIGHT_REID = 0.75        # Person ReID deep features (trained OSNet)
+    WEIGHT_BODY_COLOR = 0.13  # Body part colors (clothing backup)
+    WEIGHT_COLOR = 0.05       # General color histogram
+    WEIGHT_UPPER = 0.04       # Upper-body color signature
+    WEIGHT_LOWER = 0.03       # Lower-body color signature
     WEIGHT_SIZE = 0.0         # De-emphasize size/shape (unreliable across people)
     
     # Weights for NON-PERSON objects
@@ -599,29 +674,33 @@ class ReIDMatcher:
     WEIGHT_COLOR_GENERAL = 0.40
     WEIGHT_SIZE_GENERAL = 0.10
     
-    # Thresholds - balanced for accuracy vs pose variation tolerance
-    # Analysis from logs shows:
-    #   - Same person continuous tracking: reid ~0.85-0.98, body ~0.80-0.97
-    #   - Same person with pose change: reid ~0.70-0.80, body ~0.70-0.85
-    #   - Different person (WRONG match): reid ~0.55-0.70, body ~0.60-0.75
-    # Setting thresholds to accept pose variation but reject different people
-    REID_THRESHOLD = 0.68     # Minimum COMBINED similarity for re-identification
+    # Thresholds — recalibrated for the trained OSNet operating point.
+    # OSNet's combined-score distribution shifts vs the old random head, so the
+    # combined floor is lowered. Starting points; final values via the offline
+    # Occluded-REID ROC (Step 1.5/Step 5, an informing knob, not a CI gate) or
+    # arena tuning. See person-tracker-benchmark-strategy.
+    REID_THRESHOLD = 0.55     # Minimum COMBINED similarity for re-identification
     REID_MARGIN = 0.15        # Best match must be clearly better than second-best
     TIME_DECAY_FACTOR = 1.0   # NO time decay - features should be stable over time
     MAX_REID_TIME = 600.0     # 10 minutes max search time
-    
-    # CRITICAL: Minimum RAW reid similarity
-    # Same person with pose change: ~0.70-0.80
-    # Different person: ~0.55-0.70
-    # Set floor at 0.55 to allow pose variation while rejecting most wrong matches
-    MIN_REID_SIMILARITY_RAW = 0.60  # Raw cosine similarity floor
-    
-    # Minimum body color similarity - more tolerant for lighting variation
-    # Same person: ~0.70-0.95, Different person: ~0.60-0.75  
-    MIN_BODY_COLOR_SIMILARITY = 0.60  # Reject if body colors are too different
-    MIN_UPPER_SIMILARITY = 0.55
-    MIN_LOWER_SIMILARITY = 0.55
-    
+
+    # Minimum RAW reid cosine similarity floor.
+    # Trained OSNet's same/different cosine gap is wide, so the raw floor is
+    # lowered from the legacy 0.60 to its same/different operating point
+    # (retune in Step 5).
+    MIN_REID_SIMILARITY_RAW = 0.40  # Raw cosine similarity floor (OSNet)
+
+    # Color hard floors — now a BACKUP cue, not a gate. Relaxed so they no
+    # longer hard-reject a true match on lighting/clothing variation; the
+    # trained deep term carries the discrimination.
+    MIN_BODY_COLOR_SIMILARITY = 0.40
+    MIN_UPPER_SIMILARITY = 0.40
+    MIN_LOWER_SIMILARITY = 0.40
+
+    # gallery deep cosine clearly above bystander range (~0.47-0.57); a
+    # confident deep match bypasses the hard color vetoes
+    DEEP_CONFIDENT_BYPASS = 0.70
+
     # Legacy threshold for backward compatibility
     MIN_REID_SIMILARITY = 0.40  # Transformed similarity minimum
     
@@ -635,33 +714,39 @@ class ReIDMatcher:
         candidate_features: Dict[str, np.ndarray],
         candidate_bbox: Tuple[int, int, int, int],
         current_time: float,
-        is_person: bool = False
+        is_person: bool = False,
+        use_gallery: bool = True
     ) -> float:
         """
         Compute similarity between stored target and a candidate detection.
-        
+
         Args:
             target: Stored target appearance
             candidate_features: Features extracted from candidate
             candidate_bbox: Bounding box of candidate
             current_time: Current timestamp
             is_person: Whether the target is a person (uses specialized matching)
-            
+            use_gallery: Whether the deep term may use the multi-view gallery.
+                When False, the deep term forces the legacy max(average, anchor)
+                path (used in multi-candidate scenes so best-vs-second margins
+                aren't compressed). Non-person matching ignores this flag.
+
         Returns:
             Similarity score between 0 and 1
         """
         scores = []
         weights = []
-        
+
         # Time decay - reduce confidence for older appearances
         time_since_seen = current_time - target.last_seen_time
         if time_since_seen > cls.MAX_REID_TIME:
             return 0.0
         time_decay = cls.TIME_DECAY_FACTOR ** time_since_seen
-        
+
         if is_person:
             # Use person-specific ReID matching
-            return cls._compute_person_similarity(target, candidate_features, time_decay)
+            return cls._compute_person_similarity(
+                target, candidate_features, time_decay, use_gallery=use_gallery)
         else:
             # Use general object matching
             return cls._compute_general_similarity(target, candidate_features, time_decay)
@@ -671,7 +756,8 @@ class ReIDMatcher:
         cls,
         target: TargetAppearance,
         candidate_features: Dict[str, np.ndarray],
-        time_decay: float
+        time_decay: float,
+        use_gallery: bool = True
     ) -> float:
         """
         Compute similarity for person re-identification.
@@ -689,7 +775,7 @@ class ReIDMatcher:
         If features don't show this separation, they're not discriminative enough.
         """
         reid_sim_raw = None
-        reid_anchor_sim = None
+        deep_confident = False
         body_color_sim = None
         body_color_anchor_sim = None
         color_sim = None
@@ -700,27 +786,25 @@ class ReIDMatcher:
         
         # 1. Person ReID features (most important) - use raw cosine similarity
         if 'reid' in candidate_features:
-            target_reid = target.get_average_feature()
-            if target_reid is not None:
-                candidate_reid = candidate_features['reid']
-                # Check dimension compatibility
-                if target_reid.shape[0] == candidate_reid.shape[0]:
-                    # Raw cosine similarity for L2-normalized vectors is in [-1, 1]
-                    # From logs: Same person ~0.70-0.98 (pose dependent), Different person ~0.55-0.70
-                    reid_sim_raw = cls._cosine_similarity(target_reid, candidate_reid)
-                    
-                    # Anchor feature comparison (helps with drift against similar stature people)
-                    if target.anchor_feature is not None and target.anchor_feature.shape[0] == candidate_reid.shape[0]:
-                        reid_anchor_sim = cls._cosine_similarity(target.anchor_feature, candidate_reid)
-                        reid_sim_raw = max(reid_sim_raw, reid_anchor_sim)
-                    
-                    # Hard rejection: RAW reid similarity must be above floor
-                    # Set conservatively to allow pose variation
-                    if reid_sim_raw < cls.MIN_REID_SIMILARITY_RAW:
-                        logger.info(f"HARD REJECT: ReID raw similarity {reid_sim_raw:.3f} < {cls.MIN_REID_SIMILARITY_RAW}")
-                        return 0.0
-                else:
-                    logger.debug(f"ReID dimension mismatch: {target_reid.shape[0]} vs {candidate_reid.shape[0]}")
+            # Deep term flows through the multi-view gallery (deep_score), which
+            # already unions the pinned anchor. The raw-cosine hard-reject floor
+            # is preserved below.
+            candidate_reid = candidate_features['reid']
+            reid_sim_raw = target.deep_score(candidate_reid, use_gallery=use_gallery)
+            if reid_sim_raw is not None:
+                # Hard rejection: RAW reid similarity must be above floor
+                # Set conservatively to allow pose variation
+                if reid_sim_raw < cls.MIN_REID_SIMILARITY_RAW:
+                    logger.info(f"HARD REJECT: ReID raw similarity {reid_sim_raw:.3f} < {cls.MIN_REID_SIMILARITY_RAW}")
+                    return 0.0
+            else:
+                logger.debug("ReID deep term unavailable (no matching target feature)")
+
+        # A confident deep cosine bypasses the hard color vetoes below: a true
+        # match whose color drifted (lighting/pose) shouldn't be force-zeroed by
+        # a single low color histogram. Bystanders have low deep, so the veto
+        # still fires for them. Defined for all paths (defaults False above).
+        deep_confident = reid_sim_raw is not None and reid_sim_raw >= cls.DEEP_CONFIDENT_BYPASS
         
         # 2. Body part color similarity - use histogram intersection (stricter than Bhattacharyya)
         if 'body_color' in candidate_features:
@@ -734,9 +818,13 @@ class ReIDMatcher:
                     body_color_sim = max(body_color_sim, body_color_anchor_sim)
                 
                 # Hard rejection: if clothing colors are too different
-                if body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY:
+                if body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY and not deep_confident:
                     logger.info(f"Rejecting candidate: body color similarity {body_color_sim:.3f} < {cls.MIN_BODY_COLOR_SIMILARITY}")
                     return 0.0
+                elif body_color_sim < cls.MIN_BODY_COLOR_SIMILARITY:
+                    logger.debug(
+                        f"color low (body={body_color_sim:.3f}) but deep "
+                        f"confident ({reid_sim_raw:.3f}) — not vetoing")
         
         # Upper/lower specific clothing color to combat outfit ambiguity
         if 'upper_color' in candidate_features:
@@ -747,9 +835,13 @@ class ReIDMatcher:
                 target_upper = target.upper_color_history[-1]
             if target_upper is not None:
                 upper_sim = cls._histogram_intersection(target_upper, candidate_features['upper_color'])
-                if upper_sim < cls.MIN_UPPER_SIMILARITY:
+                if upper_sim < cls.MIN_UPPER_SIMILARITY and not deep_confident:
                     logger.info(f"Rejecting candidate: upper color similarity {upper_sim:.3f} < {cls.MIN_UPPER_SIMILARITY}")
                     return 0.0
+                elif upper_sim < cls.MIN_UPPER_SIMILARITY:
+                    logger.debug(
+                        f"color low (upper={upper_sim:.3f}) but deep "
+                        f"confident ({reid_sim_raw:.3f}) — not vetoing")
         
         if 'lower_color' in candidate_features:
             target_lower = None
@@ -759,9 +851,13 @@ class ReIDMatcher:
                 target_lower = target.lower_color_history[-1]
             if target_lower is not None:
                 lower_sim = cls._histogram_intersection(target_lower, candidate_features['lower_color'])
-                if lower_sim < cls.MIN_LOWER_SIMILARITY:
+                if lower_sim < cls.MIN_LOWER_SIMILARITY and not deep_confident:
                     logger.info(f"Rejecting candidate: lower color similarity {lower_sim:.3f} < {cls.MIN_LOWER_SIMILARITY}")
                     return 0.0
+                elif lower_sim < cls.MIN_LOWER_SIMILARITY:
+                    logger.debug(
+                        f"color low (lower={lower_sim:.3f}) but deep "
+                        f"confident ({reid_sim_raw:.3f}) — not vetoing")
         
         # 3. General color histogram
         if 'color_hist' in candidate_features:

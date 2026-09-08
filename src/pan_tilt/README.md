@@ -11,7 +11,9 @@ publication, and TF generation.
 - `ros2 run pan_tilt controller`
   Owns `/dev/ttyUSB*`, sends firmware commands, and publishes low-level state.
 - `ros2 run pan_tilt state_publisher`
-  Converts `PanTiltState` into `/joint_states`.
+  Converts `PanTiltState` into a `JointState` stream on
+  `/pan_tilt/joint_states` (private, to avoid clashing with the main-robot
+  `/joint_states` aggregator; override via the `joint_state_topic` parameter).
 - `ros2 run pan_tilt follow_head`
   YOLO-based head following. Publishes native `PanTiltCommand` messages and
   still exposes `/follow_head_service` and `/follow_head_action`.
@@ -27,8 +29,18 @@ publication, and TF generation.
   Type: `tinker_vision_msgs_26/msg/PanTiltCommand`
 - Topic: `/pan_tilt_controller/state`
   Type: `tinker_vision_msgs_26/msg/PanTiltState`
-- Topic: `/joint_states`
-  Produced by `state_publisher` from `/pan_tilt_controller/state`
+- Topic: `/pan_tilt/joint_states`
+  Produced by `state_publisher` from `/pan_tilt_controller/state`. Private
+  so it does not collide with the main-robot `/joint_states` aggregator.
+- Topic: `/pan_tilt/robot_description`
+  Published by `robot_state_publisher` in the bringup launch. Private so it
+  does not collide with the main-robot `/robot_description` latched by
+  `grasp_bringup` / `xarm_description`.
+- TF frames (global `/tf`, `/tf_static`): `base_link -> pan_link ->
+  tilt_link -> head_camera_link`. `head_camera_link` was renamed away from
+  `camera_link` specifically so that the TF tree does not conflict with the
+  xArm URDF's `link_eef -> camera_link` edge when both bringups run
+  together.
 - Service: `/pan_tilt_controller/set_torque`
   Type: `tinker_vision_msgs_26/srv/SetTorque`
 - Service: `/pan_tilt_controller/set_zero`
@@ -52,13 +64,27 @@ Canonical:
 ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0
 ```
 
-Manual low-level bringup:
+Manual low-level bringup (mirrors what `pan_tilt.launch.py` does, with
+explicit topic remaps so it can coexist with `grasp_bringup`):
 
 ```bash
 ros2 run pan_tilt controller --ros-args -p device:=/dev/ttyUSB0
-ros2 run pan_tilt state_publisher
+ros2 run pan_tilt state_publisher --ros-args \
+  -p joint_state_topic:=/pan_tilt/joint_states
 ros2 run robot_state_publisher robot_state_publisher \
-  --ros-args -p robot_description:="$(xacro src/pan_tilt/urdf/pan_tilt.urdf.xacro)"
+  --ros-args -p robot_description:="$(xacro $(ros2 pkg prefix tinker_urdf)/share/tinker_urdf/src/pan_tilt_standalone.urdf.xacro)"
+```
+
+Running alongside `grasp_bringup` (combined xArm + pan-tilt): the MoveIt
+pipeline in `grasp_bringup.launch.py` already publishes the merged
+`mobile_manipulator` URDF (which now contains the pan-tilt chain), so
+`pan_tilt.launch.py` must not start a second `robot_state_publisher`. Pass
+`launch_robot_state_publisher:=false`:
+
+```bash
+ros2 launch mobile_bringup grasp_bringup.launch.py   # terminal 1
+ros2 launch pan_tilt pan_tilt.launch.py device:=/dev/ttyUSB0 \
+    launch_robot_state_publisher:=false              # terminal 2
 ```
 
 Native command example:
@@ -72,9 +98,117 @@ ros2 topic pub --once /pan_tilt_controller/cmd \
 ## Runtime Configuration
 
 - Runtime parameters live in [config/pan_tilt.yaml](./config/pan_tilt.yaml).
-- Runtime geometry lives in [urdf/pan_tilt.urdf.xacro](./urdf/pan_tilt.urdf.xacro).
+- Runtime geometry lives in `tinker_urdf`:
+  `src/tk25_basic/src/tinker_urdf/src/pan_tilt.urdf.xacro` is a
+  `pan_tilt_macro` (parent / prefix / attach_xyz / attach_rpy /
+  camera_mount_xyz / camera_mount_rpy);
+  `pan_tilt_standalone.urdf.xacro` is the standalone wrapper this launch
+  loads, and `tracer_mini_manipulator.urdf.xacro` includes the same macro
+  with `parent="base_link"` for the combined `mobile_manipulator` URDF.
+  The geometry lives in `tinker_urdf` so the robot-description package does
+  not gain a runtime dependency on `pan_tilt`; `pan_tilt` depends on
+  `tinker_urdf` instead.
 - `config/specs.json` is retained as historical calibration/reference data only.
   The runtime stack does not load it anymore.
+- **Pan/tilt joint offsets (calibration-derived, per-robot).**
+  `pan_tilt_state_publisher` reads `pan_tilt.offsets.pan_offset_rad` /
+  `pan_tilt.offsets.tilt_offset_rad` from the active `$ROBOT_NAME` profile
+  via `tinker_robot_config` (`robots/<ROBOT_NAME>/pan_tilt/offsets.yaml`) —
+  see `_load_profile` / `_load_per_robot_offsets` in
+  `pan_tilt_state_publisher.py`. When the profile is unavailable
+  (`ROBOT_NAME` unset, `tinker_robot_config` not installed, or the profile
+  has no `pan_tilt.offsets.*` keys) the node logs a WARN and falls back to
+  the `pan_offset_rad` / `tilt_offset_rad` ROS params in
+  [config/pan_tilt.yaml](./config/pan_tilt.yaml) — those values are a dev-
+  machine fallback only, **not** per-robot, and are stamped as such in the
+  yaml's comment. Sourcing values are still `polish.json`'s
+  `theta_p_offset_rad` / `theta_t_offset_rad` after each calibration; write
+  them into the per-robot `offsets.yaml`, not just the package yaml.
+- **Per-robot URDF mount geometry (now sourced by the xacro, not launch
+  args).** Earlier revisions of `pan_tilt.launch.py` threaded
+  `robots/<ROBOT_NAME>/pan_tilt/urdf_overrides.yaml`
+  (`attach_xyz`/`attach_rpy`/`camera_mount_xyz`/`camera_mount_rpy`) through
+  `tinker_robot_config`'s `robot_description.launch.py` wrapper via an
+  `overrides_key='pan_tilt.urdf_overrides'` launch argument. That launch-arg
+  plumbing is removed — since tk25_basic `db1524a`, `pan_tilt.urdf.xacro`
+  itself sources per-robot mount geometry via a `ROBOT_NAME`-guarded
+  `<xacro:include>` of
+  `robots/$ROBOT_NAME/pan_tilt/pan_tilt_overrides.xacro` at xacro-parse
+  time, independent of launch arguments. Per-robot geometry is therefore
+  preserved whenever `ROBOT_NAME` is set (any render path, including manual
+  `xacro …`); the macro's nominal defaults apply only when `ROBOT_NAME` is
+  unset. Note the two per-robot concerns are distinct and always were:
+  `pan_tilt.urdf_overrides.*` / `pan_tilt_overrides.xacro` = URDF mount
+  geometry (never carried the joint offsets); `pan_tilt.offsets.*` =
+  joint-state calibration offsets, which were always ROS params read by
+  `pan_tilt_state_publisher` and are now resolved from the per-robot
+  profile per the bullet above.
+
+## Calibration
+
+The pan-tilt / head-camera extrinsic calibration yaml lives in
+`tinker_robot_config` under the per-robot tree:
+
+```
+src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/calibration.yaml
+```
+
+`calib_web` and `calibrate_collect` resolve this file by default via the
+`tinker_robot_config` resolver (which keys off `$ROBOT_NAME`). Operators can
+override with `-p config:=<path>` to point at a custom file (e.g. a pruned
+sidecar produced by `calib_web`'s prune-apply endpoint).
+
+```bash
+# Default — uses $ROBOT_NAME to pick robots/<ROBOT_NAME>/pan_tilt/calibration.yaml
+ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_web --ros-args -p bind:=127.0.0.1 -p port:=8765
+ROBOT_NAME=tinker2 ros2 run pan_tilt calibrate_collect --ros-args -p phase:=both -p out_dir:=$PWD/calib_out
+
+# Override
+ros2 run pan_tilt calibrate_collect --ros-args -p config:=/path/to/custom.yaml -p phase:=both
+```
+
+`calib_web`'s write paths (`save_waypoints_to_config`,
+`_overwrite_source_with_prune`) write back to the canonical source-tree
+file under `tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/`,
+not the install share — backup `*.yaml.old-<ts>` files land alongside the
+source.
+
+There is no in-tree `config/calibration.yaml` in this package anymore (it
+was retired in P5a). Full calibration procedure docs live alongside the
+code at [`pan_tilt/calibration/readme.md`](./pan_tilt/calibration/readme.md).
+
+### Applying calibration results (per-robot only)
+
+Calibration Apply (calib_web's **Preview**/**Apply** buttons and the
+`python -m pan_tilt.calibration.apply_to_urdf` CLI) targets exactly **two
+per-robot files** in the tk25_basic SOURCE tree, keyed by `$ROBOT_NAME`:
+
+```
+src/tk25_basic/src/tinker_robot_config/robots/<ROBOT_NAME>/pan_tilt/
+    pan_tilt_overrides.xacro   # mount geometry (attach / camera_mount xyz+rpy)
+    offsets.yaml               # runtime joint offsets (pan/tilt_offset_rad)
+```
+
+The shared xacros under `tinker_urdf/` are **never written** — since
+tk25_basic `db1524a` the macro auto-includes the per-robot overrides file at
+xacro-parse time, so writing the pair is the complete deployment and
+tinker1/tinker2 calibrations cannot overwrite each other. Apply **refuses
+when `ROBOT_NAME` is unset** (HTTP 400 in calib_web, exit 2 on the CLI).
+Both files land atomically, in lockstep, with `.old-<ts>` backups; an rpy
+the solve didn't fit (trivial/absent rotvec) is preserved from the current
+per-robot file, never zeroed. The forward-camera invariant (`|yaw| < π/2`
+unless `--allow-flipped-camera`) still guards the fitted camera rotation.
+
+```bash
+export ROBOT_NAME=tinker1
+python -m pan_tilt.calibration.apply_to_urdf --results calib_out/polish.json \
+    [--basic-root <tk25_basic root>] [--allow-flipped-camera]
+tkbuild tk25_basic --packages-select tinker_robot_config
+# then relaunch robot_state_publisher + pan_tilt state_publisher
+```
+
+Deployment rules and the incident history are in
+[pan_tilt_calibration_deployment.md](./pan_tilt_calibration_deployment.md).
 
 ## Firmware Assumptions
 
@@ -127,7 +261,7 @@ Verified in this worktree on `2026-04-23` against `/dev/ttyUSB0`:
 
 - controller opens the real serial device and receives `T:1001` feedback
 - `/pan_tilt_controller/state` reports `connected: true` and `feedback_ok: true`
-- `/joint_states` tracks the hardware state
-- `base_link -> camera_link` resolves through the launch stack
+- `/pan_tilt/joint_states` tracks the hardware state
+- `base_link -> head_camera_link` resolves through the launch stack
 - relative and absolute commands both move the hardware
 - the launch stack now exits cleanly on `SIGINT`

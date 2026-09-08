@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>handeye_web · calibrate</title>
+  <!-- ?v bumped on every webui release so browsers can't serve a stale cached
+       app.js/style.css (the "I fixed it but nothing changed" trap). Bump on edit. -->
+  <link rel="stylesheet" href="/static/style.css?v=0.11.0">
+</head>
+<body>
+  <header class="bg-panel">
+    <span class="title">handeye_calib · calibrate_web</span>
+    <span id="conn-indicator" class="conn-indicator">WS: connecting…</span>
+  </header>
+  <main>
+    <!-- Left dock: sticky camera + joint editor stacked vertically.
+         The joint editor pairs naturally with the live camera — the
+         operator watches the arm move as they tweak inputs and click
+         Move (joints). Presets (Home / look-forward), waypoints, sequence
+         controls, manual capture, gallery all live on the right. -->
+    <div class="left-dock">
+      <div class="cam-panel" id="cam-panel">
+        <img id="cam-img" class="cam-img" alt="">
+        <div class="cam-resize" id="cam-resize" title="drag to resize"></div>
+        <div class="frame-toolbar">
+          <label><input type="radio" name="frame-mode" value="annotated" checked> annotated</label>
+          <label><input type="radio" name="frame-mode" value="raw"> raw</label>
+        </div>
+        <div class="detection-badge" id="detection-badge">corners=0  NO DETECTION</div>
+        <div class="frame-placeholder" id="frame-placeholder">waiting for frames on <span id="placeholder-topic">/camera/xarm_camera/color/image_raw</span></div>
+      </div>
+
+      <!-- Joint editor: always visible, regardless of active tab.
+           Sends a tinker_arm_msgs/JointMove goal to /xarm/joint_move on
+           click. Safety-status line is the live SafetyEnvelope verdict on
+           the current EE pose. -->
+      <div class="joint-dock">
+        <h3>Move joints</h3>
+        <div class="unit-toggle" id="move-unit-toggle">
+          <label><input type="radio" name="move-unit" value="rad" checked> rad</label>
+          <label><input type="radio" name="move-unit" value="deg"> deg</label>
+        </div>
+        <div class="joint-grid" id="move-joint-inputs"></div>
+        <div class="row">
+          <button id="move-load-current" type="button">Load current</button>
+          <button id="move-zero" type="button">Zero all</button>
+          <button class="primary" id="move-send" type="button">Move (joints)</button>
+        </div>
+        <div class="status-line" id="move-status"></div>
+        <div class="status-line" id="move-safety-status">–</div>
+      </div>
+    </div>
+
+    <!-- Controls column: tabs + all panels. Right-hand flex item; the
+         left dock above stays sticky so the camera + joint editor are
+         always visible. -->
+    <div class="controls-col">
+    <nav class="side-tabs">
+      <button class="side-tab active" data-tab="info">Info</button>
+      <button class="side-tab" data-tab="capture">Capture</button>
+      <button class="side-tab" data-tab="solve">Solve</button>
+      <button class="side-tab" data-tab="history">History</button>
+      <button class="side-tab" data-tab="promote">Promote</button>
+    </nav>
+    <section class="side-panel-content active" data-panel="info">
+      <!-- T1 status lines stay at the top of the Info tab so the camera /
+           TF health stays glanceable, and so the existing T1/T2 assertions
+           (which look up these ids) keep passing. -->
+      <div class="status-line" id="info-camera">camera: …</div>
+      <div class="status-line" id="info-tf">tf: …</div>
+
+      <h2>Camera</h2>
+      <table class="kv-table" id="info-kv-camera">
+        <tr><td>subscribed to</td><td data-k="image_topic">–</td></tr>
+        <tr><td>ROS_DOMAIN_ID</td><td data-k="ros_domain_id">–</td></tr>
+        <tr><td>status</td><td data-k="status">–</td></tr>
+        <tr><td>frames received</td><td data-k="frame_count">0</td></tr>
+        <tr><td>last frame age</td><td data-k="frame_age">–</td></tr>
+        <tr><td>frame rate (rolling)</td><td data-k="frame_hz">–</td></tr>
+      </table>
+
+      <h2>Robot state</h2>
+      <table class="kv-table" id="info-kv-robot">
+        <tr><td>xArm joints</td><td data-k="xarm_joints">–</td></tr>
+        <tr><td>xArm TF (base→ee)</td><td data-k="tf_status">–</td></tr>
+      </table>
+
+      <h2>T<sub>base→eef</sub></h2>
+      <pre class="matrix-block" id="info-matrix-tbe">–</pre>
+
+      <h2>ChArUco board</h2>
+      <table class="kv-table" id="info-board">
+        <tr><td>grid</td><td data-k="grid">–</td></tr>
+        <tr><td>square_len</td><td data-k="square_len">–</td></tr>
+        <tr><td>marker_len</td><td data-k="marker_len">–</td></tr>
+        <tr><td>aruco_dict</td><td data-k="aruco_dict">–</td></tr>
+      </table>
+
+      <h2>Safety envelope</h2>
+      <pre class="matrix-block" id="info-safety">–</pre>
+
+      <h2>Calibration settings</h2>
+      <div class="settings-panel" id="settings-panel">
+        <div class="settings-section">
+          <label class="settings-label">observe board in</label>
+          <label><input type="radio" name="calib-frame" value="color" checked> color</label>
+          <label><input type="radio" name="calib-frame" value="ir"> left-IR (native depth ≡ camera_link)</label>
+          <div class="settings-hint" id="calib-frame-hint">switching frame discards captured samples</div>
+        </div>
+        <div class="settings-section">
+          <label><input type="checkbox" id="use-ffs-depth-input" checked> use FoundationStereo depth</label>
+          <label><input type="checkbox" id="ir-emitter-input"> IR emitter on (turn OFF for IR-frame capture)</label>
+        </div>
+        <div class="settings-section settings-grid">
+          <label>depth_weight<input type="number" id="depth-weight-input" step="0.1" min="0" value="1.0"></label>
+          <label>depth_sigma_m<input type="number" id="depth-sigma-input" step="0.001" min="0.0001" value="0.005"></label>
+          <label>depth_win<input type="number" id="depth-win-input" step="1" min="0" value="2"></label>
+          <label>depth_min_corners<input type="number" id="depth-min-corners-input" step="1" min="1" value="3"></label>
+        </div>
+        <div class="settings-section">
+          <button id="apply-config-btn" class="btn">Apply settings</button>
+          <span class="status-line" id="config-status"></span>
+        </div>
+      </div>
+    </section>
+    <section class="side-panel-content" data-panel="capture">
+      <!-- Right-side capture content. The joint editor + Move (joints) live
+           in the always-visible left dock (above the camera) alongside the
+           safety preview. This right column owns:
+             1. Presets (Home / look-forward) — fills the left-dock joint inputs
+             2. Waypoints sub-panel (list + add-current + save/reload)
+             3. Auto-capture sequence controls (run / dry / cancel + log)
+             4. Manual capture (stability gate + Capture pose button + status)
+             5. Diversity meter + sample gallery
+           Settle gate is the HARD pre-capture check — the manual Capture
+           button stays disabled until camera + intrinsics + detection +
+           steady all line up. -->
+
+      <!-- 1. Presets — populate the left-dock joint editor inputs -->
+      <div class="presets-panel">
+        <h3>Presets</h3>
+        <div class="preset-bar" id="move-presets">
+          <button data-preset="home" type="button">Home [0,0,0,0,0,0,0]</button>
+          <button data-preset="look-forward" type="button">Look forward at board</button>
+        </div>
+        <p class="muted">
+          Preset buttons fill the joint inputs in the left dock — review the
+          values, then click <strong>Move (joints)</strong> over there to
+          send. <code>Home</code> sends all seven joints to zero (verified
+          safe rest pose). <code>Look forward at board</code> is a
+          placeholder until a verified safe joint set is recorded; see the
+          TODO in <code>app.js</code>.
+        </p>
+      </div>
+
+      <!-- 2. Waypoints sub-panel: record a sequence of arm poses, save/reload
+           per-robot, then auto-capture will cycle through them. -->
+      <div class="waypoints-panel">
+        <h3>Capture waypoints</h3>
+        <p class="muted">
+          Record a sequence of arm poses, save them to disk (per-robot), and the
+          auto-capture run-button below will cycle through them. Each move goes
+          through the same SafetyEnvelope + StabilityTracker the manual Capture
+          button does — settle failures skip a step but don't abort the run.
+        </p>
+        <div class="row">
+          <button id="waypoint-add-current-btn" type="button">+ Add current joints</button>
+          <button id="waypoint-save-btn" type="button">Save to disk</button>
+          <button id="waypoint-reload-btn" type="button">Reload from disk</button>
+          <button id="waypoint-clear-btn" type="button" style="color:var(--err,#c00)">Clear all</button>
+        </div>
+        <div class="status-line" id="waypoints-status"></div>
+        <ul class="waypoints-list" id="waypoints-list">
+          <li class="waypoints-empty">no waypoints recorded yet</li>
+        </ul>
+      </div>
+
+      <div class="sequence-controls">
+  <h3>Auto-capture sequence</h3>
+  <div class="row">
+    <button class="primary" id="sequence-run-btn" type="button" disabled>Run sequence</button>
+    <button id="sequence-dry-btn" type="button" disabled>Run dry (move + settle only)</button>
+    <button id="sequence-cancel-btn" type="button" disabled>Cancel</button>
+  </div>
+  <div class="status-line" id="sequence-progress">idle</div>
+  <div class="status-line" id="sequence-status"></div>
+  <ul class="sequence-log" id="sequence-log"></ul>
+</div>
+
+      <div class="capture-panel">
+        <div class="stability-badge" id="capture-stability">stability: …</div>
+        <button class="primary" id="capture-btn" type="button" disabled>Capture pose</button>
+        <div class="status-line" id="capture-status"></div>
+
+        <div class="row" id="anchor-row">
+          <button id="btn-anchor">Anchor board (head)</button>
+          <button id="btn-anchor-clear">Clear anchor</button>
+          <span id="anchor-status" class="status">no head anchor</span>
+        </div>
+
+        <div class="diversity-meter">
+          <div class="bar"><div id="diversity-fill" class="fill"></div></div>
+          <div class="label" id="diversity-label">0° / 30°</div>
+        </div>
+
+        <h3>Captured samples</h3>
+        <div class="gallery" id="gallery">
+          <div class="gallery-empty" id="gallery-empty">no samples captured yet</div>
+        </div>
+      </div>
+    </section>
+    <section class="side-panel-content" data-panel="solve">
+      <!-- T5: Solve tab.
+           Method picker drives /api/solve {method: ...}; "auto" sweeps all
+           five OpenCV methods, the named options restrict to one. The
+           comparison table lists every method that ran with its reprojection
+           RMS, so an operator can see at a glance which method seeded the
+           winning solve. mm/deg/px units are pre-rendered server-side
+           (web_support.solve_payload_v2) so the JS doesn't have to know about
+           radians or metres. The three canvases are vanilla canvas2d (no chart
+           library): histogram + scatter of per-sample reproj_px, plus a
+           board-centroid coverage map drawn via K-pinhole projection. -->
+      <div class="solve-panel">
+        <div class="row">
+          <label>Method:
+            <select id="solve-method">
+              <option value="auto" selected>auto (best of all)</option>
+              <option>TSAI</option><option>PARK</option><option>HORAUD</option>
+              <option>ANDREFF</option><option>DANIILIDIS</option>
+            </select>
+          </label>
+          <button class="primary" id="solve-btn" type="button">Solve</button>
+        </div>
+        <div class="status-line" id="solve-status"></div>
+        <span class="gate-pill" id="solve-verdict" hidden></span>
+
+        <!-- Intrinsics-free rigid-mount go/no-go. If this FAILs, no solve can
+             pass regardless of the residual numbers below — fix the mount. -->
+        <h3>Rigid-mount check</h3>
+        <div class="status-line" id="rigid-closure">rigid-mount check: (solve to compute)</div>
+
+        <h3>Per-method comparison</h3>
+        <table class="method-table" id="method-table"></table>
+
+        <h3>Residual (all kept samples — no train/held-out split)</h3>
+        <table class="kv-table" id="solve-metrics">
+          <tr><td>trans_rmse</td><td data-k="res_trans">–</td></tr>
+          <tr><td>rot_rmse</td><td data-k="res_rot">–</td></tr>
+          <tr><td>reproj</td><td data-k="res_reproj">–</td></tr>
+          <tr><td>depth_point_rmse</td><td data-k="res_depth">–</td></tr>
+          <tr><td>kept / total</td><td data-k="res_kept">–</td></tr>
+        </table>
+
+        <h3>X (T<sub>eef→cam</sub>)</h3>
+        <table class="kv-table" id="solve-X">
+          <tr><td>xyz (mm)</td><td data-k="X_xyz_mm">–</td></tr>
+          <tr><td>rpy (deg)</td><td data-k="X_rpy_deg">–</td></tr>
+        </table>
+
+        <h3>Per-sample residuals</h3>
+        <div class="canvas-row">
+          <canvas id="resid-hist" width="360" height="140"></canvas>
+          <canvas id="resid-scatter" width="360" height="140"></canvas>
+        </div>
+        <!-- Per-sample residual in human-readable units (mm / deg) next to the
+             pixel value, since pixels are hard to judge. Rejected rows are
+             struck through. -->
+        <table class="method-table" id="per-sample-table"></table>
+
+        <h3>Rejected samples (MAD outliers — why)</h3>
+        <table class="method-table" id="rejection-table"></table>
+
+        <h3>Coverage (board centroids projected to image)</h3>
+        <canvas id="coverage" width="600" height="400"></canvas>
+      </div>
+    </section>
+    <section class="side-panel-content" data-panel="promote">
+      <!-- T6: Promote tab — side-by-side unified-diff preview for BOTH
+           hand_eye.yaml AND a per-robot wrist_camera.xacro override. Each
+           half has its own Show / Apply / status / backup-line. The xacro
+           half is gated on ROBOT_NAME (the UI shows a banner when unset,
+           offering yaml-only promote); refuses to overwrite the shared
+           vendor xacro. Confirm-before-apply on each half; backups are
+           written by the server (apply_handeye.write_with_backup) and the
+           returned backup_path is surfaced inline. -->
+      <div class="promote-panel">
+        <div class="diff-half">
+          <h3>hand_eye.yaml <span class="badge" id="yaml-target">–</span></h3>
+          <div class="status-line" id="yaml-mode">–</div>
+          <div class="row">
+            <button id="promote-yaml-diff-btn" type="button">Show diff</button>
+            <button class="primary" id="promote-yaml-apply-btn" type="button" disabled>Apply yaml</button>
+          </div>
+          <pre class="diff-block" id="promote-yaml-diff"></pre>
+          <div class="status-line" id="promote-yaml-status"></div>
+          <div class="status-line" id="promote-yaml-backup"></div>
+        </div>
+        <div class="diff-half">
+          <h3>wrist_camera.xacro <span class="badge" id="xacro-target">–</span></h3>
+          <div class="status-line" id="xacro-mode">–</div>
+          <div class="status-line diff-warn" id="xacro-warn" hidden></div>
+          <div class="row">
+            <button id="promote-xacro-diff-btn" type="button">Show diff</button>
+            <button class="primary" id="promote-xacro-apply-btn" type="button" disabled>Apply xacro</button>
+          </div>
+          <pre class="diff-block" id="promote-xacro-diff"></pre>
+          <div class="status-line" id="promote-xacro-status"></div>
+          <div class="status-line" id="promote-xacro-backup"></div>
+        </div>
+        <div class="row">
+          <button id="promote-reload-btn" type="button">Reload from disk</button>
+          <span class="status-line" id="promote-reload-status"></span>
+        </div>
+      </div>
+    </section>
+    <section class="side-panel-content" data-panel="history">
+      <!-- Historical capture sessions. Every capture is persisted to disk
+           (<HANDEYE_DUMP_DIR|calibration_data>/wrist_handeye_sessions/<name>/),
+           so a restart never loses a capture and the operator can re-open and
+           re-solve a past capture — mirrors the pan-tilt calibration history. -->
+      <div class="history-panel">
+        <div class="row">
+          <button id="history-refresh-btn" type="button">Refresh</button>
+          <span class="status-line" id="history-status">–</span>
+        </div>
+        <h3>Sessions</h3>
+        <table class="method-table" id="history-table"></table>
+
+        <div id="history-detail" hidden>
+          <h3>Selected: <span id="history-sel-name">–</span></h3>
+          <div class="row">
+            <button class="primary" id="history-load-btn" type="button">Load into live session (then Solve)</button>
+            <button id="history-delete-btn" type="button">Delete</button>
+            <span class="status-line" id="history-detail-status"></span>
+          </div>
+          <table class="kv-table" id="history-summary"></table>
+          <h3>Capture gallery</h3>
+          <div class="gallery" id="history-gallery"></div>
+          <h3>Per-sample residuals (if solved)</h3>
+          <table class="method-table" id="history-per-sample"></table>
+          <h3>Rejected (MAD) — why</h3>
+          <table class="method-table" id="history-rejection"></table>
+        </div>
+      </div>
+    </section>
+    </div><!-- /.controls-col -->
+  </main>
+  <script src="/static/app.js?v=0.11.0"></script>
+</body>
+</html>

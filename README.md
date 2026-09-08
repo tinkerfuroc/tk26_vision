@@ -17,7 +17,7 @@ Vision module for Tinker 2026 based on ROS2 Humble.
 |---------|-------------|
 | `tinker_vision_msgs_26` | Custom interface definitions (`TrackPerson`, `SpotOnShelf`, new boolean-flag `ObjectDetection.srv`) |
 | `object_detection_new` | YOLO segmentation detection — specialist `object_detection_yolo` (custom model, excludes `'person'`) + pretrained `object_detection` (backward-compat) |
-| `object_detection_generalist` | Clean pretrained YOLO + optional Gemini 2.5 Pro (bbox) + FastSAM (mask) open-vocabulary detection on `/object_detection_generalist` |
+| `object_detection_generalist` | Clean pretrained YOLO + optional Gemini 2.5 Pro (bbox) + MobileSAM (mask) open-vocabulary detection on `/object_detection_generalist` |
 | `vision_track` | Person tracking action server with ReID |
 | `tk_vision_specialized` | `SpotOnShelf` action server |
 | `pan_tilt` | Pan-tilt servo control + YOLO head follow (migrated from tk23_vision) |
@@ -81,6 +81,14 @@ Use `./scripts/build.sh`, which sources venv + ROS, runs
 `ros2 run` invokes the venv python. Plain `colcon build` produces
 `#!/usr/bin/python3` shebangs that can't import from the venv.
 
+When the repo is embedded in the full robot workspace (`<ws>/src/tk26_vision`
+with `<ws>/tkbuild` present), `build.sh` delegates to `tkbuild tk26_vision`:
+artifacts land in the canonical `<ws>/install` tree instead of creating an
+in-repo `build/`/`install/` overlay that tkbuild never updates (those go
+permanently stale — see the 2026-07-02 kimi_api incident). Set `WS_ROOT`
+explicitly (e.g. `WS_ROOT=$PWD ./scripts/build.sh`) to force the in-repo
+build; standalone worktrees behave as before.
+
 ```bash
 # From the tk26_vision repo root / worktree root
 ./scripts/build.sh
@@ -109,7 +117,7 @@ source install/setup.bash
 # Detection
 ros2 run object_detection_new yolo_seg_node                 # /object_detection_yolo (specialist, custom model, excludes 'person')
 ros2 run object_detection_new yolo_seg_default_node         # /object_detection (pretrained COCO, backward-compat)
-ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + Gemini/FastSAM fallback)
+ros2 run object_detection_generalist generalist_node        # /object_detection_generalist (pretrained YOLO + Gemini/MobileSAM fallback)
 
 # Person tracking
 ros2 run vision_track person_track_server

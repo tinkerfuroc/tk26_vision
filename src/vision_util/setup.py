@@ -1,3 +1,4 @@
+import glob
 from setuptools import find_packages, setup
 
 package_name = 'vision_util'
@@ -10,6 +11,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob.glob('launch/*.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,6 +24,9 @@ setup(
         'console_scripts': [
             'door_detection = vision_util.door_detection:main',
             'get_point_cloud = vision_util.get_point_cloud:main',
+            'get_orbbec_pc = vision_util.get_orbbec_pc:main',
+            'get_image = vision_util.get_image:main',
+            'depth_colorizer = vision_util.depth_colorizer:main',
         ],
     },
 )

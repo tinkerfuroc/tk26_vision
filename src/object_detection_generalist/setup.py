@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='cindy',
     maintainer_email='cindy.w0135@gmail.com',
-    description='Clean YOLO + optional VLM (Gemini 2.5 Pro) bbox + FastSAM '
+    description='Clean YOLO + optional VLM (Gemini 2.5 Pro) bbox + MobileSAM '
                 'mask generalist object detection service.',
     license='Apache-2.0',
     tests_require=['pytest'],

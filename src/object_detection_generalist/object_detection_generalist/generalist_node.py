@@ -60,6 +60,18 @@ from vision_util.camera_intake import (
 from vision_util.vlm_models import vision_flash_model, vision_qwen_model
 from vision_util.weights_cache import resolve_weights
 
+from .person_geometry import (
+    DEFAULT_MIN_CONTAINMENT,
+    DEFAULT_MIN_IOU,
+    DEFAULT_PERSON_CONF,
+    PersonInstance,
+    instances_from_yolo_result,
+    is_person_phrase,
+    match_person_instances,
+    pad_to_multiple,
+    parse_unmatched_policy,
+    person_class_id,
+)
 from .sam_mask import SamPredictor
 from .vlm_bbox import VlmBboxError, load_env, request_bboxes
 from .world_bbox import WorldDetector, WorldDetectorError
@@ -125,6 +137,12 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # in the service callback. Names map is fixed once the model is
         # loaded; recomputing the set per call is a wasted allocation.
         self._yolo_class_names = set(self.model.names.values())
+        self._person_cls_id = person_class_id(self.model.names)
+        if self.person_seg_geometry and self._person_cls_id is None:
+            self.get_logger().warn(
+                "person_seg_geometry: YOLO model has no 'person' class; "
+                'person boxes keep their SAM masks'
+            )
 
         # YOLO-World is the default open-vocab fallback, but it is loaded
         # lazily so force_vlm_sam requests never pull it onto the GPU. If load
@@ -211,6 +229,24 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # boost via -p world_conf_threshold:=0.10 if you see false positives.
         self.declare_parameter('world_conf_threshold', 0.05)
         self.declare_parameter('world_iou_threshold', 0.5)
+        # Person geometry (GPSR sim report 2026-10-08 §4): for person boxes
+        # from YOLO-World or the VLM, take the 3D centroid from the matching
+        # COCO 'person' instance mask of the pretrained YOLO-seg model rather
+        # than a box-prompted SAM mask, which on edge-clipped boxes segments
+        # the wall behind the person.
+        self.declare_parameter('person_seg_geometry', True)
+        # Instance floor. Ultralytics applies its own conf=0.25 on every
+        # predict call, so values below 0.25 have no effect.
+        self.declare_parameter('person_seg_conf', DEFAULT_PERSON_CONF)
+        # A person box matches a YOLO person when box IoU >= min_iou OR the
+        # YOLO person box lies >= min_containment inside it (feet-only
+        # edge-clipped persons have low IoU but full containment).
+        self.declare_parameter('person_match_min_iou', DEFAULT_MIN_IOU)
+        self.declare_parameter(
+            'person_match_min_containment', DEFAULT_MIN_CONTAINMENT)
+        # 'drop': a person box with no matching YOLO person is removed.
+        # 'sam': keep its SAM mask (the pre-2026-10 behaviour).
+        self.declare_parameter('person_seg_unmatched', 'drop')
         # Orbbec depth Image to surface in the response. Two viable choices:
         #   - /camera/depth/image_raw — depth registered to color,
         #     so size MATCHES rgb_image and segments. Requires the camera
@@ -263,6 +299,27 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         self.world_iou_threshold = float(
             self.get_parameter('world_iou_threshold').value
         )
+        self.person_seg_geometry = bool(
+            self.get_parameter('person_seg_geometry').value
+        )
+        self.person_seg_conf = float(
+            self.get_parameter('person_seg_conf').value
+        )
+        self.person_match_min_iou = float(
+            self.get_parameter('person_match_min_iou').value
+        )
+        self.person_match_min_containment = float(
+            self.get_parameter('person_match_min_containment').value
+        )
+        raw_policy = self.get_parameter('person_seg_unmatched').value
+        policy = parse_unmatched_policy(raw_policy)
+        if policy is None:
+            self.get_logger().warn(
+                f'person_seg_unmatched={raw_policy!r} is not drop|sam; '
+                'using drop'
+            )
+            policy = 'drop'
+        self.person_seg_unmatched = policy
 
     # --- service advertisement -------------------------------------------
 
@@ -875,6 +932,135 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     f'Closing VLM client during cancel raised '
                     f'{type(exc).__name__}: {exc} (safe to ignore)'
                 )
+
+    # --- person geometry ---------------------------------------------------
+
+    def _detect_person_instances(self, rgb_img) -> list[PersonInstance]:
+        """Run the pretrained YOLO-seg model; return its person instances.
+
+        Never pass ``classes=`` here: Ultralytics merges predict kwargs into
+        the cached predictor args (engine/model.py, ``get_cfg(
+        self.predictor.args, args)``), so a class filter would stick and make
+        the parent YOLO path person-only. Filter on ``boxes.cls`` instead.
+        The lock serializes the race path's two legs on the shared model.
+        """
+        h, w = rgb_img.shape[:2]
+        padded = pad_to_multiple(rgb_img, 32)
+        with self._yolo_model_lock:
+            results = self.model(
+                padded, imgsz=padded.shape[:2], verbose=False,
+            )
+        instances: list[PersonInstance] = []
+        for result in results:
+            instances.extend(instances_from_yolo_result(
+                result, h, w,
+                conf_floor=self.person_seg_conf,
+                cls_id=self._person_cls_id,
+            ))
+        return instances
+
+    @staticmethod
+    def _box_classes(n_boxes: int, labels, prompt: str) -> list[str]:
+        """Prompt class each box answers; '' when it cannot be told.
+
+        Single-class prompt: every box is that class and the label is
+        ignored, so a VLM label like 'woman holding a bowl' on prompt 'bowl'
+        stays a bowl. Multi-class prompt: the box label normalized onto the
+        prompt classes; unlabelled or unmatched boxes get ''.
+        """
+        classes = GeneralistDetectionNode._parse_prompt_classes(prompt)
+        if len(classes) == 1:
+            return [classes[0]] * n_boxes
+        out = []
+        for i in range(n_boxes):
+            label = labels[i] if labels and i < len(labels) else ''
+            cls = GeneralistDetectionNode._normalize_vlm_label(
+                label, classes, prompt)
+            out.append(cls if cls in classes else '')
+        return out
+
+    def _apply_person_geometry(self, rgb_img, bboxes, masks, labels,
+                               prompt: str):
+        """Swap SAM masks for YOLO person masks on person boxes.
+
+        Returns ``(geom_bboxes, masks, info)`` as new lists aligned 1:1 with
+        the input. A matched person box gets the YOLO instance mask and the
+        instance bbox (the centroid ROI); an unmatched one gets mask None
+        (dropped) or keeps its SAM mask, per ``person_seg_unmatched``.
+        Non-person boxes pass through unchanged. ``info`` has one entry per
+        person box for the vision log.
+        """
+        geom_bboxes = [tuple(int(v) for v in b) for b in bboxes]
+        masks = list(masks)
+        if (not self.person_seg_geometry or self._person_cls_id is None
+                or not bboxes):
+            return geom_bboxes, masks, []
+        person_idx = [
+            i for i, cls in enumerate(
+                self._box_classes(len(bboxes), labels, prompt))
+            if is_person_phrase(cls)
+        ]
+        if not person_idx:
+            return geom_bboxes, masks, []
+        try:
+            instances = self._detect_person_instances(rgb_img)
+        except Exception as exc:  # noqa: BLE001 — degrade to SAM masks
+            self.get_logger().error(
+                f'person geometry: YOLO person pass failed ({exc}); '
+                'keeping SAM masks'
+            )
+            return geom_bboxes, masks, [
+                {'box': i, 'action': 'sam_yolo_error'} for i in person_idx
+            ]
+        matches = match_person_instances(
+            [geom_bboxes[i] for i in person_idx], instances,
+            min_iou=self.person_match_min_iou,
+            min_containment=self.person_match_min_containment,
+        )
+        info = []
+        for i, match in zip(person_idx, matches):
+            entry = {
+                'box': i,
+                'iou': round(match.iou, 3),
+                'containment': round(match.containment, 3),
+            }
+            if match.instance is not None:
+                inst = instances[match.instance]
+                masks[i] = inst.mask
+                geom_bboxes[i] = inst.bbox
+                entry.update(
+                    action='yolo_person',
+                    person_bbox=list(inst.bbox),
+                    person_conf=round(inst.conf, 3),
+                )
+            elif self.person_seg_unmatched == 'sam':
+                entry['action'] = 'sam_unmatched'
+            else:
+                masks[i] = None
+                entry['action'] = 'dropped'
+            info.append(entry)
+        self.get_logger().info(
+            f'person geometry: {len(person_idx)} person box(es), '
+            f'{len(instances)} YOLO person(s): '
+            + ', '.join(
+                f"box{e['box']}={e['action']}"
+                f"(iou={e['iou']:.2f},cont={e['containment']:.2f})"
+                for e in info
+            )
+        )
+        return geom_bboxes, masks, info
+
+    @staticmethod
+    def _person_geometry_error(objects, person_info) -> str | None:
+        """Error text when person geometry dropped every person box."""
+        dropped = sum(
+            1 for e in person_info if e.get('action') == 'dropped')
+        if objects or not dropped:
+            return None
+        return (
+            f'person geometry: {dropped} person box(es) had no matching '
+            'YOLO person mask (dropped)'
+        )
 
     def _log_debug(self, _t0, request, prompt, rgb_img, result):
         """Write per-call debug artifacts. Fires unconditionally — empty

@@ -201,3 +201,12 @@ def match_person_instances(prompt_bboxes: Sequence[Bbox],
         assigned.get(p, PersonMatch(None, best_iou[p], best_cont[p]))
         for p in range(n)
     ]
+
+
+UNMATCHED_POLICIES = ('drop', 'sam')
+
+
+def parse_unmatched_policy(value) -> str | None:
+    """Normalize the ``person_seg_unmatched`` param; None when invalid."""
+    v = str(value or '').strip().lower()
+    return v if v in UNMATCHED_POLICIES else None

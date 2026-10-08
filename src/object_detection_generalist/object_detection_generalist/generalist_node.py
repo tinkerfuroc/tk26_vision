@@ -665,10 +665,14 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         with self._sam_lock:
             masks, sam_elapsed = self._sam.segment(rgb_img, bboxes)
+        labels = world_labels if len(world_labels) == len(bboxes) else None
+        geom_bboxes, masks, person_info = self._apply_person_geometry(
+            rgb_img, bboxes, masks, labels, prompt,
+        )
         objects, segments, closest_distances = self._build_fallback_objects(
-            prompt, bboxes, masks, points, valid_mask, camera,
+            prompt, geom_bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments, confs=confs,
-            labels=world_labels if len(world_labels) == len(bboxes) else None,
+            labels=labels,
             header=header, target_frame=target_frame,
         )
         objects, segments, closest_distances = self._apply_realsense_range_gate(
@@ -686,7 +690,8 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'bboxes': bboxes, 'masks': masks, 'confs': confs,
             'world_elapsed': world_elapsed, 'vlm_elapsed': 0.0,
             'sam_elapsed': sam_elapsed,
-            'error': None,
+            'person_geometry': person_info,
+            'error': self._person_geometry_error(objects, person_info),
         }
 
     def _vlm_pipeline(self, *, rgb_img, points, valid_mask, prompt,
@@ -755,8 +760,16 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                     'vlm_sam', vlm_elapsed=vlm_elapsed, error='abandoned',
                 )
             masks, sam_elapsed = self._sam.segment(rgb_img, bboxes)
+        # Abandoned while SAM ran: skip the YOLO person pass too.
+        if abandon_event is not None and abandon_event.is_set():
+            return self._empty_result(
+                'vlm_sam', vlm_elapsed=vlm_elapsed, error='abandoned',
+            )
+        geom_bboxes, masks, person_info = self._apply_person_geometry(
+            rgb_img, bboxes, masks, cls_per_box, prompt,
+        )
         objects, segments, closest_distances = self._build_fallback_objects(
-            prompt, bboxes, masks, points, valid_mask, camera,
+            prompt, geom_bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments,
             labels=cls_per_box,
             header=header, target_frame=target_frame,
@@ -779,7 +792,8 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'vlm_labels': cls_per_box,
             'vlm_raw_labels': list(raw_labels),
             'vlm_meta': vlm_meta,
-            'error': None,
+            'person_geometry': person_info,
+            'error': self._person_geometry_error(objects, person_info),
         }
 
     def _race_world_vlm(self, **ctx) -> dict:
@@ -1096,6 +1110,9 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             # on the realsense path (orbbec path doesn't touch FFS so the
             # field stays at its 'native' default).
             'depth_source': getattr(self, '_last_depth_source', 'native'),
+            # Per person box: yolo_person | dropped | sam_unmatched |
+            # sam_yolo_error, with match IoU/containment.
+            'person_geometry': result.get('person_geometry') or [],
         }
 
         if used_source == 'yolo':
@@ -1353,8 +1370,8 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
             if mask is None or mask.sum() == 0:
                 self.get_logger().warn(
-                    f'fallback object {i}: empty mask post-CC for bbox={bbox}; '
-                    'skipping'
+                    f'fallback object {i}: empty or rejected mask for '
+                    f'bbox={bbox}; skipping'
                 )
                 continue
             centroid = self._calculate_centroid(

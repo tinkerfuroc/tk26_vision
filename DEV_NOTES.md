@@ -16,6 +16,18 @@ This file is distinct from `CLAUDE.md` (which describes the *design*) and `READM
 
 ---
 
+## 2026-10-08 — generalist: person boxes take YOLO person masks (GPSR wall-centroid fix)
+
+**Symptom.** GPSR sim living-room trials (batches `t2-20-live-rerun57/59/64/68/79/92`) picked the person ~1 m behind the real one, on the south-west wall, and once outside the arena (report `tinker-sim/6.0.1/docs/issue_reports/2026-10-08-gpsr-nav-bug-report.md` §4).
+
+**Root cause.** The generalist emitted those points. With the person clipped by the image edge, YOLO-World returned a weak box (conf 0.05–0.2), box-prompted MobileSAM segmented the wall inside it, and `_calculate_centroid` put the centroid on the wall (camera distance ~2.3 → ~3.3 m).
+
+**Fix.** `person_geometry.py` + `_apply_person_geometry`: on both the VLM and YOLO-World paths, person boxes take the matching YOLO-seg `person` instance mask and box (IoU ≥ 0.3 or containment ≥ 0.8). Unmatched person boxes are dropped (`person_seg_unmatched`). Replay: `test/test_person_geometry_replay.py` on 6 saved frames (4 YOLO-World wall/outside cases, 2 VLM); each wall case also asserts the old SAM wall-mask centroid falls outside the hand-read person region.
+
+**Gotcha.** `install/object_detection_generalist` is a plain copy, not a symlink — run unit tests with `PYTHONPATH=src/tk26_vision/src/object_detection_generalist` (or rebuild) or they exercise the stale installed copy.
+
+**Open.** YOLO-seg calls the robot's own arm `person` (conf ~0.75 in downward head frames). A YOLO-World/VLM box on the arm still matches, which is status quo, pinned as a strict xfail. It needs a self-body filter, e.g. reject centroids inside the robot footprint in `base_link`.
+
 ## 2026-08-22 — .env-driven VLM model ids, tensorboard 2.20, FoundationStereo TensorRT revival
 
 **Why:** a dependency scan of `tk26_vision` surfaced three low-risk, high-value gaps: (1) every

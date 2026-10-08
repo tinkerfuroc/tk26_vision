@@ -553,16 +553,48 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         result['segments'] = segments
         return result
 
+    def _ensure_world(self) -> 'WorldDetector | None':
+        """Construct the YOLO-World detector on first use (under a lock).
+
+        The scaffolding (``_world``/``_world_load_error``/``_world_lock``) was
+        declared for lazy loading but nothing ever built the detector, so every
+        out-of-vocabulary prompt failed with "unavailable at node init"
+        (2026-09-03, sim AnyGrasp trials). A failed load is remembered and not
+        retried, so a missing weight file costs one warning, not one per call.
+        """
+        if self._world is not None:
+            return self._world
+        with self._world_lock:
+            if self._world is not None or self._world_load_error is not None:
+                return self._world
+            try:
+                self._world = WorldDetector(
+                    weights_path=str(resolve_weights(self.world_weights)),
+                    device=self.device,
+                    logger=self.get_logger(),
+                )
+                self.get_logger().info(
+                    f'YOLO-World loaded lazily from {self.world_weights} '
+                    f'on {self.device}'
+                )
+            except Exception as exc:  # noqa: BLE001 — keep the node usable
+                self._world_load_error = str(exc)
+                self.get_logger().error(f'YOLO-World load failed: {exc}')
+            return self._world
+
     def _world_pipeline(self, *, rgb_img, points, valid_mask, prompt,
                         camera, header, sort_mode, return_segments,
                         target_frame='') -> dict:
         """Run YOLO-World + SAM. Returns a result dict (never raises)."""
-        if self._world is None:
+        world = self._ensure_world()
+        if world is None:
             return self._empty_result(
-                'yolo_world', error='YOLO-World unavailable at node init'
+                'yolo_world',
+                error=f'YOLO-World unavailable: {self._world_load_error}',
             )
         try:
-            bboxes, confs, world_elapsed = self._world.detect(rgb_img, prompt)
+            bboxes, confs, world_elapsed = world.detect(rgb_img, prompt)
+            world_labels = list(getattr(world, 'last_labels', []) or [])
         except Exception as exc:  # noqa: BLE001 — model errors stay non-fatal
             self.get_logger().error(f'YOLO-World inference failed: {exc}')
             return self._empty_result(
@@ -579,6 +611,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         objects, segments, closest_distances = self._build_fallback_objects(
             prompt, bboxes, masks, points, valid_mask, camera,
             return_segments=return_segments, confs=confs,
+            labels=world_labels if len(world_labels) == len(bboxes) else None,
             header=header, target_frame=target_frame,
         )
         objects, segments, closest_distances = self._apply_realsense_range_gate(

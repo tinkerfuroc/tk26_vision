@@ -174,7 +174,15 @@ class WorldDetector:
         """
 
         h, w = rgb_bgr.shape[:2]
-        classes = [prompt]
+        # A ' . '-joined prompt is several open-vocab classes (the same grammar
+        # the VLM path uses): register each as its own class so every box
+        # carries the class it matched (self.last_labels). Before this the
+        # whole string was ONE class, so a category count saw every box
+        # labelled with the full prompt and could not tell members apart
+        # (GPSR sim battery 2026-09-30 fix5 run countObjOnPlcmt: 3 boxes found,
+        # 1 counted).
+        classes = [c.strip() for c in prompt.split(' . ') if c.strip()] or [prompt]
+        self.last_labels: List[str] = []
         if classes != self._last_classes:
             self._set_classes_on_device(classes)
             self._last_classes = classes
@@ -200,6 +208,8 @@ class WorldDetector:
                 continue
             xyxy = boxes.xyxy.cpu().numpy()
             confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+            cls_ids = (boxes.cls.cpu().numpy() if getattr(boxes, 'cls', None) is not None
+                       else None)
             for i in range(xyxy.shape[0]):
                 x1, y1, x2, y2 = xyxy[i].tolist()
                 px1 = max(0, min(int(round(x1)), w - 1))
@@ -210,6 +220,8 @@ class WorldDetector:
                     continue
                 boxes_out.append((px1, py1, px2, py2))
                 confs_out.append(float(confs[i]) if confs is not None else 1.0)
+                k = int(cls_ids[i]) if cls_ids is not None else 0
+                self.last_labels.append(classes[k] if 0 <= k < len(classes) else prompt)
 
         if self._logger is not None:
             self._logger.info(

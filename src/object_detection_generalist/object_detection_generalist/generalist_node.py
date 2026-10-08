@@ -414,7 +414,12 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         elif yolo_known:
             result = self._yolo_pipeline(**ctx)
             if not result['objects']:
-                if request.use_vlm_sam_fallback:
+                if self._person_fallback_is_futile(prompt):
+                    self.get_logger().info(
+                        f'YOLO empty for "{prompt}"; skipping open-vocab '
+                        'fallback (person geometry would drop every box)'
+                    )
+                elif request.use_vlm_sam_fallback:
                     self.get_logger().info(
                         f'YOLO empty for "{prompt}"; racing YOLO-World vs VLM'
                     )
@@ -948,6 +953,36 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
                 )
 
     # --- person geometry ---------------------------------------------------
+
+    def _detect_objects(self, *args, **kwargs):
+        """Parent YOLO pass, serialized with the person pass on one model.
+
+        A race leg abandoned late can still be inside
+        ``_detect_person_instances`` when the next service call reaches the
+        parent YOLO pipeline, and Ultralytics predictors are not
+        thread-safe.
+        """
+        with self._yolo_model_lock:
+            return super()._detect_objects(*args, **kwargs)
+
+    def _person_fallback_is_futile(self, prompt: str) -> bool:
+        """True when the open-vocab fallback cannot add a person.
+
+        With person geometry on and unmatched person boxes dropped, every
+        fallback box needs a YOLO person instance from the same frame and
+        model. After the parent YOLO pass found no person, the person pass
+        finds none either unless the parent filtered harder (higher
+        ``confidence_threshold``) or excludes 'person'; otherwise the
+        fallback would only spend the VLM wait to drop every box.
+        """
+        return bool(
+            self.person_seg_geometry
+            and self._person_cls_id is not None
+            and self.person_seg_unmatched == 'drop'
+            and is_person_phrase(prompt)
+            and self.person_seg_conf >= self.conf_threshold
+            and 'person' not in self.excluded_classes
+        )
 
     def _detect_person_instances(self, rgb_img) -> list[PersonInstance]:
         """Run the pretrained YOLO-seg model; return its person instances.

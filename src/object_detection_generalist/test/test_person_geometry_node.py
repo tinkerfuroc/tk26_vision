@@ -223,3 +223,107 @@ def test_detect_person_instances_never_passes_classes_and_filters():
 ])
 def test_parse_unmatched_policy(value, expected):
     assert parse_unmatched_policy(value) == expected
+
+
+# --- final-review fixes -----------------------------------------------------
+
+def _futile_node(**overrides):
+    node = SimpleNamespace(
+        person_seg_geometry=True, _person_cls_id=0,
+        person_seg_unmatched='drop', person_seg_conf=0.25,
+        conf_threshold=0.0, excluded_classes=set(),
+    )
+    for k, v in overrides.items():
+        setattr(node, k, v)
+    return node
+
+
+def test_person_fallback_futile_for_person_prompt_by_default():
+    assert Node._person_fallback_is_futile(_futile_node(), 'person')
+
+
+@pytest.mark.parametrize('overrides, prompt', [
+    ({}, 'cup'),
+    ({'person_seg_unmatched': 'sam'}, 'person'),
+    ({'person_seg_geometry': False}, 'person'),
+    ({'_person_cls_id': None}, 'person'),
+    # Parent filters harder than the person pass: the pass can find more.
+    ({'conf_threshold': 0.5}, 'person'),
+    # Parent never returns persons, so the pass may find what it skipped.
+    ({'excluded_classes': {'person'}}, 'person'),
+])
+def test_person_fallback_not_futile(overrides, prompt):
+    assert not Node._person_fallback_is_futile(_futile_node(**overrides), prompt)
+
+
+def _callback_node(futile):
+    from std_msgs.msg import Header
+
+    calls = []
+
+    def record(name, source):
+        def run(**ctx):
+            calls.append(name)
+            return Node._empty_result(source)
+        return run
+
+    return SimpleNamespace(
+        get_clock=lambda: SimpleNamespace(
+            now=lambda: SimpleNamespace(to_msg=lambda: Header().stamp)),
+        _select_camera=lambda c: 'orbbec',
+        _wait_for_recent_frame=lambda c: (object(), object()),
+        _get_intrinsic=lambda c: object(),
+        _process_orbbec_data=lambda rgb, depth, intr: (
+            RGB, np.zeros((H, W, 3)), np.ones((H, W), bool), Header()),
+        _select_sort_mode=Node._select_sort_mode,
+        _vision_logger=SimpleNamespace(enabled=False),
+        _yolo_class_names={'person'},
+        _yolo_pipeline=lambda **ctx: Node._empty_result('yolo'),
+        _race_world_vlm=record('race', 'vlm_sam'),
+        _world_pipeline=record('world', 'yolo_world'),
+        _vlm_pipeline=record('vlm', 'vlm_sam'),
+        _person_fallback_is_futile=lambda prompt: futile,
+        _frame_supports_tf_transform=lambda c: True,
+        allow_auto_fallback=True, enable_vlm=False,
+        get_logger=lambda: _Logger(), calls=calls,
+    )
+
+
+@pytest.mark.parametrize('use_race', [True, False])
+def test_callback_skips_futile_person_fallback(use_race):
+    from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as Srv
+    node = _callback_node(futile=True)
+    req = Srv.Request(prompt='person', camera='orbbec',
+                      use_vlm_sam_fallback=use_race)
+    res = Node._generalist_service_callback(node, req, Srv.Response())
+    assert node.calls == []
+    assert res.status == 1
+
+
+@pytest.mark.parametrize('use_race, expected', [(True, ['race']),
+                                                (False, ['world'])])
+def test_callback_keeps_person_fallback_when_not_futile(use_race, expected):
+    from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as Srv
+    node = _callback_node(futile=False)
+    req = Srv.Request(prompt='person', camera='orbbec',
+                      use_vlm_sam_fallback=use_race)
+    Node._generalist_service_callback(node, req, Srv.Response())
+    assert node.calls == expected
+
+
+def test_parent_yolo_pass_holds_the_shared_model_lock(monkeypatch):
+    # A late race leg can still be in _detect_person_instances when the next
+    # call's YOLO pipeline runs; both use the same Ultralytics predictor.
+    from object_detection_new.object_seg_yolo import YOLOSegmentationNode
+    seen = {}
+
+    def parent(self, *args, **kwargs):
+        seen['locked'] = self._yolo_model_lock.locked()
+        return 'objects', ['segments']
+
+    monkeypatch.setattr(YOLOSegmentationNode, '_detect_objects', parent)
+    node = Node.__new__(Node)
+    node._yolo_model_lock = threading.Lock()
+    assert node._detect_objects(RGB, None, 'person', None, None) == (
+        'objects', ['segments'])
+    assert seen['locked'] is True

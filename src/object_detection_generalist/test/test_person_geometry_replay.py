@@ -4,8 +4,8 @@ Report: tinker-sim/6.0.1/docs/issue_reports/2026-10-08-gpsr-nav-bug-report.md
 section 4. Runs the real yolo11m-seg model through the node's person pass
 and matching, and checks the matched mask's centroid falls in
 ``person_region`` — read by hand from the frame as where a person-mask
-centroid lands — and that the old SAM wall-mask centroid does not. Skipped when the weights are not in the local cache —
-tests never download.
+centroid lands — and that the old SAM wall-mask centroid does not.
+Skipped when the weights are not in the local cache — tests never download.
 """
 import json
 import threading

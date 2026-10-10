@@ -53,7 +53,8 @@ def is_person_phrase(text: str) -> bool:
         if tok in RELATION_WORDS:
             return False
         if tok in PERSON_WORDS:
-            # "person's bag": the possessive person word modifies the next noun.
+            # "person's bag": a possessive person word modifies the next
+            # noun.
             return not (i + 1 < len(tokens) and tokens[i + 1] == 's')
     return False
 

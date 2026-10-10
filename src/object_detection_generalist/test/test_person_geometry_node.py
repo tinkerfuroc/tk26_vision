@@ -79,7 +79,8 @@ def _node(instances=(), raises=None, **overrides):
 
 
 def _apply(node, bboxes, masks, labels, prompt):
-    return Node._apply_person_geometry(node, RGB, bboxes, masks, labels, prompt)
+    return Node._apply_person_geometry(
+        node, RGB, bboxes, masks, labels, prompt)
 
 
 def test_person_box_takes_yolo_person_mask_and_box():
@@ -219,7 +220,8 @@ def test_detect_person_instances_never_passes_classes_and_filters():
 
 
 @pytest.mark.parametrize('value, expected', [
-    ('drop', 'drop'), (' SAM ', 'sam'), ('keep', None), ('', None), (None, None),
+    ('drop', 'drop'), (' SAM ', 'sam'), ('keep', None), ('', None),
+    (None, None),
 ])
 def test_parse_unmatched_policy(value, expected):
     assert parse_unmatched_policy(value) == expected
@@ -253,7 +255,8 @@ def test_person_fallback_futile_for_person_prompt_by_default():
     ({'excluded_classes': {'person'}}, 'person'),
 ])
 def test_person_fallback_not_futile(overrides, prompt):
-    assert not Node._person_fallback_is_futile(_futile_node(**overrides), prompt)
+    node = _futile_node(**overrides)
+    assert not Node._person_fallback_is_futile(node, prompt)
 
 
 def _callback_node(futile):

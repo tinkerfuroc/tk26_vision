@@ -74,6 +74,7 @@ def test_person_class_id_list_names():
 def test_person_class_id_missing():
     assert person_class_id({0: 'cup'}) is None
 
+
 MATCH = dict(min_iou=0.3, min_containment=0.8)
 
 
@@ -98,7 +99,8 @@ def test_box_containment_fully_inside():
 
 
 def test_box_containment_partial():
-    assert box_containment((5, 0, 15, 10), (0, 0, 10, 10)) == pytest.approx(0.5)
+    assert box_containment(
+        (5, 0, 15, 10), (0, 0, 10, 10)) == pytest.approx(0.5)
 
 
 def test_box_containment_degenerate_inner():

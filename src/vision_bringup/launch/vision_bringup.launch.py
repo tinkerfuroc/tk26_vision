@@ -1,12 +1,12 @@
 """Vision perception bringup — the BT-facing vision nodes.
 
-Starts only the vision nodes the behavior_tree actually calls, selected by
-auditing the production task trees (HRI+Follow, GPSR, Restaurant, PickAndPlace).
+Starts core perception services, including RGB behaviour/litter detection,
+plus nodes selected for production tasks (HRI+Follow, GPSR, Restaurant, PickAndPlace).
 Start the sensor layer FIRST::
 
     ros2 launch vision_bringup vision_driver.launch.py    # pan-tilt + Orbbec + FFS
 
-Then this perception layer. Two always-on core nodes come up bare; the rest are
+Then this perception layer. Four default-on core nodes come up bare; the rest are
 gated per task (all task flags default OFF — opt into the one task you are
 running)::
 
@@ -25,6 +25,9 @@ Always-on core (default ON, ungated by task)
 --------------------------------------------
 - ``enable_generalist`` (true)  generalist_node  → /object_detection_generalist
 - ``enable_door``       (true)  door_detection   → /door_detection_srv
+- ``enable_behaviour_detection`` (true) → /behaviour_detection/detect
+- ``enable_litter_detection``    (true) → /litter_detection/detect
+  These RGB-only VLM services infer on request, not continuously.
 
 Per-task groups (default OFF)
 -----------------------------
@@ -98,6 +101,12 @@ def generate_launch_description():
         # Always-on core (default ON).
         DeclareLaunchArgument('enable_generalist', default_value='true'),
         DeclareLaunchArgument('enable_door', default_value='true'),
+        DeclareLaunchArgument(
+            'enable_behaviour_detection', default_value='true',
+            description='Start the on-demand RGB VLM behaviour detection service.'),
+        DeclareLaunchArgument(
+            'enable_litter_detection', default_value='true',
+            description='Start the on-demand Orbbec RGB VLM floor-litter service.'),
         # Per-task groups (default OFF).
         DeclareLaunchArgument('enable_hri', default_value='false',
                               description='HRI + Follow (one task).'),
@@ -122,6 +131,10 @@ def generate_launch_description():
               _if('enable_generalist')),
         _node('vision_util', 'door_detection',
               _if('enable_door')),
+        _node('tk_vision_specialized', 'behaviour_detection',
+              _if('enable_behaviour_detection')),
+        _node('tk_vision_specialized', 'litter_detection',
+              _if('enable_litter_detection')),
         # --- shared across tasks (OR-gated, spawn once) ---
         _node('object_detection_new', 'yolo_seg_node',
               _if_any('enable_hri', 'enable_gpsr')),

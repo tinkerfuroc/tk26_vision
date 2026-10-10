@@ -15,6 +15,8 @@ find_package(builtin_interfaces REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/SceneObservation.msg"
+  "srv/DetectRgbScene.srv"
   "msg/BoundingBox.msg"
   "msg/Face.msg"
   "msg/FaceResult.msg"

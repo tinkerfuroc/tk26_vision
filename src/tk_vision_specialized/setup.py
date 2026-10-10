@@ -31,6 +31,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'behaviour_detection = tk_vision_specialized.behaviour_detection:main',
+            'litter_detection = tk_vision_specialized.litter_detection:main',
             'spot_on_shelf_server = tk_vision_specialized.spot_on_shelf_server:main',
             'waving_person_server = tk_vision_specialized.waving_person_server:main',
             'waving_client = tk_vision_specialized.waving_client:main',

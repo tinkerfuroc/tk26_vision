@@ -2,10 +2,15 @@
 
 Task-specific vision servers. Each node wraps a narrow detection task and exposes a single ROS 2 action or service.
 
+RGB-only behaviour and floor-litter detection: see [RGB_SCENE_DETECTION.md](RGB_SCENE_DETECTION.md)
+for labels, parameters, timestamped vision logs and usage.
+
 ## Nodes
 
 | Executable | Type | Interface | Description |
 |---|---|---|---|
+| `behaviour_detection` | service | `tinker_vision_msgs_26/srv/DetectRgbScene` | RGB + VLM person posture/resting/possible-fall/waving observations at `~/detect`; logs images, boxes, results and timestamps. |
+| `litter_detection` | service | `tinker_vision_msgs_26/srv/DetectRgbScene` | Orbbec RGB + VLM suspected floor litter at `~/detect`; no depth dependency, with timestamped vision logs. |
 | `spot_on_shelf_server` | action | `tinker_vision_msgs_26/action/SpotOnShelf` | Detect objects on a shelf and bucket them into vertical layers + horizontal grids. Delegates detection to `object_detection_yolo`. |
 | `waving_person_server` | action | `tinker_vision_msgs_26/action/DetectWaving` | Find all persons raising a hand / waving in the current Orbbec frame. |
 | `waving_client` | — | — | Example client: sends `/detect_waving_persons` goals once per second and prints results. Useful for camera-alignment sanity before demos. |

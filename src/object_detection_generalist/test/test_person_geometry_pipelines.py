@@ -187,3 +187,54 @@ def test_log_debug_records_person_geometry():
         {'box': 0, 'action': 'yolo_person'}
     ]
     assert captured['dets'][0]['mask'] is PERSON_MASK
+
+
+def test_world_pipeline_returns_per_box_labels():
+    node = _node(_swap)
+    res = Node._world_pipeline(node, **CTX)
+    assert res['labels'] == ['person pointing to the left']
+
+
+def test_log_debug_uses_world_labels_not_whole_prompt():
+    # GPSR battery 2026-10-10: a multi-class prompt was logged as cls_name on
+    # every YOLO-World box, though Object.cls had the per-box class.
+    captured = {}
+    node = SimpleNamespace(
+        enable_vlm=False, vlm_model='m', vlm_fallback_models=[],
+        vlm_fallback_on_empty=False,
+        _write_debug_artifacts=lambda rgb, dets, **kw: captured.update(
+            kw, dets=dets),
+    )
+    request = SimpleNamespace(
+        camera='orbbec', target_frame='map', sort_closest=True,
+        sort_highest=False, force_vlm_sam=False, use_vlm_sam_fallback=True,
+    )
+    mug, bowl = _mask((10, 10, 30, 30)), _mask((50, 10, 80, 30))
+    result = Node._empty_result('yolo_world')
+    result.update(
+        objects=[object(), object()],
+        bboxes=[(10, 10, 30, 30), (50, 10, 80, 30)], masks=[mug, bowl],
+        confs=[0.236, 0.4], labels=['mug', 'bowl'],
+    )
+    Node._log_debug(node, time.perf_counter(), request,
+                    'mug . bowl . apple', RGB, result)
+    assert [d['cls_name'] for d in captured['dets']] == ['mug', 'bowl']
+
+
+def test_log_debug_world_without_labels_falls_back_to_prompt():
+    captured = {}
+    node = SimpleNamespace(
+        enable_vlm=False, vlm_model='m', vlm_fallback_models=[],
+        vlm_fallback_on_empty=False,
+        _write_debug_artifacts=lambda rgb, dets, **kw: captured.update(
+            kw, dets=dets),
+    )
+    request = SimpleNamespace(
+        camera='orbbec', target_frame='map', sort_closest=True,
+        sort_highest=False, force_vlm_sam=False, use_vlm_sam_fallback=True,
+    )
+    result = Node._empty_result('yolo_world')
+    result.update(objects=[object()], bboxes=[(10, 10, 30, 30)],
+                  masks=[_mask((10, 10, 30, 30))], confs=[0.5])
+    Node._log_debug(node, time.perf_counter(), request, 'mug', RGB, result)
+    assert captured['dets'][0]['cls_name'] == 'mug'

@@ -693,6 +693,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             'source': 'yolo_world',
             'objects': objects, 'segments': segments,
             'bboxes': bboxes, 'masks': masks, 'confs': confs,
+            'labels': labels or [],
             'world_elapsed': world_elapsed, 'vlm_elapsed': 0.0,
             'sam_elapsed': sam_elapsed,
             'person_geometry': person_info,
@@ -1166,14 +1167,15 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # vlm_sam / yolo_world / none — render from the live result dict.
         vlm_labels = result.get('vlm_labels') or []
         vlm_raw_labels = result.get('vlm_raw_labels') or []
+        # Same per-box class as Object.cls; the prompt only when unlabelled.
+        box_labels = (
+            vlm_labels if source == 'vlm_sam' else result.get('labels') or []
+        )
         detections = []
         for i, (bbox, mask) in enumerate(zip(bboxes, masks)):
             if mask is None or mask.sum() == 0:
                 continue
-            cls_name = (
-                vlm_labels[i] if source == 'vlm_sam' and i < len(vlm_labels)
-                else prompt
-            )
+            cls_name = box_labels[i] if i < len(box_labels) else prompt
             detections.append({
                 'bbox': bbox,
                 'mask': mask,
@@ -1379,9 +1381,9 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         ``labels`` is the per-box ``Object.cls`` to write. VLM-path callers
         normalize Gemini's free-form label down to one of the prompt classes
-        and pass the result here. YOLO-World callers pass nothing (their
-        model is configured single-class) and every object's ``cls`` falls
-        back to the full ``prompt``.
+        and pass the result here. YOLO-World callers pass the per-box class
+        from ``last_labels``. Without labels, ``cls`` falls back to the full
+        ``prompt``.
 
         ``header`` + ``target_frame`` are forwarded to ``_transform_centroid``
         so fallback centroids land in the same frame the YOLO branch

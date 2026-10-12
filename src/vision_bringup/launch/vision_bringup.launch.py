@@ -1,12 +1,12 @@
 """Vision perception bringup — the BT-facing vision nodes.
 
-Starts core perception services, including RGB behaviour/litter detection,
-plus nodes selected for production tasks (HRI+Follow, GPSR, Restaurant, PickAndPlace).
+Starts only the vision nodes the behavior_tree actually calls, selected by
+auditing the production task trees (HRI+Follow, GPSR, Restaurant, PickAndPlace).
 Start the sensor layer FIRST::
 
     ros2 launch vision_bringup vision_driver.launch.py    # pan-tilt + Orbbec + FFS
 
-Then this perception layer. Four default-on core nodes come up bare; the rest are
+Then this perception layer. Two always-on core nodes come up bare; the rest are
 gated per task (all task flags default OFF — opt into the one task you are
 running)::
 
@@ -25,9 +25,6 @@ Always-on core (default ON, ungated by task)
 --------------------------------------------
 - ``enable_generalist`` (true)  generalist_node  → /object_detection_generalist
 - ``enable_door``       (true)  door_detection   → /door_detection_srv
-- ``enable_behaviour_detection`` (true) → /behaviour_detection/detect
-- ``enable_litter_detection``    (true) → /litter_detection/detect
-  These RGB-only VLM services infer on request, not continuously.
 
 Per-task groups (default OFF)
 -----------------------------
@@ -84,9 +81,15 @@ def _if_any(*args):
 
 
 def _node(package, executable, condition, **kwargs):
+    # Every node gets use_sim_time (default false): a simulator stamps
+    # frames in sim time, and a wall-clock node computes every freshness /
+    # sync age as (wall epoch - sim seconds) -- permanently stale, so
+    # detectors reject all camera data no matter the threshold.
+    params = list(kwargs.pop('parameters', []) or [])
+    params.append({'use_sim_time': LaunchConfiguration('use_sim_time')})
     return Node(
         package=package, executable=executable, output='screen',
-        condition=condition, **kwargs,
+        condition=condition, parameters=params, **kwargs,
     )
 
 
@@ -101,12 +104,6 @@ def generate_launch_description():
         # Always-on core (default ON).
         DeclareLaunchArgument('enable_generalist', default_value='true'),
         DeclareLaunchArgument('enable_door', default_value='true'),
-        DeclareLaunchArgument(
-            'enable_behaviour_detection', default_value='true',
-            description='Start the on-demand RGB VLM behaviour detection service.'),
-        DeclareLaunchArgument(
-            'enable_litter_detection', default_value='true',
-            description='Start the on-demand Orbbec RGB VLM floor-litter service.'),
         # Per-task groups (default OFF).
         DeclareLaunchArgument('enable_hri', default_value='false',
                               description='HRI + Follow (one task).'),
@@ -118,6 +115,11 @@ def generate_launch_description():
         # Alias so `enable_pnp:=true` (operator shorthand) works identically.
         DeclareLaunchArgument('enable_pnp', default_value='false',
                               description='Alias for enable_pick_place.'),
+        # Detector-side color/depth pairing age limit. The 0.2 default suits
+        # hardware cameras; a simulator under RTX load publishes depth
+        # ~0.5-1s behind color, so sim runs pass a larger value.
+        DeclareLaunchArgument('img_sync_thres', default_value='0.2'),
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
     ]
 
     # SHM profile for these camera subscribers (matches the driver's publisher).
@@ -128,16 +130,14 @@ def generate_launch_description():
     nodes = [
         # --- always-on core ---
         _node('object_detection_generalist', 'generalist_node',
-              _if('enable_generalist')),
+              _if('enable_generalist'),
+              parameters=[{'img_sync_thres': LaunchConfiguration('img_sync_thres')}]),
         _node('vision_util', 'door_detection',
               _if('enable_door')),
-        _node('tk_vision_specialized', 'behaviour_detection',
-              _if('enable_behaviour_detection')),
-        _node('tk_vision_specialized', 'litter_detection',
-              _if('enable_litter_detection')),
         # --- shared across tasks (OR-gated, spawn once) ---
         _node('object_detection_new', 'yolo_seg_node',
-              _if_any('enable_hri', 'enable_gpsr')),
+              _if_any('enable_hri', 'enable_gpsr'),
+              parameters=[{'img_sync_thres': LaunchConfiguration('img_sync_thres')}]),
         _node('vision_track', 'person_track_server',
               _if_any('enable_hri', 'enable_gpsr')),
         _node('tk_vision_specialized', 'waving_person_server',

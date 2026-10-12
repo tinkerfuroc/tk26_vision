@@ -16,7 +16,7 @@ source install/setup.zsh   # re-source after building; this is a package
 # 1) sensor layer: pan-tilt + Orbbec + FoundationStereo (streaming)
 ros2 launch vision_bringup vision_driver.launch.py
 
-# 2) perception layer: always-on core (generalist + door) only
+# 2) default core: generalist + door + behaviour_detection + litter_detection
 ros2 launch vision_bringup vision_bringup.launch.py
 
 # opt into one task (flags default OFF):
@@ -33,7 +33,7 @@ extra node — its vision deps are the always-on core.
 | Launch / flag | Nodes |
 |---|---|
 | `vision_driver` | pan-tilt, Orbbec, FoundationStereo (streaming, non-aligned, under SHM) |
-| `vision_bringup` (bare) | generalist_node, door_detection |
+| `vision_bringup` (bare) | generalist_node, door_detection, behaviour_detection, litter_detection |
 | `enable_hri:=true` | + yolo_seg, person_track, waving, feature_recognition, feature_matching, seat_recommend_bbox, follow_head |
 | `enable_gpsr:=true` | + yolo_seg, person_track, waving, feature_recognition, get_image |
 | `enable_restaurant:=true` | + waving, follow_head |
@@ -51,6 +51,11 @@ shell sources.
 
 ## Notes
 
+- `behaviour_detection` and `litter_detection` start by default and infer only
+  on service requests. Disable them independently with
+  `enable_behaviour_detection:=false` or `enable_litter_detection:=false`.
+  Do not also start their standalone launch while bringup owns these nodes.
+  See [RGB scene bringup](docs/rgb-scene-bringup.md) for the launch contract.
 - The kimi_api nodes need `OPENROUTER_API_KEY` / `DASHSCOPE_API_KEY` in a
   workspace-root `.env`, else they raise at init. Launch from the workspace root.
 - FoundationStereo's streamed depth is non-empty only when the manipulation

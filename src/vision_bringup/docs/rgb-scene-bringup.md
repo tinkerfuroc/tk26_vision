@@ -10,11 +10,20 @@ flags. Existing generalist and door services remain in the default core.
 | `enable_litter_detection` | `true` | `litter_detection` |
 
 Both use `/camera/color/image_raw` and inherit the perception launch's DDS
-environment. Start the Orbbec driver first. These services need RGB only;
-they do not require depth or TF. Requests to `/behaviour_detection/detect`
+environment. Start the Orbbec driver first with depth registered to RGB.
+Behaviour localization also needs RGB CameraInfo and capture-time TF; litter
+detection needs RGB only. Missing localization inputs preserve RGB observations
+but set each observation's position_valid=false. Requests to `/behaviour_detection/detect`
 and `/litter_detection/detect` trigger inference and vision-log writes.
 Starting the nodes does not trigger VLM calls. Provider keys are loaded from
 the workspace `.env`; missing keys are reported when a detection is requested.
+
+Behaviour launch arguments: `behaviour_target_frame` (map),
+`behaviour_depth_topic` (/camera/depth/image_raw), and
+`behaviour_camera_info_topic` (/camera/color/camera_info). The standalone
+`rgb_scene_detection.launch.py` exposes these without the `behaviour_` prefix.
+The request's optional `target_frame` overrides the node default. No navigation
+goals are sent by these nodes; consumers must check each position_valid flag.
 
 To disable both:
 

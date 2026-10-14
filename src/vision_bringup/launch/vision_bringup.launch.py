@@ -27,7 +27,7 @@ Always-on core (default ON, ungated by task)
 - ``enable_door``       (true)  door_detection   → /door_detection_srv
 - ``enable_behaviour_detection`` (true) → /behaviour_detection/detect
 - ``enable_litter_detection``    (true) → /litter_detection/detect
-  These RGB-only VLM services infer on request, not continuously.
+  Both infer on request; behaviour also estimates 3D positions from depth/TF.
 
 Per-task groups (default OFF)
 -----------------------------
@@ -107,6 +107,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'enable_litter_detection', default_value='true',
             description='Start the on-demand Orbbec RGB VLM floor-litter service.'),
+        DeclareLaunchArgument('behaviour_target_frame', default_value='map'),
+        DeclareLaunchArgument('behaviour_depth_topic', default_value='/camera/depth/image_raw'),
+        DeclareLaunchArgument('behaviour_camera_info_topic', default_value='/camera/color/camera_info'),
         # Per-task groups (default OFF).
         DeclareLaunchArgument('enable_hri', default_value='false',
                               description='HRI + Follow (one task).'),
@@ -132,7 +135,10 @@ def generate_launch_description():
         _node('vision_util', 'door_detection',
               _if('enable_door')),
         _node('tk_vision_specialized', 'behaviour_detection',
-              _if('enable_behaviour_detection')),
+              _if('enable_behaviour_detection'),
+              parameters=[{'target_frame': LaunchConfiguration('behaviour_target_frame'),
+                           'depth_topic': LaunchConfiguration('behaviour_depth_topic'),
+                           'camera_info_topic': LaunchConfiguration('behaviour_camera_info_topic')}]),
         _node('tk_vision_specialized', 'litter_detection',
               _if('enable_litter_detection')),
         # --- shared across tasks (OR-gated, spawn once) ---

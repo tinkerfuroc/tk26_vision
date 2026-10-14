@@ -130,6 +130,18 @@ _GEMINI_PROFILE = _ProviderProfile(
     system_prompt=_GEMINI_SYSTEM_PROMPT,
     bbox_format='normalized_yxyx',
 )
+_GLM_PROFILE = _ProviderProfile(
+    name='glm',
+    # Some compatible gateways do not enforce response_format's JSON schema.
+    # State the enclosing object explicitly instead of requesting a bare array.
+    system_prompt=(
+        'Return only a JSON object with exactly one key "detections", an array '
+        'of objects with "label" and "box_2d". No markdown or explanations. '
+        'If no instances match, return {"detections": []}. '
+        + _GEMINI_SYSTEM_PROMPT.split('. ', 1)[1]
+    ),
+    bbox_format='normalized_yxyx',
+)
 _QWEN_PROFILE = _ProviderProfile(
     name='qwen',
     system_prompt=_QWEN_SYSTEM_PROMPT,
@@ -158,6 +170,8 @@ def _provider_profile_for_model(model: str) -> _ProviderProfile:
         return _QWEN3_PROFILE
     if 'qwen' in model_l:
         return _QWEN_PROFILE
+    if 'glm' in model_l:
+        return _GLM_PROFILE
     return _GEMINI_PROFILE
 
 
@@ -869,6 +883,8 @@ def _is_structurally_valid_box(box_2d) -> bool:
 def _parse_detections(raw: str, w: int, h: int,
                       profile: _ProviderProfile) -> tuple[List[Bbox], List[str], int]:
     parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError('response must be a JSON object containing detections')
     detections = parsed.get('detections', []) or []
     if not isinstance(detections, list):
         raise ValueError('detections must be an array')

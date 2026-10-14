@@ -10,12 +10,17 @@ def generate_launch_description():
     args = [DeclareLaunchArgument('enable_behaviour', default_value='true'),
             DeclareLaunchArgument('enable_litter', default_value='true'),
             DeclareLaunchArgument('rgb_topic', default_value='/camera/color/image_raw'),
+            DeclareLaunchArgument('depth_topic', default_value='/camera/depth/image_raw'),
+            DeclareLaunchArgument('camera_info_topic', default_value='/camera/color/camera_info'),
+            DeclareLaunchArgument('target_frame', default_value='map'),
             DeclareLaunchArgument('vision_log_folder', default_value='vision_log')]
     parameters = [{'rgb_topic': LaunchConfiguration('rgb_topic'),
                    'vision_log_folder': LaunchConfiguration('vision_log_folder')}]
     return LaunchDescription(args + [
         Node(package='tk_vision_specialized', executable='behaviour_detection',
-             parameters=parameters, output='screen',
+             parameters=parameters + [{key: LaunchConfiguration(key) for key in
+                                       ('depth_topic', 'camera_info_topic', 'target_frame')}],
+             output='screen',
              condition=IfCondition(LaunchConfiguration('enable_behaviour'))),
         Node(package='tk_vision_specialized', executable='litter_detection',
              parameters=parameters, output='screen',

@@ -1,4 +1,6 @@
-# Analyze the latest fresh RGB frame. No depth or TF required.
+# Behaviour localization target; empty uses node target_frame (default map).
+# Ignored by RGB-only litter_detection. Empty requests {} remain valid.
+string target_frame
 ---
 # Capture stamp/frame copied from the input image (not inference completion).
 std_msgs/Header header
@@ -8,6 +10,11 @@ uint8 STATUS_VLM_ERROR=2
 uint8 STATUS_LOG_ERROR=3
 uint8 status
 string error_msg
+# Wall time inside VLM inference, including encoding, retries and fallback.
+# -1 means inference was not attempted (e.g. no fresh RGB).
+float64 vlm_elapsed_s
+string vlm_provider
+string vlm_model
 # True iff at least one requested behaviour / litter candidate was found.
 # Only interpret a negative result when status == STATUS_OK.
 bool detected

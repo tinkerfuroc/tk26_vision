@@ -151,7 +151,7 @@ def _client_for(provider: str):
         key = openrouter_api_key()
         if not key:
             raise RuntimeError("OPENROUTER_API_KEY not set")
-        return openai.OpenAI(api_key=key, base_url=OPENROUTER_BASE_URL), _gemini_model()
+        return openai.OpenAI(api_key=key, base_url=os.getenv('OPENROUTER_BASE_URL', OPENROUTER_BASE_URL)), _gemini_model()
     if provider == "qwen":
         key = dashscope_api_key()
         if not key:

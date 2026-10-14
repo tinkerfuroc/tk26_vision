@@ -115,7 +115,7 @@ class GeminiMatchClient:
                 '(required for Gemini provider)'
             )
         self._model = model or _gemini_default_model()
-        self._base_url = base_url or _GEMINI_DEFAULT_BASE_URL
+        self._base_url = base_url or os.getenv('OPENROUTER_BASE_URL', _GEMINI_DEFAULT_BASE_URL)
 
     def match_batch(
         self,

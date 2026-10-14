@@ -65,6 +65,15 @@ def test_no_frame_json(logger):
     assert not list(Path(logger.run_dir).glob('*.jpg'))
 
 
+def test_localization_metadata_preserved(logger):
+    localization = {'target_frame': 'map', 'positions': [
+        {'valid': True, 'xyz': [1., 2., 3.], 'frame_id': 'map'},
+        {'valid': False, 'xyz': None, 'error': 'No depth'}]}
+    path = log_scene(logger, None, [], task='behaviour', capture_header=None,
+                     status=1, localization=localization)
+    assert json.loads(Path(path).read_text())['localization'] == localization
+
+
 def test_silent_imwrite_failure_is_error(logger, monkeypatch):
     monkeypatch.setattr(sys.modules['cv2'], 'imwrite', lambda *a: False)
     with pytest.raises(OSError, match='Missing/empty'):

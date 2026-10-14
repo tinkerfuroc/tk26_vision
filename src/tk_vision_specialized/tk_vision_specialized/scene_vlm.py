@@ -145,6 +145,7 @@ def infer_scene(image, task, provider_models, *, timeout_s=30.0, attempts=2,
                                     timeout=remaining, max_retries=0) as client:
                     response = client.chat.completions.create(
                         model=model, temperature=0,
+                        **({'reasoning_effort': 'low'} if 'glm' in model.lower() else {}),
                         response_format={'type': 'json_object'},
                         messages=[{'role': 'system', 'content': PROMPTS[task]},
                                   {'role': 'user', 'content': [

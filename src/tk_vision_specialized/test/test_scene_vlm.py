@@ -97,6 +97,15 @@ def test_clean_negative_does_not_fall_back(monkeypatch):
     rows, _ = infer_scene(SimpleNamespace(shape=(20, 20, 3)), 'behaviour',
                           [('qwen', 'q'), ('gemini', 'g')], client_factory=factory)
     assert rows == [] and len(calls) == 1
+    assert 'reasoning_effort' not in calls[0]['request']
+
+
+@pytest.mark.parametrize('task', ['behaviour', 'litter'])
+def test_glm_uses_low_reasoning_effort(monkeypatch, task):
+    factory, calls = fake_factory(monkeypatch, ['{"observations": []}'])
+    infer_scene(SimpleNamespace(shape=(20, 20, 3)), task,
+                [('gemini', 'glm-5.3-flash')], client_factory=factory)
+    assert calls[0]['request']['reasoning_effort'] == 'low'
 
 
 def test_malformed_json_retried(monkeypatch):

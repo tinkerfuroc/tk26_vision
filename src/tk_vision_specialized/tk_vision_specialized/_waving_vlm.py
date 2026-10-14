@@ -241,7 +241,7 @@ def request_waving_persons(rgb_bgr: np.ndarray, *, provider: str, model: str,
     if provider == 'qwen':
         b_url, reasoning = _QWEN_DEFAULT_BASE_URL, False
     elif provider == 'gemini':
-        b_url, reasoning = _GEMINI_DEFAULT_BASE_URL, True
+        b_url, reasoning = os.getenv('OPENROUTER_BASE_URL', _GEMINI_DEFAULT_BASE_URL), True
     else:
         raise WavingVlmError(f'unknown provider {provider!r} (expected qwen|gemini)')
 

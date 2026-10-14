@@ -1,4 +1,4 @@
-"""Entry point for RGB-only person behaviour observation."""
+"""Entry point for VLM person behaviours with registered-depth localization."""
 from .rgb_scene_node import run_node
 
 

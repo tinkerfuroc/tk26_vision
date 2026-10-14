@@ -354,7 +354,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         rec_msg = self._wait_for_recent_frame(camera)
         if rec_msg is None:
-            response.error_msg = f'No {camera} camera data within sync threshold'
+            response.error_msg = f'No {camera} camera frame is available'
             return response
 
         intrinsic = self._get_intrinsic(camera)
@@ -1292,7 +1292,17 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         return 'orbbec'
 
     def _wait_for_recent_frame(self, camera: str):
-        return super()._wait_for_recent_frame(camera)
+        """Use the newest available pair without an observation age cutoff."""
+        intake = self._camera_intakes.get(camera)
+        if intake is None:
+            return None
+        bundle = intake.latest()
+        if bundle is None:
+            # A provider wait timeout may still include its latest frame.
+            bundle = intake.latest_cached()
+        if bundle is None:
+            return None
+        return copy.deepcopy((bundle.color_msg, bundle.depth_msg))
 
     def _get_intrinsic(self, camera: str):
         with self.lock_info:

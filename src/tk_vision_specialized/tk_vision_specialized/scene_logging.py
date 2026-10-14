@@ -6,7 +6,7 @@ import uuid
 
 
 def log_scene(logger, image, observations, *, task, capture_header, status,
-              error='', model_info=None, annotated_image=None):
+              error='', model_info=None, annotated_image=None, localization=None):
     """Return the JSON path; report missing images/writes as logging failures.
 
     Unique per-request branches avoid millisecond filename collisions.
@@ -18,6 +18,7 @@ def log_scene(logger, image, observations, *, task, capture_header, status,
         'detected': bool(observations), 'capture_header': capture_header,
         'completed_at_utc': datetime.now(timezone.utc).isoformat(),
         'model': model_info or {}, 'bbox_format': 'pixel_xyxy_exclusive',
+        'localization': localization or {},
     }
     detections = [dict(bbox=list(o.bbox), labels=list(o.labels),
                        cls_name=','.join(o.labels), description=o.description)

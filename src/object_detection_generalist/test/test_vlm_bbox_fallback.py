@@ -24,6 +24,20 @@ MODEL_GEMINI = 'google/gemini-2.5-flash'
 MODEL_QWEN = 'qwen/qwen3-vl-8b-instruct'
 
 
+def test_glm_explicit_object_contract_and_normalized_yxyx():
+    profile = vlm_bbox._provider_profile_for_model('glm-5.3-flash')
+    assert 'JSON object' in profile.system_prompt
+    boxes, labels, _ = vlm_bbox._parse_detections(
+        '{"detections": [{"label": "person", "box_2d": [100, 200, 600, 800]}]}',
+        200, 100, profile,
+    )
+    assert boxes == [(40, 10, 160, 60)]
+    assert labels == ['person']
+    assert vlm_bbox._parse_detections('{"detections": []}', 200, 100, profile)[0] == []
+    with pytest.raises(ValueError, match='JSON object'):
+        vlm_bbox._parse_detections('[]', 200, 100, profile)
+
+
 def _attempt(model, status='success', error=None):
     record = {'model': model, 'status': status}
     if error:

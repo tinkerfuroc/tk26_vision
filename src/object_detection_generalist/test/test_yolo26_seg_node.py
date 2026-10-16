@@ -12,7 +12,9 @@ from std_msgs.msg import Header
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as Srv
 from ultralytics.engine.results import Results
 
-from object_detection_generalist.yolo26_seg_node import Yolo26SegNode, select_labels
+from object_detection_generalist.yolo26_seg_node import (
+    Yolo26SegNode, flatten_labels, select_labels,
+)
 
 
 NAMES = {0: 'cup', 1: 'bottle', 2: 'dining table'}
@@ -34,6 +36,17 @@ def test_multiple_exact_labels(prompt):
 def test_multiword_and_custom_checkpoint_labels():
     assert select_labels('Dining Table', NAMES) == {'dining table'}
     assert select_labels('red_widget', {7: 'red_widget'}) == {'red_widget'}
+
+
+def test_flatten_labels_lowercases_checkpoint_names():
+    flat = flatten_labels({0: 'Coke', 1: 'HandSanitizer', 2: 'dining table'})
+    assert flat == {0: 'coke', 1: 'handsanitizer', 2: 'dining table'}
+    assert select_labels('COKE . HandSanitizer', flat) == {'coke', 'handsanitizer'}
+
+
+def test_flatten_labels_rejects_case_only_duplicates():
+    with pytest.raises(ValueError):
+        flatten_labels({0: 'Cup', 1: 'cup'})
 
 
 @pytest.mark.parametrize('prompt', ['mug', 'cup, mug', 'cupboard', ', ;'])
@@ -201,3 +214,54 @@ def test_inference_failure_returns_error(node, monkeypatch):
     assert res.status == 1
     assert 'simulated inference failure' in res.error_msg
 
+
+
+class RecordingLogger:
+    def __init__(self):
+        self.lines = []
+
+    def __getattr__(self, level):
+        return lambda msg, *a, **k: self.lines.append((level, msg))
+
+
+def test_request_and_result_are_logged(node, monkeypatch):
+    log = RecordingLogger()
+    monkeypatch.setattr(node, 'get_logger', lambda: log)
+    call(node, prompt='cup', sort_closest=True)
+    assert any(lvl == 'info' and "prompt='cup'" in m for lvl, m in log.lines)
+    assert any(lvl == 'info' and 'detected 1 object(s)' in m and 'cup conf=' in m
+               for lvl, m in log.lines)
+
+
+def test_failure_message_is_logged(node, monkeypatch):
+    log = RecordingLogger()
+    monkeypatch.setattr(node, 'get_logger', lambda: log)
+    monkeypatch.setattr(node, '_wait_for_recent_frame', lambda camera: None)
+    call(node)
+    assert any(lvl == 'warn' and 'no detections' in m and 'camera frame' in m
+               for lvl, m in log.lines)
+
+
+def test_first_frame_per_camera_is_logged_once(node, monkeypatch):
+    from object_detection_new.object_seg_yolo import YOLOSegmentationNode
+    frames = node._wait_for_recent_frame('orbbec')
+    # Undo the fixture's instance stub so the node's wrapper runs.
+    monkeypatch.delattr(node, '_wait_for_recent_frame')
+    monkeypatch.setattr(YOLOSegmentationNode, '_wait_for_recent_frame',
+                        lambda self, camera, **kwargs: frames)
+    log = RecordingLogger()
+    monkeypatch.setattr(node, 'get_logger', lambda: log)
+    monkeypatch.setattr(node, '_camera_intakes', {
+        cam: SimpleNamespace(cfg=SimpleNamespace(
+            backend='service', provider_endpoint=f'/{cam}_server',
+            color=SimpleNamespace(topic='/unused')))
+        for cam in ('orbbec', 'realsense')
+    })
+    call(node)
+    call(node)
+    node._generalist_service_callback(
+        Srv.Request(camera='realsense'), Srv.Response())
+    first = [m for _, m in log.lines if m.startswith('first ')]
+    assert len(first) == 2
+    assert first[0].startswith('first orbbec frame from /orbbec_server (service)')
+    assert first[1].startswith('first realsense frame from /realsense_server')

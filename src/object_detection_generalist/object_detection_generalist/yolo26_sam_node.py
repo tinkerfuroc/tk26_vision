@@ -16,6 +16,31 @@ from .sam_mask import SamPredictor
 from .yolo26_seg_node import Yolo26SegNode, select_labels
 
 
+def _box_iou(a, b):
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = ((a[2] - a[0]) * (a[3] - a[1])
+             + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+    return inter / union if union > 0 else 0.0
+
+
+def drop_duplicate_boxes(bboxes, confs, iou_threshold):
+    """Indices to keep when one object gets several labels.
+
+    Class-agnostic: of any boxes overlapping at IoU >= iou_threshold only the
+    highest-confidence one survives. Kept indices stay in model order;
+    iou_threshold <= 0 disables the filter.
+    """
+    if iou_threshold <= 0:
+        return list(range(len(bboxes)))
+    kept = []
+    for i in sorted(range(len(bboxes)), key=lambda i: -confs[i]):
+        if all(_box_iou(bboxes[i], bboxes[j]) < iou_threshold for j in kept):
+            kept.append(i)
+    return sorted(kept)
+
+
 class Yolo26SamNode(Yolo26SegNode):
     """Fixed-label YOLO26 detector whose boxes are segmented by MobileSAM."""
 
@@ -43,10 +68,13 @@ class Yolo26SamNode(Yolo26SegNode):
     def _declare_parameters(self):
         super()._declare_parameters()
         self.declare_parameter('sam_weights', 'mobile_sam.pt')
+        # Same object, several labels: keep the most confident (0 disables).
+        self.declare_parameter('duplicate_iou', 0.7)
 
     def _load_parameters(self):
         super()._load_parameters()
         self.sam_weights = self.get_parameter('sam_weights').value
+        self.duplicate_iou = float(self.get_parameter('duplicate_iou').value)
 
     def _detect_bboxes(self, rgb_img, selected_labels):
         """Return boxes, confidences, labels and class IDs in model order."""
@@ -110,6 +138,20 @@ class Yolo26SamNode(Yolo26SegNode):
                 confs.append(conf)
                 labels.append(cls_name)
                 detected_class_ids.append(cls_id)
+        keep = drop_duplicate_boxes(bboxes, confs, self.duplicate_iou)
+        if len(keep) < len(bboxes):
+            dropped = [
+                f'{labels[i]} conf={confs[i]:.2f}'
+                for i in range(len(bboxes)) if i not in keep
+            ]
+            self.get_logger().info(
+                f'dropped duplicate label(s) on the same object: '
+                f'{", ".join(dropped)}'
+            )
+            bboxes, confs, labels, detected_class_ids = (
+                [seq[i] for i in keep]
+                for seq in (bboxes, confs, labels, detected_class_ids)
+            )
         self.get_logger().info(
             f'YOLO26 bbox inference: {elapsed * 1000:.2f} ms, '
             f'{len(bboxes)} detection(s)'

@@ -11,7 +11,9 @@ from std_msgs.msg import Header
 from tinker_vision_msgs_26.srv import ObjectDetectionGeneralist as Srv
 from ultralytics.engine.results import Results
 
-from object_detection_generalist.yolo26_sam_node import Yolo26SamNode
+from object_detection_generalist.yolo26_sam_node import (
+    Yolo26SamNode, drop_duplicate_boxes,
+)
 
 
 NAMES = {0: 'cup', 1: 'bottle', 2: 'dining table'}
@@ -173,3 +175,31 @@ def test_sam_failure_is_reported_without_crashing_service(node, monkeypatch):
     assert response.status == 1
     assert response.detection_source == 'none'
     assert 'simulated MobileSAM failure' in response.error_msg
+
+
+def test_duplicate_labels_on_one_object_keep_highest_conf():
+    # Boxes from a real 2026-10-16 scan: banana and coke on one object.
+    bboxes = [(694, 261, 913, 501), (691, 265, 744, 421),
+              (535, 261, 725, 499), (691, 263, 744, 421)]
+    confs = [0.62, 0.62, 0.47, 0.38]
+    assert drop_duplicate_boxes(bboxes, confs, 0.7) == [0, 1, 2]
+    assert drop_duplicate_boxes(bboxes, confs, 0.0) == [0, 1, 2, 3]
+
+
+class DuplicateLabelModel(FakeDetectionModel):
+    def __call__(self, image, **kwargs):
+        self.calls.append(kwargs)
+        return [Results(image, path='', names=self.names, boxes=torch.tensor([
+            [5, 5, 25, 25, 0.5, 0],
+            [5, 6, 25, 25, 0.9, 1],
+            [40, 5, 60, 25, 0.8, 1],
+        ]))]
+
+
+def test_duplicate_filter_runs_before_sam(node):
+    node.model = DuplicateLabelModel()
+    response = call(node)
+    assert sorted((o.cls, round(o.conf, 2)) for o in response.objects) == [
+        ('bottle', 0.8), ('bottle', 0.9)]
+    assert FakeSamPredictor.instances[0].calls[-1] == [
+        (5, 6, 25, 25), (40, 5, 60, 25)]

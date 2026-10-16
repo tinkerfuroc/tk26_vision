@@ -9,11 +9,19 @@ import cv2
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.parameter import Parameter
 
 from object_detection_new.object_seg_yolo import YOLOSegmentationNode
 
 from .generalist_node import GeneralistDetectionNode
+
+
+def flatten_labels(names: dict[int, str]) -> dict[int, str]:
+    """Lowercase checkpoint labels; reject labels that differ only by case."""
+    flat = {i: name.lower() for i, name in names.items()}
+    if len(set(flat.values())) != len(flat):
+        raise ValueError(
+            f'Checkpoint labels collide when lowercased: {names}')
+    return flat
 
 
 def select_labels(prompt: str, names: dict[int, str]) -> frozenset[str] | None:
@@ -50,19 +58,10 @@ class Yolo26SegNode(GeneralistDetectionNode):
     _pipeline_description = 'YOLO26 segmentation'
 
     def __init__(self, node_name='yolo26_seg_node', parameter_overrides=None):
-        defaults = {
-            'model_path': Parameter(
-                'model_path', value=self._default_model_path),
-            'service_name': Parameter(
-                'service_name', value=self._default_service_name),
-            'confidence_threshold': Parameter(
-                'confidence_threshold', value=0.25),
-        }
-        defaults.update({p.name: p for p in parameter_overrides or []})
         # Skip GeneralistDetectionNode.__init__: no SAM, VLM or World models.
         YOLOSegmentationNode.__init__(
             self, node_name=node_name,
-            parameter_overrides=list(defaults.values()),
+            parameter_overrides=parameter_overrides or [],
         )
         self._yolo_class_names = set(self.model.names.values())
         self.declare_parameter(
@@ -79,6 +78,17 @@ class Yolo26SegNode(GeneralistDetectionNode):
             f'{self.model_path}; '
             f'labels={self.model.names}'
         )
+
+    def declare_parameter(self, name, value=None, *args, **kwargs):
+        # Swap in this node's defaults at declare time. Passing them as
+        # parameter_overrides would beat --ros-args -p values.
+        defaults = {
+            'model_path': self._default_model_path,
+            'service_name': self._default_service_name,
+            'confidence_threshold': 0.25,
+        }
+        value = defaults.get(name, value)
+        return super().declare_parameter(name, value, *args, **kwargs)
 
     def _declare_parameters(self):
         YOLOSegmentationNode._declare_parameters(self)
@@ -102,8 +112,66 @@ class Yolo26SegNode(GeneralistDetectionNode):
             )
         if not self.model.names:
             raise ValueError('The checkpoint contains no labels')
+        # Results, the labels param and grasp labels all read model.names;
+        # lowercase once here so callers never see checkpoint casing.
+        self.model.model.names = flatten_labels(self.model.names)
         self.model.to(self.device)
         self._yolo_loaded_device = self.device
+
+    def _wait_for_recent_frame(self, camera, **kwargs):
+        frames = YOLOSegmentationNode._wait_for_recent_frame(
+            self, camera, **kwargs)
+        logged = self.__dict__.setdefault('_first_frame_logged', set())
+        if frames is not None and camera not in logged:
+            logged.add(camera)
+            cfg = self._camera_intakes[camera].cfg
+            source = (cfg.provider_endpoint if cfg.backend == 'service'
+                      else cfg.color.topic)
+            color, depth = frames
+            stamp = color.header.stamp.sec + color.header.stamp.nanosec * 1e-9
+            age = self.get_clock().now().nanoseconds * 1e-9 - stamp
+            self.get_logger().info(
+                f'first {camera} frame from {source} ({cfg.backend}): '
+                f'color {color.width}x{color.height} {color.encoding}, '
+                f'depth {depth.width}x{depth.height} {depth.encoding}, '
+                f'frame={color.header.frame_id!r}, age={age * 1000:.0f} ms'
+            )
+        return frames
+
+    def _generalist_service_callback(self, request, response):
+        # Console trace of every request and its outcome, on all exit paths.
+        started = time.perf_counter()
+        self.get_logger().info(
+            f'request: camera={request.camera!r} prompt={request.prompt!r} '
+            f'target_frame={request.target_frame!r} '
+            f'sort_closest={request.sort_closest} '
+            f'sort_highest={request.sort_highest} '
+            f'return_segments={request.return_segments}'
+        )
+        try:
+            response = GeneralistDetectionNode._generalist_service_callback(
+                self, request, response)
+        except Exception as exc:
+            self.get_logger().error(f'request failed with exception: {exc}')
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if response.objects:
+            found = ', '.join(
+                f'{o.cls} conf={o.conf:.2f} at ({o.centroid.x:.3f}, '
+                f'{o.centroid.y:.3f}, {o.centroid.z:.3f})'
+                for o in response.objects
+            )
+            self.get_logger().info(
+                f'detected {len(response.objects)} object(s) in '
+                f'{elapsed_ms:.0f} ms [frame={response.header.frame_id!r}]: '
+                f'{found}'
+            )
+        else:
+            self.get_logger().warn(
+                f'no detections in {elapsed_ms:.0f} ms '
+                f'(status={response.status}): {response.error_msg}'
+            )
+        return response
 
     def _detect_objects(self, *args, **kwargs):
         with self._yolo_model_lock:

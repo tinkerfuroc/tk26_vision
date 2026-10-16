@@ -3,16 +3,27 @@
 <title>Orbbec · 场景检测验证</title>
 <style>
 :root{color-scheme:dark;font-family:Inter,"Microsoft YaHei",sans-serif;background:#0b1220;color:#e6edf7}*{box-sizing:border-box}body{margin:0;padding:28px;max-width:1600px;margin:auto}header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:25px}h1{font-size:26px;margin:6px 0}h2{font-size:17px;margin:0 0 16px}p{color:#91a4bd;font-size:14px;line-height:1.65}.eyebrow{color:#66d9c7;font:12px monospace;letter-spacing:2px}.pill{border:1px solid #314359;border-radius:30px;padding:8px 14px;font-size:13px;color:#afc1d9}.layout{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(360px,1fr);gap:22px}.panel{background:#111e30;border:1px solid #25364b;border-radius:16px;padding:20px}.camera{position:relative;aspect-ratio:4/3;background:#050b13;border-radius:10px;overflow:hidden;display:grid;place-items:center}.camera img{width:100%;height:100%;object-fit:contain}.camera .empty{position:absolute;color:#94a8bf}.camera img:not([src]){display:none}.meta{white-space:pre-wrap;font:12px monospace;color:#8fa7c4;overflow-wrap:anywhere;margin-top:12px;line-height:1.7}.actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0 10px}button{border:0;border-radius:10px;padding:15px;background:#59d3bd;color:#07281f;cursor:pointer;font:600 15px inherit}button.secondary{background:#88acff;color:#0d2149}button:disabled{opacity:.4;cursor:not-allowed}.cards{display:grid;gap:20px}.row{display:flex;justify-content:space-between;align-items:center;gap:10px}.status{font-size:12px;color:#99aec8}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.metric{background:#0b1524;padding:12px;border-radius:8px;font-size:12px;color:#93a8c2}.metric strong{display:block;color:#e6edf7;font-size:22px;font-weight:500;margin-top:5px}.result-image{width:100%;max-height:310px;object-fit:contain;background:#07101c;border-radius:8px}.result-image:not([src]){display:none}.details{font-size:13px;line-height:1.7;color:#c0d0e4;overflow-wrap:anywhere}.item{border-top:1px solid #293a50;padding:12px 0}.tag{display:inline-block;background:#203b47;color:#85e3d4;padding:2px 8px;border-radius:5px;margin-right:5px}.error{color:#ffb3a7}.success{color:#78dec7}details{margin-top:12px}pre{white-space:pre-wrap;font-size:12px;max-height:280px;overflow:auto;color:#9db3ce}@media(max-width:900px){body{padding:16px}.layout{grid-template-columns:1fr}header{align-items:flex-start}.pill{max-width:145px}.camera{aspect-ratio:16/10}}
+.pantilt{border-top:1px solid #293a50;margin-top:18px;padding-top:18px}.pantilt h2{margin:0}.pt-axis{display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center;margin-top:14px;font-size:14px}.pt-axis input[type=number]{width:90px;background:#0b1524;color:#e6edf7;border:1px solid #314359;border-radius:6px;padding:8px}.pt-axis input[type=range]{grid-column:1/-1;width:100%;accent-color:#59d3bd}.pantilt p{font-size:12px}
 </style></head><body>
 <header><div><div class="eyebrow">TINKER VISION / VALIDATION</div><h1>Orbbec 场景检测验证</h1><p>实时 RGB 预览 · 按需检测 · 独立保留两类检测结果</p></div><div class="pill" id="connection">连接中…</div></header>
-<main class="layout"><section class="panel"><div class="row"><h2>实时画面</h2><span class="status">RGB · 最高 5 FPS</span></div><div class="camera"><span class="empty" id="empty">等待 Orbbec RGB 图像…</span><img id="live" alt="Orbbec 实时 RGB"></div><div class="meta" id="camera-meta">等待相机状态</div><div class="actions"><button id="behaviour-button" disabled>检测人物行为</button><button class="secondary" id="litter-button" disabled>检测地面垃圾</button></div><p>行为：睡觉 / 坐着休息 / 倒地 / 站立或坐姿挥手。<br>按钮调用 ROS 检测服务；模型、定位及日志保存由检测节点负责。</p><p id="services">正在发现检测服务…</p></section><section class="cards" id="cards"></section></main>
+<main class="layout"><section class="panel"><div class="row"><h2>实时画面</h2><span class="status">RGB · 最高 5 FPS</span></div><div class="camera"><span class="empty" id="empty">等待 Orbbec RGB 图像…</span><img id="live" alt="Orbbec 实时 RGB"></div><div class="meta" id="camera-meta">等待相机状态</div>
+<div class="pantilt">
+<div class="row"><h2>云台角度</h2><span class="status" id="pt-state">等待云台反馈…</span></div>
+<div class="pt-axis"><label for="pt-pan">水平 / Pan (°)</label><input id="pt-pan" type="number" min="-180" max="180" step="0.1" value="0"><input aria-label="水平角度滑块" id="pt-pan-range" type="range" min="-180" max="180" step="0.1" value="0"></div>
+<div class="pt-axis"><label for="pt-tilt">俯仰 / Tilt (°)</label><input id="pt-tilt" type="number" min="-30" max="90" step="0.1" value="0"><input aria-label="俯仰角度滑块" id="pt-tilt-range" type="range" min="-30" max="90" step="0.1" value="0"></div>
+<div class="actions"><button id="pt-apply" disabled>应用角度</button><button id="pt-current" class="secondary" disabled>填入当前角度</button></div>
+<div class="meta" id="pt-feedback">实际角度：—</div>
+<p>水平 −180°～180°，俯仰 −30°～90°。调整输入后点击“应用角度”才会转动。</p>
+<div class="status" id="pt-result" role="status" aria-live="polite"></div>
+</div>
+<div class="actions"><button id="behaviour-button" disabled>检测人物行为</button><button class="secondary" id="litter-button" disabled>检测地面垃圾</button></div><p>行为：睡觉 / 坐着休息 / 倒地 / 站立或坐姿挥手。<br>按钮调用 ROS 检测服务；模型、定位及日志保存由检测节点负责。</p><p id="services">正在发现检测服务…</p></section><section class="cards" id="cards"></section></main>
 <template id="card"><article class="panel"><div class="row"><h2></h2><span class="status phase">尚未检测</span></div><div class="metrics"><div class="metric">VLM 耗时<strong class="vlm">—</strong></div><div class="metric">服务总耗时<strong class="total">—</strong></div></div><img class="result-image" alt="本次检测的标注结果"><div class="details">点击左侧按钮开始检测</div><div class="meta info"></div><details><summary>查看结构化结果</summary><pre></pre></details></article></template>
 <script>
 const tasks=['behaviour','litter'], titles={behaviour:'人物行为',litter:'地面垃圾'};
 const labels={lying_resting_or_sleeping:'躺卧休息 / 疑似睡觉',sitting_on_bed:'坐在床上',sitting_on_sofa:'坐在沙发上',sitting_on_chair:'坐在椅子上',lying_on_floor_possible_fall:'倒地 / 疑似摔倒',standing_waving:'站立挥手',sitting_waving:'坐姿挥手',floor_litter:'地面垃圾'};
 const cards={}, pending=new Set(); let state=null;
 for(const task of tasks){const fragment=document.querySelector('#card').content.cloneNode(true);const card=fragment.querySelector('article');card.querySelector('h2').textContent=titles[task];cards[task]=card;document.querySelector('#cards').append(fragment);document.getElementById(task+'-button').onclick=()=>detect(task)}
-function buttons(){for(const t of tasks)document.getElementById(t+'-button').disabled=!state?.camera_ready||!state?.services[t]||pending.has(t)||state?.busy.includes(t)}
+function buttons(){ptControls();for(const t of tasks)document.getElementById(t+'-button').disabled=!state?.camera_ready||!state?.services[t]||pending.has(t)||state?.busy.includes(t)}
 function seconds(s){return Number.isFinite(s)&&s>=0?s.toFixed(2)+' s':'未调用'}
 function stamp(s){return s?`${s.sec}.${String(s.nanosec).padStart(9,'0')} · ${s.frame_id}`:'—'}
 async function status(){try{const r=await fetch('/api/state');if(!r.ok)throw Error();state=await r.json();document.getElementById('connection').textContent=state.camera_ready?'● RGB 已连接':'○ 等待新鲜 RGB';document.getElementById('camera-meta').textContent=`${state.rgb_topic}\n采集时间戳 ${stamp(state.stamp)}\n最近接收 ${state.image_age_s===null?'—':state.image_age_s.toFixed(1)+' 秒前'}`;document.getElementById('services').textContent=tasks.map(t=>titles[t]+'服务：'+(state.services[t]?'就绪':'未发现')).join(' / ');buttons()}catch(e){state=null;buttons();document.getElementById('connection').textContent='连接中断，重试中…'}setTimeout(status,1000)}
@@ -20,5 +31,43 @@ async function preview(){let url;try{const r=await fetch('/api/frame.jpg?t='+Dat
 async function detect(task){pending.add(task);buttons();const card=cards[task],phase=card.querySelector('.phase');phase.className='status phase';const start=performance.now();phase.textContent='检测中…';const timer=setInterval(()=>phase.textContent=`检测中 · ${((performance.now()-start)/1000).toFixed(1)} s`,100);card.querySelector('.details').textContent='正在调用检测服务…';card.querySelector('.result-image').removeAttribute('src');card.querySelector('.vlm').textContent='—';card.querySelector('.total').textContent='—';card.querySelector('.info').textContent='';card.querySelector('pre').textContent='';
 try{const r=await fetch('/api/detect/'+task,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const data=await r.json();if(!r.ok)throw Error(data.error||'HTTP '+r.status);clearInterval(timer);card.querySelector('.vlm').textContent=seconds(data.vlm_elapsed_s);card.querySelector('.total').textContent=seconds(data.service_elapsed_s);phase.textContent=data.status===0?(data.detected?'发现目标':'未发现目标'):'检测异常';phase.classList.add(data.status===0?'success':'error');if(data.annotated_image||data.rgb_image)card.querySelector('.result-image').src=data.annotated_image||data.rgb_image;const details=card.querySelector('.details');details.textContent=data.error||(data.observations.length?'':'本次图像中未检测到目标');for(const obs of data.observations){const item=document.createElement('div');item.className='item';for(const label of obs.labels){const tag=document.createElement('span');tag.className='tag';tag.textContent=labels[label]||label;item.append(tag)}const description=document.createElement('div');description.textContent=obs.description;item.append(description);const box=document.createElement('div');box.textContent='BBox [x1, y1, x2, y2]：'+obs.bbox.join(', ');item.append(box);if(task==='behaviour'){const p=document.createElement('div');p.textContent=obs.position_valid?`位置 (${obs.position.frame_id})：${obs.position.xyz.map(n=>n.toFixed(3)).join(', ')} m`:'未定位：'+obs.position_error;item.append(p)}details.append(item)}card.querySelector('.info').textContent=`模型：${data.model||'—'} / ${data.provider||'—'}\n采集：${stamp(data.stamp)}\n日志：${data.log_json||'—'}`;const {rgb_image,annotated_image,...metadata}=data;card.querySelector('pre').textContent=JSON.stringify(metadata,null,2)
 }catch(e){phase.textContent='调用失败';phase.classList.add('error');card.querySelector('.details').textContent=e.message}finally{clearInterval(timer);pending.delete(task);buttons()}}
+let ptSending=false, ptInitialized=false;
+function ptControls(){
+  const p=state?.pan_tilt, ready=!!p?.ready;
+  document.getElementById('pt-apply').disabled=!ready||ptSending;
+  document.getElementById('pt-current').disabled=!ready||ptSending;
+  document.getElementById('pt-state').textContent=ready?'● 已连接':'○ 未连接 / 反馈过期';
+  document.getElementById('pt-feedback').textContent=p&&Number.isFinite(p.pan_deg)&&Number.isFinite(p.tilt_deg)
+    ?'实际角度：水平 '+p.pan_deg.toFixed(2)+'° · 俯仰 '+p.tilt_deg.toFixed(2)+'°'+(ready?'':'（非实时）'):'实际角度：—';
+  if(ready&&!ptInitialized){ptFill();ptInitialized=true}
+}
+function ptFill(){
+  const p=state?.pan_tilt;if(!p?.ready)return;
+  for(const axis of ['pan','tilt']){
+    const value=p[axis+'_deg'].toFixed(1);
+    document.getElementById('pt-'+axis).value=value;
+    document.getElementById('pt-'+axis+'-range').value=value;
+  }
+}
+for(const axis of ['pan','tilt']){
+  const field=document.getElementById('pt-'+axis),range=document.getElementById('pt-'+axis+'-range');
+  field.oninput=()=>{ptInitialized=true;if(field.value!==''&&field.checkValidity())range.value=field.value};
+  range.oninput=()=>{ptInitialized=true;field.value=range.value};
+}
+document.getElementById('pt-current').onclick=ptFill;
+document.getElementById('pt-apply').onclick=async()=>{
+  const body={},result=document.getElementById('pt-result');
+  for(const axis of ['pan','tilt']){
+    const input=document.getElementById('pt-'+axis);
+    if(input.value===''||!Number.isFinite(input.valueAsNumber)||!input.reportValidity()){result.textContent='请输入范围内的角度';return}
+    body[axis+'_deg']=input.valueAsNumber;
+  }
+  ptSending=true;ptControls();result.textContent='正在发送…';
+  try{
+    const r=await fetch('/api/pan_tilt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const data=await r.json();if(!r.ok)throw Error(data.error||'HTTP '+r.status);
+    result.textContent='已发送目标：水平 '+data.pan_deg+'° · 俯仰 '+data.tilt_deg+'°；请查看实际角度';
+  }catch(e){result.textContent=e.message}finally{ptSending=false;ptControls()}
+};
 status();preview();
 </script></body></html>

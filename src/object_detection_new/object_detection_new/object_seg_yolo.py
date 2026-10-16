@@ -666,8 +666,8 @@ class YOLOSegmentationNode(Node):
             RGB image
         points : np.ndarray
             3D point cloud array
-        target_cls : str
-            Target class to detect
+        target_cls : str | collection[str] | None
+            One class, a collection of checkpoint labels, or None for all.
         valid_mask : np.ndarray
             Valid depth mask
         header : Header
@@ -701,7 +701,22 @@ class YOLOSegmentationNode(Node):
 
         # Run YOLO inference
         start_time = self.get_clock().now()
-        results = self.model(rgb_padded, imgsz=(h_pad, w_pad), verbose=False)
+        predict_kwargs = {}
+        if not isinstance(target_cls, str):
+            # Explicitly reset classes on all-label calls: Ultralytics retains
+            # predictor options across requests. Legacy single-label calls
+            # keep their existing inference defaults.
+            predict_kwargs = {
+                'classes': None if target_cls is None else [
+                    i for i, name in self.model.names.items()
+                    if name in target_cls
+                ],
+                'conf': self.conf_threshold,
+                'retina_masks': True,
+            }
+        results = self.model(
+            rgb_padded, imgsz=(h_pad, w_pad), verbose=False, **predict_kwargs
+        )
         end_time = self.get_clock().now()
         inference_time = (end_time - start_time).nanoseconds / 1e6  # ms
         self.get_logger().info(f'YOLO inference time: {inference_time:.2f} ms')
@@ -794,7 +809,10 @@ class YOLOSegmentationNode(Node):
                 if cls_name in self.excluded_classes:
                     continue
 
-                if cls_name != target_cls:
+                if target_cls is not None and (
+                    cls_name != target_cls if isinstance(target_cls, str)
+                    else cls_name not in target_cls
+                ):
                     continue
 
                 closest_distance = math.sqrt(

@@ -2,6 +2,7 @@
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -13,6 +14,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 from tinker_vision_msgs_26.srv import DetectRgbScene
 
 
@@ -32,6 +34,12 @@ class SceneWeb(Node):
         self.received = 0.0
         self.stamp = None
         self.busy = set()
+        self.pan_tilt = None
+        self.pan_tilt_received = 0.0
+        self.pan_tilt_pub = self.create_publisher(
+            PanTiltCommand, '/pan_tilt_controller/cmd', 10)
+        self.create_subscription(
+            PanTiltState, '/pan_tilt_controller/state', self.on_pan_tilt, 10)
         self.detectors = {task: self.create_client(
             DetectRgbScene, self.declare_parameter(task + '_service',
                                                   '/' + task + '_detection/detect').value)
@@ -55,13 +63,58 @@ class SceneWeb(Node):
         except Exception as exc:
             self.get_logger().warning('Preview decode failed: ' + str(exc))
 
+    def on_pan_tilt(self, msg):
+        with self.lock:
+            self.pan_tilt = {
+                'pan_deg': math.degrees(msg.pan_rad),
+                'tilt_deg': math.degrees(msg.tilt_rad),
+                'connected': msg.connected, 'feedback_ok': msg.feedback_ok}
+            self.pan_tilt_received = time.monotonic()
+
+    def pan_tilt_state(self):
+        # Caller holds self.lock.
+        result = dict(self.pan_tilt or {})
+        age = time.monotonic() - self.pan_tilt_received if self.pan_tilt else None
+        result['ready'] = bool(
+            age is not None and age < 1.0 and result.get('connected')
+            and result.get('feedback_ok')
+            and all(math.isfinite(result[k]) for k in ('pan_deg', 'tilt_deg'))
+            and self.pan_tilt_pub.get_subscription_count() > 0)
+        result['age_s'] = age
+        for key in ('pan_deg', 'tilt_deg'):
+            if key in result and not math.isfinite(result[key]):
+                result[key] = None
+        return result
+
+    def move_pan_tilt(self, data):
+        if not isinstance(data, dict):
+            return 400, {'error': '请提供水平和俯仰角度'}
+        values = []
+        for key, low, high in (('pan_deg', -180, 180), ('tilt_deg', -30, 90)):
+            value = data.get(key)
+            if (type(value) not in (int, float) or not math.isfinite(value)
+                    or not low <= value <= high):
+                return 400, {'error': f'{key} 必须是 {low} 到 {high} 之间的有限数值'}
+            values.append(float(value))
+        with self.lock:
+            if not self.pan_tilt_state()['ready']:
+                return 503, {'error': '云台未连接或反馈已过期，未发送动作'}
+            msg = PanTiltCommand()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.mode = PanTiltCommand.ABSOLUTE
+            msg.pan_rad, msg.tilt_rad = map(math.radians, values)
+            msg.speed_raw = 120
+            msg.accel_raw = 20
+            self.pan_tilt_pub.publish(msg)
+        return 200, {'sent': True, 'pan_deg': values[0], 'tilt_deg': values[1]}
+
     def state(self):
         with self.lock:
             age = time.monotonic() - self.received if self.jpeg else None
             return {'rgb_topic': self.topic, 'image_age_s': age, 'stamp': self.stamp,
                     'camera_ready': age is not None and age < 2,
                     'services': {k: c.service_is_ready() for k, c in self.detectors.items()},
-                    'busy': sorted(self.busy)}
+                    'busy': sorted(self.busy), 'pan_tilt': self.pan_tilt_state()}
 
     def detect(self, task):
         client = self.detectors[task]
@@ -159,6 +212,22 @@ def make_handler(node):
             origin = self.headers.get('Origin')
             if (origin and urlsplit(origin).netloc != self.headers.get('Host')) or self.headers.get('Content-Type') != 'application/json':
                 self.send(403, {'error': 'Only same-origin JSON requests are allowed'})
+                return
+            if self.path == '/api/pan_tilt':
+                try:
+                    size = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < size <= 1024:
+                        raise ValueError('invalid body size')
+                    data = json.loads(self.rfile.read(size))
+                except (ValueError, UnicodeError):
+                    self.send(400, {'error': '无效的角度请求'})
+                    return
+                try:
+                    status, result = node.move_pan_tilt(data)
+                    self.send(status, result)
+                except Exception as exc:
+                    node.get_logger().error('Pan-tilt command failed: ' + type(exc).__name__)
+                    self.send(500, {'error': '云台命令发送失败'})
                 return
             task = {'/api/detect/behaviour': 'behaviour', '/api/detect/litter': 'litter'}.get(self.path)
             if task is None:

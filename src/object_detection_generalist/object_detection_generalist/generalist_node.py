@@ -178,15 +178,17 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         # flags override this:
         #   - force_vlm_sam=True  → VLM only, regardless of enable_vlm.
         #   - use_vlm_sam_fallback=True → race YOLO-World vs VLM concurrently.
-        self.declare_parameter('enable_vlm', False)
-        self.declare_parameter('vlm_model', vision_flash_model())
+        self.declare_parameter('enable_vlm', True)
+        # Primary: DashScope Qwen-VL (VISION_QWEN_MODEL); fallback: flash model
+        # (VISION_VLM_FLASH_MODEL, glm-5.3-flash via OpenRouter).
+        self.declare_parameter('vlm_model', f'dashscope/{vision_qwen_model()}')
         # Fallback chain. A 'dashscope/' prefix routes the model to Alibaba
         # DashScope's OpenAI-compatible endpoint (separate DASHSCOPE_API_KEY +
         # base URL) instead of OpenRouter — see vlm_bbox._split_provider. qwen
         # is served via DashScope so it stays reachable on networks where
         # openrouter.ai is blocked.
         self.declare_parameter(
-            'vlm_fallback_models', [f'dashscope/{vision_qwen_model()}']
+            'vlm_fallback_models', [vision_flash_model()]
         )
         # Convenience switch: make the DashScope qwen model the PRIMARY VLM and
         # drop OpenRouter from the chain entirely. Use this on networks where
@@ -380,7 +382,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
 
         sort_mode = self._select_sort_mode(request)
         prompt = (request.prompt or '').strip()
-        if not prompt:
+        if not prompt and not getattr(self, '_checkpoint_only', False):
             response.error_msg = 'prompt is empty'
             if self._vision_logger.enabled:
                 self._log_debug(
@@ -399,7 +401,10 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         yolo_known = prompt in self._yolo_class_names
 
         # --- branching ----------------------------------------------------
-        if request.force_vlm_sam:
+        if getattr(self, '_checkpoint_only', False):
+            # Fixed-label subclasses share camera intake and response assembly.
+            result = self._yolo_pipeline(**ctx)
+        elif request.force_vlm_sam:
             # Operator override: VLM + SAM only (semantics unchanged from the
             # original generalist behavior; ignores enable_vlm).
             # INVARIANT: force_vlm_sam ⇒ YOLO-World must NOT run. This branch
@@ -1375,6 +1380,7 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         return_segments: bool,
         confs: list[float] | None = None,
         labels: list[str] | None = None,
+        class_ids: list[int] | None = None,
         header=None,
         target_frame: str = '',
     ):
@@ -1392,6 +1398,9 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
         and pass the result here. YOLO-World callers pass nothing (their
         model is configured single-class) and every object's ``cls`` falls
         back to the full ``prompt``.
+
+        ``class_ids`` optionally supplies checkpoint class IDs in the same
+        order. Open-vocabulary callers omit it and retain ``object_id=-1``.
 
         ``header`` + ``target_frame`` are forwarded to ``_transform_centroid``
         so fallback centroids land in the same frame the YOLO branch
@@ -1442,7 +1451,11 @@ class GeneralistDetectionNode(YOLOSegmentationNode):
             obj.cls = labels[i] if labels and i < len(labels) else prompt
             obj.centroid = centroid
             obj.id = 0
-            obj.object_id = -1
+            obj.object_id = (
+                int(class_ids[i])
+                if class_ids is not None and i < len(class_ids)
+                else -1
+            )
             obj.similarity = 0.0
             obj.being_pointed = 0
             objects.append(obj)

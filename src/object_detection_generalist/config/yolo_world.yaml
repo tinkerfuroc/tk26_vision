@@ -1,0 +1,9 @@
+/**:
+  ros__parameters:
+    # Dedicated endpoint for hangzhougrasp. "coke" takes the open-vocabulary path.
+    service_name: object_detection_yolo_world
+    model_path: yolo11m-seg.pt
+    allow_auto_fallback: true
+    enable_vlm: false
+    world_weights: yolov8s-worldv2.pt
+    sam_weights: mobile_sam.pt
